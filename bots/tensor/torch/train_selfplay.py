@@ -369,10 +369,13 @@ def main():
             "episode": ep + 1,
             "reward": round(mean_reward, 4),
             "resources": round(mean_ti, 2),
-"best_resources": round(mean_ti, 2),
+            "best_resources": round(mean_ti, 2),
             "pi_loss": round(stats["pi_loss"], 5),
             "vf_loss": round(stats["vf_loss"], 5),
             "entropy": round(stats["entropy"], 4),
+            "approx_kl": round(stats.get("approx_kl", 0), 6),
+            "clip_frac": round(stats.get("clip_frac", 0), 4),
+            "explained_var": stats.get("explained_var", 0),
             "lr": round(scheduler.get_last_lr()[0], 8),
             "sps": stats["n_steps"],
             "elapsed": round(elapsed, 1),
@@ -398,7 +401,9 @@ def main():
                 f"W/L={total_wins}/{total_losses}/{total_games}  "
                 f"reward={mean_reward:+.2f}  ti={mean_ti:.0f}  "
                 f"pi={stats['pi_loss']:+.4f}  "
-                f"league={len(league.models)}  top=[{top3}]  "
+                f"kl={stats.get('approx_kl', 0):.4f}  "
+                f"ev={stats.get('explained_var', 0):.2f}  "
+                f"clip={stats.get('clip_frac', 0):.2f}  "
                 f"collect={t_collect:.1f}s train={t_train:.1f}s  [{elapsed:.0f}s]"
             )
 
