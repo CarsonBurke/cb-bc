@@ -217,14 +217,12 @@ export default function TrainingView() {
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             <Stat label="Episodes" value={progress} />
-            <Stat label="Best Resources" value={fmt(latest?.best_resources, 1)} />
-<Stat label="Last Reward" value={fmt(latest?.reward, 3)} />
+            <Stat label="Last Reward" value={fmt(latest?.reward, 3)} />
             <Stat label="Last Resources" value={fmt(latest?.resources, 1)} />
+            <Stat label="Expl. Variance" value={fmt(latest?.explained_var, 3)} />
             <Stat label="Entropy" value={fmt(latest?.entropy, 3)} />
+            <Stat label="Approx KL" value={fmt(latest?.approx_kl, 5)} />
             <Stat label="Elapsed" value={latest ? `${latest.elapsed}s` : '—'} />
-            {config.envs && <Stat label="Envs" value={config.envs} />}
-            {config.ep_len && <Stat label="Rounds/Ep" value={config.ep_len} />}
-            {config.grid && <Stat label="Grid" value={`${config.grid}x${config.grid}`} />}
             {config.lr && <Stat label="LR" value={config.lr} />}
           </div>
         )}
@@ -245,8 +243,16 @@ export default function TrainingView() {
             <Card title="Loss & Entropy" id="train-loss-chart" defaultOpen={false}>
               <LossChart episodes={episodes} />
             </Card>
-            <Card title="Best Resources" id="train-best-res" defaultOpen={false}>
-              <SingleChart episodes={episodes} label="Best" dataKey="best_resources" color="#f9e2af" fillColor="#f9e2af20" />
+            <Card title="Explained Variance" id="train-ev">
+              <SingleChart episodes={episodes} label="Explained Var" dataKey="explained_var" color="#a6e3a1" fillColor="#a6e3a120" />
+            </Card>
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card title="Approx KL" id="train-kl" defaultOpen={false}>
+              <SingleChart episodes={episodes} label="KL" dataKey="approx_kl" color="#fab387" />
+            </Card>
+            <Card title="Clip Fraction" id="train-clip" defaultOpen={false}>
+              <SingleChart episodes={episodes} label="Clip Frac" dataKey="clip_frac" color="#f9e2af" />
             </Card>
           </div>
         </>
@@ -261,9 +267,11 @@ export default function TrainingView() {
                 <Th>Ep</Th>
                 <Th>Reward</Th>
                 <Th>Resources</Th>
-<Th>Best Res</Th>
                 <Th>Pi Loss</Th>
                 <Th>Entropy</Th>
+                <Th>KL</Th>
+                <Th>Clip%</Th>
+                <Th>ExplVar</Th>
                 <Th>SPS</Th>
               </Thead>
               <tbody>
@@ -272,11 +280,11 @@ export default function TrainingView() {
                     <Td>{e.episode}</Td>
                     <Td>{fmt(e.reward, 3)}</Td>
                     <Td>{fmt(e.resources, 1)}</Td>
-                    <Td className={e.resources >= e.best_resources ? 'text-green font-medium' : ''}>
-                      {fmt(e.best_resources, 1)}
-                    </Td>
                     <Td>{fmt(e.pi_loss, 4)}</Td>
                     <Td>{fmt(e.entropy, 3)}</Td>
+                    <Td>{fmt(e.approx_kl, 5)}</Td>
+                    <Td>{fmt(e.clip_frac, 3)}</Td>
+                    <Td>{fmt(e.explained_var, 3)}</Td>
                     <Td>{e.sps?.toLocaleString()}</Td>
                   </Tr>
                 ))}
