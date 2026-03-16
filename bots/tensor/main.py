@@ -19,9 +19,10 @@ from tensor_lib import MLP, SinusoidalPositionEmbedding
 GRID_SIZE = 5
 GRID_HALF = GRID_SIZE // 2
 # Per tile: is_wall(1) + ore_ti(1) + ore_ax(1)
-#         + bld_type(4: none/econ/road/military) + bld_friendly(1) + bld_dir(2)
-#         + has_unit(1) + unit_friendly(1) = 12
-TILE_FEATURES = 12
+#         + bld_type(8: none/harvester/conveyor/splitter/road/support/military/core)
+#         + bld_friendly(1) + bld_dir(2)
+#         + has_unit(1) + unit_friendly(1) = 16
+TILE_FEATURES = 16
 # Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy, n_builders, prev_reward = 12
 GLOBAL_FEATURES = 12
 POS_EMBED_DIM = 8
@@ -72,19 +73,20 @@ ENV_IDX = {
 # 0=none, 1=economy(harvester/conveyor-family), 2=road, 3=military(turrets/barrier/foundry/launcher)
 BLD_IDX = {
     EntityType.HARVESTER: 1,
-    EntityType.CONVEYOR: 1,
-    EntityType.SPLITTER: 1,
-    EntityType.ARMOURED_CONVEYOR: 1,
-    EntityType.BRIDGE: 1,
-    EntityType.ROAD: 2,
-    EntityType.GUNNER: 3,
-    EntityType.SENTINEL: 3,
-    EntityType.BREACH: 3,
-    EntityType.BARRIER: 3,
-    EntityType.FOUNDRY: 3,
-    EntityType.LAUNCHER: 3,
+    EntityType.CONVEYOR: 2,
+    EntityType.ARMOURED_CONVEYOR: 2,
+    EntityType.SPLITTER: 3,
+    EntityType.ROAD: 4,
+    EntityType.BARRIER: 5,
+    EntityType.BRIDGE: 5,
+    EntityType.FOUNDRY: 5,
+    EntityType.GUNNER: 6,
+    EntityType.SENTINEL: 6,
+    EntityType.BREACH: 6,
+    EntityType.LAUNCHER: 6,
+    EntityType.CORE: 7,
 }
-N_BLD_TYPES = 4
+N_BLD_TYPES = 8
 
 # Direction -> (dx, dy) normalized offsets
 DIR_DXY = {
@@ -500,7 +502,7 @@ class Player:
                     except Exception:
                         features.extend([0.0, 0.0])
                 else:
-                    features.append(1.0)  # none category
+                    features.append(1.0)  # none category (index 0)
                     features.extend([0.0] * (N_BLD_TYPES - 1))
                     features.extend([0.0, 0.0, 0.0])  # friendly, dir_dx, dir_dy
 

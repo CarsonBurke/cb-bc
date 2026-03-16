@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # ---- Architecture constants (must match main.py) ----
 
-TILE_FEATURES = 12
+TILE_FEATURES = 16
 GLOBAL_FEATURES = 12
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
@@ -143,6 +143,7 @@ def ppo_update(
     """PPO update on flattened rollout data. Returns stats dict."""
     N = obs.shape[0]
     sum_pi, sum_vf, sum_ent = 0.0, 0.0, 0.0
+    sum_kl, sum_clip_frac = 0.0, 0.0
     n_updates = 0
 
     for epoch in range(ppo_epochs):
@@ -166,6 +167,9 @@ def ppo_update(
             with torch.no_grad():
                 approx_kl = ((ratio - 1) - logratio).mean()
                 approx_kl_acc += approx_kl.item()
+                clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean()
+                sum_kl += approx_kl.item()
+                sum_clip_frac += clip_frac.item()
                 n_mb += 1
 
             mb_adv = advantages[idx]
@@ -193,10 +197,22 @@ def ppo_update(
         if target_kl is not None and n_mb > 0 and approx_kl_acc / n_mb > target_kl:
             break
 
+    # Explained variance: how well the value function predicts returns
+    with torch.no_grad():
+        _, _, _, all_values, _ = model(obs, h)
+        v_pred = all_values.view(-1)
+        var_returns = returns.var()
+        ev = 1.0 - (returns - v_pred).var() / (var_returns + 1e-8) if var_returns > 1e-8 else 0.0
+        if isinstance(ev, torch.Tensor):
+            ev = ev.item()
+
     return {
         "pi_loss": sum_pi / max(n_updates, 1),
         "vf_loss": sum_vf / max(n_updates, 1),
         "entropy": sum_ent / max(n_updates, 1),
+        "approx_kl": sum_kl / max(n_updates, 1),
+        "clip_frac": sum_clip_frac / max(n_updates, 1),
+        "explained_var": round(ev, 4),
         "n_updates": n_updates,
     }
 
