@@ -50,12 +50,12 @@ Replays are written to `replays/`.
 
 ### Tooling
 
-- **ELO tournament:** `python ablations/elo.py` — round-robin (both sides, all 6 maps), parallel. Writes `ablations/elo_results.json`.
+- **Full pipeline:** `python ablations/elo.py` — runs tournament (round-robin, both sides, all 6 maps, parallel), appends to `ablations/history.json`, generates `ablations/REPORT.md`. One command does everything.
 - **Selective:** `python ablations/elo.py bot_a bot_b` — specific bots only.
-- **History:** `python ablations/history.py` — appends ELO results to `ablations/history.json` with timestamps, bot lineage, and changelogs.
-- **Report:** `python ablations/report.py` — generates `ablations/REPORT.md` with rankings, ELO progression, win rate matrix, lineage tree, and key stats.
-- **Viewer:** `python ablations/viewer.py` — generates `ablations/viewer/dashboard.html` from template and opens in browser. Dashboard has sidebar with round selection, ELO progression chart, lineage node graph, rankings with deltas, win rate heatmap, ELO distribution bars, and collapsible match results grouped by map.
-- **Full pipeline:** `python ablations/elo.py && python ablations/history.py && python ablations/report.py && python ablations/viewer.py`
+- **With stats:** `python ablations/elo.py --stats` — collect per-turn stats via wrapper bots.
+- **With dashboard:** `python ablations/elo.py --view` — also opens the HTML dashboard after report.
+- **Skip history:** `python ablations/elo.py --no-history` — run matches only, skip history/report.
+- **Viewer only:** `python ablations/viewer.py` — opens dashboard from existing history.
 - **Competitive ablation process:** Read and follow `ablations/ABLATION_PROMPT.md` — overseer loop with two parallel agent tracks (A and B), iterative improvement, ELO evaluation. **This is the default task when asked to run ablations.**
 
 ### Workflow
@@ -63,7 +63,7 @@ Replays are written to `replays/`.
 1. **Version, don't mutate.** `cp -r bots/v3 bots/v4`. Always keep the previous version for A/B comparison.
 2. **One change per version.** Isolate variables for clear ablation signal.
 3. **Add a changelog comment** at the top of `main.py`: `# v2: improved economy`. The history tracker reads this.
-4. **Evaluate.** `python ablations/elo.py && python ablations/history.py && python ablations/report.py && python ablations/viewer.py`
+4. **Evaluate.** `python ablations/elo.py`
 5. **Remote validate.** `.venv/bin/cambc test-run` to confirm no CPU timeouts before submitting.
 6. **Submit winners.** `.venv/bin/cambc submit bots/<best_bot>`
 

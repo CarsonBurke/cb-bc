@@ -64,7 +64,7 @@ Each agent copies the baseline to their new version dir and makes ONE novel impr
 
 ### 5. Evaluate
 ```bash
-python ablations/elo.py && python ablations/history.py && python ablations/report.py && python ablations/viewer.py
+python ablations/elo.py
 ```
 Only include the top bots + new versions + starter in the tournament to keep it fast. Don't re-test clearly weak bots from old rounds.
 
@@ -100,7 +100,7 @@ Final response: key changes and reasoning (under 500 chars).
 ## Efficiency Rules
 
 - Launch agents in **parallel** (single message, multiple Agent tool calls)
-- Full pipeline: `python ablations/elo.py && python ablations/history.py && python ablations/report.py && python ablations/viewer.py`
+- Full pipeline: `python ablations/elo.py`
 - Only tournament the **current best + new versions + starter** — prune clearly dead bots to keep runs fast
 - Use `ablations/REPORT.md` to brief agents — don't re-read all bot code every round
 - One improvement hypothesis per agent per round — no multi-change versions
