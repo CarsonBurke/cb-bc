@@ -1,15 +1,228 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import { spawn } from 'child_process'
+import { spawn, execSync } from 'child_process'
 import { resolve } from 'path'
+import { readdirSync, readFileSync, statSync } from 'fs'
 
 const PROJECT_ROOT = resolve(import.meta.dirname, '..')
+
+// Find the bundled visualiser dist directory
+function findVisualiserDist() {
+  try {
+    const result = execSync(
+      `${resolve(PROJECT_ROOT, '.venv/bin/python3')} -c "from pathlib import Path; import cambc; p = Path(cambc.__file__).parent / 'data' / 'visualiser'; print(p if (p / 'index.html').exists() else '')"`,
+      { encoding: 'utf8' },
+    ).trim()
+    return result || null
+  } catch {
+    return null
+  }
+}
+
+const VISUALISER_DIST = findVisualiserDist()
 
 function replayApiPlugin() {
   return {
     name: 'replay-api',
     configureServer(server) {
+      const replaysDir = resolve(PROJECT_ROOT, 'replays')
+      const sessionsDir = resolve(PROJECT_ROOT, 'bots/tensor/sessions')
+
+      // List training sessions
+      server.middlewares.use('/api/train-sessions', (_req, res) => {
+        res.setHeader('Content-Type', 'application/json')
+        try {
+          const dirs = readdirSync(sessionsDir, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => {
+              const metaPath = resolve(sessionsDir, d.name, 'meta.json')
+              let meta = { name: d.name }
+              try { meta = JSON.parse(readFileSync(metaPath, 'utf8')) } catch {}
+              const logPath = resolve(sessionsDir, d.name, 'train_log.json')
+              let episodes = 0
+              try {
+                const log = JSON.parse(readFileSync(logPath, 'utf8'))
+                episodes = log.episodes?.length || 0
+              } catch {}
+              const st = statSync(resolve(sessionsDir, d.name))
+              return { id: d.name, ...meta, episodes, mtime: st.mtimeMs }
+            })
+            .sort((a, b) => b.mtime - a.mtime)
+          res.end(JSON.stringify(dirs))
+        } catch {
+          res.end(JSON.stringify([]))
+        }
+      })
+
+      // Helper: resolve session directory from query param
+      function sessionDir(req) {
+        const url = new URL(req.url, 'http://localhost')
+        const session = url.searchParams.get('session')
+        if (session && !session.includes('..')) {
+          return resolve(sessionsDir, session)
+        }
+        return null
+      }
+
+      // Training replays (session-aware)
+      server.middlewares.use('/api/train-replays', (req, res) => {
+        res.setHeader('Content-Type', 'application/json')
+        const sd = sessionDir(req)
+        const dir = sd ? resolve(sd, 'replays') : resolve(PROJECT_ROOT, 'replays/training')
+        try {
+          const files = readdirSync(dir)
+            .filter(f => f.endsWith('.replay26'))
+            .map(f => {
+              const st = statSync(resolve(dir, f))
+              return { name: f, size: st.size, mtime: st.mtimeMs }
+            })
+            .sort((a, b) => b.mtime - a.mtime)
+          res.end(JSON.stringify(files))
+        } catch {
+          res.end(JSON.stringify([]))
+        }
+      })
+
+      // Serve training replay files (session-aware)
+      server.middlewares.use('/api/train-replay/', (req, res) => {
+        const url = new URL(req.url, 'http://localhost')
+        const session = url.searchParams.get('session')
+        const filename = decodeURIComponent(url.pathname.replace(/^\//, ''))
+        if (!filename || filename.includes('..')) {
+          res.statusCode = 400
+          res.end('Bad request')
+          return
+        }
+        let dir
+        if (session && !session.includes('..')) {
+          dir = resolve(sessionsDir, session, 'replays')
+        } else {
+          dir = resolve(PROJECT_ROOT, 'replays/training')
+        }
+        try {
+          const data = readFileSync(resolve(dir, filename))
+          res.setHeader('Content-Type', 'application/octet-stream')
+          res.setHeader('Content-Length', data.length)
+          res.end(data)
+        } catch {
+          res.statusCode = 404
+          res.end('Not found')
+        }
+      })
+
+      // Training log (session-aware)
+      server.middlewares.use('/api/train-log', (req, res) => {
+        res.setHeader('Content-Type', 'application/json')
+        const sd = sessionDir(req)
+        const logPath = sd
+          ? resolve(sd, 'train_log.json')
+          : resolve(PROJECT_ROOT, 'bots/tensor/train_log.json')
+        try {
+          const data = readFileSync(logPath, 'utf8')
+          res.end(data)
+        } catch {
+          res.end(JSON.stringify({ episodes: [], config: {} }))
+        }
+      })
+
+      // List available replay files
+      server.middlewares.use('/api/replays', (_req, res) => {
+        try {
+          const files = readdirSync(replaysDir)
+            .filter(f => f.endsWith('.replay26'))
+            .map(f => {
+              const st = statSync(resolve(replaysDir, f))
+              return { name: f, size: st.size, mtime: st.mtimeMs }
+            })
+            .sort((a, b) => {
+              const na = parseInt(a.name.match(/\d+/)?.[0] ?? '0', 10)
+              const nb = parseInt(b.name.match(/\d+/)?.[0] ?? '0', 10)
+              return nb - na
+            })
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify(files))
+        } catch {
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify([]))
+        }
+      })
+
+      // Serve a specific replay file
+      server.middlewares.use('/api/replay/', (req, res) => {
+        const filename = decodeURIComponent(req.url.replace(/^\//, '').split('?')[0])
+        if (!filename || filename.includes('..')) {
+          res.statusCode = 400
+          res.end('Bad request')
+          return
+        }
+        try {
+          const data = readFileSync(resolve(replaysDir, filename))
+          res.setHeader('Content-Type', 'application/octet-stream')
+          res.setHeader('Content-Length', data.length)
+          res.end(data)
+        } catch {
+          res.statusCode = 404
+          res.end('Not found')
+        }
+      })
+
+      // Serve the bundled visualiser static files
+      // The visualiser uses absolute paths (/assets/..., /*.png) so we
+      // serve it at /viewer/ with rewritten HTML, and also serve its
+      // assets/images as a fallback for any path not handled by Vite.
+      if (VISUALISER_DIST) {
+        const visTypes = {
+          html: 'text/html', js: 'application/javascript', css: 'text/css',
+          wasm: 'application/wasm', png: 'image/png', svg: 'image/svg+xml',
+          json: 'application/json', ico: 'image/x-icon', webp: 'image/webp',
+        }
+
+        server.middlewares.use('/viewer/', (req, res) => {
+          const urlPath = req.url.split('?')[0].replace(/^\//, '') || 'index.html'
+          try {
+            let data = readFileSync(resolve(VISUALISER_DIST, urlPath))
+            const ext = urlPath.split('.').pop()
+            // Rewrite asset paths in HTML to point to /viewer/
+            if (ext === 'html') {
+              data = Buffer.from(
+                data.toString()
+                  .replace(/src="\/assets\//g, 'src="/viewer/assets/')
+                  .replace(/href="\/assets\//g, 'href="/viewer/assets/')
+              )
+            }
+            res.setHeader('Content-Type', visTypes[ext] || 'application/octet-stream')
+            res.end(data)
+          } catch {
+            res.statusCode = 404
+            res.end('Not found')
+          }
+        })
+
+        // Fallback: serve visualiser images/assets for paths the viewer JS
+        // requests with absolute URLs (e.g. /base_gold.png, /bg.png)
+        server.middlewares.use((req, res, next) => {
+          const urlPath = req.url.split('?')[0].replace(/^\//, '')
+          if (!urlPath || urlPath.startsWith('src/') || urlPath.startsWith('node_modules/') || urlPath.startsWith('@')) {
+            return next()
+          }
+          const filePath = resolve(VISUALISER_DIST, urlPath)
+          try {
+            const data = readFileSync(filePath)
+            const ext = urlPath.split('.').pop()
+            if (visTypes[ext]) {
+              res.setHeader('Content-Type', visTypes[ext])
+              res.end(data)
+              return
+            }
+          } catch {
+            // Not a visualiser file, pass through
+          }
+          next()
+        })
+      }
+
+      // Legacy: launch external cambc watch
       server.middlewares.use('/api/watch', (req, res) => {
         const url = new URL(req.url, 'http://localhost')
         const matchId = url.searchParams.get('match_id')
@@ -19,7 +232,7 @@ function replayApiPlugin() {
           return
         }
 
-        const replayPath = resolve(PROJECT_ROOT, 'replays', `match_${matchId}.replay26`)
+        const replayPath = resolve(replaysDir, `match_${matchId}.replay26`)
         const cambc = resolve(PROJECT_ROOT, '.venv/bin/cambc')
 
         const proc = spawn(cambc, ['watch', replayPath], {
@@ -50,7 +263,6 @@ function replayApiPlugin() {
           }
         })
 
-        // Timeout after 5s
         setTimeout(() => {
           if (!responded) {
             responded = true

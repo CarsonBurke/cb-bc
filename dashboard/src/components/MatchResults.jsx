@@ -1,49 +1,30 @@
 import { useState } from 'react'
+import { useSetAtom } from 'jotai'
+import { viewerAtom, viewerMinimizedAtom } from '../store'
 import MatchStats from './MatchStats'
 import { Table, Th, Td, Thead, Tr } from './Table'
 
-function WatchButton({ matchId }) {
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(false)
-
-  async function handleWatch() {
-    setLoading(true)
-    setError(false)
-    try {
-      const res = await fetch(`/api/watch?match_id=${matchId}`)
-      const data = await res.json()
-      if (data.url) {
-        window.open(data.url, '_blank')
-      } else {
-        setError(true)
-      }
-    } catch {
-      setError(true)
-    } finally {
-      setLoading(false)
-    }
-  }
-
+function WatchButton({ matchId, onWatch }) {
   return (
     <button
-      onClick={handleWatch}
-      disabled={loading}
-      className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-blue/10 text-blue hover:bg-blue/20 transition-colors disabled:opacity-50"
+      onClick={(e) => { e.stopPropagation(); onWatch(matchId) }}
+      className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-blue/10 text-blue hover:bg-blue/20 transition-colors"
       title="Watch replay"
     >
       <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
         <path d="M4 2l10 6-10 6V2z" />
       </svg>
-      {loading ? '...' : error ? 'N/A' : 'Watch'}
+      Watch
     </button>
   )
 }
 
-function MatchRow({ match }) {
+function MatchRow({ match, onWatch }) {
   const [expanded, setExpanded] = useState(false)
   const m = match
   const draw = m.winner === 'draw' || !m.winner
   const hasStats = !!m.stats
+  const matchId = m.match_id ?? m._idx
 
   return (
     <>
@@ -61,7 +42,7 @@ function MatchRow({ match }) {
         </Td>
         <Td>
           <div className="flex items-center gap-2">
-            <WatchButton matchId={m.match_id ?? m._idx} />
+            <WatchButton matchId={matchId} onWatch={onWatch} />
             {hasStats && (
               <button
                 onClick={(e) => { e.stopPropagation(); setExpanded(!expanded) }}
@@ -90,6 +71,17 @@ function MatchRow({ match }) {
 }
 
 export default function MatchResults({ matches }) {
+  const setViewer = useSetAtom(viewerAtom)
+  const setMinimized = useSetAtom(viewerMinimizedAtom)
+
+  function handleWatch(matchId) {
+    setViewer({
+      url: `/viewer/?replayUrl=/api/replay/match_${matchId}.replay26`,
+      title: `Match ${matchId}`,
+    })
+    setMinimized(false)
+  }
+
   const byMap = {}
   ;(matches || []).forEach((m, idx) => {
     const map = m.map || 'unknown'
@@ -111,7 +103,7 @@ export default function MatchResults({ matches }) {
             </Thead>
             <tbody>
               {byMap[map].map((m, i) => (
-                <MatchRow key={i} match={m} />
+                <MatchRow key={i} match={m} onWatch={handleWatch} />
               ))}
             </tbody>
           </Table>
