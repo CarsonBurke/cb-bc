@@ -1,0 +1,60 @@
+{
+  "models": [
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 1030.5,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/league/gen_0.json",
+      "timestamp": 1773699192.6147106,
+      "wins": 4,
+      "losses": 2,
+      "draws": 0
+    },
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/league/gen_0.json",
+      "timestamp": 1773699202.2767744,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_1",
+      "gen": 1,
+      "elo": 969.5,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/league/gen_1.json",
+      "timestamp": 1773699214.1836417,
+      "wins": 0,
+      "losses": 2,
+      "draws": 0
+    }
+  ],
+  "matches": [
+    {
+      "a": "gen_0",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773699202.2770164
+    },
+    {
+      "a": "gen_0",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773699202.2770245
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773699214.1838005
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773699214.1838033
+    }
+  ]
+}
