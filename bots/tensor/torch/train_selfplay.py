@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast  # noqa: F401 — engine exec's bot files and needs ast in sys.modules
 import json
 import multiprocessing as mp
 import os
@@ -52,7 +53,7 @@ def _init_session(name: str) -> dict:
         "dir": d,
         "league_dir": league_dir,
         "league_json": league_dir / "league.json",
-        "weight_path": d / "weights.json",
+        "weight_path": d / "weights.pkl",
         "log_path": d / "train_log.json",
         "replay_dir": replay_dir,
     }
@@ -85,9 +86,9 @@ class League:
             json.dump({"models": self.models, "matches": self.match_history}, f, indent=2)
 
     def add_model(self, weights: list[list[float]], gen: int) -> dict:
-        path = str(self.league_dir / f"gen_{gen}.json")
-        with open(path, "w") as f:
-            json.dump(weights, f)
+        path = str(self.league_dir / f"gen_{gen}.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(weights, f, protocol=pickle.HIGHEST_PROTOCOL)
         entry = {
             "id": f"gen_{gen}", "gen": gen, "elo": ELO_DEFAULT,
             "path": path, "timestamp": time.time(),
@@ -150,8 +151,28 @@ def _run_game(args: tuple) -> tuple[str | None, str | None]:
         os.environ.pop("TENSOR_TRAIN_LOG", None)
 
     traj_path = log_path if os.path.exists(log_path) else None
-    # Winner determined later from replay; return None for now
     return traj_path, None
+
+
+def _run_game_with_opp(args: tuple) -> tuple[str | None, str | None]:
+    """Like _run_game but takes an extra opp_weights_path arg and sets the env var."""
+    *game_args, opp_weights_path = args
+    os.environ["TENSOR_OPP_WEIGHTS"] = opp_weights_path
+    try:
+        return _run_game(tuple(game_args))
+    finally:
+        os.environ.pop("TENSOR_OPP_WEIGHTS", None)
+
+
+def _classify_winner(game_trajs: list[list]) -> str | None:
+    """Determine winner from trajectory data."""
+    if not game_trajs:
+        return None
+    total_harv = sum(
+        sum(1 for s in t if isinstance(s, (list, tuple)) and len(s) >= 10 and s[9] > 0.5)
+        for t in game_trajs
+    )
+    return "a" if total_harv > 0 else "b"
 
 
 def collect_games(
@@ -163,7 +184,23 @@ def collect_games(
     opp_id: str,
     replay_dir: Path | None = None,
 ) -> tuple[list[list], list[str | None]]:
-    """Run games with fork multiprocessing. Returns (trajectories, winners)."""
+    """Run games against a single opponent. Returns (trajectories, winners)."""
+    opponents = [{"path": opponent_weights_path, "id": opp_id}]
+    all_trajs, per_opp = collect_all_games(
+        opponents, n_games, maps, n_workers, episode_num, replay_dir,
+    )
+    return all_trajs, per_opp.get(opp_id, [])
+
+
+def collect_all_games(
+    opponents: list[dict],
+    games_per_opp: int,
+    maps: list[str],
+    n_workers: int,
+    episode_num: int,
+    replay_dir: Path | None = None,
+) -> tuple[list[list], dict[str, list[str | None]]]:
+    """Run games against all opponents in a single pool. Returns (trajectories, per_opp_winners)."""
     bot_a = str(PROJECT_ROOT / "bots" / "tensor" / "main.py")
     bot_b = str(PROJECT_ROOT / "bots" / "tensor_opp" / "main.py")
     engine_root = str(PROJECT_ROOT)
@@ -172,36 +209,54 @@ def collect_games(
     replay_dir.mkdir(parents=True, exist_ok=True)
 
     tmpdir = tempfile.mkdtemp(prefix="selfplay_")
-    game_args = []
-    for i in range(n_games):
-        map_path = str(PROJECT_ROOT / "maps" / random.choice(maps))
-        log_path = os.path.join(tmpdir, f"traj_{i}.pkl")
-        replay_path = str(replay_dir / f"ep{episode_num}_{opp_id}_g{i}.replay26")
-        seed = random.randint(1, 2**31)
-        game_args.append((bot_a, bot_b, map_path, engine_root, replay_path, log_path, seed))
 
-    os.environ["TENSOR_OPP_WEIGHTS"] = opponent_weights_path
-    # Use fork — no torch imported yet, so no fork issues
+    # Build all game args across all opponents
+    game_args = []
+    game_opp_ids = []  # track which opponent each game belongs to
+    game_opp_paths = []  # track weight path per game
+    gi = 0
+    for opp in opponents:
+        for i in range(games_per_opp):
+            map_path = str(PROJECT_ROOT / "maps" / random.choice(maps))
+            log_path = os.path.join(tmpdir, f"traj_{gi}.pkl")
+            replay_path = str(replay_dir / f"ep{episode_num}_{opp['id']}_g{i}.replay26")
+            seed = random.randint(1, 2**31)
+            game_args.append((bot_a, bot_b, map_path, engine_root, replay_path, log_path, seed))
+            game_opp_ids.append(opp["id"])
+            game_opp_paths.append(opp["path"])
+            gi += 1
+
+    n_games = len(game_args)
+
+    # All opponents share the same weight path env var per game.
+    # Since fork copies env, we set TENSOR_OPP_WEIGHTS per-game via a wrapper.
+    # But the current _run_game doesn't support per-game opp weights in the env.
+    # Workaround: group by opponent path, run one pool for all (same opp path for now).
+    # If all opponents use different weight files, we need to pass it through args.
+    # For now: use the most common case where we can batch by opp path.
+
+    # Group games by opponent weight path to minimize env var switches
+    # Actually, since fork copies the env at fork time, we can't have per-game env vars
+    # in pool.map. Instead, embed the opp weight path in the game args tuple.
+    opp_game_args = [
+        (*ga, game_opp_paths[i])
+        for i, ga in enumerate(game_args)
+    ]
+
     ctx = mp.get_context("fork")
     with ctx.Pool(min(n_workers, n_games)) as pool:
-        results = pool.map(_run_game, game_args)
-    os.environ.pop("TENSOR_OPP_WEIGHTS", None)
+        results = pool.map(_run_game_with_opp, opp_game_args)
 
-    trajectories, winners = [], []
-    for traj_path, _winner in results:
+    trajectories = []
+    per_opp_winners: dict[str, list[str | None]] = {}
+    for i, (traj_path, _winner) in enumerate(results):
+        opp_id = game_opp_ids[i]
         game_trajs = _read_trajectory_file(traj_path)
         trajectories.extend(game_trajs)
-        # Winner: did our bot (A) place any harvesters on ore?
-        if game_trajs:
-            total_harv = sum(
-                sum(1 for s in t if isinstance(s, (list, tuple)) and len(s) >= 10 and s[9] > 0.5)
-                for t in game_trajs
-            )
-            winners.append("a" if total_harv > 0 else "b")
-        else:
-            winners.append(None)
+        per_opp_winners.setdefault(opp_id, []).append(_classify_winner(game_trajs))
+
     shutil.rmtree(tmpdir, ignore_errors=True)
-    return trajectories, winners
+    return trajectories, per_opp_winners
 
 
 def _read_trajectory_file(path: str | None) -> list[list]:
@@ -293,21 +348,20 @@ def main():
                 print(f"Seeded league with gen_0")
                 opponents = league.sample_opponents(1)
 
-        # Save current weights for bot A
+        # Save current weights for bot A (must write to WEIGHT_PATH so the bot reads them)
         if model is not None:
             model.save_weights(weight_path)
+            model.save_weights(str(WEIGHT_PATH))
 
-        # Collect games (fork, no torch)
-        all_trajs = []
+        # Collect all games in a single pool (all opponents at once)
+        all_trajs, per_opp_winners = collect_all_games(
+            opponents, args.games_per_opp, maps, n_workers, ep + 1,
+            replay_dir=replay_dir,
+        )
         total_wins, total_losses, total_games = 0, 0, 0
         per_opp_results: list[tuple[dict, list[str | None]]] = []
-
         for opp in opponents:
-            trajs, winners = collect_games(
-                opp["path"], args.games_per_opp, maps, n_workers, ep + 1, opp["id"],
-                replay_dir=replay_dir,
-            )
-            all_trajs.extend(trajs)
+            winners = per_opp_winners.get(opp["id"], [])
             per_opp_results.append((opp, winners))
             for w in winners:
                 total_games += 1
@@ -356,9 +410,9 @@ def main():
                     dmg = s.get("dmg", 0)
                     conv = s.get("conv", 0)
                 r_harv += harv * 5.0
-                r_conv += conv * 2.0
-                r_dti += max(dti, 0) * 0.2
-                r_dmg += dmg * 1.0
+                r_conv += conv * 10.0
+                r_dti += max(dti, 0) * 2.0
+                r_dmg += dmg * 20.0
             return r_harv + r_conv + r_dti + r_dmg, r_harv, r_conv, r_dti, r_dmg
 
         def _traj_ti(traj):

@@ -377,18 +377,16 @@ class VecEnv:
             core_dx, core_dy, ecore_dx, ecore_dy, n_builders,
         ], dim=-1)  # (N, 11)
 
-        # Sinusoidal position embedding (8)
-        pos_feats = torch.zeros(N, POS_EMBED_DIM, device=DEVICE)
-        px = self.bot_x.float()
-        py = self.bot_y.float()
-        half = _POS_QUARTER * 2
-        for i in range(_POS_QUARTER):
-            ax = px * _POS_FREQS[i]
-            pos_feats[:, 2 * i] = torch.sin(ax)
-            pos_feats[:, 2 * i + 1] = torch.cos(ax)
-            ay = py * _POS_FREQS[i]
-            pos_feats[:, half + 2 * i] = torch.sin(ay)
-            pos_feats[:, half + 2 * i + 1] = torch.cos(ay)
+        # Sinusoidal position embedding (8) — vectorized
+        # Must interleave sin/cos per frequency to match main.py ordering:
+        # [sin(x*f0), cos(x*f0), sin(x*f1), cos(x*f1), sin(y*f0), cos(y*f0), ...]
+        px = self.bot_x.float().unsqueeze(-1)  # (N, 1)
+        py = self.bot_y.float().unsqueeze(-1)
+        angles_x = px * _POS_FREQS  # (N, Q) broadcast
+        angles_y = py * _POS_FREQS
+        pos_x = torch.stack([angles_x.sin(), angles_x.cos()], dim=-1).reshape(N, -1)
+        pos_y = torch.stack([angles_y.sin(), angles_y.cos()], dim=-1).reshape(N, -1)
+        pos_feats = torch.cat([pos_x, pos_y], dim=-1)  # (N, 4*Q = POS_EMBED_DIM)
 
         return torch.cat([tile_flat, global_feats, pos_feats], dim=-1)  # (N, INPUT_SIZE)
 
@@ -489,50 +487,54 @@ class VecEnv:
         Propagates connectivity from core through conveyors. Harvesters on
         ore tiles adjacent to connected conveyors deliver resources.
         Returns (N,) count of delivering harvesters.
+
+        Uses gather-based target lookup instead of per-direction shift loops.
+        Each chain iteration is 1 gather + 1 mask op instead of 8 shift+mask ops.
+        Adjacency check uses max_pool2d instead of 9 shift ops.
         """
         N, G = self.n, self.gs
+        idx = torch.arange(N, device=DEVICE)
 
         # Initialize: tiles within distance 1 of core center are connected
-        connected = torch.zeros(N, G, G, dtype=torch.bool, device=DEVICE)
+        connected = torch.zeros(N, G, G, dtype=torch.float32, device=DEVICE)
         for dy in range(-1, 2):
             for dx in range(-1, 2):
                 cy = (self.core_y + dy).clamp(0, G - 1)
                 cx = (self.core_x + dx).clamp(0, G - 1)
-                connected[torch.arange(N, device=DEVICE), cy, cx] = True
+                connected[idx, cy, cx] = 1.0
 
-        # Propagate: a conveyor is connected if the tile it points to is connected
+        # Precompute: for each conveyor, the flat index of its target tile
+        # Target = (y + conv_dy, x + conv_dx), clamped to grid
         is_conv = self.buildings == BLD_CONV
+        yy = torch.arange(G, device=DEVICE).view(1, G, 1).expand(N, G, G)
+        xx = torch.arange(G, device=DEVICE).view(1, 1, G).expand(N, G, G)
+        target_y = (yy + self.conv_dy).clamp(0, G - 1)
+        target_x = (xx + self.conv_dx).clamp(0, G - 1)
+        target_flat = target_y * G + target_x  # (N, G, G) flat index into G*G grid
 
+        # Propagate: a conveyor is connected if its target tile is connected
+        conv_mask = is_conv.float()
         for _ in range(MAX_CHAIN):
-            new_conn = connected.clone()
-            for dy in range(-1, 2):
-                for dx in range(-1, 2):
-                    if dy == 0 and dx == 0:
-                        continue
-                    # Conveyors pointing in direction (dx, dy)
-                    pointing = is_conv & (self.conv_dx == dx) & (self.conv_dy == dy)
-                    if not pointing.any():
-                        continue
-                    # Their target tile (y+dy, x+dx) — check if connected
-                    target_conn = shift_2d(connected, dy, dx)
-                    # If target is connected, this conveyor tile is connected
-                    new_conn |= (pointing & target_conn)
-
-            if torch.equal(new_conn, connected):
-                break  # converged early
-            connected = new_conn
+            # Gather connectivity at each conveyor's target position
+            conn_flat = connected.reshape(N, -1)  # (N, G*G)
+            target_conn = conn_flat.gather(1, target_flat.reshape(N, -1)).reshape(N, G, G)
+            # Conveyors whose target is connected become connected
+            newly = conv_mask * target_conn
+            updated = torch.maximum(connected, newly)
+            if torch.equal(updated, connected):
+                break
+            connected = updated
 
         # Harvesters on ore deliver if adjacent to a connected tile
+        # max_pool2d with 3x3 kernel: any neighbor connected → tile is adj_connected
+        conn_4d = connected.unsqueeze(1)  # (N, 1, G, G)
+        adj_connected = F.max_pool2d(
+            conn_4d, kernel_size=3, stride=1, padding=1,
+        ).squeeze(1) > 0.5  # (N, G, G)
+
         is_harv_ore = (self.buildings == BLD_HARV) & (
             (self.env == ENV_ORE_TI) | (self.env == ENV_ORE_AX)
         )
-
-        # Check adjacency to connected tiles
-        adj_connected = torch.zeros(N, G, G, dtype=torch.bool, device=DEVICE)
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
-                adj_connected |= shift_2d(connected, -dy, -dx)
-
         delivering = is_harv_ore & adj_connected
         return delivering.float().sum(dim=(1, 2))  # (N,)
 
