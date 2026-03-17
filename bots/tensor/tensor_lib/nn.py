@@ -10,6 +10,8 @@ from operator import mul as _mul
 
 from .tensor import Tensor
 
+_DOT = math.sumprod if hasattr(math, "sumprod") else None
+
 
 class Linear:
     """Fully connected layer: y = x @ W + b.
@@ -204,6 +206,106 @@ class LayerNorm:
         return [self.gamma, self.beta]
 
 
+class RMSNorm:
+    """RMS normalization over the last dimension with learnable scale only."""
+
+    __slots__ = ("dim", "gamma", "eps")
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        self.dim = dim
+        self.eps = eps
+        self.gamma = Tensor([1.0] * dim, (dim,), requires_grad=True)
+
+    def __call__(self, x: Tensor) -> Tensor:
+        if len(x.shape) == 1:
+            N = x.shape[0]
+            mean_sq = sum(v * v for v in x.data) / N
+            inv_rms = 1.0 / (mean_sq + self.eps) ** 0.5
+            out_data = [
+                x.data[i] * inv_rms * self.gamma.data[i]
+                for i in range(N)
+            ]
+            out = Tensor(out_data, x.shape)
+        else:
+            M, N = x.shape
+            out_data = [0.0] * (M * N)
+            inv_rms_rows = [0.0] * M
+            for m in range(M):
+                base = m * N
+                row = x.data[base : base + N]
+                mean_sq = sum(v * v for v in row) / N
+                inv_rms = 1.0 / (mean_sq + self.eps) ** 0.5
+                inv_rms_rows[m] = inv_rms
+                for j in range(N):
+                    out_data[base + j] = row[j] * inv_rms * self.gamma.data[j]
+            out = Tensor(out_data, x.shape)
+
+        out.requires_grad = x.requires_grad or self.gamma.requires_grad
+        out._prev = (x, self.gamma)
+
+        _x = x
+        _gamma = self.gamma
+        _eps = self.eps
+
+        def _backward():
+            from .tensor import _ensure_grad
+
+            if not any(t.requires_grad for t in (_x, _gamma)):
+                return
+
+            if len(_x.shape) == 1:
+                N = _x.shape[0]
+                x_data = _x.data
+                og = out.grad.data
+                gamma = _gamma.data
+                mean_sq = sum(v * v for v in x_data) / N
+                inv_rms = 1.0 / (mean_sq + _eps) ** 0.5
+                dot = sum(og[i] * gamma[i] * x_data[i] for i in range(N))
+
+                if _gamma.requires_grad:
+                    _ensure_grad(_gamma)
+                    for i in range(N):
+                        _gamma.grad.data[i] += og[i] * x_data[i] * inv_rms
+
+                if _x.requires_grad:
+                    _ensure_grad(_x)
+                    coeff = (inv_rms ** 3) / N
+                    for i in range(N):
+                        _x.grad.data[i] += og[i] * gamma[i] * inv_rms - x_data[i] * coeff * dot
+            else:
+                M, N = _x.shape
+                x_data = _x.data
+                og = out.grad.data
+                gamma = _gamma.data
+
+                if _gamma.requires_grad:
+                    _ensure_grad(_gamma)
+                if _x.requires_grad:
+                    _ensure_grad(_x)
+
+                for m in range(M):
+                    base = m * N
+                    row = x_data[base : base + N]
+                    mean_sq = sum(v * v for v in row) / N
+                    inv_rms = 1.0 / (mean_sq + _eps) ** 0.5
+                    dot = sum(og[base + j] * gamma[j] * row[j] for j in range(N))
+                    coeff = (inv_rms ** 3) / N
+                    for j in range(N):
+                        if _gamma.requires_grad:
+                            _gamma.grad.data[j] += og[base + j] * row[j] * inv_rms
+                        if _x.requires_grad:
+                            _x.grad.data[base + j] += (
+                                og[base + j] * gamma[j] * inv_rms
+                                - row[j] * coeff * dot
+                            )
+
+        out._backward = _backward
+        return out
+
+    def parameters(self) -> list[Tensor]:
+        return [self.gamma]
+
+
 class Dropout:
     """Inverted dropout. Only active during training."""
 
@@ -285,14 +387,26 @@ class MLP:
         output_heads: dict[str, int],
         activation: str = "relu",
         use_layernorm: bool = False,
+        rmsnorm_layers: list[bool] | tuple[bool, ...] | None = None,
         dropout: float = 0.0,
     ):
         act_cls = {"relu": ReLU, "tanh": Tanh, "sigmoid": Sigmoid, "silu": SiLU}[activation]
+        if rmsnorm_layers is None:
+            rmsnorm_layers = [False] * len(hidden_sizes)
+        else:
+            assert len(rmsnorm_layers) == len(hidden_sizes), (
+                f"rmsnorm_layers len {len(rmsnorm_layers)} != hidden sizes len {len(hidden_sizes)}"
+            )
+        assert not (use_layernorm and any(rmsnorm_layers)), (
+            "LayerNorm and RMSNorm should not be enabled on the same trunk layer set"
+        )
 
         layers: list = []
         prev = input_size
-        for h in hidden_sizes:
+        for i, h in enumerate(hidden_sizes):
             layers.append(Linear(prev, h))
+            if rmsnorm_layers[i]:
+                layers.append(RMSNorm(h))
             if use_layernorm:
                 layers.append(LayerNorm(h))
             layers.append(act_cls())
@@ -344,17 +458,32 @@ class MLP:
                 N = layer.out_features
                 w_rows = [w[j::N] for j in range(N)]
                 b = list(layer.bias.data) if layer.bias is not None else None
-                # Check if next layer is an activation we can fuse
+                # Check if following layers are a norm + activation we can fuse
                 act = None
                 if i + 1 < len(trunk_layers):
                     nxt = trunk_layers[i + 1]
+                    if isinstance(nxt, RMSNorm):
+                        rms_gamma = list(nxt.gamma.data)
+                        if i + 2 < len(trunk_layers):
+                            nxt2 = trunk_layers[i + 2]
+                            if isinstance(nxt2, (ReLU, SiLU, Tanh, Sigmoid)):
+                                act = type(nxt2).__name__
+                        ops.append(('linear_rmsnorm', act, w_rows, b, N, rms_gamma, nxt.eps))
+                        i += 3 if act is not None else 2
+                        continue
                     if isinstance(nxt, (ReLU, SiLU, Tanh, Sigmoid)):
                         act = type(nxt).__name__
-                        i += 1  # skip the activation layer
+                        i += 2
+                        ops.append(('linear', act, w_rows, b, N))
+                        continue
                 ops.append(('linear', act, w_rows, b, N))
+                i += 1
+                continue
             elif isinstance(layer, LayerNorm):
                 ops.append(('layernorm', layer.dim, layer.gamma.data,
                             layer.beta.data, layer.eps))
+            elif isinstance(layer, RMSNorm):
+                ops.append(('rmsnorm', layer.dim, layer.gamma.data, layer.eps))
             # Standalone activations (not fused) — only hit if not preceded by Linear
             elif isinstance(layer, ReLU):
                 ops.append(('relu',))
@@ -388,6 +517,7 @@ class MLP:
             self._infer_cache = self._build_infer_cache()
 
         _exp = math.exp
+        _dot = _DOT
         ops, head_ops = self._infer_cache
         h = features
 
@@ -398,7 +528,7 @@ class MLP:
                 if act == 'SiLU':
                     out = [0.0] * N
                     for j in range(N):
-                        x = sum(map(_mul, h, w_rows[j]))
+                        x = _dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))
                         if b is not None:
                             x += b[j]
                         if x >= 0:
@@ -409,19 +539,19 @@ class MLP:
                     h = out
                 elif act == 'ReLU':
                     if b is not None:
-                        h = [max(0.0, sum(map(_mul, h, w_rows[j])) + b[j]) for j in range(N)]
+                        h = [max(0.0, (_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) + b[j]) for j in range(N)]
                     else:
-                        h = [max(0.0, sum(map(_mul, h, w_rows[j]))) for j in range(N)]
+                        h = [max(0.0, _dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) for j in range(N)]
                 elif act == 'Tanh':
                     _tanh = math.tanh
                     if b is not None:
-                        h = [_tanh(sum(map(_mul, h, w_rows[j])) + b[j]) for j in range(N)]
+                        h = [_tanh((_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) + b[j]) for j in range(N)]
                     else:
-                        h = [_tanh(sum(map(_mul, h, w_rows[j]))) for j in range(N)]
+                        h = [_tanh(_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) for j in range(N)]
                 elif act == 'Sigmoid':
                     out = [0.0] * N
                     for j in range(N):
-                        x = sum(map(_mul, h, w_rows[j]))
+                        x = _dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))
                         if b is not None:
                             x += b[j]
                         if x >= 0:
@@ -433,15 +563,58 @@ class MLP:
                 else:
                     # No activation to fuse
                     if b is not None:
-                        h = [sum(map(_mul, h, w_rows[j])) + b[j] for j in range(N)]
+                        h = [(_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) + b[j] for j in range(N)]
                     else:
-                        h = [sum(map(_mul, h, w_rows[j])) for j in range(N)]
+                        h = [_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j])) for j in range(N)]
+            elif tag == 'linear_rmsnorm':
+                _, act, w_rows, b, N, gamma, eps = op
+                out = [0.0] * N
+                mean_sq = 0.0
+                for j in range(N):
+                    x = _dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))
+                    if b is not None:
+                        x += b[j]
+                    out[j] = x
+                    mean_sq += x * x
+                inv_rms = 1.0 / (mean_sq / N + eps) ** 0.5
+                if act == 'SiLU':
+                    for j in range(N):
+                        x = out[j] * inv_rms * gamma[j]
+                        if x >= 0:
+                            out[j] = x / (1.0 + _exp(-x))
+                        else:
+                            e = _exp(x)
+                            out[j] = x * e / (1.0 + e)
+                elif act == 'ReLU':
+                    for j in range(N):
+                        x = out[j] * inv_rms * gamma[j]
+                        out[j] = x if x > 0.0 else 0.0
+                elif act == 'Tanh':
+                    for j in range(N):
+                        out[j] = math.tanh(out[j] * inv_rms * gamma[j])
+                elif act == 'Sigmoid':
+                    for j in range(N):
+                        x = out[j] * inv_rms * gamma[j]
+                        if x >= 0:
+                            out[j] = 1.0 / (1.0 + _exp(-x))
+                        else:
+                            e = _exp(x)
+                            out[j] = e / (1.0 + e)
+                else:
+                    for j in range(N):
+                        out[j] = out[j] * inv_rms * gamma[j]
+                h = out
             elif tag == 'layernorm':
                 _, dim, g, lb, eps = op
                 mu = sum(h) / dim
                 var = sum((v - mu) ** 2 for v in h) / dim
                 inv_std = 1.0 / (var + eps) ** 0.5
                 h = [(h[i] - mu) * inv_std * g[i] + lb[i] for i in range(dim)]
+            elif tag == 'rmsnorm':
+                _, dim, g, eps = op
+                mean_sq = sum(v * v for v in h) / dim
+                inv_rms = 1.0 / (mean_sq + eps) ** 0.5
+                h = [h[i] * inv_rms * g[i] for i in range(dim)]
             elif tag == 'relu':
                 h = [x if x > 0.0 else 0.0 for x in h]
             elif tag == 'silu':
@@ -468,9 +641,9 @@ class MLP:
         results: dict[str, list[float]] = {}
         for name, w_rows, b, N in head_ops:
             if b is not None:
-                results[name] = [sum(map(_mul, h, w_rows[j])) + b[j] for j in range(N)]
+                results[name] = [(_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) + b[j] for j in range(N)]
             else:
-                results[name] = [sum(map(_mul, h, w_rows[j])) for j in range(N)]
+                results[name] = [_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j])) for j in range(N)]
         return results
 
     def save(self) -> list[list[float]]:
@@ -478,11 +651,30 @@ class MLP:
         return [list(p.data) for p in self.parameters()]
 
     def load(self, state: list[list[float]]) -> None:
-        """Load parameters from nested lists."""
-        params = self.parameters()
-        assert len(state) == len(params), (
-            f"State has {len(state)} entries, model has {len(params)} params"
-        )
+        """Load parameters from nested lists.
+
+        Supports legacy MLP states saved before RMSNorm parameters were added.
+        """
+        full_params = self.parameters()
+        legacy_params: list[Tensor] = []
+        for layer in self.trunk.layers:
+            if isinstance(layer, Linear):
+                legacy_params.extend(layer.parameters())
+            elif isinstance(layer, LayerNorm):
+                legacy_params.extend(layer.parameters())
+        for head in self.heads.values():
+            legacy_params.extend(head.parameters())
+
+        if len(state) == len(full_params):
+            params = full_params
+        elif len(state) == len(legacy_params):
+            params = legacy_params
+        else:
+            raise AssertionError(
+                f"State has {len(state)} entries, model has {len(full_params)} params "
+                f"({len(legacy_params)} legacy without RMSNorm)"
+            )
+
         for p, s in zip(params, state):
             assert len(p.data) == len(s), (
                 f"Param size mismatch: {len(p.data)} vs {len(s)}"
