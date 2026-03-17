@@ -6,25 +6,55 @@ Same as tensor_proxy but:
 - Uses argmax (greedy) actions from server response
 """
 
+import importlib.util
 import math
 import os
-import pickle
 import random
 import struct
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor"))
+_TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor")
+sys.path.insert(0, _TENSOR_DIR)
+_TENSOR_MAIN_PATH = os.path.join(_TENSOR_DIR, "main.py")
+_TENSOR_SPEC = importlib.util.spec_from_file_location("_tensor_main_proxy_opp", _TENSOR_MAIN_PATH)
+_TENSOR_MAIN = importlib.util.module_from_spec(_TENSOR_SPEC)
+_TENSOR_SPEC.loader.exec_module(_TENSOR_MAIN)
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
-from main import (
-    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES, POS_EMBED_DIM,
-    INPUT_SIZE, HIDDEN_SIZES, H_DIM, DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9,
-    ENV_IDX, BLD_IDX, N_BLD_TYPES, DIR_DXY, _argmax,
-)
 from tensor_lib import SinusoidalPositionEmbedding
 
+GRID_SIZE = _TENSOR_MAIN.GRID_SIZE
+GRID_HALF = _TENSOR_MAIN.GRID_HALF
+TILE_FEATURES = _TENSOR_MAIN.TILE_FEATURES
+GLOBAL_FEATURES = _TENSOR_MAIN.GLOBAL_FEATURES
+POS_EMBED_DIM = _TENSOR_MAIN.POS_EMBED_DIM
+INPUT_SIZE = _TENSOR_MAIN.INPUT_SIZE
+HIDDEN_SIZES = _TENSOR_MAIN.HIDDEN_SIZES
+H_DIM = _TENSOR_MAIN.H_DIM
+DIRECTIONS = _TENSOR_MAIN.DIRECTIONS
+BUILD_ACTIONS = _TENSOR_MAIN.BUILD_ACTIONS
+DIR_MAP_9 = _TENSOR_MAIN.DIR_MAP_9
+ENV_IDX = _TENSOR_MAIN.ENV_IDX
+BLD_IDX = _TENSOR_MAIN.BLD_IDX
+N_BLD_TYPES = _TENSOR_MAIN.N_BLD_TYPES
+DIR_DXY = _TENSOR_MAIN.DIR_DXY
+_argmax = _TENSOR_MAIN._argmax
+_TensorPlayer = _TENSOR_MAIN.Player
+
+# Struct-based binary IPC protocol (replaces pickle for speed)
+_OBS_FLOATS = INPUT_SIZE + H_DIM
+_OBS_STRUCT = struct.Struct(f'={_OBS_FLOATS}f')
+_ACT_INTS = 3  # bt, bd, md
+_ACT_B_FLOATS = H_DIM  # h_next only (no log_prob for opponent)
+_ACT_B_STRUCT = struct.Struct(f'={_ACT_INTS}i{_ACT_B_FLOATS}f')
+
 _opened_pipes = {}
+
+
+def _new_proxy_player():
+    """Create a bare tensor Player without model construction or weight I/O."""
+    return object.__new__(_TensorPlayer)
 
 
 def _get_pipes():
@@ -38,26 +68,33 @@ def _get_pipes():
     return obs_wfd, act_rfd
 
 
-def _send_obs(obs_wfd, game_id, unit_id, obs, h_prev):
-    data = pickle.dumps((game_id, unit_id, obs, h_prev), protocol=pickle.HIGHEST_PROTOCOL)
-    os.write(obs_wfd, struct.pack("!I", len(data)) + data)
-
-
-def _recv_action(act_rfd):
-    raw = b""
-    while len(raw) < 4:
-        chunk = os.read(act_rfd, 4 - len(raw))
-        if not chunk:
-            return None
-        raw += chunk
-    length = struct.unpack("!I", raw)[0]
+def _read_exact(fd, n):
     data = b""
-    while len(data) < length:
-        chunk = os.read(act_rfd, length - len(data))
+    while len(data) < n:
+        chunk = os.read(fd, n - len(data))
         if not chunk:
             return None
         data += chunk
-    return pickle.loads(data)
+    return data
+
+
+def _send_obs(obs_wfd, game_id, unit_id, obs, h_prev):
+    payload = _OBS_STRUCT.pack(*obs, *h_prev)
+    os.write(obs_wfd, struct.pack('=I', len(payload)) + payload)
+
+
+def _recv_action(act_rfd):
+    raw = _read_exact(act_rfd, 4)
+    if raw is None:
+        return None
+    length = struct.unpack('=I', raw)[0]
+    data = _read_exact(act_rfd, length)
+    if data is None:
+        return None
+    vals = _ACT_B_STRUCT.unpack(data)
+    bt, bd, md = vals[0], vals[1], vals[2]
+    h_next = list(vals[3:3 + H_DIM])
+    return bt, bd, md, h_next
 
 
 class Player:
@@ -70,8 +107,6 @@ class Player:
         self.h_prev = [0.0] * H_DIM
         self._prev_reward = 0.0
         self._prev_resources = None
-        self._prev_enemy_core_hp = 500.0
-        self._own_core_hp = 500.0
         self._n_builders_cached = 1
         self._unit_id = id(self) % (2**31)
 
@@ -134,21 +169,13 @@ class Player:
             build_dir_idx = random.randint(0, 8)
             move_dir_idx = random.randint(0, 8)
 
-        # Execute actions
-        from main import Player as _P
+        # Execute actions directly
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        _p = _P.__new__(_P)
-        _p.core_center = self.core_center
-        _p.enemy_core = self.enemy_core
-        _p.my_team = self.my_team
-        _p._n_builders_cached = self._n_builders_cached
-        _P._execute_build(_p, ct, build_action, build_dir)
+        self._execute_build(ct, build_action, build_dir)
 
         move_dir = DIR_MAP_9[move_dir_idx]
-        _p2 = _P.__new__(_P)
-        _p2.core_center = self.core_center
-        _P._execute_move(_p2, ct, move_dir)
+        self._execute_move(ct, move_dir)
 
         # Update resource snapshot for delta features
         self._prev_resources = ct.get_global_resources()
@@ -166,9 +193,64 @@ class Player:
             except Exception:
                 continue
 
+    def _execute_build(self, ct, action, direction):
+        pos = ct.get_position()
+        build_pos = pos.add(direction)
+        if action == "conveyor":
+            conv_dir = direction
+            if self.core_center:
+                conv_dir = build_pos.direction_to(self.core_center)
+                if conv_dir == Direction.CENTRE:
+                    conv_dir = direction
+            if ct.can_build_conveyor(build_pos, conv_dir):
+                ct.build_conveyor(build_pos, conv_dir)
+        elif action == "harvester":
+            if ct.can_build_harvester(build_pos):
+                ct.build_harvester(build_pos)
+        elif action == "road":
+            if ct.can_build_road(build_pos):
+                ct.build_road(build_pos)
+        elif action == "gunner":
+            if ct.can_build_gunner(build_pos, direction):
+                ct.build_gunner(build_pos, direction)
+        elif action == "sentinel":
+            if ct.can_build_sentinel(build_pos, direction):
+                ct.build_sentinel(build_pos, direction)
+        elif action == "breach":
+            if ct.can_build_breach(build_pos, direction):
+                ct.build_breach(build_pos, direction)
+        elif action == "splitter":
+            if ct.can_build_splitter(build_pos, direction):
+                ct.build_splitter(build_pos, direction)
+        elif action == "armoured_conveyor":
+            if ct.can_build_armoured_conveyor(build_pos, direction):
+                ct.build_armoured_conveyor(build_pos, direction)
+        elif action == "barrier":
+            if ct.can_build_barrier(build_pos):
+                ct.build_barrier(build_pos)
+        elif action == "foundry":
+            if ct.can_build_foundry(build_pos):
+                ct.build_foundry(build_pos)
+        elif action == "launcher":
+            if ct.can_build_launcher(build_pos):
+                ct.build_launcher(build_pos)
+
+    def _execute_move(self, ct, direction):
+        if direction == Direction.CENTRE:
+            return
+        if ct.can_move(direction):
+            ct.move(direction)
+            return
+        for alt in (direction.rotate_left(), direction.rotate_right()):
+            if ct.can_move(alt):
+                ct.move(alt)
+                return
+
     def _encode_state(self, ct):
-        from main import Player as _P
-        _p = _P.__new__(_P)
+        _TensorPlayer._discover_ore(ct)
+        if not hasattr(self, '_proxy'):
+            self._proxy = _new_proxy_player()
+        _p = self._proxy
         _p.core_center = self.core_center
         _p.enemy_core = self.enemy_core
         _p.my_team = self.my_team
@@ -176,9 +258,6 @@ class Player:
         _p._prev_reward = self._prev_reward
         _p._n_builders_cached = self._n_builders_cached
         _p._prev_resources = self._prev_resources
-        _p._own_core_hp = self._own_core_hp
-        _p._prev_enemy_core_hp = self._prev_enemy_core_hp
-        result = _P._encode_state(_p, ct)
+        result = _TensorPlayer._encode_state(_p, ct)
         self._n_builders_cached = _p._n_builders_cached
-        self._own_core_hp = _p._own_core_hp
         return result

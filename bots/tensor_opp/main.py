@@ -7,23 +7,87 @@ Same architecture as tensor bot but:
 """
 
 import json
+import importlib.util
 import math
 import os
 import random
 import sys
 
 # Reuse all code from tensor bot
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor"))
+_TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor")
+sys.path.insert(0, _TENSOR_DIR)
+_TENSOR_MAIN_PATH = os.path.join(_TENSOR_DIR, "main.py")
+_TENSOR_SPEC = importlib.util.spec_from_file_location("_tensor_main_opp", _TENSOR_MAIN_PATH)
+_TENSOR_MAIN = importlib.util.module_from_spec(_TENSOR_SPEC)
+_TENSOR_SPEC.loader.exec_module(_TENSOR_MAIN)
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 from tensor_lib import MLP, SinusoidalPositionEmbedding
 
-# Import constants and helpers from tensor bot
-from main import (
-    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES, POS_EMBED_DIM,
-    INPUT_SIZE, HIDDEN_SIZES, H_DIM, DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9,
-    ENV_IDX, BLD_IDX, N_BLD_TYPES, DIR_DXY, _argmax,
-)
+GRID_SIZE = _TENSOR_MAIN.GRID_SIZE
+GRID_HALF = _TENSOR_MAIN.GRID_HALF
+TILE_FEATURES = _TENSOR_MAIN.TILE_FEATURES
+GLOBAL_FEATURES = _TENSOR_MAIN.GLOBAL_FEATURES
+POS_EMBED_DIM = _TENSOR_MAIN.POS_EMBED_DIM
+INPUT_SIZE = _TENSOR_MAIN.INPUT_SIZE
+HIDDEN_SIZES = _TENSOR_MAIN.HIDDEN_SIZES
+H_DIM = _TENSOR_MAIN.H_DIM
+RMSNORM_LAYERS = _TENSOR_MAIN.RMSNORM_LAYERS
+DIRECTIONS = _TENSOR_MAIN.DIRECTIONS
+BUILD_ACTIONS = _TENSOR_MAIN.BUILD_ACTIONS
+DIR_MAP_9 = _TENSOR_MAIN.DIR_MAP_9
+ENV_IDX = _TENSOR_MAIN.ENV_IDX
+BLD_IDX = _TENSOR_MAIN.BLD_IDX
+N_BLD_TYPES = _TENSOR_MAIN.N_BLD_TYPES
+DIR_DXY = _TENSOR_MAIN.DIR_DXY
+_argmax = _TENSOR_MAIN._argmax
+_TensorPlayer = _TENSOR_MAIN.Player
+
+_MODEL_CACHE = {}
+
+
+def _weight_cache_key(path: str) -> tuple[str, int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return path, st.st_mtime_ns, st.st_size
+
+
+def _get_shared_model(path: str):
+    cache_key = _weight_cache_key(path)
+    if cache_key is not None and cache_key in _MODEL_CACHE:
+        return _MODEL_CACHE[cache_key]
+
+    model = MLP(
+        input_size=INPUT_SIZE + H_DIM,
+        hidden_sizes=HIDDEN_SIZES,
+        output_heads={
+            "build_type": len(BUILD_ACTIONS),
+            "build_dir": 9,
+            "move_dir": 9,
+            "h_next": H_DIM,
+        },
+        activation="silu",
+        rmsnorm_layers=RMSNORM_LAYERS,
+    )
+    model.eval()
+
+    if path and os.path.exists(path):
+        try:
+            if path.endswith(".pkl"):
+                import pickle
+                with open(path, "rb") as f:
+                    model.load(pickle.load(f))
+            else:
+                with open(path) as f:
+                    model.load(json.load(f))
+        except Exception:
+            pass
+
+    if cache_key is not None:
+        _MODEL_CACHE[cache_key] = model
+    return model
 
 
 class Player:
@@ -40,34 +104,11 @@ class Player:
         self._n_builders_cached = 1
 
         self.pos_encoder = SinusoidalPositionEmbedding(POS_EMBED_DIM)
-
-        self.model = MLP(
-            input_size=INPUT_SIZE + H_DIM,
-            hidden_sizes=HIDDEN_SIZES,
-            output_heads={
-                "build_type": len(BUILD_ACTIONS),
-                "build_dir": 9,
-                "move_dir": 9,
-                "h_next": H_DIM,
-            },
-            activation="silu",
-        )
-        self.model.eval()
         self.h_prev = [0.0] * H_DIM
 
         # Load opponent weights from env var
         opp_path = os.environ.get("TENSOR_OPP_WEIGHTS", "")
-        if opp_path and os.path.exists(opp_path):
-            try:
-                if opp_path.endswith(".pkl"):
-                    import pickle
-                    with open(opp_path, "rb") as f:
-                        self.model.load(pickle.load(f))
-                else:
-                    with open(opp_path) as f:
-                        self.model.load(json.load(f))
-            except Exception:
-                pass
+        self.model = _get_shared_model(opp_path)
 
     def run(self, ct):
         etype = ct.get_entity_type()
@@ -153,8 +194,8 @@ class Player:
         return result
 
     def _proxy(self):
-        from main import Player as _P
-        _p = _P.__new__(_P)
+        _P = _TensorPlayer
+        _p = object.__new__(_P)
         _p.core_center = self.core_center
         _p.enemy_core = self.enemy_core
         _p.my_team = self.my_team
