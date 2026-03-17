@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -105,8 +106,6 @@ def parse_replay_winner(replay_path: str, bot_a: str, bot_b: str) -> str:
 
 def run_match(bot_a: str, bot_b: str, map_name: str, match_id: int, collect_stats: bool = False) -> MatchResult:
     """Run a single cambc match and parse the winner from the replay."""
-    import subprocess
-
     replay_path = str(REPLAYS_DIR / f"match_{match_id}.replay26")
 
     run_a, run_b = bot_a, bot_b
@@ -122,7 +121,7 @@ def run_match(bot_a: str, bot_b: str, map_name: str, match_id: int, collect_stat
     try:
         subprocess.run(
             [VENV_CAMBC, "run", run_a, run_b, map_name, "--replay", replay_path],
-            capture_output=True, text=True, timeout=300,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300,
             cwd=str(PROJECT_ROOT),
         )
         winner = parse_replay_winner(replay_path, bot_a, bot_b)
@@ -219,7 +218,11 @@ def discover_bots() -> list[str]:
 # Leaderboard + JSON output
 # ---------------------------------------------------------------------------
 
-def build_leaderboard(ratings: dict[str, trueskill.Rating], results: list[MatchResult]) -> tuple[list[dict], list[dict]]:
+def build_leaderboard(
+    ratings: dict[str, trueskill.Rating],
+    results: list[MatchResult],
+    collect_stats: bool = False,
+) -> tuple[list[dict], list[dict]]:
     """Build leaderboard and match data. Returns (leaderboard, matches)."""
     bots = sorted(ratings.keys(), key=lambda b: conservative_rating(ratings[b]), reverse=True)
 
@@ -258,13 +261,17 @@ def build_leaderboard(ratings: dict[str, trueskill.Rating], results: list[MatchR
             "draws": record[b]["d"],
         })
 
-    from ablations.stats_wrapper import aggregate_match_stats
     match_data = []
+    aggregate_match_stats = None
+    if collect_stats:
+        from ablations.stats_wrapper import aggregate_match_stats as _aggregate_match_stats
+        aggregate_match_stats = _aggregate_match_stats
     for r in results:
         entry = {"bot_a": r.bot_a, "bot_b": r.bot_b, "map": r.map_name, "winner": r.winner, "match_id": r.match_id}
-        stats = aggregate_match_stats(r.match_id)
-        if stats:
-            entry["stats"] = stats
+        if aggregate_match_stats is not None:
+            stats = aggregate_match_stats(r.match_id)
+            if stats:
+                entry["stats"] = stats
         match_data.append(entry)
 
     return leaderboard, match_data
@@ -400,14 +407,33 @@ def append_history(elo_data: dict) -> dict:
         if bot_name in bots_round:
             bots_round[bot_name]["stats"] = stats
 
+    compact_matches = []
+    for match in elo_data.get("matches", []):
+        compact = {
+            "bot_a": match["bot_a"],
+            "bot_b": match["bot_b"],
+            "map": match["map"],
+            "winner": match["winner"],
+            "match_id": match["match_id"],
+        }
+        stats = match.get("stats")
+        if stats:
+            compact["stats"] = {
+                team_key: {
+                    k: v for k, v in team_stats.items() if k != "snapshots"
+                } if team_stats else None
+                for team_key, team_stats in stats.items()
+            }
+        compact_matches.append(compact)
+
     history["rounds"].append({
         "round_id": round_id,
         "timestamp": timestamp,
         "bots": bots_round,
-        "matches": elo_data.get("matches", []),
+        "matches": compact_matches,
     })
 
-    HISTORY_FILE.write_text(json.dumps(history, indent=2) + "\n")
+    HISTORY_FILE.write_text(json.dumps(history, separators=(",", ":")) + "\n")
     print(f"\nRound {round_id} appended to {HISTORY_FILE}")
     print(f"  Bots: {', '.join(sorted(bots_round))}")
     print(f"  Lineage entries: {len(history['lineage'])}")
@@ -688,10 +714,10 @@ def main():
             results.append(r)
 
     ratings = compute_trueskill(results, bots, prior)
-    leaderboard, match_data = build_leaderboard(ratings, results)
+    leaderboard, match_data = build_leaderboard(ratings, results, args.stats)
 
     elo_data = {"leaderboard": leaderboard, "matches": match_data}
-    RESULTS_FILE.write_text(json.dumps(elo_data, indent=2))
+    RESULTS_FILE.write_text(json.dumps(elo_data, separators=(",", ":")))
     print(f"\nDetailed results written to {RESULTS_FILE}")
 
     # History + Report

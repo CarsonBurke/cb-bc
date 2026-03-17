@@ -154,7 +154,7 @@ def create_wrapper(bot_main_py: str, team: str, match_id: int) -> str:
 
         def _save():
             try:
-                Path(STATS_PATH).write_text(json.dumps(_stats, indent=2))
+                Path(STATS_PATH).write_text(json.dumps(_stats, separators=(",", ":")))
             except Exception:
                 pass
 
