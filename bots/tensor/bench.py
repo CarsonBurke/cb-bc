@@ -15,6 +15,14 @@ import random
 sys.path.insert(0, "bots/tensor")
 from tensor_lib import Tensor, Linear, ReLU, SiLU, LayerNorm, Sequential, MLP, Adam, SGD
 from tensor_lib.embed import SinusoidalPositionEmbedding, LearnedPositionEmbedding, RelativeGridEmbedding
+from main import (
+    INPUT_SIZE as PROD_INPUT_SIZE,
+    HIDDEN_SIZES as PROD_HIDDEN_SIZES,
+    H_DIM as PROD_H_DIM,
+    BUILD_ACTIONS as PROD_BUILD_ACTIONS,
+    POS_EMBED_DIM as PROD_POS_EMBED_DIM,
+    RMSNORM_LAYERS as PROD_RMSNORM_LAYERS,
+)
 
 
 def bench(fn, n=200, warmup=10, label=""):
@@ -288,26 +296,48 @@ def bench_inference():
 
     bench(single_unit_infer_fast_big, label="Big unit MLP.infer() fast path")
 
-    # Actual bot config
-    mlp_bot = MLP(191, [32, 16], {"build_type": 12, "build_dir": 9, "move_dir": 9}, activation="silu")
+    # Actual production bot config
+    prod_heads = {
+        "build_type": len(PROD_BUILD_ACTIONS),
+        "build_dir": 9,
+        "move_dir": 9,
+        "h_next": PROD_H_DIM,
+    }
+    mlp_bot = MLP(
+        PROD_INPUT_SIZE + PROD_H_DIM,
+        PROD_HIDDEN_SIZES,
+        prod_heads,
+        activation="silu",
+        rmsnorm_layers=PROD_RMSNORM_LAYERS,
+    )
     mlp_bot.eval()
-    sin_bot = SinusoidalPositionEmbedding(8)
+    sin_bot = SinusoidalPositionEmbedding(PROD_POS_EMBED_DIM)
+
+    def make_prod_features():
+        base = [random.random() for _ in range(PROD_INPUT_SIZE - PROD_POS_EMBED_DIM)]
+        base.extend(sin_bot.encode(15, 20))
+        base.extend([0.0] * PROD_H_DIM)
+        return base
 
     def bot_tensor_path():
-        features = [random.random() for _ in range(183)]
-        features.extend(sin_bot.encode(15, 20))
-        x = Tensor(features, (1, 191))
+        features = make_prod_features()
+        x = Tensor(features, (1, PROD_INPUT_SIZE + PROD_H_DIM))
         outputs = mlp_bot(x)
-        _ = max(range(12), key=lambda i: outputs["build_type"].data[i])
+        _ = max(range(len(PROD_BUILD_ACTIONS)), key=lambda i: outputs["build_type"].data[i])
 
     def bot_infer_path():
-        features = [random.random() for _ in range(183)]
-        features.extend(sin_bot.encode(15, 20))
+        features = make_prod_features()
         outputs = mlp_bot.infer(features)
-        _ = max(range(12), key=lambda i: outputs["build_type"][i])
+        _ = max(range(len(PROD_BUILD_ACTIONS)), key=lambda i: outputs["build_type"][i])
 
-    bench(bot_tensor_path, label="Bot config Tensor path (191->[32,16])")
-    bench(bot_infer_path, label="Bot config infer() path (191->[32,16])")
+    bench(
+        bot_tensor_path,
+        label=f"Production bot Tensor path ({PROD_INPUT_SIZE + PROD_H_DIM}->{PROD_HIDDEN_SIZES})",
+    )
+    bench(
+        bot_infer_path,
+        label=f"Production bot infer() path ({PROD_INPUT_SIZE + PROD_H_DIM}->{PROD_HIDDEN_SIZES})",
+    )
 
 
 # ── Training step simulation ────────────────────────────────────
