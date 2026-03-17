@@ -89,6 +89,13 @@ class League:
         path = str(self.league_dir / f"gen_{gen}.pkl")
         with open(path, "wb") as f:
             pickle.dump(weights, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return self._register(path, gen)
+
+    def register_model(self, path: str, gen: int) -> dict:
+        """Register an externally-saved checkpoint (e.g. torch state_dict)."""
+        return self._register(path, gen)
+
+    def _register(self, path: str, gen: int) -> dict:
         entry = {
             "id": f"gen_{gen}", "gen": gen, "elo": ELO_DEFAULT,
             "path": path, "timestamp": time.time(),
@@ -138,12 +145,14 @@ class League:
 
 # ---- Game runner (no torch, safe to fork) ----
 
-def _run_game(args: tuple) -> tuple[str | None, str | None]:
+def _run_game(args: tuple) -> tuple[str | None, dict[int, dict[int, int]] | None]:
     bot_a, bot_b, map_path, engine_root, replay_path, log_path, seed = args
     os.environ["TENSOR_TRAIN_LOG"] = log_path
     try:
         from cambc.cambc_engine import run_game
+        from replay_parser import extract_working_harvesters
         run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
+        working = extract_working_harvesters(replay_path)
     except Exception as e:
         print(f"  Game error: {e}")
         return None, None
@@ -151,10 +160,10 @@ def _run_game(args: tuple) -> tuple[str | None, str | None]:
         os.environ.pop("TENSOR_TRAIN_LOG", None)
 
     traj_path = log_path if os.path.exists(log_path) else None
-    return traj_path, None
+    return traj_path, working
 
 
-def _run_game_with_opp(args: tuple) -> tuple[str | None, str | None]:
+def _run_game_with_opp(args: tuple) -> tuple[str | None, dict[int, dict[int, int]] | None]:
     """Like _run_game but takes an extra opp_weights_path arg and sets the env var."""
     *game_args, opp_weights_path = args
     os.environ["TENSOR_OPP_WEIGHTS"] = opp_weights_path
@@ -199,8 +208,10 @@ def collect_all_games(
     n_workers: int,
     episode_num: int,
     replay_dir: Path | None = None,
+    profile: dict[str, float] | None = None,
 ) -> tuple[list[list], dict[str, list[str | None]]]:
     """Run games against all opponents in a single pool. Returns (trajectories, per_opp_winners)."""
+    t_total = time.perf_counter() if profile is not None else 0.0
     bot_a = str(PROJECT_ROOT / "bots" / "tensor" / "main.py")
     bot_b = str(PROJECT_ROOT / "bots" / "tensor_opp" / "main.py")
     engine_root = str(PROJECT_ROOT)
@@ -244,16 +255,27 @@ def collect_all_games(
     ]
 
     ctx = mp.get_context("fork")
+    t_phase = time.perf_counter() if profile is not None else 0.0
     with ctx.Pool(min(n_workers, n_games)) as pool:
         results = pool.map(_run_game_with_opp, opp_game_args)
+    if profile is not None:
+        profile["pool_map_s"] = time.perf_counter() - t_phase
 
+    from replay_parser import augment_trajectories_with_working_counts
+
+    t_phase = time.perf_counter() if profile is not None else 0.0
     trajectories = []
     per_opp_winners: dict[str, list[str | None]] = {}
-    for i, (traj_path, _winner) in enumerate(results):
+    for i, (traj_path, working) in enumerate(results):
         opp_id = game_opp_ids[i]
         game_trajs = _read_trajectory_file(traj_path)
+        game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
         trajectories.extend(game_trajs)
         per_opp_winners.setdefault(opp_id, []).append(_classify_winner(game_trajs))
+    if profile is not None:
+        profile["postprocess_s"] = time.perf_counter() - t_phase
+        profile["collection_total_s"] = time.perf_counter() - t_total
+        profile["games"] = float(n_games)
 
     shutil.rmtree(tmpdir, ignore_errors=True)
     return trajectories, per_opp_winners
@@ -289,6 +311,9 @@ def main():
     parser.add_argument("--league-size", type=int, default=20)
     parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--teacher", action="store_true", help="Train large teacher model, distill to student at end")
+    parser.add_argument("--distill-epochs", type=int, default=20, help="Distillation epochs")
+    parser.add_argument("--distill-lr", type=float, default=1e-3, help="Distillation learning rate")
     parser.add_argument("--session", type=str, default="", help="Session name (empty=new)")
     parser.add_argument("--save", type=str, default="", help="Override weight path")
     args = parser.parse_args()
@@ -338,13 +363,16 @@ def main():
         if not opponents:
             # No league yet — need to init model first
             if model is None:
-                from model import BuilderMLP, DEVICE, train_on_trajectories
+                from model import BuilderMLP, DEVICE, train_on_trajectories, TEACHER_HIDDEN
                 import torch
-                model = BuilderMLP().to(DEVICE)
+                hidden = TEACHER_HIDDEN if args.teacher else None
+                model = BuilderMLP(hidden=hidden).to(DEVICE)
                 model.load_weights(weight_path)
                 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes)
-                league.add_model(model.export_weights(), 0)
+                ckpt = str(league.league_dir / "gen_0.pkl")
+                model.save_weights(ckpt)
+                league.register_model(ckpt, 0)
                 print(f"Seeded league with gen_0")
                 opponents = league.sample_opponents(1)
 
@@ -372,13 +400,15 @@ def main():
 
         # ---- Now import torch and train (only on first iteration) ----
         if model is None:
-            from model import BuilderMLP, DEVICE, train_on_trajectories
+            from model import BuilderMLP, DEVICE, train_on_trajectories, TEACHER_HIDDEN
             import torch
-            model = BuilderMLP().to(DEVICE)
+            hidden = TEACHER_HIDDEN if args.teacher else None
+            model = BuilderMLP(hidden=hidden).to(DEVICE)
             model.load_weights(weight_path)
             optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes)
-            print(f"Device: {DEVICE}")
+            n_params = sum(p.numel() for p in model.parameters())
+            print(f"Device: {DEVICE} | {'Teacher' if args.teacher else 'Student'} model: {n_params:,} params")
 
         t1 = time.time()
         stats = train_on_trajectories(model, optimizer, all_trajs)
@@ -387,7 +417,9 @@ def main():
 
         # Checkpoint to league + per-game ELO updates
         if (ep + 1) % args.checkpoint_every == 0 or ep == 0:
-            league.add_model(model.export_weights(), gen)
+            ckpt = str(league.league_dir / f"gen_{gen}.pkl")
+            model.save_weights(ckpt)
+            league.register_model(ckpt, gen)
             for opp, winners in per_opp_results:
                 for w in winners:
                     if w is not None:
@@ -396,24 +428,23 @@ def main():
 
         # Stats
         def _traj_reward(traj):
-            r_harv, r_conv, r_dti, r_dmg = 0.0, 0.0, 0.0, 0.0
+            r_harv, r_conv, r_work, r_dmg = 0.0, 0.0, 0.0, 0.0
             for s in traj:
                 if isinstance(s, (list, tuple)):
                     n = len(s)
-                    dti = s[6]
-                    harv = s[9] if n > 9 else 0.0
+                    n_working = s[6] if n > 6 else 0
+                    conv_r = s[7] if n > 7 else 0.0
+                    harv_r = s[9] if n > 9 else 0.0
                     dmg = s[10] if n > 10 else 0.0
-                    conv = s[12] if n > 12 else 0.0
                 else:
-                    dti = s.get("dti", 0)
-                    harv = s.get("harv", 0)
+                    n_working = s.get("n_working", 0)
+                    conv_r = s.get("conv_r", 0)
+                    harv_r = s.get("harv_r", 0)
                     dmg = s.get("dmg", 0)
-                    conv = s.get("conv", 0)
-                r_harv += harv * 5.0
-                r_conv += conv * 10.0
-                r_dti += max(dti, 0) * 2.0
-                r_dmg += dmg * 20.0
-            return r_harv + r_conv + r_dti + r_dmg, r_harv, r_conv, r_dti, r_dmg
+                r_harv += harv_r; r_conv += conv_r
+                r_work += n_working * 0.5; r_dmg += dmg * 20.0
+            total = r_harv + r_conv + r_work + r_dmg
+            return total, r_harv, r_conv, r_work, r_dmg
 
         def _traj_ti(traj):
             last = traj[-1]
@@ -424,7 +455,7 @@ def main():
         mean_reward = sum(r[0] for r in rewards) / n_trajs
         mean_r_harv = sum(r[1] for r in rewards) / n_trajs
         mean_r_conv = sum(r[2] for r in rewards) / n_trajs
-        mean_r_dti = sum(r[3] for r in rewards) / n_trajs
+        mean_r_work = sum(r[3] for r in rewards) / n_trajs
         mean_r_dmg = sum(r[4] for r in rewards) / n_trajs
         mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
         elapsed = time.time() - t_start
@@ -433,7 +464,7 @@ def main():
             "reward": round(mean_reward, 4),
             "r_harv": round(mean_r_harv, 4),
             "r_conv": round(mean_r_conv, 4),
-            "r_dti": round(mean_r_dti, 4),
+            "r_work": round(mean_r_work, 4),
             "r_dmg": round(mean_r_dmg, 4),
             "resources": round(mean_ti, 2),
             "best_resources": round(mean_ti, 2),
@@ -475,9 +506,10 @@ def main():
             )
 
     model.save_weights(weight_path)
-    # Also copy final weights to global path for the bot to use
-    shutil.copy2(weight_path, str(WEIGHT_PATH))
     league.save()
+
+    if not args.teacher:
+        model.save_weights(str(WEIGHT_PATH))
 
     print(f"\nDone in {time.time() - t_start:.0f}s")
     print(f"\nLeague rankings:")

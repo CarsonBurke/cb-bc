@@ -1,7 +1,4 @@
-"""Shared model, constants, and PPO training code.
-
-Used by train_gpu.py, train_engine.py, and train_selfplay.py.
-"""
+"""Shared model, constants, and PPO training code."""
 
 from __future__ import annotations
 
@@ -10,6 +7,7 @@ import os
 from pathlib import Path
 
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -26,10 +24,12 @@ GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN = [32, 32, 32, 16]
+TEACHER_HIDDEN = [128, 128, 128, 64]
 H_DIM = 16
 INPUT_SIZE = OBS_SIZE + H_DIM
 N_BUILD = 12
 N_DIR = 9
+ACTOR_RMSNORM_LAYERS = (True, False, True, False)
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.json"
@@ -71,26 +71,31 @@ def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float =
 class BuilderMLP(nn.Module):
     """MLP with shared encoder, separate actor trunk and deep critic.
 
-    Architecture:
-        [obs, h_prev] -> encoder (Linear(INPUT_SIZE,32) + SiLU, shared)
-                                   ├─ actor_trunk ([32→32, 32→32, 32→16] + SiLU) -> {policy heads, h_next}
-                                   └─ critic ([128→128→1] with SiLU + RMSNorm, training-only)
+    Args:
+        hidden: Hidden layer sizes. Defaults to HIDDEN (production).
+                Use TEACHER_HIDDEN for larger teacher model.
     """
 
-    def __init__(self):
+    def __init__(self, hidden: list[int] | None = None):
         super().__init__()
+        hidden = hidden or HIDDEN
+        self._hidden = hidden
+
         # Shared encoder: first hidden layer only
-        enc_dim = HIDDEN[0]
+        enc_dim = hidden[0]
         self.encoder = nn.Sequential(
             _ortho_init(nn.Linear(INPUT_SIZE, enc_dim)),
+            RMSNorm(enc_dim),
             nn.SiLU(),
         )
 
         # Actor trunk: remaining hidden layers
         actor_layers: list[nn.Module] = []
         prev = enc_dim
-        for h in HIDDEN[1:]:
+        for i, h in enumerate(hidden[1:], start=1):
             actor_layers.append(_ortho_init(nn.Linear(prev, h)))
+            if ACTOR_RMSNORM_LAYERS[i]:
+                actor_layers.append(RMSNorm(h))
             actor_layers.append(nn.SiLU())
             prev = h
         self.actor_trunk = nn.Sequential(*actor_layers)
@@ -102,33 +107,66 @@ class BuilderMLP(nn.Module):
         self.head_h_next = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)
 
         # Separate deep critic (training-only, not exported)
+        critic_dim = max(CRITIC_DIM, enc_dim * 2)
         self.critic = nn.Sequential(
-            _ortho_init(nn.Linear(enc_dim, CRITIC_DIM)),
-            RMSNorm(CRITIC_DIM),
+            _ortho_init(nn.Linear(enc_dim, critic_dim)),
+            RMSNorm(critic_dim),
             nn.SiLU(),
-            _ortho_init(nn.Linear(CRITIC_DIM, CRITIC_DIM)),
-            RMSNorm(CRITIC_DIM),
+            _ortho_init(nn.Linear(critic_dim, critic_dim)),
+            RMSNorm(critic_dim),
             nn.SiLU(),
-            _ortho_init(nn.Linear(CRITIC_DIM, 1), std=1.0),
+            _ortho_init(nn.Linear(critic_dim, 1), std=1.0),
         )
+
+    def train(self, mode=True):
+        # Invalidate fused head cache when entering train mode
+        if mode and hasattr(self, '_cached_head_w'):
+            del self._cached_head_w
+            del self._cached_head_b
+        return super().train(mode)
 
     def forward(self, x, h_prev):
         trunk_in = torch.cat([x, h_prev], dim=-1)
         enc = self.encoder(trunk_in)
         h = self.actor_trunk(enc)
-        return (
-            self.head_build_type(h),
-            self.head_build_dir(h),
-            self.head_move_dir(h),
-            self.critic(enc).squeeze(-1),
-            torch.tanh(self.head_h_next(h)),
-        )
 
-    def _linear_layers(self) -> list[nn.Linear]:
-        """Policy layers only — used for export/import (critic excluded)."""
-        enc_linears = [m for m in self.encoder if isinstance(m, nn.Linear)]
-        actor_linears = [m for m in self.actor_trunk if isinstance(m, nn.Linear)]
-        return enc_linears + actor_linears + [
+        # Fuse 4 head matmuls into one kernel launch
+        # Cache fused weights in eval mode (inference hot path)
+        if self.training:
+            combined_w = torch.cat([
+                self.head_build_type.weight, self.head_build_dir.weight,
+                self.head_move_dir.weight, self.head_h_next.weight,
+            ], dim=0)
+            combined_b = torch.cat([
+                self.head_build_type.bias, self.head_build_dir.bias,
+                self.head_move_dir.bias, self.head_h_next.bias,
+            ])
+        else:
+            if not hasattr(self, '_cached_head_w'):
+                self._cached_head_w = torch.cat([
+                    self.head_build_type.weight, self.head_build_dir.weight,
+                    self.head_move_dir.weight, self.head_h_next.weight,
+                ], dim=0)
+                self._cached_head_b = torch.cat([
+                    self.head_build_type.bias, self.head_build_dir.bias,
+                    self.head_move_dir.bias, self.head_h_next.bias,
+                ])
+            combined_w = self._cached_head_w
+            combined_b = self._cached_head_b
+
+        combined = F.linear(h, combined_w, combined_b)
+        bt_l, bd_l, md_l, h_raw = combined.split([N_BUILD, N_DIR, N_DIR, H_DIM], dim=-1)
+
+        # Skip critic during inference — it's only needed for training
+        value = self.critic(enc).squeeze(-1) if self.training else torch.zeros(h.shape[0], device=h.device)
+
+        return bt_l, bd_l, md_l, value, torch.tanh(h_raw)
+
+    def _policy_state_modules(self) -> list[nn.Module]:
+        """Policy modules only in tensor_lib serialization order (critic excluded)."""
+        enc_modules = [m for m in self.encoder if isinstance(m, (nn.Linear, RMSNorm))]
+        actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
+        return enc_modules + actor_modules + [
             self.head_build_type, self.head_build_dir, self.head_move_dir,
             self.head_h_next,
         ]
@@ -136,25 +174,45 @@ class BuilderMLP(nn.Module):
     def export_weights(self) -> list[list[float]]:
         """Export weights as JSON list. Transposes to match tensor_lib (in, out) format."""
         state: list[list[float]] = []
-        for layer in self._linear_layers():
-            state.append(layer.weight.T.contiguous().view(-1).tolist())
-            state.append(layer.bias.view(-1).tolist())
+        for layer in self._policy_state_modules():
+            if isinstance(layer, nn.Linear):
+                state.append(layer.weight.T.contiguous().view(-1).tolist())
+                state.append(layer.bias.view(-1).tolist())
+            else:
+                state.append(layer.weight.view(-1).tolist())
         return state
 
     def import_weights(self, state: list[list[float]]) -> None:
-        """Load weights from tensor_lib JSON format."""
+        """Load weights from tensor_lib JSON format, including legacy no-RMSNorm states."""
+        modules = self._policy_state_modules()
+        full_entries = sum(2 if isinstance(layer, nn.Linear) else 1 for layer in modules)
+        legacy_entries = sum(2 for layer in modules if isinstance(layer, nn.Linear))
+        if len(state) == full_entries:
+            load_rmsnorm = True
+        elif len(state) == legacy_entries:
+            load_rmsnorm = False
+        else:
+            raise AssertionError(
+                f"State has {len(state)} entries, expected {full_entries} "
+                f"({legacy_entries} legacy without RMSNorm)"
+            )
+
         idx = 0
         dev = next(self.parameters()).device
-        for layer in self._linear_layers():
-            w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
-            in_f, out_f = layer.in_features, layer.out_features
-            layer.weight.data = w_flat.view(in_f, out_f).T.contiguous()
-            idx += 1
-            layer.bias.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
-            idx += 1
+        for layer in modules:
+            if isinstance(layer, nn.Linear):
+                w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
+                in_f, out_f = layer.in_features, layer.out_features
+                layer.weight.data = w_flat.view(in_f, out_f).T.contiguous()
+                idx += 1
+                layer.bias.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
+                idx += 1
+            elif load_rmsnorm:
+                layer.weight.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
+                idx += 1
 
     def save_weights(self, path: str | Path = WEIGHT_PATH) -> None:
-        """Save weights. Uses JSON for .json paths (bot compat), pickle otherwise."""
+        """Save weights. Uses JSON for .json, pickle list format for .pkl (bot compat)."""
         path = str(path)
         if path.endswith(".json"):
             with open(path, "w") as f:
@@ -162,7 +220,7 @@ class BuilderMLP(nn.Module):
         else:
             import pickle
             with open(path, "wb") as f:
-                pickle.dump(self.export_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(self.export_weights(), f)
 
     def load_weights(self, path: str | Path = WEIGHT_PATH) -> bool:
         path = str(path)
@@ -175,7 +233,13 @@ class BuilderMLP(nn.Module):
             else:
                 import pickle
                 with open(path, "rb") as f:
-                    self.import_weights(pickle.load(f))
+                    data = pickle.load(f)
+                if isinstance(data, dict):
+                    # torch state_dict format (legacy)
+                    self.load_state_dict(data)
+                else:
+                    # list-of-lists format (current + old pickle)
+                    self.import_weights(data)
             return True
         except Exception as e:
             print(f"Could not load weights from {path}: {e}")
@@ -204,6 +268,7 @@ def ppo_update(
     max_grad_norm: float = 0.5,
     target_kl: float | None = None,
     clip_vloss: bool = True,
+    profile: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """PPO update on flattened rollout data. Returns stats dict."""
     N = obs.shape[0]
@@ -226,13 +291,22 @@ def ppo_update(
         for start in range(0, N, minibatch_size):
             idx = perm[start:start + minibatch_size]
 
+            t_phase = time.perf_counter() if profile is not None else 0.0
             bt_l, bd_l, md_l, value, _ = model(obs[idx], h[idx])
+            if profile is not None and DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            if profile is not None:
+                profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
+
+            t_phase = time.perf_counter() if profile is not None else 0.0
             bt_d = Categorical(logits=bt_l)
             bd_d = Categorical(logits=bd_l)
             md_d = Categorical(logits=md_l)
 
-            new_lp = bt_d.log_prob(bt_act[idx]) + bd_d.log_prob(bd_act[idx]) + md_d.log_prob(md_act[idx])
-            entropy = bt_d.entropy() + bd_d.entropy() + md_d.entropy()
+            # Mask build_dir when build_type is "none" (idx 0) — causally irrelevant
+            bd_mask = (bt_act[idx] != 0).float()
+            new_lp = bt_d.log_prob(bt_act[idx]) + bd_d.log_prob(bd_act[idx]) * bd_mask + md_d.log_prob(md_act[idx])
+            entropy = bt_d.entropy() + bd_d.entropy() * bd_mask + md_d.entropy()
 
             logratio = new_lp - old_log_probs[idx]
             ratio = logratio.exp()
@@ -244,15 +318,25 @@ def ppo_update(
                 sum_kl += approx_kl.item()
                 sum_clip_frac += clip_frac.item()
                 n_mb += 1
+            if profile is not None and DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            if profile is not None:
+                profile["ppo_dist_s"] = profile.get("ppo_dist_s", 0.0) + (time.perf_counter() - t_phase)
 
+            t_phase = time.perf_counter() if profile is not None else 0.0
             mb_adv = advantages[idx]
             mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
             pg1 = -mb_adv * ratio
             pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
             pi_loss = torch.max(pg1, pg2).mean()
+            if profile is not None and DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            if profile is not None:
+                profile["ppo_policy_loss_s"] = profile.get("ppo_policy_loss_s", 0.0) + (time.perf_counter() - t_phase)
 
             # Value loss with optional clipping (CleanRL-style)
+            t_phase = time.perf_counter() if profile is not None else 0.0
             newvalue = value.view(-1)
             if clip_vloss and old_values is not None:
                 v_loss_unclipped = (newvalue - returns[idx]) ** 2
@@ -263,13 +347,22 @@ def ppo_update(
                 vf_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
             else:
                 vf_loss = 0.5 * ((newvalue - returns[idx]) ** 2).mean()
+            if profile is not None and DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            if profile is not None:
+                profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_phase)
 
             loss = pi_loss + vf_coeff * vf_loss - entropy_coeff * entropy.mean()
 
+            t_phase = time.perf_counter() if profile is not None else 0.0
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
+            if profile is not None and DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            if profile is not None:
+                profile["ppo_backward_step_s"] = profile.get("ppo_backward_step_s", 0.0) + (time.perf_counter() - t_phase)
 
             sum_pi += pi_loss.item()
             sum_vf += vf_loss.item()
@@ -309,21 +402,22 @@ def _parse_trajectories(
         for step in traj:
             if isinstance(step, (list, tuple)):
                 n = len(step)
+                # Tuple: obs, h, bt, bd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp
                 obs, h_prev, bt, bd, md = step[:5]
-                dti = step[6] if n > 6 else 0.0
-                harv = step[9] if n > 9 else 0.0
+                n_working = step[6] if n > 6 else 0
+                conv_r = step[7] if n > 7 else 0.0
+                harv_r = step[9] if n > 9 else 0.0
                 dmg = step[10] if n > 10 else 0.0
                 old_lp = step[11] if n > 11 else 0.0
-                conv = step[12] if n > 12 else 0.0
             else:
                 obs = step["obs"]
                 h_prev = step["h_prev"]
                 bt, bd, md = step["bt"], step["bd"], step["md"]
-                dti = step.get("dti", 0)
-                harv = step.get("harv", 0)
+                n_working = step.get("n_working", 0)
+                conv_r = step.get("conv_r", 0)
+                harv_r = step.get("harv_r", 0)
                 dmg = step.get("dmg", 0)
                 old_lp = step.get("old_lp", 0)
-                conv = step.get("conv", 0)
             all_obs.append(obs)
             all_h.append(h_prev)
             all_bt.append(bt)
@@ -331,8 +425,8 @@ def _parse_trajectories(
             all_md.append(md)
             all_old_lp.append(old_lp)
 
-            # Reward: delivery-first, placement as stepping stones
-            reward = harv * 5.0 + conv * 10.0 + max(dti, 0) * 2.0 + dmg * 20.0
+            # Reward: harv + conv + working harvesters + damage
+            reward = harv_r + conv_r + n_working * 0.5 + dmg * 20.0
             all_rewards.append(reward)
             idx += 1
         ep_boundaries.append((start, idx))
@@ -466,10 +560,14 @@ def train_on_trajectories(
     trajectories: list[list],
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
+    profile: dict[str, float] | None = None,
     **ppo_kwargs,
 ) -> dict[str, float]:
     """End-to-end: trajectories -> model values -> GAE -> PPO update."""
+    t_phase = time.perf_counter() if profile is not None else 0.0
     data = _parse_trajectories(trajectories)
+    if profile is not None:
+        profile["parse_s"] = time.perf_counter() - t_phase
     if data is None:
         return {"pi_loss": 0, "vf_loss": 0, "entropy": 0, "n_updates": 0, "n_steps": 0}
 
@@ -479,21 +577,92 @@ def train_on_trajectories(
     # Chunked to avoid OOM on large trajectory batches
     N = data["n_steps"]
     values = torch.empty(N, device=DEVICE)
+    t_phase = time.perf_counter() if profile is not None else 0.0
     with torch.no_grad():
         for i in range(0, N, 8192):
             _, _, _, v, _ = model(obs[i:i + 8192], h[i:i + 8192])
             values[i:i + 8192] = v.view(-1)
+    if profile is not None and DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    if profile is not None:
+        profile["value_forward_s"] = time.perf_counter() - t_phase
 
+    t_phase = time.perf_counter() if profile is not None else 0.0
     advantages, returns = _compute_gae(
         data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,
     )
+    if profile is not None and DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    if profile is not None:
+        profile["gae_s"] = time.perf_counter() - t_phase
 
+    ppo_profile = profile if profile is not None else None
     stats = ppo_update(
         model, optimizer,
         obs, h, data["bt"], data["bd"], data["md"],
         data["old_log_probs"], advantages, returns,
         old_values=values,
+        profile=ppo_profile,
         **ppo_kwargs,
     )
     stats["n_steps"] = data["n_steps"]
     return stats
+
+
+def distill(
+    teacher: BuilderMLP,
+    student: BuilderMLP,
+    optimizer: torch.optim.Optimizer,
+    obs: torch.Tensor,
+    h: torch.Tensor,
+    epochs: int = 4,
+    minibatch_size: int = 2048,
+    temperature: float = 2.0,
+) -> dict[str, float]:
+    """Distill teacher policy into student via KL divergence on logits.
+
+    Both models must share the same input/output dimensions (same obs space
+    and action heads), but can have different hidden sizes.
+    """
+    N = obs.shape[0]
+    teacher.eval()
+    student.train()
+
+    # Get teacher logits (no grad needed)
+    t_bt, t_bd, t_md = [], [], []
+    with torch.no_grad():
+        for i in range(0, N, 8192):
+            bt_l, bd_l, md_l, _, _ = teacher(obs[i:i + 8192], h[i:i + 8192])
+            t_bt.append(bt_l)
+            t_bd.append(bd_l)
+            t_md.append(md_l)
+    t_bt = torch.cat(t_bt)
+    t_bd = torch.cat(t_bd)
+    t_md = torch.cat(t_md)
+
+    sum_loss = 0.0
+    n_updates = 0
+    T = temperature
+
+    for _ in range(epochs):
+        perm = torch.randperm(N, device=DEVICE)
+        for start in range(0, N, minibatch_size):
+            idx = perm[start:start + minibatch_size]
+            s_bt, s_bd, s_md, _, _ = student(obs[idx], h[idx])
+
+            # KL(teacher || student) on softened logits
+            loss = (
+                F.kl_div(F.log_softmax(s_bt / T, dim=-1), F.softmax(t_bt[idx] / T, dim=-1), reduction='batchmean')
+                + F.kl_div(F.log_softmax(s_bd / T, dim=-1), F.softmax(t_bd[idx] / T, dim=-1), reduction='batchmean')
+                + F.kl_div(F.log_softmax(s_md / T, dim=-1), F.softmax(t_md[idx] / T, dim=-1), reduction='batchmean')
+            ) * (T * T)
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(student.parameters(), 0.5)
+            optimizer.step()
+
+            sum_loss += loss.item()
+            n_updates += 1
+
+    return {"distill_loss": sum_loss / max(n_updates, 1), "n_updates": n_updates}
