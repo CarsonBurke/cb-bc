@@ -1,0 +1,205 @@
+{
+  "models": [
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_0.json",
+      "timestamp": 1773711172.3643868,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_1",
+      "gen": 1,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_1.json",
+      "timestamp": 1773711173.4055693,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_2",
+      "gen": 2,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_2.json",
+      "timestamp": 1773711173.5908532,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_3",
+      "gen": 3,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_3.json",
+      "timestamp": 1773711173.8230011,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_4",
+      "gen": 4,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_4.json",
+      "timestamp": 1773711174.0618606,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_5",
+      "gen": 5,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_5.json",
+      "timestamp": 1773711174.30987,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_6",
+      "gen": 6,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_6.json",
+      "timestamp": 1773711174.5443077,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_7",
+      "gen": 7,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_7.json",
+      "timestamp": 1773711174.7786493,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_8",
+      "gen": 8,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_8.json",
+      "timestamp": 1773711175.0178564,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_9",
+      "gen": 9,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_9.json",
+      "timestamp": 1773711175.2513022,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_10",
+      "gen": 10,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_10.json",
+      "timestamp": 1773711175.4851146,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_11",
+      "gen": 11,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_11.json",
+      "timestamp": 1773711175.7138958,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_12",
+      "gen": 12,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_12.json",
+      "timestamp": 1773711175.9341629,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_13",
+      "gen": 13,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_13.json",
+      "timestamp": 1773711176.163527,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_14",
+      "gen": 14,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_14.json",
+      "timestamp": 1773711176.3956077,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_15",
+      "gen": 15,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_15.json",
+      "timestamp": 1773711176.6171389,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_16",
+      "gen": 16,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_16.json",
+      "timestamp": 1773711176.8399315,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_17",
+      "gen": 17,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_17.json",
+      "timestamp": 1773711177.0572522,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_18",
+      "gen": 18,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_18.json",
+      "timestamp": 1773711177.2860932,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_19",
+      "gen": 19,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183252/league/gen_19.json",
+      "timestamp": 1773711177.5195563,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    }
+  ],
+  "matches": []
+}

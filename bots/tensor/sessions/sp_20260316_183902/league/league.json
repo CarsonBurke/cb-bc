@@ -1,0 +1,128 @@
+{
+  "models": [
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 1095.5,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183902/league/gen_0.json",
+      "timestamp": 1773711542.7027016,
+      "wins": 8,
+      "losses": 1,
+      "draws": 0
+    },
+    {
+      "id": "gen_1",
+      "gen": 1,
+      "elo": 1028.6,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183902/league/gen_1.json",
+      "timestamp": 1773711551.3156278,
+      "wins": 4,
+      "losses": 2,
+      "draws": 0
+    },
+    {
+      "id": "gen_2",
+      "gen": 2,
+      "elo": 954.0,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183902/league/gen_2.json",
+      "timestamp": 1773711580.8592606,
+      "wins": 0,
+      "losses": 3,
+      "draws": 0
+    },
+    {
+      "id": "gen_3",
+      "gen": 3,
+      "elo": 958.4,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183902/league/gen_3.json",
+      "timestamp": 1773711617.0559275,
+      "wins": 0,
+      "losses": 3,
+      "draws": 0
+    },
+    {
+      "id": "gen_4",
+      "gen": 4,
+      "elo": 963.5,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_183902/league/gen_4.json",
+      "timestamp": 1773711653.136029,
+      "wins": 0,
+      "losses": 3,
+      "draws": 0
+    }
+  ],
+  "matches": [
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773711551.3157487
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773711551.3157532
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773711551.3157558
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_1",
+      "winner": "b",
+      "timestamp": 1773711580.859402
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_1",
+      "winner": "b",
+      "timestamp": 1773711580.8594048
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_1",
+      "winner": "b",
+      "timestamp": 1773711580.859407
+    },
+    {
+      "a": "gen_3",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773711617.0560806
+    },
+    {
+      "a": "gen_3",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773711617.0560832
+    },
+    {
+      "a": "gen_3",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773711617.0560844
+    },
+    {
+      "a": "gen_4",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773711653.1361935
+    },
+    {
+      "a": "gen_4",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773711653.1361957
+    },
+    {
+      "a": "gen_4",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773711653.136197
+    }
+  ]
+}
