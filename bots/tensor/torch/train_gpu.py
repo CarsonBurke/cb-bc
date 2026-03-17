@@ -77,63 +77,84 @@ _POS_FREQS = torch.tensor(
 
 WEIGHT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "weights.json")
 
+from model import RMSNorm, CRITIC_DIM, _ortho_init
 
-# ---- Model ----
 
 class BuilderMLP(nn.Module):
-    """MLP with recurrent hidden state and value head for PPO.
+    """MLP with shared encoder, separate actor trunk and deep critic.
 
-    Architecture: [obs, h_prev] -> trunk -> {action heads, value, h_next}
-    Built dynamically from HIDDEN so architecture changes propagate.
+    Architecture:
+        [obs, h_prev] -> encoder (Linear(335,32) + SiLU, shared)
+                          ├─ actor_trunk ([32→32, 32→32, 32→16] + SiLU) -> {policy heads, h_next}
+                          └─ critic ([128→128→1] with RMSNorm + SiLU, training-only)
+
+    Note: This is a local copy because train_gpu.py uses different INPUT_SIZE/TILE_FEATURES
+    than model.py (simplified sim obs vs full game obs). The architecture is identical.
     """
 
     def __init__(self):
         super().__init__()
-        layers: list[nn.Module] = []
-        prev = INPUT_SIZE + H_DIM  # obs + recurrent hidden
-        for h in HIDDEN:
-            layers.append(nn.Linear(prev, h))
-            layers.append(nn.SiLU())
+        # Shared encoder: first hidden layer only
+        enc_dim = HIDDEN[0]
+        self.encoder = nn.Sequential(
+            _ortho_init(nn.Linear(INPUT_SIZE + H_DIM, enc_dim)),
+            nn.SiLU(),
+        )
+
+        # Actor trunk: remaining hidden layers
+        actor_layers: list[nn.Module] = []
+        prev = enc_dim
+        for h in HIDDEN[1:]:
+            actor_layers.append(_ortho_init(nn.Linear(prev, h)))
+            actor_layers.append(nn.SiLU())
             prev = h
-        self.trunk = nn.Sequential(*layers)
-        self.head_build_type = nn.Linear(prev, N_BUILD)
-        self.head_build_dir = nn.Linear(prev, N_DIR)
-        self.head_move_dir = nn.Linear(prev, N_DIR)
-        self.head_value = nn.Linear(prev, 1)
-        self.head_h_next = nn.Linear(prev, H_DIM)
+        self.actor_trunk = nn.Sequential(*actor_layers)
+
+        # Policy heads: small std for near-uniform initial policy
+        self.head_build_type = _ortho_init(nn.Linear(prev, N_BUILD), std=0.01)
+        self.head_build_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
+        self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
+        self.head_h_next = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)
+
+        # Separate deep critic (training-only, not exported)
+        self.critic = nn.Sequential(
+            _ortho_init(nn.Linear(enc_dim, CRITIC_DIM)),
+            RMSNorm(CRITIC_DIM),
+            nn.SiLU(),
+            _ortho_init(nn.Linear(CRITIC_DIM, CRITIC_DIM)),
+            RMSNorm(CRITIC_DIM),
+            nn.SiLU(),
+            _ortho_init(nn.Linear(CRITIC_DIM, 1), std=1.0),
+        )
 
     def forward(
         self, x: torch.Tensor, h_prev: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (bt_logits, bd_logits, md_logits, value, h_next)."""
         trunk_in = torch.cat([x, h_prev], dim=-1)
-        h = self.trunk(trunk_in)
+        enc = self.encoder(trunk_in)
+        h = self.actor_trunk(enc)
         return (
             self.head_build_type(h),
             self.head_build_dir(h),
             self.head_move_dir(h),
-            self.head_value(h).squeeze(-1),
-            torch.tanh(self.head_h_next(h)),  # bounded hidden state
+            self.critic(enc).squeeze(-1),
+            torch.tanh(self.head_h_next(h)),
         )
 
     def _linear_layers(self) -> list[nn.Linear]:
-        """All Linear layers in parameter order (trunk, action heads, value, h_next)."""
-        trunk_linears = [m for m in self.trunk if isinstance(m, nn.Linear)]
-        return trunk_linears + [
+        """Policy layers only — used for export/import (critic excluded)."""
+        enc_linears = [m for m in self.encoder if isinstance(m, nn.Linear)]
+        actor_linears = [m for m in self.actor_trunk if isinstance(m, nn.Linear)]
+        return enc_linears + actor_linears + [
             self.head_build_type,
             self.head_build_dir,
             self.head_move_dir,
-            self.head_value,
             self.head_h_next,
         ]
 
     def export_weights(self) -> list[list[float]]:
-        """Export all weights as JSON-compatible nested lists.
-
-        tensor_lib Linear stores weight as (in, out) row-major.
-        PyTorch Linear stores weight as (out, in).
-        We transpose before flattening.
-        """
+        """Export weights as JSON list. Transposes to match tensor_lib (in, out) format."""
         state: list[list[float]] = []
         for layer in self._linear_layers():
             state.append(layer.weight.T.contiguous().view(-1).tolist())
