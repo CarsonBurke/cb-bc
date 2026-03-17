@@ -12,7 +12,7 @@ export default function Card({ title, children, className = '', defaultOpen = tr
       {title && (
         <button
           onClick={() => setOpen(!open)}
-          className="flex items-center gap-2 w-full text-left px-5 py-3 hover:bg-surface0/30 transition-colors"
+          className={`flex items-center gap-2 w-full text-left px-5 py-3 hover:bg-surface0/30 transition-colors border-surface0 ${open && "border-b"}`}
         >
           <svg
             className={`w-3 h-3 text-overlay0 transition-transform ${open ? 'rotate-90' : ''}`}

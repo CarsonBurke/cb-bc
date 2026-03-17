@@ -79,7 +79,7 @@ function SingleChart({ episodes, label, dataKey, color, fillColor }) {
 }
 
 function RewardBreakdownChart({ episodes }) {
-  if (!episodes.length || episodes[0].r_harv == null) return null
+  if (!episodes.length) return null
 
   return (
     <div className="min-h-[200px]">
@@ -87,10 +87,10 @@ function RewardBreakdownChart({ episodes }) {
         data={{
           labels: episodes.map(e => e.episode),
           datasets: [
-            { label: 'Harvester', data: episodes.map(e => e.r_harv), borderColor: '#a6e3a1', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Conveyor', data: episodes.map(e => e.r_conv), borderColor: '#89b4fa', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Delivery', data: episodes.map(e => e.r_dti), borderColor: '#f9e2af', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Damage', data: episodes.map(e => e.r_dmg), borderColor: '#f38ba8', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Harvester', data: episodes.map(e => e.r_harv || 0), borderColor: '#a6e3a1', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Conveyor', data: episodes.map(e => e.r_conv || 0), borderColor: '#89b4fa', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Working', data: episodes.map(e => e.r_work || 0), borderColor: '#f9e2af', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Damage', data: episodes.map(e => e.r_dmg || 0), borderColor: '#f38ba8', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
           ],
         }}
         options={{
@@ -100,6 +100,33 @@ function RewardBreakdownChart({ episodes }) {
           scales: {
             x: { ticks: { color: CHART_THEME.subtext, maxTicksLimit: 10 }, grid: { color: CHART_THEME.grid } },
             y: { ticks: { color: CHART_THEME.subtext }, grid: { color: CHART_THEME.grid } },
+          },
+          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+}
+
+function OreStatusChart({ episodes }) {
+  if (!episodes.length || episodes[0].uncapped_frac == null) return null
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{
+          labels: episodes.map(e => e.episode),
+          datasets: [
+            { label: 'Uncapped %', data: episodes.map(e => (e.uncapped_frac || 0) * 100), borderColor: '#fab387', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Idle %', data: episodes.map(e => (e.idle_frac || 0) * 100), borderColor: '#94e2d5', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+          ],
+        }}
+        options={{
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          scales: {
+            x: { ticks: { color: CHART_THEME.subtext, maxTicksLimit: 10 }, grid: { color: CHART_THEME.grid } },
+            y: { ticks: { color: CHART_THEME.subtext }, grid: { color: CHART_THEME.grid }, min: 0, max: 100 },
           },
           plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
         }}
@@ -269,6 +296,9 @@ export default function TrainingView() {
             </Card>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card title="Ore Status" id="train-ore-status">
+              <OreStatusChart episodes={episodes} />
+            </Card>
             <Card title="Resources / Episode" id="train-ep-res">
               <SingleChart episodes={episodes} label="Resources" dataKey="resources" color="#89b4fa" />
             </Card>
@@ -318,7 +348,7 @@ export default function TrainingView() {
                 {[...episodes].reverse().map(e => (
                   <Tr key={e.episode}>
                     <Td>{e.episode}</Td>
-                    <Td title={e.r_harv != null ? `Harv: ${fmt(e.r_harv, 3)}  Conv: ${fmt(e.r_conv, 3)}  Delivery: ${fmt(e.r_dti, 3)}  Dmg: ${fmt(e.r_dmg, 3)}` : ''}>{fmt(e.reward, 3)}</Td>
+                    <Td title={`Harv: ${fmt(e.r_harv, 2)}  Conv: ${fmt(e.r_conv, 2)}  Work: ${fmt(e.r_work, 2)}  Dmg: ${fmt(e.r_dmg, 2)}`}>{fmt(e.reward, 3)}</Td>
                     <Td>{fmt(e.resources, 1)}</Td>
                     <Td>{fmt(e.pi_loss, 4)}</Td>
                     <Td>{fmt(e.entropy, 3)}</Td>
