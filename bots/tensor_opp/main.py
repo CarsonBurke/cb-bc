@@ -34,6 +34,9 @@ class Player:
         self.num_spawned = 0
         self.num_builders = 0
         self._prev_reward = 0.0
+        self._prev_resources = None
+        self._prev_enemy_core_hp = 500.0
+        self._own_core_hp = 500.0
         self._n_builders_cached = 1
 
         self.pos_encoder = SinusoidalPositionEmbedding(POS_EMBED_DIM)
@@ -56,11 +59,15 @@ class Player:
         opp_path = os.environ.get("TENSOR_OPP_WEIGHTS", "")
         if opp_path and os.path.exists(opp_path):
             try:
-                with open(opp_path) as f:
-                    self.model.load(json.load(f))
+                if opp_path.endswith(".pkl"):
+                    import pickle
+                    with open(opp_path, "rb") as f:
+                        self.model.load(pickle.load(f))
+                else:
+                    with open(opp_path) as f:
+                        self.model.load(json.load(f))
             except Exception:
                 pass
-        self._harv_rewarded_ores = set()
 
     def run(self, ct):
         etype = ct.get_entity_type()
@@ -73,10 +80,7 @@ class Player:
         if self.core_center is None:
             self.core_center = ct.get_position()
         ti, ax = ct.get_global_resources()
-        if self.num_spawned < 3:
-            reserve_floor = 150 + 50 * self.num_spawned
-        else:
-            reserve_floor = 250 + 75 * (self.num_spawned - 3)
+        reserve_floor = 150 * (self.num_spawned + 1)
         if ti < reserve_floor:
             return
         if ct.get_scale_percent() > 300:
@@ -123,6 +127,9 @@ class Player:
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
 
+        # Update resource snapshot for delta features
+        self._prev_resources = ct.get_global_resources()
+
     def _find_core(self, ct):
         if self.my_team is None:
             self.my_team = ct.get_team()
@@ -142,6 +149,7 @@ class Player:
         result = _P._encode_state(_p, ct)
         # Sync back cached values
         self._n_builders_cached = _p._n_builders_cached
+        self._own_core_hp = _p._own_core_hp
         return result
 
     def _proxy(self):
@@ -152,14 +160,64 @@ class Player:
         _p.my_team = self.my_team
         _p.pos_encoder = self.pos_encoder
         _p._prev_reward = self._prev_reward
+        _p._prev_resources = self._prev_resources
+        _p._prev_enemy_core_hp = self._prev_enemy_core_hp
+        _p._own_core_hp = self._own_core_hp
         _p._n_builders_cached = self._n_builders_cached
-        _p._harv_rewarded_ores = self._harv_rewarded_ores
+        _p._conv_count = 0  # opponent doesn't track this
         return _P, _p
 
     def _execute_build(self, ct, action, direction):
-        _P, _p = self._proxy()
-        _P._execute_build(_p, ct, action, direction)
+        """Opponent build — no rewards needed, just execute."""
+        pos = ct.get_position()
+        build_pos = pos.add(direction)
+        if action == "conveyor":
+            conv_dir = direction
+            if self.core_center:
+                conv_dir = build_pos.direction_to(self.core_center)
+                if conv_dir == Direction.CENTRE:
+                    conv_dir = direction
+            if ct.can_build_conveyor(build_pos, conv_dir):
+                ct.build_conveyor(build_pos, conv_dir)
+        elif action == "harvester":
+            if ct.can_build_harvester(build_pos):
+                ct.build_harvester(build_pos)
+        elif action == "road":
+            if ct.can_build_road(build_pos):
+                ct.build_road(build_pos)
+        elif action == "gunner":
+            if ct.can_build_gunner(build_pos, direction):
+                ct.build_gunner(build_pos, direction)
+        elif action == "sentinel":
+            if ct.can_build_sentinel(build_pos, direction):
+                ct.build_sentinel(build_pos, direction)
+        elif action == "breach":
+            if ct.can_build_breach(build_pos, direction):
+                ct.build_breach(build_pos, direction)
+        elif action == "splitter":
+            if ct.can_build_splitter(build_pos, direction):
+                ct.build_splitter(build_pos, direction)
+        elif action == "armoured_conveyor":
+            if ct.can_build_armoured_conveyor(build_pos, direction):
+                ct.build_armoured_conveyor(build_pos, direction)
+        elif action == "barrier":
+            if ct.can_build_barrier(build_pos):
+                ct.build_barrier(build_pos)
+        elif action == "foundry":
+            if ct.can_build_foundry(build_pos):
+                ct.build_foundry(build_pos)
+        elif action == "launcher":
+            if ct.can_build_launcher(build_pos):
+                ct.build_launcher(build_pos)
 
     def _execute_move(self, ct, direction):
-        _P, _p = self._proxy()
-        _P._execute_move(_p, ct, direction)
+        """Opponent move — simplified, no road auto-build."""
+        if direction == Direction.CENTRE:
+            return
+        if ct.can_move(direction):
+            ct.move(direction)
+            return
+        for alt in (direction.rotate_left(), direction.rotate_right()):
+            if ct.can_move(alt):
+                ct.move(alt)
+                return

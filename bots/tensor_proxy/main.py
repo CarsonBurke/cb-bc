@@ -81,9 +81,9 @@ class Player:
         self.h_prev = [0.0] * H_DIM
         self._prev_resources = None
         self._prev_enemy_core_hp = 500.0
+        self._own_core_hp = 500.0
         self._n_builders_cached = 1
         self._prev_reward = 0.0
-        self._harv_rewarded_ores = set()
         self._train_log = [] if _TRAIN_LOG else None
         self._unit_id = id(self) % (2**31)  # Unique per player instance
 
@@ -98,10 +98,7 @@ class Player:
         if self.core_center is None:
             self.core_center = ct.get_position()
         ti, ax = ct.get_global_resources()
-        if self.num_spawned < 3:
-            reserve_floor = 150 + 50 * self.num_spawned
-        else:
-            reserve_floor = 250 + 75 * (self.num_spawned - 3)
+        reserve_floor = 150 * (self.num_spawned + 1)
         if ti < reserve_floor:
             return
         if ct.get_scale_percent() > 300:
@@ -166,9 +163,7 @@ class Player:
         _p.enemy_core = self.enemy_core
         _p.my_team = self.my_team
         _p._n_builders_cached = self._n_builders_cached
-        _p._harv_rewarded_ores = self._harv_rewarded_ores
         harv_reward, conv_reward = _P._execute_build(_p, ct, build_action, build_dir)
-        self._harv_rewarded_ores = _p._harv_rewarded_ores
 
         move_dir = DIR_MAP_9[move_dir_idx]
         _p2 = _P.__new__(_P)
@@ -197,7 +192,7 @@ class Player:
                 except Exception:
                     pass
 
-        self._prev_reward = harv_reward * 5.0 + conv_reward * 2.0 + max(ti_delivered, 0) * 0.2 + enemy_dmg * 1.0
+        self._prev_reward = harv_reward * 5.0 + conv_reward * 10.0 + max(ti_delivered, 0) * 2.0 + enemy_dmg * 20.0
         self._prev_resources = (ti_after, ax_after)
 
         if self._train_log is not None:
@@ -232,8 +227,12 @@ class Player:
         _p.pos_encoder = self.pos_encoder
         _p._prev_reward = self._prev_reward
         _p._n_builders_cached = self._n_builders_cached
+        _p._prev_resources = self._prev_resources
+        _p._own_core_hp = self._own_core_hp
+        _p._prev_enemy_core_hp = self._prev_enemy_core_hp
         result = _P._encode_state(_p, ct)
         self._n_builders_cached = _p._n_builders_cached
+        self._own_core_hp = _p._own_core_hp
         return result
 
     def _flush_log(self):
