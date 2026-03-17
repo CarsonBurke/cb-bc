@@ -3,10 +3,10 @@
     {
       "id": "gen_0",
       "gen": 0,
-      "elo": 1097.3,
+      "elo": 1129.4,
       "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_200756/league/gen_0.pkl",
       "timestamp": 1773716878.0045586,
-      "wins": 13,
+      "wins": 16,
       "losses": 5,
       "draws": 0
     },
@@ -131,6 +131,16 @@
       "draws": 0
     },
     {
+      "id": "gen_23",
+      "gen": 23,
+      "elo": 1005.6,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_200756/league/gen_23.pkl",
+      "timestamp": 1773718395.389344,
+      "wins": 3,
+      "losses": 3,
+      "draws": 0
+    },
+    {
       "id": "gen_0",
       "gen": 0,
       "elo": 1000,
@@ -141,13 +151,13 @@
       "draws": 0
     },
     {
-      "id": "gen_32",
-      "gen": 32,
-      "elo": 984.0,
-      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_200756/league/gen_32.pkl",
-      "timestamp": 1773719005.3712695,
-      "wins": 1,
-      "losses": 2,
+      "id": "gen_33",
+      "gen": 33,
+      "elo": 967.9,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_200756/league/gen_33.pkl",
+      "timestamp": 1773719073.9183273,
+      "wins": 0,
+      "losses": 3,
       "draws": 0
     },
     {
@@ -188,16 +198,6 @@
       "timestamp": 1773716940.7315593,
       "wins": 4,
       "losses": 5,
-      "draws": 0
-    },
-    {
-      "id": "gen_23",
-      "gen": 23,
-      "elo": 1005.6,
-      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_200756/league/gen_23.pkl",
-      "timestamp": 1773718395.389344,
-      "wins": 3,
-      "losses": 3,
       "draws": 0
     }
   ],
@@ -795,6 +795,24 @@
       "b": "gen_23",
       "winner": "b",
       "timestamp": 1773719005.371839
+    },
+    {
+      "a": "gen_33",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773719073.9189434
+    },
+    {
+      "a": "gen_33",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773719073.918946
+    },
+    {
+      "a": "gen_33",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773719073.9189472
     }
   ]
 }

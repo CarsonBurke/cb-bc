@@ -1,0 +1,72 @@
+{
+  "models": [
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 918.0,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_232323/league/gen_0.pkl",
+      "timestamp": 1773728603.5928104,
+      "wins": 0,
+      "losses": 6,
+      "draws": 0
+    },
+    {
+      "id": "gen_1",
+      "gen": 1,
+      "elo": 1043.7,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_232323/league/gen_1.pkl",
+      "timestamp": 1773728633.6930606,
+      "wins": 3,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_2",
+      "gen": 2,
+      "elo": 1038.3,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_232323/league/gen_2.pkl",
+      "timestamp": 1773728761.6015296,
+      "wins": 3,
+      "losses": 0,
+      "draws": 0
+    }
+  ],
+  "matches": [
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773728633.6931825
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773728633.6931868
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773728633.693189
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773728761.6016538
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773728761.6016564
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773728761.6016579
+    }
+  ]
+}

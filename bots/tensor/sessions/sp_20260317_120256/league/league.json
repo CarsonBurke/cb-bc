@@ -1,0 +1,184 @@
+{
+  "models": [
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 884.2,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260317_120256/league/gen_0.pkl",
+      "timestamp": 1773774176.8907092,
+      "wins": 0,
+      "losses": 9,
+      "draws": 0
+    },
+    {
+      "id": "gen_1",
+      "gen": 1,
+      "elo": 994.5,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260317_120256/league/gen_1.pkl",
+      "timestamp": 1773774210.8387506,
+      "wins": 3,
+      "losses": 3,
+      "draws": 0
+    },
+    {
+      "id": "gen_2",
+      "gen": 2,
+      "elo": 1038.3,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260317_120256/league/gen_2.pkl",
+      "timestamp": 1773774341.9822042,
+      "wins": 3,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_3",
+      "gen": 3,
+      "elo": 1049.2,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260317_120256/league/gen_3.pkl",
+      "timestamp": 1773774509.0672052,
+      "wins": 3,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_4",
+      "gen": 4,
+      "elo": 985.8,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260317_120256/league/gen_4.pkl",
+      "timestamp": 1773774669.8916497,
+      "wins": 3,
+      "losses": 3,
+      "draws": 0
+    },
+    {
+      "id": "gen_5",
+      "gen": 5,
+      "elo": 998.3,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260317_120256/league/gen_5.pkl",
+      "timestamp": 1773774841.1290927,
+      "wins": 3,
+      "losses": 3,
+      "draws": 0
+    },
+    {
+      "id": "gen_6",
+      "gen": 6,
+      "elo": 1049.7,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260317_120256/league/gen_6.pkl",
+      "timestamp": 1773775016.4122155,
+      "wins": 3,
+      "losses": 0,
+      "draws": 0
+    }
+  ],
+  "matches": [
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774210.838844
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774210.8388486
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774210.8388505
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774341.9823248
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774341.982327
+    },
+    {
+      "a": "gen_2",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774341.982329
+    },
+    {
+      "a": "gen_3",
+      "b": "gen_1",
+      "winner": "a",
+      "timestamp": 1773774509.067339
+    },
+    {
+      "a": "gen_3",
+      "b": "gen_1",
+      "winner": "a",
+      "timestamp": 1773774509.0673413
+    },
+    {
+      "a": "gen_3",
+      "b": "gen_1",
+      "winner": "a",
+      "timestamp": 1773774509.0673425
+    },
+    {
+      "a": "gen_4",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774669.8918197
+    },
+    {
+      "a": "gen_4",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774669.891822
+    },
+    {
+      "a": "gen_4",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773774669.8918235
+    },
+    {
+      "a": "gen_5",
+      "b": "gen_4",
+      "winner": "a",
+      "timestamp": 1773774841.1293244
+    },
+    {
+      "a": "gen_5",
+      "b": "gen_4",
+      "winner": "a",
+      "timestamp": 1773774841.129327
+    },
+    {
+      "a": "gen_5",
+      "b": "gen_4",
+      "winner": "a",
+      "timestamp": 1773774841.1293292
+    },
+    {
+      "a": "gen_6",
+      "b": "gen_5",
+      "winner": "a",
+      "timestamp": 1773775016.4124446
+    },
+    {
+      "a": "gen_6",
+      "b": "gen_5",
+      "winner": "a",
+      "timestamp": 1773775016.412447
+    },
+    {
+      "a": "gen_6",
+      "b": "gen_5",
+      "winner": "a",
+      "timestamp": 1773775016.412449
+    }
+  ]
+}
