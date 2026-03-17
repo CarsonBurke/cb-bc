@@ -108,6 +108,7 @@ WEIGHT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.
 _TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
 
 
+
 class Player:
     def __init__(self):
         self.core_center: Position | None = None
@@ -127,7 +128,6 @@ class Player:
                 "build_type": len(BUILD_ACTIONS),  # 12
                 "build_dir": 9,
                 "move_dir": 9,
-                "value": 1,
                 "h_next": H_DIM,
             },
             activation="silu",
@@ -149,6 +149,7 @@ class Player:
         self._prev_enemy_core_hp: float = 500.0
         self._n_builders_cached: int = 1
         self._prev_reward: float = 0.0
+        self._harv_rewarded_ores: set[tuple[int, int]] = set()
 
     def run(self, ct: Controller) -> None:
         etype = ct.get_entity_type()
@@ -213,9 +214,8 @@ class Player:
 
         # Encode game state + recurrent hidden -> feature vector
         obs = self._encode_state(ct)
-        features = obs + self.h_prev
 
-        # Fast inference (raw lists, no Tensor overhead)
+        features = obs + self.h_prev
         outputs = self.model.infer(features)
 
         # Update recurrent hidden state (tanh-bounded)
@@ -280,7 +280,7 @@ class Player:
                 build_type_idx,
                 build_dir_idx,
                 move_dir_idx,
-                outputs["value"][0],
+                0.0,  # value placeholder (critic is training-only)
                 ti_delivered,
                 ax_delivered,
                 ti_after,
@@ -433,7 +433,12 @@ class Player:
                 pass
 
         best_dist = None
+        best_ore = None
         for ore in ore_tiles:
+            ore_key = (ore.x, ore.y)
+            # Skip if we already got proximity reward for this ore tile
+            if ore_key in self._harv_rewarded_ores:
+                continue
             my_dist = max(abs(ore.x - pos.x), abs(ore.y - pos.y))
             # Skip if a friendly harvester is already on or closer to this ore
             contested = False
@@ -444,9 +449,11 @@ class Player:
                     break
             if not contested and (best_dist is None or my_dist < best_dist):
                 best_dist = my_dist
+                best_ore = ore_key
 
-        if best_dist is None:
+        if best_dist is None or best_ore is None:
             return 0.0
+        self._harv_rewarded_ores.add(best_ore)
         return 1.0 / (1.0 + best_dist)
 
     def _find_core(self, ct: Controller) -> Position:

@@ -45,7 +45,6 @@ class Player:
                 "build_type": len(BUILD_ACTIONS),
                 "build_dir": 9,
                 "move_dir": 9,
-                "value": 1,
                 "h_next": H_DIM,
             },
             activation="silu",
@@ -61,6 +60,7 @@ class Player:
                     self.model.load(json.load(f))
             except Exception:
                 pass
+        self._harv_rewarded_ores = set()
 
     def run(self, ct):
         etype = ct.get_entity_type()
@@ -153,6 +153,7 @@ class Player:
         _p.pos_encoder = self.pos_encoder
         _p._prev_reward = self._prev_reward
         _p._n_builders_cached = self._n_builders_cached
+        _p._harv_rewarded_ores = self._harv_rewarded_ores
         return _P, _p
 
     def _execute_build(self, ct, action, direction):

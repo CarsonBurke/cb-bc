@@ -342,7 +342,7 @@ def main():
 
         # Stats
         def _traj_reward(traj):
-            total = 0.0
+            r_harv, r_conv, r_dti, r_dmg = 0.0, 0.0, 0.0, 0.0
             for s in traj:
                 if isinstance(s, (list, tuple)):
                     n = len(s)
@@ -355,19 +355,32 @@ def main():
                     harv = s.get("harv", 0)
                     dmg = s.get("dmg", 0)
                     conv = s.get("conv", 0)
-                total += harv * 5.0 + conv * 2.0 + max(dti, 0) * 0.2 + dmg * 1.0
-            return total
+                r_harv += harv * 5.0
+                r_conv += conv * 2.0
+                r_dti += max(dti, 0) * 0.2
+                r_dmg += dmg * 1.0
+            return r_harv + r_conv + r_dti + r_dmg, r_harv, r_conv, r_dti, r_dmg
 
         def _traj_ti(traj):
             last = traj[-1]
             return last[8] if isinstance(last, (list, tuple)) else last.get("ti", 0)
 
-        mean_reward = sum(_traj_reward(t) for t in all_trajs) / max(len(all_trajs), 1)
-        mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / max(len(all_trajs), 1)
+        n_trajs = max(len(all_trajs), 1)
+        rewards = [_traj_reward(t) for t in all_trajs]
+        mean_reward = sum(r[0] for r in rewards) / n_trajs
+        mean_r_harv = sum(r[1] for r in rewards) / n_trajs
+        mean_r_conv = sum(r[2] for r in rewards) / n_trajs
+        mean_r_dti = sum(r[3] for r in rewards) / n_trajs
+        mean_r_dmg = sum(r[4] for r in rewards) / n_trajs
+        mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
         elapsed = time.time() - t_start
         train_log.append({
             "episode": ep + 1,
             "reward": round(mean_reward, 4),
+            "r_harv": round(mean_r_harv, 4),
+            "r_conv": round(mean_r_conv, 4),
+            "r_dti": round(mean_r_dti, 4),
+            "r_dmg": round(mean_r_dmg, 4),
             "resources": round(mean_ti, 2),
             "best_resources": round(mean_ti, 2),
             "pi_loss": round(stats["pi_loss"], 5),
