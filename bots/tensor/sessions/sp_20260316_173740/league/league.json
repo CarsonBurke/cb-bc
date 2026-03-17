@@ -1,0 +1,38 @@
+{
+  "models": [
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 1001.5,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_173740/league/gen_0.json",
+      "timestamp": 1773707861.1532753,
+      "wins": 1,
+      "losses": 1,
+      "draws": 0
+    },
+    {
+      "id": "gen_1",
+      "gen": 1,
+      "elo": 998.5,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/sp_20260316_173740/league/gen_1.json",
+      "timestamp": 1773707901.8411968,
+      "wins": 1,
+      "losses": 1,
+      "draws": 0
+    }
+  ],
+  "matches": [
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "a",
+      "timestamp": 1773707901.8413203
+    },
+    {
+      "a": "gen_1",
+      "b": "gen_0",
+      "winner": "b",
+      "timestamp": 1773707901.8413246
+    }
+  ]
+}
