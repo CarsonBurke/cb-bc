@@ -119,7 +119,6 @@ function LossChart({ episodes }) {
           datasets: [
             { label: 'Policy Loss', data: episodes.map(e => e.pi_loss), borderColor: '#f38ba8', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
             { label: 'Value Loss', data: episodes.map(e => e.vf_loss), borderColor: '#f9e2af', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Entropy', data: episodes.map(e => e.entropy), borderColor: '#cba6f7', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
           ],
         }}
         options={{
@@ -278,8 +277,11 @@ export default function TrainingView() {
             </Card>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <Card title="Loss & Entropy" id="train-loss-chart" defaultOpen={false}>
+            <Card title="Loss" id="train-loss-chart" defaultOpen={false}>
               <LossChart episodes={episodes} />
+            </Card>
+            <Card title="Entropy" id="train-entropy" defaultOpen={false}>
+              <SingleChart episodes={episodes} label="Entropy" dataKey="entropy" color="#cba6f7" fillColor="#cba6f720" />
             </Card>
             <Card title="Explained Variance" id="train-ev">
               <SingleChart episodes={episodes} label="Explained Var" dataKey="explained_var" color="#a6e3a1" fillColor="#a6e3a120" />
