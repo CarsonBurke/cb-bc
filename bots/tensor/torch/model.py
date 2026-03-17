@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 # ---- Architecture constants (must match main.py) ----
 
 TILE_FEATURES = 16
-GLOBAL_FEATURES = 12
+GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN = [32, 32, 32, 16]
@@ -72,9 +72,9 @@ class BuilderMLP(nn.Module):
     """MLP with shared encoder, separate actor trunk and deep critic.
 
     Architecture:
-        [obs, h_prev] -> encoder (Linear(335,32) + SiLU, shared)
-                          ├─ actor_trunk ([32→32, 32→32, 32→16] + SiLU) -> {policy heads, h_next}
-                          └─ critic ([128→128→1] with SiLU + RMSNorm, training-only)
+        [obs, h_prev] -> encoder (Linear(INPUT_SIZE,32) + SiLU, shared)
+                                   ├─ actor_trunk ([32→32, 32→32, 32→16] + SiLU) -> {policy heads, h_next}
+                                   └─ critic ([128→128→1] with SiLU + RMSNorm, training-only)
     """
 
     def __init__(self):
@@ -154,16 +154,28 @@ class BuilderMLP(nn.Module):
             idx += 1
 
     def save_weights(self, path: str | Path = WEIGHT_PATH) -> None:
-        with open(str(path), "w") as f:
-            json.dump(self.export_weights(), f)
+        """Save weights. Uses JSON for .json paths (bot compat), pickle otherwise."""
+        path = str(path)
+        if path.endswith(".json"):
+            with open(path, "w") as f:
+                json.dump(self.export_weights(), f)
+        else:
+            import pickle
+            with open(path, "wb") as f:
+                pickle.dump(self.export_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def load_weights(self, path: str | Path = WEIGHT_PATH) -> bool:
         path = str(path)
         if not os.path.exists(path):
             return False
         try:
-            with open(path) as f:
-                self.import_weights(json.load(f))
+            if path.endswith(".json"):
+                with open(path) as f:
+                    self.import_weights(json.load(f))
+            else:
+                import pickle
+                with open(path, "rb") as f:
+                    self.import_weights(pickle.load(f))
             return True
         except Exception as e:
             print(f"Could not load weights from {path}: {e}")
@@ -319,8 +331,8 @@ def _parse_trajectories(
             all_md.append(md)
             all_old_lp.append(old_lp)
 
-            # Reward: 4 signals
-            reward = harv * 5.0 + conv * 2.0 + max(dti, 0) * 0.2 + dmg * 1.0
+            # Reward: delivery-first, placement as stepping stones
+            reward = harv * 5.0 + conv * 10.0 + max(dti, 0) * 2.0 + dmg * 20.0
             all_rewards.append(reward)
             idx += 1
         ep_boundaries.append((start, idx))
@@ -354,30 +366,63 @@ def _compute_gae(
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """GAE with proper truncation handling.
+    """Vectorized GAE on GPU with proper truncation handling.
 
+    Pads episodes to (E, max_len), computes TD residuals in one shot,
+    then reverse-scans over T (sequential) but vectorized across all E episodes.
     Episodes >= _TRUNCATION_THRESHOLD steps bootstrap with V(s_final);
     shorter episodes (core destroyed / unit killed) bootstrap with 0.
     """
+    dev = rewards.device
     N = rewards.shape[0]
-    advantages = torch.zeros(N, device=rewards.device)
-    for start, end in ep_boundaries:
+    n_eps = len(ep_boundaries)
+    max_len = max(end - start for start, end in ep_boundaries)
+    gl = gamma * gae_lambda
+
+    # Pad episodes into (E, T) tensors
+    r_pad = torch.zeros(n_eps, max_len, device=dev)
+    v_pad = torch.zeros(n_eps, max_len, device=dev)
+    # nonterminal: 1.0 for all valid steps; 0.0 at last step of terminal episodes
+    # and for all padding positions (prevents GAE leaking across episode boundaries)
+    nonterminal = torch.zeros(n_eps, max_len, device=dev)
+
+    for i, (start, end) in enumerate(ep_boundaries):
         ep_len = end - start
-        # Truncated episodes bootstrap with V(s_T) as approximation for V(s_{T+1}).
-        # Trajectory data doesn't include the post-action next state, so this is the
-        # best available estimate. Bias is ~(gamma-1)*V(s_T) ≈ -0.01*V(s_T), small.
-        bootstrap_val = values[end - 1].item() if ep_len >= _TRUNCATION_THRESHOLD else 0.0
-        gae = 0.0
-        for t in range(end - 1, start - 1, -1):
-            if t < end - 1:
-                next_val = values[t + 1]
-                next_nonterminal = 1.0
-            else:
-                next_val = bootstrap_val
-                next_nonterminal = 1.0 if ep_len >= _TRUNCATION_THRESHOLD else 0.0
-            delta = rewards[t] + gamma * next_val * next_nonterminal - values[t]
-            gae = delta + gamma * gae_lambda * next_nonterminal * gae
-            advantages[t] = gae
+        r_pad[i, :ep_len] = rewards[start:end]
+        v_pad[i, :ep_len] = values[start:end]
+        truncated = ep_len >= _TRUNCATION_THRESHOLD
+        # Interior steps are nonterminal; last step only if truncated
+        if ep_len > 1:
+            nonterminal[i, :ep_len - 1] = 1.0
+        if truncated:
+            nonterminal[i, ep_len - 1] = 1.0
+
+    # Build next_values: shift values left, last position gets bootstrap
+    next_v = torch.zeros_like(v_pad)
+    if max_len > 1:
+        next_v[:, :-1] = v_pad[:, 1:]
+    for i, (start, end) in enumerate(ep_boundaries):
+        ep_len = end - start
+        # Truncated: bootstrap with V(s_T) as approx for V(s_{T+1})
+        if ep_len >= _TRUNCATION_THRESHOLD:
+            next_v[i, ep_len - 1] = v_pad[i, ep_len - 1]
+        # Terminal: next_v stays 0 (already zero-initialized)
+
+    # TD residuals: delta = r + gamma * next_v * nonterminal - v
+    delta = r_pad + gamma * next_v * nonterminal - v_pad
+
+    # Reverse scan for GAE (sequential over T, vectorized over E)
+    gae = torch.zeros(n_eps, device=dev)
+    adv_pad = torch.zeros_like(r_pad)
+    for t in range(max_len - 1, -1, -1):
+        gae = delta[:, t] + gl * nonterminal[:, t] * gae
+        adv_pad[:, t] = gae
+
+    # Unpad back to flat (N,) tensor
+    advantages = torch.zeros(N, device=dev)
+    for i, (start, end) in enumerate(ep_boundaries):
+        advantages[start:end] = adv_pad[i, :end - start]
+
     returns = advantages + values
     return advantages, returns
 
@@ -431,9 +476,13 @@ def train_on_trajectories(
     obs, h = data["obs"], data["h"]
 
     # Compute value estimates with the current model (replaces zero placeholders)
+    # Chunked to avoid OOM on large trajectory batches
+    N = data["n_steps"]
+    values = torch.empty(N, device=DEVICE)
     with torch.no_grad():
-        _, _, _, values, _ = model(obs, h)
-        values = values.view(-1)
+        for i in range(0, N, 8192):
+            _, _, _, v, _ = model(obs[i:i + 8192], h[i:i + 8192])
+            values[i:i + 8192] = v.view(-1)
 
     advantages, returns = _compute_gae(
         data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,

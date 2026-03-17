@@ -23,8 +23,9 @@ GRID_HALF = GRID_SIZE // 2
 #         + bld_friendly(1) + bld_dir(2)
 #         + has_unit(1) + unit_friendly(1) = 16
 TILE_FEATURES = 16
-# Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy, n_builders, prev_reward = 12
-GLOBAL_FEATURES = 12
+# Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy,
+#         n_builders, prev_reward, ti_delta, ax_delta, hp_advantage = 15
+GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN_SIZES = [32, 32, 32, 16]
@@ -110,6 +111,9 @@ _TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
 
 
 class Player:
+    _conv_count: int = 0  # global conveyor count across all units
+    _harv_rewarded_ores: set[tuple[int, int]] = set()  # shared across all units
+
     def __init__(self):
         self.core_center: Position | None = None
         self.enemy_core: Position | None = None
@@ -147,9 +151,9 @@ class Player:
         self._train_log: list | None = [] if _TRAIN_LOG else None
         self._prev_resources: tuple[float, float] | None = None
         self._prev_enemy_core_hp: float = 500.0
+        self._own_core_hp: float = 500.0
         self._n_builders_cached: int = 1
         self._prev_reward: float = 0.0
-        self._harv_rewarded_ores: set[tuple[int, int]] = set()
 
     def run(self, ct: Controller) -> None:
         etype = ct.get_entity_type()
@@ -167,17 +171,10 @@ class Player:
         ti, ax = ct.get_global_resources()
         rnd = ct.get_current_round()
 
-        # Reserve floor: always keep enough ti for builders to actually build.
-        # Starts high (builders need resources for harvesters/conveyors),
-        # then grows further with each additional builder.
-        #   builder 1: need 150 ti (harvester=80 + conveyors)
-        #   builder 2: need 200 ti
-        #   builder 3: need 250 ti
-        #   builder 4+: need 250 + 75 * (n - 3)
-        if self.num_spawned < 3:
-            reserve_floor = 150 + 50 * self.num_spawned
-        else:
-            reserve_floor = 250 + 75 * (self.num_spawned - 3)
+        # Reserve floor: each builder needs ~150 ti to build infrastructure
+        # (harvester=80 + conveyors + roads). Keep enough for all existing builders.
+        reserve_per_builder = 150
+        reserve_floor = reserve_per_builder * (self.num_spawned + 1)
         if ti < reserve_floor:
             return
 
@@ -251,9 +248,8 @@ class Player:
             ax_delivered = 0.0
         else:
             prev_ti, prev_ax = self._prev_resources
-            n_bld = max(1, self._n_builders_cached)
-            ti_delivered = max(0.0, ti_before - prev_ti) / n_bld
-            ax_delivered = max(0.0, ax_before - prev_ax) / n_bld
+            ti_delivered = max(0.0, ti_before - prev_ti)
+            ax_delivered = max(0.0, ax_before - prev_ax)
 
         enemy_dmg = 0.0
         if self.enemy_core is not None:
@@ -268,7 +264,7 @@ class Player:
                     pass
 
         # Store reward for next step's obs (same formula as training)
-        self._prev_reward = harv_reward * 5.0 + conv_reward * 2.0 + max(ti_delivered, 0) * 0.2 + enemy_dmg * 1.0
+        self._prev_reward = harv_reward * 5.0 + conv_reward * 10.0 + max(ti_delivered, 0) * 2.0 + enemy_dmg * 20.0
         self._prev_resources = (ti_after, ax_after)
 
         # Log trajectory step
@@ -473,7 +469,7 @@ class Player:
     # ---- State encoding ----
 
     def _encode_state(self, ct: Controller) -> list[float]:
-        """Encode 5x5 grid (12 feat/tile) + global (11) + pos embed (8)."""
+        """Encode 5x5 grid (16 feat/tile) + global (15) + pos embed (8)."""
         pos = ct.get_position()
         my_team = self.my_team
         features: list[float] = []
@@ -547,21 +543,41 @@ class Player:
             ecore_dx = edx / d
             ecore_dy = edy / d
 
-        # Count friendly builders in vision
+        # Count friendly builders in vision + track core HPs
         n_builders = 0
+        own_hp, enemy_hp = self._own_core_hp, self._prev_enemy_core_hp
         for eid in ct.get_nearby_entities():
             try:
-                if ct.get_entity_type(eid) == EntityType.BUILDER_BOT and ct.get_team(eid) == my_team:
+                etype = ct.get_entity_type(eid)
+                team = ct.get_team(eid)
+                if etype == EntityType.BUILDER_BOT and team == my_team:
                     n_builders += 1
+                elif etype == EntityType.CORE:
+                    if team == my_team:
+                        own_hp = ct.get_hp(eid)
+                        self._own_core_hp = own_hp
+                    else:
+                        enemy_hp = ct.get_hp(eid)
             except Exception:
                 pass
         self._n_builders_cached = n_builders
+
+        # Resource deltas
+        ti_delta, ax_delta = 0.0, 0.0
+        if self._prev_resources is not None:
+            prev_ti, prev_ax = self._prev_resources
+            ti_delta = (ti - prev_ti) / 500.0
+            ax_delta = (ax - prev_ax) / 500.0
+
+        # HP advantage: (own - enemy) / 500
+        hp_advantage = (own_hp - enemy_hp) / 500.0
 
         features.extend([
             rnd, x_norm, y_norm, ti / 500.0, ax / 500.0, scale,
             core_dx, core_dy, ecore_dx, ecore_dy,
             n_builders / 10.0,
             self._prev_reward,
+            ti_delta, ax_delta, hp_advantage,
         ])
 
         # Sinusoidal position embedding (8 values)
@@ -591,12 +607,23 @@ class Player:
                     conv_dir = direction
             if ct.can_build_conveyor(build_pos, conv_dir):
                 ct.build_conveyor(build_pos, conv_dir)
-                return 0.0, self._conveyor_chain_reward(ct, build_pos, conv_dir)
+                Player._conv_count += 1
+                chain_r = self._conveyor_chain_reward(ct, build_pos, conv_dir)
+                # Small distance-based reward: closer to core = better.
+                # Diminishes to 0 as global conveyor count reaches 10 (bootstrap only).
+                dist_r = 0.0
+                if self.core_center and Player._conv_count <= 10:
+                    dist = max(abs(build_pos.x - self.core_center.x),
+                               abs(build_pos.y - self.core_center.y))
+                    fade = 1.0 - Player._conv_count / 10.0
+                    dist_r = fade / (1.0 + dist)
+                return 0.0, chain_r + dist_r
         elif action == "harvester":
             if ct.can_build_harvester(build_pos):
                 ct.build_harvester(build_pos)
                 return 1.0, 0.0
-            else:
+            elif not self._harv_rewarded_ores:
+                # First failed attempt only — bootstrap "go find ore"
                 return self._nearest_uncontested_ore_reward(ct), 0.0
         elif action == "road":
             if ct.can_build_road(build_pos):
@@ -616,7 +643,15 @@ class Player:
         elif action == "armoured_conveyor":
             if ct.can_build_armoured_conveyor(build_pos, direction):
                 ct.build_armoured_conveyor(build_pos, direction)
-                return 0.0, self._conveyor_chain_reward(ct, build_pos, direction)
+                Player._conv_count += 1
+                chain_r = self._conveyor_chain_reward(ct, build_pos, direction)
+                dist_r = 0.0
+                if self.core_center and Player._conv_count <= 10:
+                    dist = max(abs(build_pos.x - self.core_center.x),
+                               abs(build_pos.y - self.core_center.y))
+                    fade = 1.0 - Player._conv_count / 10.0
+                    dist_r = fade / (1.0 + dist)
+                return 0.0, chain_r + dist_r
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):
                 ct.build_barrier(build_pos)
