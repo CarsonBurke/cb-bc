@@ -249,6 +249,16 @@ def _decode_zigzag(n: int) -> int:
     return (n >> 1) ^ -(n & 1)
 
 
+def _unpack_varints(data: bytes) -> list[int]:
+    """Decode a packed repeated varint/enum field from a length-delimited blob."""
+    values = []
+    pos = 0
+    while pos < len(data):
+        v, pos = _decode_varint(data, pos)
+        values.append(v)
+    return values
+
+
 def _decode_message(data: bytes, start: int, end: int) -> dict[int, list]:
     fields: dict[int, list] = {}
     pos = start
@@ -333,7 +343,17 @@ def decode_proto(msg_type: str, data: bytes, schema: dict) -> dict:
             continue
         fname, ftype, frule = id_to_field[fid]
         if frule == "repeated":
-            result[fname] = [_decode_typed(ftype, wt, val, schema) for wt, val in entries]
+            decoded = []
+            for wt, val in entries:
+                # Proto3 packs repeated scalar/enum fields into a single
+                # length-delimited blob. Detect: wire type is LENGTH_DELIMITED
+                # but the field type is not a message type.
+                if wt == LENGTH_DELIMITED and not _is_message(ftype, schema) and ftype not in ("string", "bytes"):
+                    for v in _unpack_varints(val):
+                        decoded.append(_decode_typed(ftype, VARINT, v, schema))
+                else:
+                    decoded.append(_decode_typed(ftype, wt, val, schema))
+            result[fname] = decoded
         else:
             wt, val = entries[-1]
             result[fname] = _decode_typed(ftype, wt, val, schema)
@@ -703,12 +723,6 @@ def score_conveyor_flow_from_replay(
         ddx, ddy = REPLAY_DIR_DXY.get(dir_int, (0, 0))
         mag = (ddx * ddx + ddy * ddy) ** 0.5
         conv_data[(x, y)] = (ddx / mag, ddy / mag) if mag > 0 else (0.0, 0.0)
-
-    count = 0
-    for ent in entities.values():
-        if ent.get("kind") in _CONV_KINDS and count < 5:
-            print(f"DEBUG conveyor: team={ent.get('team')} dir={ent.get('direction')} pos={ent.get('position')}")
-            count += 1
 
     return score_conveyor_flow_from_data(
         wall_set=wall_set,
