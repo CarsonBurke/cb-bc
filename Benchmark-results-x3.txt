@@ -1,0 +1,24 @@
+== Matmul ==
+  1x32 @ 32x16 (single input)               median     10.1 us   p95     20.6 us
+  4x32 @ 32x16 (small batch)                median     38.9 us   p95     65.3 us
+  8x32 @ 32x32 (hidden layer)               median    162.9 us   p95    302.5 us
+  8x64 @ 64x32 (larger hidden)              median    333.9 us   p95    589.8 us
+  1x64 @ 64x64 (single, wide)               median     87.7 us   p95    186.5 us
+  16x32 @ 32x8 (output head)                median     79.0 us   p95    121.6 us
+
+== Matmul ==
+  1x32 @ 32x16 (single input)               median     10.0 us   p95     13.0 us
+  4x32 @ 32x16 (small batch)                median     38.8 us   p95     52.8 us
+  8x32 @ 32x32 (hidden layer)               median    157.3 us   p95    228.8 us
+  8x64 @ 64x32 (larger hidden)              median    292.6 us   p95    508.4 us
+  1x64 @ 64x64 (single, wide)               median     70.8 us   p95    105.5 us
+  16x32 @ 32x8 (output head)                median     77.6 us   p95    106.4 us
+
+== Matmul ==
+  1x32 @ 32x16 (single input)               median     10.1 us   p95     15.2 us
+  4x32 @ 32x16 (small batch)                median     39.5 us   p95     76.1 us
+  8x32 @ 32x32 (hidden layer)               median    156.1 us   p95    263.0 us
+  8x64 @ 64x32 (larger hidden)              median    288.8 us   p95    461.9 us
+  1x64 @ 64x64 (single, wide)               median     75.3 us   p95    133.5 us
+  16x32 @ 32x8 (output head)                median     80.6 us   p95    144.5 us
+

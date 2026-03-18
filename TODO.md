@@ -5,6 +5,7 @@
 
 ## Rewards
 - Flow fields for conveyor bonus efficiency
+- Global critic (critic sees full map)
 
 ## Architecture
 - Different network architectures
