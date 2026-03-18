@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 from pathlib import Path
@@ -12,28 +13,112 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # ---- Architecture constants (must match main.py) ----
 
-TILE_FEATURES = 16
-GLOBAL_FEATURES = 15
+TILE_FEATURES = 17
+GLOBAL_FEATURES = 14
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN = [32, 32, 32, 16]
+HIDDEN = [64, 64, 48, 48]
 TEACHER_HIDDEN = [128, 128, 128, 64]
 H_DIM = 16
 INPUT_SIZE = OBS_SIZE + H_DIM
-N_BUILD = 12
+N_BUILD = 13  # 0=none, 1-11=build types, 12=destroy
 N_DIR = 9
-ACTOR_RMSNORM_LAYERS = (True, False, True, False)
+ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.json"
 REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
+
+# ---- Action masking ----
+# Build costs (ti, ax) indexed by BUILD_ACTIONS:
+# none, harvester, conveyor, road, gunner, sentinel, breach, splitter,
+# armoured_conveyor, barrier, foundry, launcher, destroy
+_MASK_COSTS_TI = [0, 80, 3, 1, 10, 15, 30, 6, 10, 3, 120, 20, 0]
+_MASK_COSTS_AX = [0, 0, 0, 0, 0, 0, 10, 0, 5, 0, 0, 0, 0]
+
+# Tile indices in 5x5 grid for the 9 build directions (NW,N,NE,W,C,E,SW,S,SE)
+_MASK_BD_TILES = [6, 7, 8, 11, 12, 13, 16, 17, 18]
+
+# Observation feature indices for resources/scale
+_OBS_GLOBAL_START = 5 * 5 * TILE_FEATURES  # 425
+_OBS_TI = _OBS_GLOBAL_START + 3
+_OBS_AX = _OBS_GLOBAL_START + 4
+_OBS_SCALE = _OBS_GLOBAL_START + 5
+
+# Per-device cached index tensors (created once, reused)
+_mask_idx_cache: dict = {}
+
+
+def _mask_indices(device: torch.device):
+    """Get or create cached mask index tensors for the given device."""
+    if device not in _mask_idx_cache:
+        _mask_idx_cache[device] = (
+            torch.tensor(_MASK_COSTS_TI, dtype=torch.float32, device=device),
+            torch.tensor(_MASK_COSTS_AX, dtype=torch.float32, device=device),
+            torch.tensor([t * TILE_FEATURES for t in _MASK_BD_TILES], dtype=torch.long, device=device),      # is_wall
+            torch.tensor([t * TILE_FEATURES + 4 for t in _MASK_BD_TILES], dtype=torch.long, device=device),  # bld_none (no building)
+            torch.tensor([t * TILE_FEATURES + 15 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # has_unit
+            torch.tensor([t * TILE_FEATURES + 12 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # bld_friendly
+            torch.tensor([t * TILE_FEATURES + 11 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # bld_core
+        )
+    return _mask_idx_cache[device]
+
+
+def compute_action_masks(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute build_type, build_dir, destroy_dir, and move_dir boolean masks.
+
+    Args:
+        obs: (B, OBS_SIZE) observation tensor
+    Returns:
+        bt_mask: (B, N_BUILD) boolean — True = action allowed
+        bd_mask: (B, N_DIR) boolean — True = direction allowed for building
+        dd_mask: (B, N_DIR) boolean — True = direction allowed for destroy
+        md_mask: (B, N_DIR) boolean — True = direction allowed for moving
+    """
+    costs_ti, costs_ax, wall_idx, nobld_idx, unit_idx, friendly_idx, core_idx = _mask_indices(obs.device)
+
+    ti = obs[:, _OBS_TI] * 500.0
+    ax = obs[:, _OBS_AX] * 500.0
+    scale = obs[:, _OBS_SCALE] * 5.0  # scale_pct / 100
+
+    # Build type: floor(scale * base_cost) <= available resources
+    actual_ti = (scale.unsqueeze(1) * costs_ti.unsqueeze(0)).floor()
+    actual_ax = (scale.unsqueeze(1) * costs_ax.unsqueeze(0)).floor()
+    bt_mask = (ti.unsqueeze(1) >= actual_ti) & (ax.unsqueeze(1) >= actual_ax)
+    bt_mask[:, 0] = True  # "none" always allowed
+
+    # Build dir: tile not wall, no existing building, and no occupying unit.
+    bd_mask = (obs[:, wall_idx] == 0.0) & (obs[:, nobld_idx] == 1.0) & (obs[:, unit_idx] == 0.0)
+
+    # Destroy dir: has a friendly non-core building
+    dd_mask = (obs[:, nobld_idx] == 0.0) & (obs[:, friendly_idx] == 1.0) & (obs[:, core_idx] == 0.0)
+
+    # Move dir: tile not wall, no existing building, and no occupying unit.
+    # This matches the runtime behavior where the bot may first place a road
+    # on the target tile before moving into it. Centre is always allowed.
+    md_mask = bd_mask.clone()
+    md_mask[:, 4] = True
+
+    # Destroy bt allowed only if any destroyable direction exists
+    bt_mask[:, 12] = bt_mask[:, 12] & dd_mask.any(dim=1)
+
+    # Force none-only when nothing affordable/destroyable or no valid direction
+    has_build = bt_mask[:, 1:12].any(dim=1) & bd_mask.any(dim=1)
+    has_destroy = bt_mask[:, 12]
+    force_none = ~has_build & ~has_destroy
+    if force_none.any():
+        bt_mask[force_none, 1:] = False
+        bd_mask[force_none] = True  # dir is irrelevant, avoid NaN
+        dd_mask[force_none] = True
+
+    return bt_mask, bd_mask, dd_mask, md_mask
+
 
 # Sinusoidal position embedding frequencies
 _POS_QUARTER = POS_EMBED_DIM // 4
@@ -66,6 +151,34 @@ def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float =
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias_const)
     return layer
+
+
+def sample_logits_gumbel(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    *,
+    return_log_prob: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Sample exactly from softmax(logits / temperature) via Gumbel-max."""
+    scaled = logits if temperature == 1.0 else logits / temperature
+    gumbel = -torch.empty_like(scaled).exponential_().log()
+    actions = (scaled + gumbel).argmax(dim=-1)
+    if not return_log_prob:
+        return actions, None
+    chosen_logits = scaled.gather(1, actions.unsqueeze(1)).squeeze(1)
+    chosen = chosen_logits - torch.logsumexp(scaled, dim=-1)
+    return actions, chosen
+
+
+def action_log_prob_and_entropy(
+    logits: torch.Tensor,
+    actions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return chosen-action log_probs and categorical entropy from logits."""
+    log_probs = F.log_softmax(logits, dim=-1)
+    chosen = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+    return chosen, entropy
 
 
 class BuilderMLP(nn.Module):
@@ -125,8 +238,12 @@ class BuilderMLP(nn.Module):
             del self._cached_head_b
         return super().train(mode)
 
-    def forward(self, x, h_prev):
-        trunk_in = torch.cat([x, h_prev], dim=-1)
+    def _forward_from_trunk_in(
+        self,
+        trunk_in: torch.Tensor,
+        *,
+        include_value: bool,
+    ):
         enc = self.encoder(trunk_in)
         h = self.actor_trunk(enc)
 
@@ -157,10 +274,18 @@ class BuilderMLP(nn.Module):
         combined = F.linear(h, combined_w, combined_b)
         bt_l, bd_l, md_l, h_raw = combined.split([N_BUILD, N_DIR, N_DIR, H_DIM], dim=-1)
 
-        # Skip critic during inference — it's only needed for training
-        value = self.critic(enc).squeeze(-1) if self.training else torch.zeros(h.shape[0], device=h.device)
+        if include_value:
+            value = self.critic(enc).squeeze(-1)
+            return bt_l, bd_l, md_l, value, torch.tanh(h_raw)
+        return bt_l, bd_l, md_l, torch.tanh(h_raw)
 
-        return bt_l, bd_l, md_l, value, torch.tanh(h_raw)
+    def forward(self, x, h_prev):
+        trunk_in = torch.cat([x, h_prev], dim=-1)
+        return self._forward_from_trunk_in(trunk_in, include_value=True)
+
+    def infer_packed(self, trunk_in: torch.Tensor):
+        """Inference-only path for already-packed [obs, h_prev] batches."""
+        return self._forward_from_trunk_in(trunk_in, include_value=False)
 
     def _policy_state_modules(self) -> list[nn.Module]:
         """Policy modules only in tensor_lib serialization order (critic excluded)."""
@@ -293,20 +418,26 @@ def ppo_update(
 
             t_phase = time.perf_counter() if profile is not None else 0.0
             bt_l, bd_l, md_l, value, _ = model(obs[idx], h[idx])
-            if profile is not None and DEVICE.type == "cuda":
-                torch.cuda.synchronize()
             if profile is not None:
                 profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
 
             t_phase = time.perf_counter() if profile is not None else 0.0
-            bt_d = Categorical(logits=bt_l)
-            bd_d = Categorical(logits=bd_l)
-            md_d = Categorical(logits=md_l)
+            # Apply action masks to logits (affordability + spatial validity)
+            bt_m, bd_m, dd_m, md_m = compute_action_masks(obs[idx])
+            bt_l = bt_l.masked_fill(~bt_m, -1e9)
+            # Use destroy dir mask when action was destroy, build dir mask otherwise
+            is_destroy = (bt_act[idx] == 12)
+            effective_bd_m = torch.where(is_destroy.unsqueeze(1), dd_m, bd_m)
+            bd_l = bd_l.masked_fill(~effective_bd_m, -1e9)
+            md_l = md_l.masked_fill(~md_m, -1e9)
 
             # Mask build_dir when build_type is "none" (idx 0) — causally irrelevant
-            bd_mask = (bt_act[idx] != 0).float()
-            new_lp = bt_d.log_prob(bt_act[idx]) + bd_d.log_prob(bd_act[idx]) * bd_mask + md_d.log_prob(md_act[idx])
-            entropy = bt_d.entropy() + bd_d.entropy() * bd_mask + md_d.entropy()
+            bd_causal = (bt_act[idx] != 0).float()
+            bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[idx])
+            bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[idx])
+            md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[idx])
+            new_lp = bt_lp + bd_lp * bd_causal + md_lp
+            entropy = bt_ent + bd_ent * bd_causal + md_ent
 
             logratio = new_lp - old_log_probs[idx]
             ratio = logratio.exp()
@@ -318,8 +449,6 @@ def ppo_update(
                 sum_kl += approx_kl.item()
                 sum_clip_frac += clip_frac.item()
                 n_mb += 1
-            if profile is not None and DEVICE.type == "cuda":
-                torch.cuda.synchronize()
             if profile is not None:
                 profile["ppo_dist_s"] = profile.get("ppo_dist_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -330,8 +459,6 @@ def ppo_update(
             pg1 = -mb_adv * ratio
             pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
             pi_loss = torch.max(pg1, pg2).mean()
-            if profile is not None and DEVICE.type == "cuda":
-                torch.cuda.synchronize()
             if profile is not None:
                 profile["ppo_policy_loss_s"] = profile.get("ppo_policy_loss_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -347,8 +474,6 @@ def ppo_update(
                 vf_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
             else:
                 vf_loss = 0.5 * ((newvalue - returns[idx]) ** 2).mean()
-            if profile is not None and DEVICE.type == "cuda":
-                torch.cuda.synchronize()
             if profile is not None:
                 profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -359,8 +484,6 @@ def ppo_update(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
-            if profile is not None and DEVICE.type == "cuda":
-                torch.cuda.synchronize()
             if profile is not None:
                 profile["ppo_backward_step_s"] = profile.get("ppo_backward_step_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -391,58 +514,69 @@ def _parse_trajectories(
     Returns dict with keys: obs, h, bt, bd, md, old_log_probs, rewards,
     ep_boundaries. Or None if no data.
     """
-    all_obs, all_h = [], []
-    all_bt, all_bd, all_md = [], [], []
-    all_rewards, all_old_lp = [], []
-    ep_boundaries = []
-
-    idx = 0
-    for traj in trajectories:
-        start = idx
-        for step in traj:
-            if isinstance(step, (list, tuple)):
-                n = len(step)
-                # Tuple: obs, h, bt, bd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp
-                obs, h_prev, bt, bd, md = step[:5]
-                n_working = step[6] if n > 6 else 0
-                conv_r = step[7] if n > 7 else 0.0
-                harv_r = step[9] if n > 9 else 0.0
-                dmg = step[10] if n > 10 else 0.0
-                old_lp = step[11] if n > 11 else 0.0
-            else:
-                obs = step["obs"]
-                h_prev = step["h_prev"]
-                bt, bd, md = step["bt"], step["bd"], step["md"]
-                n_working = step.get("n_working", 0)
-                conv_r = step.get("conv_r", 0)
-                harv_r = step.get("harv_r", 0)
-                dmg = step.get("dmg", 0)
-                old_lp = step.get("old_lp", 0)
-            all_obs.append(obs)
-            all_h.append(h_prev)
-            all_bt.append(bt)
-            all_bd.append(bd)
-            all_md.append(md)
-            all_old_lp.append(old_lp)
-
-            # Reward: harv + conv + working harvesters + damage
-            reward = harv_r + conv_r + n_working * 0.5 + dmg * 20.0
-            all_rewards.append(reward)
-            idx += 1
-        ep_boundaries.append((start, idx))
-
-    N = len(all_obs)
+    # Pre-count total steps to allocate tensors up front, avoiding
+    # 7 large Python lists and the GC pressure they cause.
+    N = sum(len(traj) for traj in trajectories)
     if N == 0:
         return None
 
+    # Pre-allocate CPU tensors, fill in-place, transfer to device once.
+    obs_t = torch.empty(N, OBS_SIZE, dtype=torch.float32)
+    h_t = torch.empty(N, H_DIM, dtype=torch.float32)
+    bt_t = torch.empty(N, dtype=torch.long)
+    bd_t = torch.empty(N, dtype=torch.long)
+    md_t = torch.empty(N, dtype=torch.long)
+    lp_t = torch.empty(N, dtype=torch.float32)
+    rw_t = torch.empty(N, dtype=torch.float32)
+    ep_boundaries = []
+
+    # Disable cyclic GC — the loop creates no reference cycles, and the
+    # collector's O(live_objects) scan is expensive with many live tensors.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        idx = 0
+        for traj in trajectories:
+            start = idx
+            for step in traj:
+                if isinstance(step, (list, tuple)):
+                    n = len(step)
+                    obs_t[idx] = torch.tensor(step[0], dtype=torch.float32)
+                    h_t[idx] = torch.tensor(step[1], dtype=torch.float32)
+                    bt_t[idx] = step[2]
+                    bd_t[idx] = step[3]
+                    md_t[idx] = step[4]
+                    n_working = step[6] if n > 6 else 0
+                    conv_r = step[7] if n > 7 else 0.0
+                    harv_r = step[9] if n > 9 else 0.0
+                    dmg = step[10] if n > 10 else 0.0
+                    lp_t[idx] = step[11] if n > 11 else 0.0
+                else:
+                    obs_t[idx] = torch.tensor(step["obs"], dtype=torch.float32)
+                    h_t[idx] = torch.tensor(step["h_prev"], dtype=torch.float32)
+                    bt_t[idx] = step["bt"]
+                    bd_t[idx] = step["bd"]
+                    md_t[idx] = step["md"]
+                    n_working = step.get("n_working", 0)
+                    conv_r = step.get("conv_r", 0)
+                    harv_r = step.get("harv_r", 0)
+                    dmg = step.get("dmg", 0)
+                    lp_t[idx] = step.get("old_lp", 0)
+                rw_t[idx] = harv_r + conv_r + n_working * 2.5 + dmg * 20.0
+                idx += 1
+            ep_boundaries.append((start, idx))
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
     return {
-        "obs": torch.tensor(all_obs, dtype=torch.float32, device=DEVICE),
-        "h": torch.tensor(all_h, dtype=torch.float32, device=DEVICE),
-        "bt": torch.tensor(all_bt, dtype=torch.long, device=DEVICE),
-        "bd": torch.tensor(all_bd, dtype=torch.long, device=DEVICE),
-        "md": torch.tensor(all_md, dtype=torch.long, device=DEVICE),
-        "old_log_probs": torch.tensor(all_old_lp, dtype=torch.float32, device=DEVICE),
-        "rewards": torch.tensor(all_rewards, dtype=torch.float32, device=DEVICE),
+        "obs": obs_t.to(DEVICE),
+        "h": h_t.to(DEVICE),
+        "bt": bt_t.to(DEVICE),
+        "bd": bd_t.to(DEVICE),
+        "md": md_t.to(DEVICE),
+        "old_log_probs": lp_t.to(DEVICE),
+        "rewards": rw_t.to(DEVICE),
         "ep_boundaries": ep_boundaries,
         "n_steps": N,
     }
@@ -582,8 +716,6 @@ def train_on_trajectories(
         for i in range(0, N, 8192):
             _, _, _, v, _ = model(obs[i:i + 8192], h[i:i + 8192])
             values[i:i + 8192] = v.view(-1)
-    if profile is not None and DEVICE.type == "cuda":
-        torch.cuda.synchronize()
     if profile is not None:
         profile["value_forward_s"] = time.perf_counter() - t_phase
 
@@ -591,8 +723,6 @@ def train_on_trajectories(
     advantages, returns = _compute_gae(
         data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,
     )
-    if profile is not None and DEVICE.type == "cuda":
-        torch.cuda.synchronize()
     if profile is not None:
         profile["gae_s"] = time.perf_counter() - t_phase
 
@@ -632,7 +762,8 @@ def distill(
     t_bt, t_bd, t_md = [], [], []
     with torch.no_grad():
         for i in range(0, N, 8192):
-            bt_l, bd_l, md_l, _, _ = teacher(obs[i:i + 8192], h[i:i + 8192])
+            packed = torch.cat([obs[i:i + 8192], h[i:i + 8192]], dim=-1)
+            bt_l, bd_l, md_l, _ = teacher.infer_packed(packed)
             t_bt.append(bt_l)
             t_bd.append(bd_l)
             t_md.append(md_l)

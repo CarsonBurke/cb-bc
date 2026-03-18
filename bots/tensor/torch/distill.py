@@ -25,7 +25,7 @@ from model import (
     distill, _parse_trajectories,
 )
 from train_batched import collect_games_batched
-from train_selfplay import (
+from training_utils import (
     League, _init_session, PROJECT_ROOT,
 )
 

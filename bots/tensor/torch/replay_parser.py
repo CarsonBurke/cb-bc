@@ -583,9 +583,8 @@ def extract_working_harvesters(replay_path: str | Path) -> dict[int, dict[int, i
 
 
 # Obs vector layout indices
-_GLOBAL_START = 25 * 16  # GRID_SIZE^2 * TILE_FEATURES = 400
+_GLOBAL_START = 25 * 17  # GRID_SIZE^2 * TILE_FEATURES = 425
 _ROUND_OBS_IDX = _GLOBAL_START  # first global feature = rnd / 2000.0
-_PREV_REWARD_IDX = _GLOBAL_START + 11  # prev_reward is 12th global feature
 
 
 def augment_trajectories_with_working_counts(
@@ -596,14 +595,12 @@ def augment_trajectories_with_working_counts(
     """Override n_working in trajectory steps with precomputed replay ground truth.
 
     Each trajectory step is a tuple with n_working at index 6.
-    Round number is extracted from obs[400] (= rnd / 2000.0).
-    Also fixes prev_reward in obs to match the updated n_working.
+    Round number is extracted from obs[425] (= rnd / 2000.0).
     """
     if not working:
         return trajectories  # fallback: leave unchanged
 
     for traj in trajectories:
-        prev_reward_override = 0.0
         for i, step in enumerate(traj):
             if not isinstance(step, (list, tuple)) or len(step) < 7:
                 continue
@@ -615,18 +612,10 @@ def augment_trajectories_with_working_counts(
             obs = step[0]
             rnd = int(round(obs[_ROUND_OBS_IDX] * 2000.0))
             rnd = max(0, min(rnd, 1999))
-            # Fix prev_reward in obs to match previous step's augmented reward
-            if isinstance(obs, list) and len(obs) > _PREV_REWARD_IDX:
-                obs[_PREV_REWARD_IDX] = prev_reward_override
             # Get working harvester count for this team at this round
             counts = working.get(rnd, {})
             n_working = counts.get(team, 0)
             step[6] = n_working
-            # Recompute reward for prev_reward of next step
-            harv_r = step[9] if len(step) > 9 else 0.0
-            conv_r = step[7] if len(step) > 7 else 0.0
-            dmg = step[10] if len(step) > 10 else 0.0
-            prev_reward_override = harv_r + conv_r + dmg * 20.0 + n_working * 0.5
 
     return trajectories
 
