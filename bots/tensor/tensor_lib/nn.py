@@ -495,15 +495,28 @@ class MLP:
                 ops.append(('sigmoid',))
             i += 1
 
-        head_ops: list = []
+        # Fuse all output heads into one cached linear pass, then slice back into
+        # per-head outputs. This keeps the public infer() API unchanged while
+        # reducing Python loop overhead in the 2ms engine hot path.
+        head_names: list[str] = []
+        head_slices: list[tuple[int, int]] = []
+        fused_w_rows: list[list[float]] = []
+        fused_bias: list[float] | None = []
+        offset = 0
         for name, head in self.heads.items():
             w = head.weight.data
             N = head.out_features
-            w_rows = [w[j::N] for j in range(N)]
-            b = list(head.bias.data) if head.bias is not None else None
-            head_ops.append((name, w_rows, b, N))
+            head_names.append(name)
+            head_slices.append((offset, offset + N))
+            fused_w_rows.extend(w[j::N] for j in range(N))
+            if fused_bias is not None:
+                if head.bias is not None:
+                    fused_bias.extend(head.bias.data)
+                else:
+                    fused_bias.extend([0.0] * N)
+            offset += N
 
-        return [ops, head_ops]
+        return [ops, (head_names, head_slices, fused_w_rows, fused_bias, offset)]
 
     def infer(self, features: list[float]) -> dict[str, list[float]]:
         """Fast inference for a single input — bypasses Tensor overhead.
@@ -518,7 +531,7 @@ class MLP:
 
         _exp = math.exp
         _dot = _DOT
-        ops, head_ops = self._infer_cache
+        ops, fused_heads = self._infer_cache
         h = features
 
         for op in ops:
@@ -638,12 +651,15 @@ class MLP:
                         out[i] = e / (1.0 + e)
                 h = out
 
+        head_names, head_slices, fused_w_rows, fused_bias, total_out = fused_heads
+        if fused_bias is not None:
+            fused_out = [(_dot(h, fused_w_rows[j]) if _dot is not None else sum(map(_mul, h, fused_w_rows[j]))) + fused_bias[j] for j in range(total_out)]
+        else:
+            fused_out = [_dot(h, fused_w_rows[j]) if _dot is not None else sum(map(_mul, h, fused_w_rows[j])) for j in range(total_out)]
+
         results: dict[str, list[float]] = {}
-        for name, w_rows, b, N in head_ops:
-            if b is not None:
-                results[name] = [(_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) + b[j] for j in range(N)]
-            else:
-                results[name] = [_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j])) for j in range(N)]
+        for name, (start, end) in zip(head_names, head_slices):
+            results[name] = fused_out[start:end]
         return results
 
     def save(self) -> list[list[float]]:

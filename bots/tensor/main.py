@@ -1,12 +1,19 @@
 # tensor: Neural network-powered builder bot.
-# Uses a lightweight MLP (32->16 hidden) to decide what to build, where to build,
+# Uses a lightweight MLP (64->48 hidden) to decide what to build, where to build,
 # and where to move. Forward pass fits within ~0.7ms of the 2ms CPU budget.
 # Supports online REINFORCE learning and offline weight loading.
 
+import atexit
+import gc
 import json
 import math
 import os
 import random
+
+# Disable cyclic GC — the bot creates no reference cycles (only lists,
+# tuples, floats, and a plain MLP). Avoids unpredictable collection
+# pauses within the 2ms-per-turn CPU budget.
+gc.disable()
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
@@ -18,19 +25,19 @@ from tensor_lib import MLP, SinusoidalPositionEmbedding
 # -- Layout constants --
 GRID_SIZE = 5
 GRID_HALF = GRID_SIZE // 2
-# Per tile: is_wall(1) + ore_ti(1) + ore_ax(1)
+# Per tile: is_wall(1) + ore_ti(1) + ore_ax(1) + is_impassable(1)
 #         + bld_type(8: none/harvester/conveyor/splitter/road/support/military/core)
 #         + bld_friendly(1) + bld_dir(2)
-#         + has_unit(1) + unit_friendly(1) = 16
-TILE_FEATURES = 16
+#         + has_unit(1) + unit_friendly(1) = 17
+TILE_FEATURES = 17
 # Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy,
-#         n_builders, prev_reward, ti_delta, ax_delta, hp_advantage = 15
-GLOBAL_FEATURES = 15
+#         n_builders, ti_delta, ax_delta, hp_advantage = 14
+GLOBAL_FEATURES = 14
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN_SIZES = [32, 32, 32, 16]
+HIDDEN_SIZES = [64, 64, 48, 48]
 H_DIM = 16  # Recurrent hidden state size
-RMSNORM_LAYERS = [True, False, True, False]
+RMSNORM_LAYERS = [True, True, True, True]
 
 DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
 
@@ -48,6 +55,7 @@ BUILD_ACTIONS = [
     "barrier",
     "foundry",
     "launcher",
+    "destroy",
 ]
 
 # Maps network output index -> Direction (3x3 grid layout)
@@ -103,6 +111,39 @@ DIR_DXY = {
     Direction.SOUTHEAST: (1, 1),
 }
 
+# Base build costs (titanium, axionite) indexed by BUILD_ACTIONS
+BUILD_COSTS = (
+    (0, 0),      # none
+    (80, 0),     # harvester
+    (3, 0),      # conveyor
+    (1, 0),      # road
+    (10, 0),     # gunner
+    (15, 0),     # sentinel
+    (30, 10),    # breach
+    (6, 0),      # splitter
+    (10, 5),     # armoured_conveyor
+    (3, 0),      # barrier
+    (120, 0),    # foundry
+    (20, 0),     # launcher
+    (0, 0),      # destroy
+)
+
+# Tile indices in 5x5 grid for each build direction (matches DIR_MAP_9 order)
+_BUILD_DIR_TILE_INDICES = tuple(
+    (GRID_HALF + int(DIR_DXY[d][1])) * GRID_SIZE + (GRID_HALF + int(DIR_DXY[d][0]))
+    for d in DIR_MAP_9
+)
+
+# Offset where global features start in observation vector
+_GLOBAL_OBS_START = GRID_SIZE * GRID_SIZE * TILE_FEATURES
+
+_ZERO_TILE = (0.0,) * TILE_FEATURES
+_NO_BUILD_TILE = (1.0,) + (0.0,) * (N_BLD_TYPES - 1) + (0.0, 0.0, 0.0)
+_BLD_ONE_HOTS = tuple(
+    tuple(1.0 if i == idx else 0.0 for i in range(N_BLD_TYPES))
+    for idx in range(N_BLD_TYPES)
+)
+
 # Weights file path (adjacent to main.py)
 WEIGHT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.json")
 
@@ -110,6 +151,18 @@ WEIGHT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.
 _TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
 _SHARED_MODEL = None
 _SHARED_MODEL_KEY = None
+_LIVE_LOG_PLAYERS: set["Player"] = set()
+
+
+def _flush_live_logs() -> None:
+    for player in list(_LIVE_LOG_PLAYERS):
+        try:
+            player._flush_log()
+        except Exception:
+            pass
+
+
+atexit.register(_flush_live_logs)
 
 
 def _weight_cache_key(path: str) -> tuple[str, int, int] | None:
@@ -190,7 +243,8 @@ class Player:
         self._train_log: list | None = [] if _TRAIN_LOG else None
         self._prev_resources: tuple[float, float] | None = None
         self._n_builders_cached: int = 1
-        self._prev_reward: float = 0.0
+        if self._train_log is not None:
+            _LIVE_LOG_PLAYERS.add(self)
 
     def run(self, ct: Controller) -> None:
         etype = ct.get_entity_type()
@@ -256,25 +310,32 @@ class Player:
         # Encode game state + recurrent hidden -> feature vector
         obs = self._encode_state(ct)
 
-        features = obs + self.h_prev
+        h_in = self.h_prev
+        features = obs + h_in
         outputs = self.model.infer(features)
 
         # Update recurrent hidden state (tanh-bounded)
         h_raw = outputs["h_next"]
         self.h_prev = [math.tanh(x) for x in h_raw]
 
+        # Compute action masks (which builds are affordable, which tiles are free/destroyable)
+        bt_mask, bd_mask, dd_mask, md_mask = _compute_masks_from_obs(obs)
+
         # Decode each head via argmax (sample in training mode)
         if self._train_log is not None:
-            build_type_idx, bt_lp = _sample_from_logits(outputs["build_type"])
-            build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"])
-            move_dir_idx, md_lp = _sample_from_logits(outputs["move_dir"])
+            build_type_idx, bt_lp = _sample_from_logits(outputs["build_type"], bt_mask)
+            # Use destroy dir mask when destroy chosen, build dir mask otherwise
+            dir_mask = dd_mask if build_type_idx == 12 else bd_mask
+            build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"], dir_mask)
+            move_dir_idx, md_lp = _sample_from_logits(outputs["move_dir"], md_mask)
             # Mask build_dir log_prob when build_type is "none" (idx 0)
             # — the direction is causally irrelevant, so exclude from policy gradient
             old_log_prob = bt_lp + (bd_lp if build_type_idx != 0 else 0.0) + md_lp
         else:
-            build_type_idx = _argmax(outputs["build_type"])
-            build_dir_idx = _argmax(outputs["build_dir"])
-            move_dir_idx = _argmax(outputs["move_dir"])
+            build_type_idx = _argmax(outputs["build_type"], bt_mask)
+            dir_mask = dd_mask if build_type_idx == 12 else bd_mask
+            build_dir_idx = _argmax(outputs["build_dir"], dir_mask)
+            move_dir_idx = _argmax(outputs["move_dir"], md_mask)
 
         # Snapshot resources before actions to isolate delivery from spending
         ti_before, ax_before = ct.get_global_resources()
@@ -294,7 +355,6 @@ class Player:
         # Global working harvester count (accumulated from all units' vision this round)
         n_working = Player._working_harv_count
 
-        self._prev_reward = place_reward + enemy_dmg * 20.0 + n_working * 0.5
         ti_after, ax_after = ct.get_global_resources()
         self._prev_resources = (ti_after, ax_after)
 
@@ -303,7 +363,7 @@ class Player:
             # Tuple: obs, h, bt, bd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp
             self._train_log.append((
                 obs,
-                list(self.h_prev),
+                list(h_in),
                 build_type_idx,
                 build_dir_idx,
                 move_dir_idx,
@@ -417,7 +477,7 @@ class Player:
                 key = (tile_pos.x, tile_pos.y)
                 prev = Player._harv_proximity.get(key, 0.0)
                 d = max(abs(tile_pos.x - pos.x), abs(tile_pos.y - pos.y))
-                reward = self._PLACE_HARV / (1.0 + d)
+                reward = min(self._PLACE_HARV / (1.0 + d), self._PLACE_HARV * 0.1)
                 delta = reward - prev
                 if delta > best_delta:
                     best_delta, best_key, best_reward = delta, key, reward
@@ -475,7 +535,7 @@ class Player:
                 prev = prev or 0.0
                 d = abs(tile_pos.x - pos.x) + abs(tile_pos.y - pos.y)
                 effective_dist = max(0, d - 1)
-                reward = self._PLACE_CONV / (1.0 + effective_dist)
+                reward = min(self._PLACE_CONV / (1.0 + effective_dist), self._PLACE_CONV * 0.1)
                 delta = reward - prev
                 if delta > best_delta:
                     best_delta, best_key, best_reward = delta, key, reward
@@ -502,64 +562,88 @@ class Player:
 
     # ---- State encoding ----
 
-    def _encode_state(self, ct: Controller) -> list[float]:
-        """Encode 5x5 grid (16 feat/tile) + global (15) + pos embed (8)."""
+    def _encode_state_into(self, ct: Controller, features) -> None:
+        """Append encoded state into a list-like float buffer."""
         pos = ct.get_position()
         my_team = self.my_team
-        features: list[float] = []
+        append = features.append
+        extend = features.extend
+        get_tile_env = ct.get_tile_env
+        get_tile_building_id = ct.get_tile_building_id
+        get_tile_builder_bot_id = ct.get_tile_builder_bot_id
+        get_entity_type = ct.get_entity_type
+        get_team = ct.get_team
+        get_direction = ct.get_direction
 
-        # 5x5 local grid: 12 features per tile
+        # 5x5 local grid
         w, h = ct.get_map_width(), ct.get_map_height()
         for dy in range(-GRID_HALF, GRID_HALF + 1):
             for dx in range(-GRID_HALF, GRID_HALF + 1):
                 tx, ty = pos.x + dx, pos.y + dy
                 if tx < 0 or tx >= w or ty < 0 or ty >= h or not ct.is_in_vision(Position(tx, ty)):
-                    features.extend([0.0] * TILE_FEATURES)
+                    extend(_ZERO_TILE)
                     continue
                 tp = Position(tx, ty)
 
-                # Environment (3): is_wall, ore_ti, ore_ax
-                env = ct.get_tile_env(tp)
-                features.append(1.0 if env == Environment.WALL else 0.0)
-                features.append(1.0 if env == Environment.ORE_TITANIUM else 0.0)
-                features.append(1.0 if env == Environment.ORE_AXIONITE else 0.0)
+                env = get_tile_env(tp)
+                append(1.0 if env == Environment.WALL else 0.0)
+                append(1.0 if env == Environment.ORE_TITANIUM else 0.0)
+                append(1.0 if env == Environment.ORE_AXIONITE else 0.0)
+                append(0.0 if ct.is_tile_passable(tp) else 1.0)
 
-                # Building type one-hot (4) + friendly (1) + dir (2) = 7
-                bid = ct.get_tile_building_id(tp)
+                bid = get_tile_building_id(tp)
                 if bid is not None:
-                    btype = ct.get_entity_type(bid)
+                    btype = get_entity_type(bid)
                     bidx = BLD_IDX.get(btype, 3)
-                    features.extend(1.0 if i == bidx else 0.0 for i in range(N_BLD_TYPES))
-                    features.append(1.0 if ct.get_team(bid) == my_team else -1.0)
+                    extend(_BLD_ONE_HOTS[bidx])
+                    append(1.0 if get_team(bid) == my_team else -1.0)
                     try:
-                        bdir = ct.get_direction(bid)
+                        bdir = get_direction(bid)
                         bdx, bdy = DIR_DXY.get(bdir, (0, 0))
-                        features.append(float(bdx))
-                        features.append(float(bdy))
+                        append(float(bdx))
+                        append(float(bdy))
                     except Exception:
-                        features.extend([0.0, 0.0])
+                        extend((0.0, 0.0))
                 else:
-                    features.append(1.0)  # none category (index 0)
-                    features.extend([0.0] * (N_BLD_TYPES - 1))
-                    features.extend([0.0, 0.0, 0.0])  # friendly, dir_dx, dir_dy
+                    extend(_NO_BUILD_TILE)
 
-                # Unit (2): has_unit, unit_friendly
-                uid = ct.get_tile_builder_bot_id(tp)
+                uid = get_tile_builder_bot_id(tp)
                 if uid is not None:
-                    features.append(1.0)
-                    features.append(1.0 if ct.get_team(uid) == my_team else -1.0)
+                    append(1.0)
+                    append(1.0 if get_team(uid) == my_team else -1.0)
                 else:
-                    features.extend([0.0, 0.0])
+                    extend((0.0, 0.0))
 
-        # Global features (11 values)
         rnd = ct.get_current_round() / 2000.0
-        w, h = ct.get_map_width(), ct.get_map_height()
         x_norm = pos.x / max(w, 1)
         y_norm = pos.y / max(h, 1)
         ti, ax = ct.get_global_resources()
         scale = ct.get_scale_percent() / 500.0
 
-        # Direction to own core
+        n_builders = 0
+        own_hp, enemy_hp = Player._own_core_hp, Player._enemy_core_hp
+        for eid in ct.get_nearby_entities():
+            try:
+                etype = get_entity_type(eid)
+                team = get_team(eid)
+                if etype == EntityType.BUILDER_BOT and team == my_team:
+                    n_builders += 1
+                elif etype == EntityType.CORE:
+                    if team == my_team:
+                        if self.core_center is None:
+                            self.core_center = ct.get_position(eid)
+                        own_hp = ct.get_hp(eid)
+                        Player._own_core_hp = own_hp
+                    else:
+                        if self.enemy_core is None:
+                            self.enemy_core = ct.get_position(eid)
+                        hp = ct.get_hp(eid)
+                        Player._enemy_core_hp = hp
+                        enemy_hp = hp
+            except Exception:
+                pass
+        self._n_builders_cached = n_builders
+
         core_dx, core_dy = 0.0, 0.0
         if self.core_center is not None:
             cdx = self.core_center.x - pos.x
@@ -568,7 +652,6 @@ class Player:
             core_dx = cdx / d
             core_dy = cdy / d
 
-        # Direction to enemy core
         ecore_dx, ecore_dy = 0.0, 0.0
         if self.enemy_core is not None:
             edx = self.enemy_core.x - pos.x
@@ -577,48 +660,27 @@ class Player:
             ecore_dx = edx / d
             ecore_dy = edy / d
 
-        # Count friendly builders in vision + track core HPs
-        n_builders = 0
-        own_hp, enemy_hp = Player._own_core_hp, Player._enemy_core_hp
-        for eid in ct.get_nearby_entities():
-            try:
-                etype = ct.get_entity_type(eid)
-                team = ct.get_team(eid)
-                if etype == EntityType.BUILDER_BOT and team == my_team:
-                    n_builders += 1
-                elif etype == EntityType.CORE:
-                    if team == my_team:
-                        own_hp = ct.get_hp(eid)
-                        Player._own_core_hp = own_hp
-                    else:
-                        hp = ct.get_hp(eid)
-                        Player._enemy_core_hp = hp
-                        enemy_hp = hp
-            except Exception:
-                pass
-        self._n_builders_cached = n_builders
-
-        # Resource deltas
         ti_delta, ax_delta = 0.0, 0.0
         if self._prev_resources is not None:
             prev_ti, prev_ax = self._prev_resources
             ti_delta = (ti - prev_ti) / 500.0
             ax_delta = (ax - prev_ax) / 500.0
 
-        # HP advantage: (own - enemy) / 500
         hp_advantage = (own_hp - enemy_hp) / 500.0
 
-        features.extend([
+        extend([
             rnd, x_norm, y_norm, ti / 500.0, ax / 500.0, scale,
             core_dx, core_dy, ecore_dx, ecore_dy,
             n_builders / 10.0,
-            self._prev_reward,
             ti_delta, ax_delta, hp_advantage,
         ])
 
-        # Sinusoidal position embedding (8 values)
-        features.extend(self.pos_encoder.encode(pos.x, pos.y))
+        extend(self.pos_encoder.encode(pos.x, pos.y))
 
+    def _encode_state(self, ct: Controller) -> list[float]:
+        """Encode 5x5 grid (16 feat/tile) + global (14) + pos embed (8)."""
+        features: list[float] = []
+        self._encode_state_into(ct, features)
         return features
 
     # ---- Action execution ----
@@ -685,6 +747,11 @@ class Player:
         elif action == "launcher":
             if ct.can_build_launcher(build_pos):
                 ct.build_launcher(build_pos)
+        elif action == "destroy":
+            try:
+                ct.destroy(build_pos)
+            except Exception:
+                pass
         return 0.0, 0.0
 
     def _execute_move(self, ct: Controller, direction: Direction) -> None:
@@ -726,15 +793,80 @@ class Player:
                 pickle.dump(self._train_log, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception:
             pass
+        self._train_log = []
+        _LIVE_LOG_PLAYERS.discard(self)
 
 
-def _argmax(data: list[float]) -> int:
-    """C-friendly argmax using max() with key."""
+def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], list[bool], list[bool]]:
+    """Compute build_type, build_dir, destroy_dir, and move_dir action masks.
+
+    Returns (bt_mask, bd_mask, dd_mask, md_mask) as lists of booleans (True = allowed).
+    """
+    g = _GLOBAL_OBS_START
+    ti = obs[g + 3] * 500.0
+    ax = obs[g + 4] * 500.0
+    scale = obs[g + 5] * 5.0  # scale_pct / 100
+
+    # Build type mask: can we afford it? (indices 0-11)
+    bt_mask = [True]  # "none" always allowed
+    any_affordable = False
+    for i in range(1, 12):
+        base_ti, base_ax = BUILD_COSTS[i]
+        ok = ti >= int(scale * base_ti) and ax >= int(scale * base_ax)
+        bt_mask.append(ok)
+        any_affordable = any_affordable or ok
+
+    # Build dir mask: is the target tile empty and visible?
+    bd_mask = [False] * 9
+    any_build_dir = False
+    # Destroy dir mask: has friendly non-core building
+    dd_mask = [False] * 9
+    any_destroy_dir = False
+    # Move dir mask: can move there after optional road placement on that tile.
+    md_mask = [False] * 9
+    for d_idx in range(9):
+        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
+        # Buildable if: not wall, no building, and no unit occupying the tile.
+        if obs[ts] == 0.0 and obs[ts + 4] == 1.0 and obs[ts + 15] == 0.0:
+            bd_mask[d_idx] = True
+            any_build_dir = True
+            md_mask[d_idx] = True
+        # Destroyable if: has building (bld_none==0), friendly (bld_friendly==1), not core (bld_core==0)
+        if obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0:
+            dd_mask[d_idx] = True
+            any_destroy_dir = True
+    md_mask[4] = True  # staying in place is always allowed
+
+    # Destroy type mask (index 12)
+    bt_mask.append(any_destroy_dir)
+
+    # If nothing affordable/destroyable or nowhere to act, force "none"
+    has_build = any_affordable and any_build_dir
+    has_destroy = any_destroy_dir
+    if not has_build and not has_destroy:
+        n = len(BUILD_COSTS)
+        return [True] + [False] * (n - 1), [True] * 9, [True] * 9, md_mask
+
+    return bt_mask, bd_mask, dd_mask, md_mask
+
+
+def _argmax(data: list[float], mask: list[bool] | None = None) -> int:
+    """C-friendly argmax using max() with key, with optional mask."""
+    if mask is not None:
+        masked = [d if m else float('-inf') for d, m in zip(data, mask)]
+        return max(range(len(masked)), key=masked.__getitem__)
     return max(range(len(data)), key=data.__getitem__)
 
 
-def _sample_from_logits(logits: list[float]) -> tuple[int, float]:
-    """Sample action from logits using softmax. Returns (index, log_prob)."""
+def _sample_from_logits(
+    logits: list[float], mask: list[bool] | None = None,
+) -> tuple[int, float]:
+    """Sample action from logits using softmax. Returns (index, log_prob).
+
+    If mask is provided, masked (False) actions get -1e9 logits.
+    """
+    if mask is not None:
+        logits = [l if m else -1e9 for l, m in zip(logits, mask)]
     mx = max(logits)
     exps = [math.exp(x - mx) for x in logits]
     s = sum(exps)
