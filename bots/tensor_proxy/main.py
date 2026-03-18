@@ -154,8 +154,6 @@ class Player:
     def _run_core(self, ct):
         if self.core_center is None:
             self.core_center = ct.get_position()
-        # NOTE: _discover_ore/_scan_* not called here to avoid cross-module
-        # Controller calls before ct.spawn_builder (engine module tracking bug).
         ti, ax = ct.get_global_resources()
         reserve_floor = 150 * (self.num_spawned + 1)
         if ti < reserve_floor:
@@ -201,7 +199,7 @@ class Player:
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir)
+        harv_reward, _ = self._execute_build(ct, build_action, build_dir)
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
@@ -214,7 +212,7 @@ class Player:
             self._train_log.append((
                 obs.tolist(), list(h_in),
                 build_type_idx, build_dir_idx, move_dir_idx,
-                value, n_working, conv_reward, ti_after,
+                value, n_working, 0.0, ti_after,
                 harv_reward, _TensorPlayer._enemy_core_dmg, old_log_prob,
             ))
             if ct.get_current_round() >= 1999:
@@ -271,7 +269,6 @@ class Player:
         return self._obs_buf
 
     def _execute_build(self, ct, action, direction):
-        """Execute build directly (avoids cross-module Controller calls that can panic)."""
         if action == "none":
             return 0.0, 0.0
 
@@ -300,6 +297,11 @@ class Player:
         elif action == "harvester":
             if ct.can_build_harvester(build_pos):
                 ct.build_harvester(build_pos)
+                ore_key = (build_pos.x, build_pos.y)
+                given = _TensorPlayer._harv_proximity.get(ore_key, 0.0)
+                _TensorPlayer._harv_proximity[ore_key] = _TensorPlayer._PLACE_HARV
+                return _TensorPlayer._PLACE_HARV - given, 0.0
+            return _TensorPlayer._proximity_reward(self._get_proxy(), ct), 0.0
         elif action == "road":
             if ct.can_build_road(build_pos):
                 ct.build_road(build_pos)
@@ -379,6 +381,7 @@ class Player:
         return penalty_sum / total_ore, n_uncapped / total_ore, n_idle / total_ore
 
     def _flush_log(self):
+        """Write trajectory log. Flow bonus is injected by game_worker after run_game."""
         if not self._train_log or not _TRAIN_LOG:
             return
         try:

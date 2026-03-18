@@ -12,6 +12,36 @@ import pickle
 from replay_parser import parse_replay, extract_working_harvesters_from_replay
 
 
+def _inject_flow_bonus(log_path: str, flow_bonus: float) -> None:
+    """Re-read the trajectory pickle, append flow_bonus as index 12 on each
+    trajectory's terminal step (0.0 on all others), write back in-place."""
+    if not log_path or not os.path.exists(log_path) or flow_bonus == 0.0:
+        return
+    try:
+        trajs = []
+        with open(log_path, "rb") as f:
+            while True:
+                try:
+                    trajs.append(pickle.load(f))
+                except EOFError:
+                    break
+        if not trajs:
+            return
+        # Distribute bonus equally across all trajectories from this game
+        bonus_per_traj = flow_bonus / max(len(trajs), 1)
+        for traj in trajs:
+            if not traj:
+                continue
+            traj[-1] = tuple(traj[-1]) + (bonus_per_traj,)
+            for i in range(len(traj) - 1):
+                traj[i] = tuple(traj[i]) + (0.0,)
+        with open(log_path, "wb") as f:
+            for traj in trajs:
+                pickle.dump(traj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+
+
 def _run_game_proxy(args):
     bot_a, bot_b, map_path, engine_root, replay_path, log_path, seed = args
     os.environ["TENSOR_TRAIN_LOG"] = log_path
@@ -29,7 +59,21 @@ def _run_game_proxy(args):
         return None, None, None
     finally:
         os.environ.pop("TENSOR_TRAIN_LOG", None)
-    return (log_path if os.path.exists(log_path) else None), working, winner
+
+    # Score flow field from completed replay and inject into trajectory file.
+    # Done here (after run_game) so the replay is guaranteed to exist.
+    actual_log = log_path if os.path.exists(log_path) else None
+    if actual_log:
+        try:
+            from flow_field import score_conveyor_flow_from_data, REPLAY_DIR_DXY
+            from replay_parser import score_conveyor_flow_from_replay
+            flow_bonus = score_conveyor_flow_from_replay(replay_path, team=0)
+            flow_bonus *= 3.0  # FLOW_BONUS_SCALE
+            _inject_flow_bonus(actual_log, flow_bonus)
+        except Exception:
+            pass
+
+    return actual_log, working, winner
 
 
 def main(argv=None):

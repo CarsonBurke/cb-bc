@@ -32,6 +32,8 @@ N_DIR = 9
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
+LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.json"
+REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
 
 # ---- Action masking ----
 # Build costs (ti, ax) indexed by BUILD_ACTIONS:
@@ -532,6 +534,7 @@ def _parse_trajectories(
         idx = 0
         for ep_i, traj in enumerate(trajectories):
             start = idx
+            ep_harv = ep_work = ep_dmg = 0.0
             for step in traj:
                 if isinstance(step, (list, tuple)):
                     n = len(step)
@@ -558,7 +561,10 @@ def _parse_trajectories(
                     harv_r = step.get("harv_r", 0)
                     dmg = step.get("dmg", 0)
                     lp_t[idx] = step.get("old_lp", 0)
-                rw_t[idx] = harv_r + conv_r + n_working * 2.5 + dmg * 20.0
+                rw_t[idx] = harv_r + n_working * 2.5 + dmg * 20.0
+                ep_harv += harv_r
+                ep_work += n_working
+                ep_dmg += dmg
                 idx += 1
 
             ep_boundaries.append((start, idx))
@@ -571,6 +577,13 @@ def _parse_trajectories(
                     flow_t[ep_i] = last_step[12] if len(last_step) > 12 else 0.0
                 else:
                     flow_t[ep_i] = last_step.get("flow_r", 0.0)
+
+            print(
+                f"  [traj {ep_i:3d}] steps={idx - start:4d} "
+                f"harv={ep_harv:.2f} "
+                f"work_sum={ep_work:.0f} dmg={ep_dmg:.2f} "
+                f"flow={float(flow_t[ep_i]):.3f}"
+            )
 
     finally:
         if gc_was_enabled:
