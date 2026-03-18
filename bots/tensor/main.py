@@ -17,6 +17,8 @@ gc.disable()
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
+from flow_field import score_conveyor_flow
+
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -377,7 +379,7 @@ class Player:
             ))
 
             if ct.get_current_round() >= 1999:
-                self._flush_log()
+                self._flush_log(ct)
 
     @staticmethod
     def _discover_ore(ct: Controller) -> None:
@@ -682,7 +684,7 @@ class Player:
     # ---- Action execution ----
 
     _PLACE_HARV = 5.0
-    _PLACE_CONV = 2.5
+    _PLACE_CONV = 0.5
 
     def _execute_build(
         self, ct: Controller, action: str, direction: Direction
@@ -796,24 +798,75 @@ class Player:
                 ct.move(alt)
                 return
 
-
-    def _flush_log(self) -> None:
+    def _flush_log(self, ct: Controller | None = None) -> None:
         """Append trajectory log to file specified by TENSOR_TRAIN_LOG (pickle).
 
-        Uses append mode so multiple builder instances' trajectories
-        are all preserved in the same file as separate pickle objects.
+        Injects a post-mortem flow field alignment bonus into the terminal
+        reward of the trajectory before writing.
+
+        Pass `ct` when calling at end of game (round >= 1999) so the scorer
+        can read final map state. Called from atexit without ct — skips scoring.
         """
         if not self._train_log or not _TRAIN_LOG:
             return
+
+        # Post-mortem conveyor flow field bonus
+        if ct is not None and self.core_center is not None and Player._all_ore:
+            try:
+                flow_bonus = score_conveyor_flow(
+                    ct,
+                    team=self.my_team,
+                    core_pos=self.core_center,
+                    ore_positions=Player._all_ore,
+                )
+                # Scale to be in a similar range as your per-step rewards.
+                # _PLACE_HARV=5.0 and _PLACE_CONV=2.5 are the main per-step signals;
+                # a well-connected chain of 10 conveyors should produce ~5-10 bonus.
+                # Tune FLOW_BONUS_SCALE to taste.
+                FLOW_BONUS_SCALE = 3.0
+                flow_bonus *= FLOW_BONUS_SCALE
+            except Exception:
+                flow_bonus = 0.0
+        else:
+            flow_bonus = 0.0
+
+        # Inject into the last trajectory step's reward fields.
+        # Trajectory tuple layout (from _run_builder):
+        #   [0]  obs
+        #   [1]  h
+        #   [2]  build_type_idx
+        #   [3]  build_dir_idx
+        #   [4]  move_dir_idx
+        #   [5]  value placeholder        <- leave as 0.0
+        #   [6]  n_working
+        #   [7]  conv_reward
+        #   [8]  ti_after
+        #   [9]  harv_reward
+        #   [10] enemy_dmg
+        #   [11] old_log_prob
+        #
+        # We append flow_bonus as a 13th field so the trainer can handle it
+        # separately from the per-step rewards (easier to tune weighting).
+
+        log = self._train_log
+
+        # Append flow_bonus only to the terminal step
+        last = log[-1]
+        log[-1] = last + (flow_bonus,)
+
+        # Pad all earlier steps with 0.0 so every tuple has the same length
+        for i in range(len(log) - 1):
+            log[i] = log[i] + (0.0,)
+
         try:
             import pickle
             with open(_TRAIN_LOG, "ab") as f:
-                pickle.dump(self._train_log, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(log, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception:
             pass
+
         self._train_log = []
         _LIVE_LOG_PLAYERS.discard(self)
-
 
 def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
     """Compute build_type and build_dir action masks.
