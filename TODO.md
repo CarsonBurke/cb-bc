@@ -6,3 +6,6 @@
 ## Rewards
 - Flow fields for conveyor bonus efficiency
 
+## Architecture
+- Different network architectures
+- Tensor lib optimizations
