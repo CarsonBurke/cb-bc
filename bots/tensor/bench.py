@@ -25,7 +25,7 @@ from main import (
 )
 
 
-def bench(fn, n=200, warmup=10, label=""):
+def bench(fn, n=2000, warmup=10, label=""):
     """Run fn n times, report median and p95 in microseconds."""
     for _ in range(warmup):
         fn()

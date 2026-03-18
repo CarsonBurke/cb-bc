@@ -7,7 +7,6 @@ Same as tensor_proxy but:
 """
 
 from array import array
-import importlib.util
 import math
 import os
 import random
@@ -16,10 +15,11 @@ import sys
 
 _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor")
 sys.path.insert(0, _TENSOR_DIR)
-_TENSOR_MAIN_PATH = os.path.join(_TENSOR_DIR, "main.py")
-_TENSOR_SPEC = importlib.util.spec_from_file_location("_tensor_main_proxy_opp", _TENSOR_MAIN_PATH)
-_TENSOR_MAIN = importlib.util.module_from_spec(_TENSOR_SPEC)
-_TENSOR_SPEC.loader.exec_module(_TENSOR_MAIN)
+# Use regular import instead of importlib to avoid engine module tracking issues.
+# The engine's pyo3 runtime tracks the "active Python module" during Controller
+# API calls. Modules loaded via importlib.util.spec_from_file_location corrupt
+# this tracking, causing "'NoneType' object has no attribute 'A'" panics.
+import main as _TENSOR_MAIN
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
@@ -119,11 +119,14 @@ class Player:
         self._unit_id = id(self) % (2**31)
 
     def run(self, ct):
-        etype = ct.get_entity_type()
-        if etype == EntityType.CORE:
-            self._run_core(ct)
-        elif etype == EntityType.BUILDER_BOT:
-            self._run_builder(ct)
+        try:
+            etype = ct.get_entity_type()
+            if etype == EntityType.CORE:
+                self._run_core(ct)
+            elif etype == EntityType.BUILDER_BOT:
+                self._run_builder(ct)
+        except Exception:
+            pass
 
     def _run_core(self, ct):
         if self.core_center is None:
@@ -194,6 +197,28 @@ class Player:
     def _execute_build(self, ct, action, direction):
         pos = ct.get_position()
         build_pos = pos.add(direction)
+
+        # Bounds check
+        w, h = ct.get_map_width(), ct.get_map_height()
+        if build_pos.x < 0 or build_pos.x >= w or build_pos.y < 0 or build_pos.y >= h:
+            return
+
+        # Auto-destroy friendly non-core building if affordable
+        bid = ct.get_tile_building_id(build_pos)
+        if bid is not None:
+            try:
+                if ct.get_team(bid) == self.my_team and ct.get_entity_type(bid) != EntityType.CORE:
+                    idx = BUILD_ACTIONS.index(action)
+                    base_ti, base_ax = BUILD_COSTS[idx]
+                    scale = ct.get_scale_percent() / 100.0
+                    ti, ax = ct.get_global_resources()
+                    if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
+                        ct.destroy(build_pos)
+                    else:
+                        return
+            except Exception:
+                pass
+
         if action == "conveyor":
             conv_dir = direction
             if self.core_center:
@@ -232,11 +257,6 @@ class Player:
         elif action == "launcher":
             if ct.can_build_launcher(build_pos):
                 ct.build_launcher(build_pos)
-        elif action == "destroy":
-            try:
-                ct.destroy(build_pos)
-            except Exception:
-                pass
 
     def _execute_move(self, ct, direction):
         if direction == Direction.CENTRE:

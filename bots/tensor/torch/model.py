@@ -27,7 +27,7 @@ HIDDEN = [64, 64, 48, 48]
 TEACHER_HIDDEN = [128, 128, 128, 64]
 H_DIM = 16
 INPUT_SIZE = OBS_SIZE + H_DIM
-N_BUILD = 13  # 0=none, 1-11=build types, 12=destroy
+N_BUILD = 12
 N_DIR = 9
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 
@@ -38,9 +38,9 @@ REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
 # ---- Action masking ----
 # Build costs (ti, ax) indexed by BUILD_ACTIONS:
 # none, harvester, conveyor, road, gunner, sentinel, breach, splitter,
-# armoured_conveyor, barrier, foundry, launcher, destroy
-_MASK_COSTS_TI = [0, 80, 3, 1, 10, 15, 30, 6, 10, 3, 120, 20, 0]
-_MASK_COSTS_AX = [0, 0, 0, 0, 0, 0, 10, 0, 5, 0, 0, 0, 0]
+# armoured_conveyor, barrier, foundry, launcher
+_MASK_COSTS_TI = [0, 80, 3, 1, 10, 15, 30, 6, 10, 3, 120, 20]
+_MASK_COSTS_AX = [0, 0, 0, 0, 0, 0, 10, 0, 5, 0, 0, 0]
 
 # Tile indices in 5x5 grid for the 9 build directions (NW,N,NE,W,C,E,SW,S,SE)
 _MASK_BD_TILES = [6, 7, 8, 11, 12, 13, 16, 17, 18]
@@ -70,16 +70,17 @@ def _mask_indices(device: torch.device):
     return _mask_idx_cache[device]
 
 
-def compute_action_masks(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute build_type, build_dir, destroy_dir, and move_dir boolean masks.
+def compute_action_masks(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute build_type and build_dir boolean masks.
+
+    Build directions allow both empty tiles and tiles with friendly non-core
+    buildings (the execution layer auto-destroys before building).
 
     Args:
         obs: (B, OBS_SIZE) observation tensor
     Returns:
         bt_mask: (B, N_BUILD) boolean — True = action allowed
-        bd_mask: (B, N_DIR) boolean — True = direction allowed for building
-        dd_mask: (B, N_DIR) boolean — True = direction allowed for destroy
-        md_mask: (B, N_DIR) boolean — True = direction allowed for moving
+        bd_mask: (B, N_DIR) boolean — True = direction allowed
     """
     costs_ti, costs_ax, wall_idx, nobld_idx, unit_idx, friendly_idx, core_idx = _mask_indices(obs.device)
 
@@ -93,31 +94,21 @@ def compute_action_masks(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
     bt_mask = (ti.unsqueeze(1) >= actual_ti) & (ax.unsqueeze(1) >= actual_ax)
     bt_mask[:, 0] = True  # "none" always allowed
 
-    # Build dir: tile not wall, no existing building, and no occupying unit.
-    bd_mask = (obs[:, wall_idx] == 0.0) & (obs[:, nobld_idx] == 1.0) & (obs[:, unit_idx] == 0.0)
+    # Build dir: empty tile OR friendly non-core building (auto-destroyed before build).
+    # Must not be a wall and must not have a unit.
+    not_wall = obs[:, wall_idx] == 0.0
+    no_unit = obs[:, unit_idx] == 0.0
+    empty = obs[:, nobld_idx] == 1.0
+    replaceable = (obs[:, nobld_idx] == 0.0) & (obs[:, friendly_idx] == 1.0) & (obs[:, core_idx] == 0.0)
+    bd_mask = not_wall & no_unit & (empty | replaceable)
 
-    # Destroy dir: has a friendly non-core building
-    dd_mask = (obs[:, nobld_idx] == 0.0) & (obs[:, friendly_idx] == 1.0) & (obs[:, core_idx] == 0.0)
-
-    # Move dir: tile not wall, no existing building, and no occupying unit.
-    # This matches the runtime behavior where the bot may first place a road
-    # on the target tile before moving into it. Centre is always allowed.
-    md_mask = bd_mask.clone()
-    md_mask[:, 4] = True
-
-    # Destroy bt allowed only if any destroyable direction exists
-    bt_mask[:, 12] = bt_mask[:, 12] & dd_mask.any(dim=1)
-
-    # Force none-only when nothing affordable/destroyable or no valid direction
-    has_build = bt_mask[:, 1:12].any(dim=1) & bd_mask.any(dim=1)
-    has_destroy = bt_mask[:, 12]
-    force_none = ~has_build & ~has_destroy
+    # Force none-only when nothing affordable or no valid direction
+    force_none = ~bt_mask[:, 1:].any(dim=1) | ~bd_mask.any(dim=1)
     if force_none.any():
         bt_mask[force_none, 1:] = False
         bd_mask[force_none] = True  # dir is irrelevant, avoid NaN
-        dd_mask[force_none] = True
 
-    return bt_mask, bd_mask, dd_mask, md_mask
+    return bt_mask, bd_mask
 
 
 # Sinusoidal position embedding frequencies
@@ -423,13 +414,9 @@ def ppo_update(
 
             t_phase = time.perf_counter() if profile is not None else 0.0
             # Apply action masks to logits (affordability + spatial validity)
-            bt_m, bd_m, dd_m, md_m = compute_action_masks(obs[idx])
+            bt_m, bd_m = compute_action_masks(obs[idx])
             bt_l = bt_l.masked_fill(~bt_m, -1e9)
-            # Use destroy dir mask when action was destroy, build dir mask otherwise
-            is_destroy = (bt_act[idx] == 12)
-            effective_bd_m = torch.where(is_destroy.unsqueeze(1), dd_m, bd_m)
-            bd_l = bd_l.masked_fill(~effective_bd_m, -1e9)
-            md_l = md_l.masked_fill(~md_m, -1e9)
+            bd_l = bd_l.masked_fill(~bd_m, -1e9)
 
             # Mask build_dir when build_type is "none" (idx 0) — causally irrelevant
             bd_causal = (bt_act[idx] != 0).float()

@@ -29,6 +29,27 @@ import tempfile
 import time
 from pathlib import Path
 
+
+def _maybe_run_worker_mode() -> None:
+    if "--worker-result" not in sys.argv:
+        return
+    from game_worker import main as _game_worker_main
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--worker-result", required=True)
+    parser.add_argument("--worker-pipes", required=True)
+    parser.add_argument("--worker-game-args", required=True)
+    args, _ = parser.parse_known_args()
+    _game_worker_main([
+        "--result", args.worker_result,
+        "--pipes", args.worker_pipes,
+        "--game-args", args.worker_game_args,
+    ])
+    raise SystemExit(0)
+
+
+_maybe_run_worker_mode()
+
 import torch
 import torch.nn.functional as F
 
@@ -51,7 +72,6 @@ from replay_parser import augment_trajectories_with_working_counts
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
-WORKER_SCRIPT = Path(__file__).with_name("game_worker.py")
 
 from training_utils import (
     League, _init_session, _default_session_name, _read_trajectory_file,
@@ -66,6 +86,7 @@ _H_STRUCT = struct.Struct(f'={H_DIM}f')
 _LP_STRUCT = struct.Struct('=f')
 _H_BYTES = H_DIM * 4
 DEFAULT_COALESCE_MS = 0.25 if DEVICE.type == "cuda" else 0.0
+WORKER_LAUNCH_STAGGER_S = 0.02
 DUMMY_OPP_PATH = "__dummy__"
 DUMMY_OPP_ID = "dummy"
 _ZERO_H_BYTES = bytes(_H_BYTES)
@@ -124,7 +145,7 @@ def _dummy_indices(device: torch.device):
 
 def _dummy_policy(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Cheap scripted opponent for early curriculum episodes."""
-    bt_mask, bd_mask, _dd_mask, _md_mask = compute_action_masks(obs)
+    bt_mask, bd_mask = compute_action_masks(obs)
     ore_ti_idx, ore_ax_idx = _dummy_indices(obs.device)
     ore_score = obs.index_select(1, ore_ti_idx) + obs.index_select(1, ore_ax_idx)
     has_ore_dir = bd_mask & (ore_score > 0.0)
@@ -151,13 +172,18 @@ def _dummy_policy(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
     move_dir = torch.full_like(build_type, 4)
     return build_type, build_dir, move_dir
 
-def _load_worker_result(result_path: str) -> tuple[str | None, dict | None] | tuple[None, None]:
+def _load_worker_result(result_path: str) -> tuple[str | None, dict | None, str | None]:
     try:
         with open(result_path, "rb") as f:
             result = pickle.load(f)
     except (OSError, pickle.PickleError, EOFError):
-        return (None, None)
-    return result if isinstance(result, tuple) and len(result) == 2 else (None, None)
+        return (None, None, None)
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            return result
+        if len(result) == 2:
+            return result[0], result[1], None
+    return (None, None, None)
 
 
 def _recommended_worker_count(n_games: int) -> int:
@@ -212,7 +238,8 @@ def collect_games_batched(
     """Run all games with batched GPU inference via pipes. Returns (trajs, winners, per_opp_winners)."""
     t_total = time.perf_counter() if profile is not None else 0.0
     bot_a = str(PROJECT_ROOT / "bots" / "tensor_proxy" / "main.py")
-    bot_b = str(PROJECT_ROOT / "bots" / "tensor_proxy_opp" / "main.py")
+    bot_b_proxy = str(PROJECT_ROOT / "bots" / "tensor_proxy_opp" / "main.py")
+    bot_b_dummy = str(PROJECT_ROOT / "bots" / "tensor_dummy" / "main.py")
     engine_root = str(PROJECT_ROOT)
     replay_dir.mkdir(parents=True, exist_ok=True)
     tmpdir = tempfile.mkdtemp(prefix="batched_")
@@ -225,6 +252,7 @@ def collect_games_batched(
         log_path = os.path.join(tmpdir, f"traj_{i}.pkl")
         replay_path = str(replay_dir / f"ep{episode_num}_{opp_ids[i]}_g{i}.replay26")
         seed = random.randint(1, 2**31)
+        bot_b = bot_b_dummy if opp_weight_paths[i] == DUMMY_OPP_PATH else bot_b_proxy
         game_args.append((bot_a, bot_b, map_path, engine_root, replay_path, log_path, seed))
 
     # Load opponent models on GPU (deduplicate by weight path)
@@ -275,39 +303,47 @@ def collect_games_batched(
     def _launch_game(i: int) -> None:
         obs_r_a, obs_w_a = os.pipe()
         act_r_a, act_w_a = os.pipe()
-        obs_r_b, obs_w_b = os.pipe()
-        act_r_b, act_w_b = os.pipe()
+        use_proxy_b = opp_weight_paths[i] != DUMMY_OPP_PATH
+        obs_r_b = obs_w_b = act_r_b = act_w_b = -1
+        if use_proxy_b:
+            obs_r_b, obs_w_b = os.pipe()
+            act_r_b, act_w_b = os.pipe()
         result_path = os.path.join(tmpdir, f"result_{i}.pkl")
         worker_env = os.environ.copy()
         worker_env["CUDA_VISIBLE_DEVICES"] = ""
+        worker_fds = tuple(fd for fd in (obs_w_a, act_r_a, obs_w_b, act_r_b) if fd >= 0)
         proc = subprocess.Popen(
             [
                 sys.executable,
-                str(WORKER_SCRIPT),
-                "--result", result_path,
-                "--pipes", f"{obs_w_a},{act_r_a},{obs_w_b},{act_r_b}",
-                "--game-args", json.dumps(game_args[i]),
+                str(Path(__file__).resolve()),
+                "--worker-result", result_path,
+                "--worker-pipes", f"{obs_w_a},{act_r_a},{obs_w_b},{act_r_b}",
+                "--worker-game-args", json.dumps(game_args[i]),
             ],
             close_fds=True,
             cwd=str(PROJECT_ROOT),
             env=worker_env,
-            pass_fds=(obs_w_a, act_r_a, obs_w_b, act_r_b),
+            pass_fds=worker_fds,
         )
         processes[i] = {"proc": proc, "result_path": result_path}
+        if WORKER_LAUNCH_STAGGER_S > 0.0:
+            time.sleep(WORKER_LAUNCH_STAGGER_S)
 
         os.close(obs_w_a)
         os.close(act_r_a)
-        os.close(obs_w_b)
-        os.close(act_r_b)
+        if use_proxy_b:
+            os.close(obs_w_b)
+            os.close(act_r_b)
 
         fd_to_info[obs_r_a] = (i, "a")
-        fd_to_info[obs_r_b] = (i, "b")
         act_fds[(i, "a")] = act_w_a
-        act_fds[(i, "b")] = act_w_b
         active_fds.add(obs_r_a)
-        active_fds.add(obs_r_b)
         selector.register(obs_r_a, selectors.EVENT_READ)
-        selector.register(obs_r_b, selectors.EVENT_READ)
+        if use_proxy_b:
+            fd_to_info[obs_r_b] = (i, "b")
+            act_fds[(i, "b")] = act_w_b
+            active_fds.add(obs_r_b)
+            selector.register(obs_r_b, selectors.EVENT_READ)
 
     def _reap_processes() -> None:
         for game_idx, proc_info in list(processes.items()):
@@ -407,15 +443,11 @@ def collect_games_batched(
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
                 # Apply action masks before sampling
-                bt_m, bd_m, dd_m, md_m = compute_action_masks(obs_t)
+                bt_m, bd_m = compute_action_masks(obs_t)
                 bt_l.masked_fill_(~bt_m, -1e9)
+                bd_l.masked_fill_(~bd_m, -1e9)
                 bt_act, bt_lp = sample_logits_gumbel(bt_l)
-                # Use destroy dir mask for units that chose destroy, build dir otherwise
-                is_destroy = (bt_act == 12)
-                effective_bd_m = torch.where(is_destroy.unsqueeze(1), dd_m, bd_m)
-                bd_l.masked_fill_(~effective_bd_m, -1e9)
                 bd_act, bd_lp = sample_logits_gumbel(bd_l)
-                md_l.masked_fill_(~md_m, -1e9)
                 md_act, md_lp = sample_logits_gumbel(md_l)
                 # Mask build_dir log_prob when build_type is "none" (idx 0)
                 bd_causal = (bt_act != 0).float()
@@ -510,14 +542,11 @@ def collect_games_batched(
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    bt_m, bd_m, dd_m, md_m = compute_action_masks(obs_t)
+                    bt_m, bd_m = compute_action_masks(obs_t)
                     bt_l.masked_fill_(~bt_m, -1e9)
+                    bd_l.masked_fill_(~bd_m, -1e9)
                     bt_act, _ = sample_logits_gumbel(bt_l, OPP_TEMP, return_log_prob=False)
-                    is_destroy = (bt_act == 12)
-                    effective_bd_m = torch.where(is_destroy.unsqueeze(1), dd_m, bd_m)
-                    bd_l.masked_fill_(~effective_bd_m, -1e9)
                     bd_act, _ = sample_logits_gumbel(bd_l, OPP_TEMP, return_log_prob=False)
-                    md_l.masked_fill_(~md_m, -1e9)
                     md_act, _ = sample_logits_gumbel(md_l, OPP_TEMP, return_log_prob=False)
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
@@ -596,24 +625,19 @@ def collect_games_batched(
     per_opp_winners = {}
     for i, result in enumerate(results):
         oid = opp_ids[i]
-        if isinstance(result, tuple):
+        if isinstance(result, tuple) and len(result) == 3:
+            log_path, working, w = result
+        elif isinstance(result, tuple) and len(result) == 2:
             log_path, working = result
+            w = None
         else:
-            log_path, working = result, None
+            log_path, working, w = None, None, None
         if log_path is None:
             per_opp_winners.setdefault(oid, []).append(None)
             continue
         game_trajs = _read_trajectory_file(log_path)
         game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
         trajectories.extend(game_trajs)
-        if game_trajs:
-            total_harv = sum(
-                sum(1 for s in t if isinstance(s, (list, tuple)) and len(s) >= 10 and s[9] > 0.5)
-                for t in game_trajs
-            )
-            w = "a" if total_harv > 0 else "b"
-        else:
-            w = None
         winners.append(w)
         per_opp_winners.setdefault(oid, []).append(w)
     if profile is not None:
@@ -645,6 +669,9 @@ def main():
     parser.add_argument("--distill-lr", type=float, default=1e-3, help="Distillation learning rate")
     parser.add_argument("--coalesce-ms", type=float, default=DEFAULT_COALESCE_MS)
     parser.add_argument("--session", type=str, default="")
+    parser.add_argument("--worker-result", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-pipes", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-game-args", type=str, default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     session_name = args.session or _default_session_name()
@@ -681,8 +708,8 @@ def main():
 
     for ep in range(args.episodes):
         t0 = time.time()
-        gen = league.latest_gen() + 1
-        current_id = f"gen_{gen}"
+        current_gen = league.latest_gen()
+        current_id = f"gen_{current_gen}" if current_gen >= 0 else None
         dummy_phase = ep < args.dummy_episodes
         games_per_opp = args.games_per_opp
         if dummy_phase:
@@ -730,9 +757,14 @@ def main():
         t_train = time.time() - t1
 
         if (ep + 1) % args.checkpoint_every == 0 or ep == 0:
+            gen = league.latest_gen() + 1
             ckpt = str(league.league_dir / f"gen_{gen}.pkl")
             model.save_weights(ckpt)
             league.register_model(ckpt, gen)
+            current_id = f"gen_{gen}"
+
+        # Update ELO every episode using the latest registered model
+        if current_id is not None:
             for opp, winners in per_opp_results:
                 if opp["path"] == DUMMY_OPP_PATH:
                     continue

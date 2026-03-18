@@ -499,9 +499,7 @@ class Player:
         fdx, fdy = DIR_DXY.get(facing, (0, 0))
         for ore_pos in (Player._all_ore or []):
             key = (ore_pos.x, ore_pos.y)
-            prev = Player._conv_proximity.get(key)
-            if prev is not None and prev < 0:
-                continue  # already finalized by a prior placement
+            prev = Player._conv_proximity.get(key, 0.0)
             dx, dy = ore_pos.x - pos.x, ore_pos.y - pos.y
             d = abs(dx) + abs(dy)
             # Cardinal adjacent: check facing doesn't point at ore
@@ -509,12 +507,13 @@ class Player:
                 continue  # facing into the ore — useless
             if best_dist is None or d < best_dist:
                 best_dist, best_key = d, key
-                best_given = prev or 0.0
+                best_given = prev
         if best_key is None:
             return 0.0
         effective_dist = max(0, best_dist - 1)  # target is cardinal adjacent (d=1)
         reward = self._PLACE_CONV / (1.0 + effective_dist)
-        Player._conv_proximity[best_key] = -1.0  # mark finalized
+        # Store max so rebuilds get zero (reward - reward = 0)
+        Player._conv_proximity[best_key] = max(best_given, reward)
         return reward - best_given
 
     def _proximity_reward_conv(self, ct: Controller) -> float:
@@ -529,10 +528,7 @@ class Player:
                 if env not in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
                     continue
                 key = (tile_pos.x, tile_pos.y)
-                prev = Player._conv_proximity.get(key)
-                if prev is not None and prev < 0:
-                    continue  # finalized by successful placement
-                prev = prev or 0.0
+                prev = Player._conv_proximity.get(key, 0.0)
                 d = abs(tile_pos.x - pos.x) + abs(tile_pos.y - pos.y)
                 effective_dist = max(0, d - 1)
                 reward = min(self._PLACE_CONV / (1.0 + effective_dist), self._PLACE_CONV * 0.1)
@@ -691,12 +687,38 @@ class Player:
     def _execute_build(
         self, ct: Controller, action: str, direction: Direction
     ) -> tuple[float, float]:
-        """Execute build action. Returns (harv_reward, conv_reward)."""
+        """Execute build action. Returns (harv_reward, conv_reward).
+
+        If the target tile has a friendly non-core building, auto-destroys it
+        first (destroy has no cooldown cost). Skips if we can't afford the build.
+        """
         if action == "none":
             return 0.0, 0.0
 
         pos = ct.get_position()
         build_pos = pos.add(direction)
+
+        # Bounds check — build_pos can be out of map when near edges
+        w, h = ct.get_map_width(), ct.get_map_height()
+        if build_pos.x < 0 or build_pos.x >= w or build_pos.y < 0 or build_pos.y >= h:
+            return 0.0, 0.0
+
+        # Auto-destroy friendly non-core building to make room.
+        # Check affordability first to avoid destroying for nothing.
+        bid = ct.get_tile_building_id(build_pos)
+        if bid is not None:
+            try:
+                if ct.get_team(bid) == self.my_team and ct.get_entity_type(bid) != EntityType.CORE:
+                    idx = BUILD_ACTIONS.index(action)
+                    base_ti, base_ax = BUILD_COSTS[idx]
+                    scale = ct.get_scale_percent() / 100.0
+                    ti, ax = ct.get_global_resources()
+                    if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
+                        ct.destroy(build_pos)
+                    else:
+                        return 0.0, 0.0
+            except Exception:
+                pass
 
         if action == "conveyor":
             conv_dir = direction
@@ -713,7 +735,8 @@ class Player:
             if ct.can_build_harvester(build_pos):
                 ct.build_harvester(build_pos)
                 ore_key = (build_pos.x, build_pos.y)
-                given = Player._harv_proximity.pop(ore_key, 0.0)
+                given = Player._harv_proximity.get(ore_key, 0.0)
+                Player._harv_proximity[ore_key] = self._PLACE_HARV
                 return self._PLACE_HARV - given, 0.0
             # Failed — proximity reward toward nearest ore (one-time per ore)
             return self._proximity_reward(ct), 0.0
@@ -747,11 +770,6 @@ class Player:
         elif action == "launcher":
             if ct.can_build_launcher(build_pos):
                 ct.build_launcher(build_pos)
-        elif action == "destroy":
-            try:
-                ct.destroy(build_pos)
-            except Exception:
-                pass
         return 0.0, 0.0
 
     def _execute_move(self, ct: Controller, direction: Direction) -> None:
@@ -797,57 +815,47 @@ class Player:
         _LIVE_LOG_PLAYERS.discard(self)
 
 
-def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], list[bool], list[bool]]:
-    """Compute build_type, build_dir, destroy_dir, and move_dir action masks.
+def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
+    """Compute build_type and build_dir action masks.
 
-    Returns (bt_mask, bd_mask, dd_mask, md_mask) as lists of booleans (True = allowed).
+    Build directions allow both empty tiles and tiles with friendly non-core
+    buildings (the execution layer auto-destroys before building).
+
+    Returns (bt_mask, bd_mask) as lists of booleans (True = allowed).
     """
     g = _GLOBAL_OBS_START
     ti = obs[g + 3] * 500.0
     ax = obs[g + 4] * 500.0
     scale = obs[g + 5] * 5.0  # scale_pct / 100
 
-    # Build type mask: can we afford it? (indices 0-11)
+    # Build type mask: can we afford it?
     bt_mask = [True]  # "none" always allowed
     any_affordable = False
-    for i in range(1, 12):
+    for i in range(1, len(BUILD_COSTS)):
         base_ti, base_ax = BUILD_COSTS[i]
         ok = ti >= int(scale * base_ti) and ax >= int(scale * base_ax)
         bt_mask.append(ok)
         any_affordable = any_affordable or ok
 
-    # Build dir mask: is the target tile empty and visible?
+    # Build dir mask: empty tile OR friendly non-core building (auto-destroyed).
+    # Must not be a wall and must not have a unit.
     bd_mask = [False] * 9
-    any_build_dir = False
-    # Destroy dir mask: has friendly non-core building
-    dd_mask = [False] * 9
-    any_destroy_dir = False
-    # Move dir mask: can move there after optional road placement on that tile.
-    md_mask = [False] * 9
+    any_dir = False
     for d_idx in range(9):
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
-        # Buildable if: not wall, no building, and no unit occupying the tile.
-        if obs[ts] == 0.0 and obs[ts + 4] == 1.0 and obs[ts + 15] == 0.0:
+        not_wall = obs[ts] == 0.0
+        no_unit = obs[ts + 15] == 0.0
+        empty = obs[ts + 4] == 1.0
+        replaceable = obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0
+        if not_wall and no_unit and (empty or replaceable):
             bd_mask[d_idx] = True
-            any_build_dir = True
-            md_mask[d_idx] = True
-        # Destroyable if: has building (bld_none==0), friendly (bld_friendly==1), not core (bld_core==0)
-        if obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0:
-            dd_mask[d_idx] = True
-            any_destroy_dir = True
-    md_mask[4] = True  # staying in place is always allowed
+            any_dir = True
 
-    # Destroy type mask (index 12)
-    bt_mask.append(any_destroy_dir)
+    # If nothing affordable or nowhere to build, force "none" (dir irrelevant)
+    if not any_affordable or not any_dir:
+        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9
 
-    # If nothing affordable/destroyable or nowhere to act, force "none"
-    has_build = any_affordable and any_build_dir
-    has_destroy = any_destroy_dir
-    if not has_build and not has_destroy:
-        n = len(BUILD_COSTS)
-        return [True] + [False] * (n - 1), [True] * 9, [True] * 9, md_mask
-
-    return bt_mask, bd_mask, dd_mask, md_mask
+    return bt_mask, bd_mask
 
 
 def _argmax(data: list[float], mask: list[bool] | None = None) -> int:

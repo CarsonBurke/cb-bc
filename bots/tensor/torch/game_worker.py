@@ -9,7 +9,7 @@ import json
 import os
 import pickle
 
-from replay_parser import extract_working_harvesters
+from replay_parser import extract_working_harvesters, parse_replay, extract_working_harvesters_from_replay
 
 
 def _run_game_proxy(args):
@@ -19,13 +19,17 @@ def _run_game_proxy(args):
         from cambc.cambc_engine import run_game
 
         run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
-        working = extract_working_harvesters(replay_path)
-    except Exception as e:
+        replay = parse_replay(replay_path)
+        working = extract_working_harvesters_from_replay(replay)
+        # Winner: 0 = TEAM_A, 1 = TEAM_B
+        winner_val = replay.get("winner")
+        winner = "a" if winner_val == 0 else ("b" if winner_val == 1 else None)
+    except BaseException as e:
         print(f"  Game error: {e}")
-        return None, None
+        return None, None, None
     finally:
         os.environ.pop("TENSOR_TRAIN_LOG", None)
-    return (log_path if os.path.exists(log_path) else None), working
+    return (log_path if os.path.exists(log_path) else None), working, winner
 
 
 def main(argv=None):
