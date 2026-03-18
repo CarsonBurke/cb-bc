@@ -126,6 +126,21 @@ function replayApiPlugin() {
         }
       })
 
+      // League data (session-aware)
+      server.middlewares.use('/api/league', (req, res) => {
+        res.setHeader('Content-Type', 'application/json')
+        const sd = sessionDir(req)
+        const leaguePath = sd
+          ? resolve(sd, 'league', 'league.json')
+          : resolve(PROJECT_ROOT, 'bots/tensor/league/league.json')
+        try {
+          const data = readFileSync(leaguePath, 'utf8')
+          res.end(data)
+        } catch {
+          res.end(JSON.stringify([]))
+        }
+      })
+
       // List available replay files
       server.middlewares.use('/api/replays', (_req, res) => {
         try {

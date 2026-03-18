@@ -1,8 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { viewerAtom, viewerMinimizedAtom, trainSessionAtom } from '../store'
-import { Line } from 'react-chartjs-2'
+import { Line, Bar } from 'react-chartjs-2'
+import { Chart as ChartJS, BarElement } from 'chart.js'
 import Card from './Card'
+
+ChartJS.register(BarElement)
 import { Table, Th, Td, Thead, Tr } from './Table'
 import { CHART_THEME } from '../data'
 
@@ -12,14 +15,22 @@ function useTrainLog(session) {
   const [data, setData] = useState({ episodes: [], config: {} })
   const [loading, setLoading] = useState(true)
   const timer = useRef(null)
+  const lastLen = useRef(0)
 
   useEffect(() => {
     setLoading(true)
+    lastLen.current = 0
     function fetch_log() {
       const qs = session ? `?session=${encodeURIComponent(session)}` : ''
       fetch(`/api/train-log${qs}`)
         .then(r => r.json())
-        .then(setData)
+        .then(d => {
+          const n = d.episodes?.length || 0
+          if (n !== lastLen.current) {
+            lastLen.current = n
+            setData(d)
+          }
+        })
         .catch(() => {})
         .finally(() => setLoading(false))
     }
@@ -31,6 +42,80 @@ function useTrainLog(session) {
   return { data, loading }
 }
 
+function useLeague(session) {
+  const [models, setModels] = useState([])
+  const timer = useRef(null)
+  const lastHash = useRef('')
+
+  useEffect(() => {
+    lastHash.current = ''
+    function fetch_league() {
+      const qs = session ? `?session=${encodeURIComponent(session)}` : ''
+      fetch(`/api/league${qs}`)
+        .then(r => r.text())
+        .then(text => {
+          if (text !== lastHash.current) {
+            lastHash.current = text
+            try { setModels(JSON.parse(text).models || []) } catch {}
+          }
+        })
+        .catch(() => {})
+    }
+    fetch_league()
+    timer.current = setInterval(fetch_league, POLL_MS)
+    return () => clearInterval(timer.current)
+  }, [session])
+
+  return models
+}
+
+function LeagueEloChart({ models }) {
+  if (!models.length) return null
+  const sorted = [...models].sort((a, b) => a.gen - b.gen)
+  const labels = sorted.map(m => m.id)
+  const elos = sorted.map(m => m.elo)
+  const colors = sorted.map((_, i) => i === sorted.length - 1 ? '#a6e3a1' : '#89b4fa')
+
+  return (
+    <div className="min-h-[200px]">
+      <Bar
+        data={{
+          labels,
+          datasets: [{
+            label: 'ELO',
+            data: elos,
+            backgroundColor: colors,
+            borderColor: colors,
+            borderWidth: 1,
+          }],
+        }}
+        options={{
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: { ticks: { color: CHART_THEME.subtext, maxRotation: 45 }, grid: { color: CHART_THEME.grid } },
+            y: { ticks: { color: CHART_THEME.subtext }, grid: { color: CHART_THEME.grid } },
+          },
+          plugins: { legend: { display: false } },
+        }}
+      />
+    </div>
+  )
+}
+
+const MAX_CHART_POINTS = 200
+
+function downsample(arr, max = MAX_CHART_POINTS) {
+  if (arr.length <= max) return arr
+  const step = arr.length / max
+  const result = []
+  for (let i = 0; i < max - 1; i++) {
+    result.push(arr[Math.round(i * step)])
+  }
+  result.push(arr[arr.length - 1]) // always include latest
+  return result
+}
+
 function fmt(v, decimals = 2) {
   if (v == null) return '—'
   return typeof v === 'number' ? v.toFixed(decimals) : String(v)
@@ -38,6 +123,7 @@ function fmt(v, decimals = 2) {
 
 function SingleChart({ episodes, label, dataKey, color, fillColor }) {
   if (!episodes.length) return null
+  const ds = downsample(episodes)
 
   const opts = {
     responsive: true,
@@ -60,10 +146,10 @@ function SingleChart({ episodes, label, dataKey, color, fillColor }) {
     <div className="min-h-[200px]">
       <Line
         data={{
-          labels: episodes.map(e => e.episode),
+          labels: ds.map(e => e.episode),
           datasets: [{
             label,
-            data: episodes.map(e => e[dataKey] ?? null),
+            data: ds.map(e => e[dataKey] ?? null),
             borderColor: color,
             backgroundColor: fillColor || color + '20',
             fill: !!fillColor,
@@ -81,17 +167,18 @@ function SingleChart({ episodes, label, dataKey, color, fillColor }) {
 
 function RewardBreakdownChart({ episodes }) {
   if (!episodes.length) return null
+  const ds = downsample(episodes)
 
   return (
     <div className="min-h-[200px]">
       <Line
         data={{
-          labels: episodes.map(e => e.episode),
+          labels: ds.map(e => e.episode),
           datasets: [
-            { label: 'Harvester', data: episodes.map(e => e.r_harv || 0), borderColor: '#a6e3a1', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Conveyor', data: episodes.map(e => e.r_conv || 0), borderColor: '#89b4fa', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Working', data: episodes.map(e => e.r_work || 0), borderColor: '#f9e2af', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Damage', data: episodes.map(e => e.r_dmg || 0), borderColor: '#f38ba8', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Harvester', data: ds.map(e => e.r_harv || 0), borderColor: '#a6e3a1', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Conveyor', data: ds.map(e => e.r_conv || 0), borderColor: '#89b4fa', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Working', data: ds.map(e => e.r_work || 0), borderColor: '#f9e2af', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Damage', data: ds.map(e => e.r_dmg || 0), borderColor: '#f38ba8', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
           ],
         }}
         options={{
@@ -111,15 +198,16 @@ function RewardBreakdownChart({ episodes }) {
 
 function LossChart({ episodes }) {
   if (!episodes.length) return null
+  const ds = downsample(episodes)
 
   return (
     <div className="min-h-[200px]">
       <Line
         data={{
-          labels: episodes.map(e => e.episode),
+          labels: ds.map(e => e.episode),
           datasets: [
-            { label: 'Policy Loss', data: episodes.map(e => e.pi_loss), borderColor: '#f38ba8', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Value Loss', data: episodes.map(e => e.vf_loss), borderColor: '#f9e2af', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Policy Loss', data: ds.map(e => e.pi_loss), borderColor: '#f38ba8', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Value Loss', data: ds.map(e => e.vf_loss), borderColor: '#f9e2af', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
           ],
         }}
         options={{
@@ -227,6 +315,7 @@ function TrainingReplays({ session }) {
 export default function TrainingView() {
   const session = useAtomValue(trainSessionAtom)
   const { data, loading } = useTrainLog(session)
+  const leagueModels = useLeague(session)
   const { episodes, config } = data
 
   const latest = episodes[episodes.length - 1]
@@ -276,8 +365,8 @@ export default function TrainingView() {
             <Card title="Win Rate" id="train-winrate">
               <SingleChart episodes={episodes} label="Win Rate" dataKey="winrate" color="#cba6f7" />
             </Card>
-            <Card title="ELO" id="train-elo">
-              <SingleChart episodes={episodes} label="ELO" dataKey="elo" color="#f9e2af" fillColor="#f9e2af20" />
+            <Card title="League ELO" id="train-elo">
+              <LeagueEloChart models={leagueModels} />
             </Card>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
