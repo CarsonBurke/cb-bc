@@ -63,7 +63,7 @@ from model import (
     sample_logits_gumbel,
     train_on_trajectories,
 )
-from bots.tensor.replay_parser import augment_trajectories_with_working_counts
+from replay_parser import augment_trajectories_with_working_counts
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
