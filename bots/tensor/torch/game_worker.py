@@ -28,12 +28,12 @@ def _run_game_proxy(args):
     return (log_path if os.path.exists(log_path) else None), working
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Batched training game worker")
     parser.add_argument("--result", required=True)
     parser.add_argument("--pipes", required=True)
     parser.add_argument("--game-args", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     pipe_fds = tuple(int(fd) for fd in args.pipes.split(",") if fd)
     if len(pipe_fds) != 4:
