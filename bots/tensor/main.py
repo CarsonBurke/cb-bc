@@ -212,13 +212,10 @@ def _get_shared_model() -> MLP:
     return model
 
 
-
 class Player:
-    _conv_count: int = 0  # global conveyor count across all units
     _all_ore: list[Position] | None = None  # discovered ore tiles (accumulated)
     _all_ore_keys: set[tuple[int, int]] = set()
     _harv_proximity: dict[tuple[int, int], float] = {}  # ore_key → proximity reward given
-    _conv_proximity: dict[tuple[int, int], float] = {}  # ore_key → conv proximity reward given
     _working_harv_positions: set[tuple[int, int]] = set()  # accumulated per round
     _working_harv_round: int = -1
     _working_harv_count: int = 0  # final count from previous round
@@ -339,14 +336,10 @@ class Player:
             build_dir_idx = _argmax(outputs["build_dir"], dir_mask)
             move_dir_idx = _argmax(outputs["move_dir"], md_mask)
 
-        # Snapshot resources before actions to isolate delivery from spending
-        ti_before, ax_before = ct.get_global_resources()
-
         # Execute actions
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir)
-        place_reward = harv_reward + conv_reward
+        harv_reward, _ = self._execute_build(ct, build_action, build_dir)
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
@@ -362,16 +355,29 @@ class Player:
 
         # Log trajectory step
         if self._train_log is not None:
-            # Tuple: obs, h, bt, bd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp
+            # Tuple layout:
+            #   [0]  obs
+            #   [1]  h
+            #   [2]  build_type_idx
+            #   [3]  build_dir_idx
+            #   [4]  move_dir_idx
+            #   [5]  value placeholder (0.0)
+            #   [6]  n_working
+            #   [7]  conv_reward (always 0.0 — conveyor credit via flow bonus)
+            #   [8]  ti_after
+            #   [9]  harv_reward
+            #   [10] enemy_dmg
+            #   [11] old_log_prob
+            #   [12] flow_bonus (0.0 on all steps except terminal)
             self._train_log.append((
                 obs,
                 list(h_in),
                 build_type_idx,
                 build_dir_idx,
                 move_dir_idx,
-                0.0,  # value placeholder
+                0.0,   # value placeholder
                 n_working,
-                conv_reward,
+                0.0,   # conv_reward — always 0, flow field handles conveyor credit
                 ti_after,
                 harv_reward,
                 enemy_dmg,
@@ -624,7 +630,7 @@ class Player:
         extend(self.pos_encoder.encode(pos.x, pos.y))
 
     def _encode_state(self, ct: Controller) -> list[float]:
-        """Encode 5x5 grid (16 feat/tile) + global (14) + pos embed (8)."""
+        """Encode 5x5 grid (17 feat/tile) + global (14) + pos embed (8)."""
         features: list[float] = []
         self._encode_state_into(ct, features)
         return features
@@ -632,12 +638,14 @@ class Player:
     # ---- Action execution ----
 
     _PLACE_HARV = 5.0
-    _PLACE_CONV = 0.5
 
     def _execute_build(
         self, ct: Controller, action: str, direction: Direction
     ) -> tuple[float, float]:
-        """Execute build action. Returns (harv_reward, conv_reward).
+        """Execute build action. Returns (harv_reward, 0.0).
+
+        Conveyor quality credit is handled entirely by the post-mortem flow
+        field bonus distributed across conveyor-placing steps in _compute_gae.
 
         If the target tile has a friendly non-core building, auto-destroys it
         first (destroy has no cooldown cost). Skips if we can't afford the build.
@@ -678,9 +686,6 @@ class Player:
                     conv_dir = direction
             if ct.can_build_conveyor(build_pos, conv_dir):
                 ct.build_conveyor(build_pos, conv_dir)
-                Player._conv_count += 1
-            # Rewards for conveyors are handled at the end of the game
-            return 0.0, 0.0
         elif action == "harvester":
             if ct.can_build_harvester(build_pos):
                 ct.build_harvester(build_pos)
@@ -688,7 +693,6 @@ class Player:
                 given = Player._harv_proximity.get(ore_key, 0.0)
                 Player._harv_proximity[ore_key] = self._PLACE_HARV
                 return self._PLACE_HARV - given, 0.0
-            # Failed — proximity reward toward nearest ore (one-time per ore)
             return self._proximity_reward(ct), 0.0
         elif action == "road":
             if ct.can_build_road(build_pos):
@@ -708,9 +712,6 @@ class Player:
         elif action == "armoured_conveyor":
             if ct.can_build_armoured_conveyor(build_pos, direction):
                 ct.build_armoured_conveyor(build_pos, direction)
-                Player._conv_count += 1
-            # Rewards for conveyors are handled at the end of the game
-            return 0.0, 0.0
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):
                 ct.build_barrier(build_pos)
@@ -720,6 +721,11 @@ class Player:
         elif action == "launcher":
             if ct.can_build_launcher(build_pos):
                 ct.build_launcher(build_pos)
+        elif action == "destroy":
+            try:
+                ct.destroy(build_pos)
+            except Exception:
+                pass
         return 0.0, 0.0
 
     def _execute_move(self, ct: Controller, direction: Direction) -> None:
@@ -749,16 +755,16 @@ class Player:
     def _flush_log(self, ct: Controller | None = None) -> None:
         """Append trajectory log to file specified by TENSOR_TRAIN_LOG (pickle).
 
-        Injects a post-mortem flow field alignment bonus into the terminal
-        reward of the trajectory before writing.
+        Injects a post-mortem flow field alignment bonus as index 12 on the
+        terminal step. The trainer distributes this bonus across all conveyor-
+        placing steps in the episode via _compute_gae.
 
-        Pass `ct` when calling at end of game (round >= 1999) so the scorer
-        can read final map state. Called from atexit without ct — skips scoring.
+        Pass `ct` at end of game (round >= 1999). Called from atexit without
+        ct — skips scoring and writes 0.0.
         """
         if not self._train_log or not _TRAIN_LOG:
             return
 
-        # Post-mortem conveyor flow field bonus
         if ct is not None and self.core_center is not None and Player._all_ore:
             try:
                 flow_bonus = score_conveyor_flow(
@@ -767,10 +773,6 @@ class Player:
                     core_pos=self.core_center,
                     ore_positions=Player._all_ore,
                 )
-                # Scale to be in a similar range as your per-step rewards.
-                # _PLACE_HARV=5.0 and _PLACE_CONV=2.5 are the main per-step signals;
-                # a well-connected chain of 10 conveyors should produce ~5-10 bonus.
-                # Tune FLOW_BONUS_SCALE to taste.
                 FLOW_BONUS_SCALE = 3.0
                 flow_bonus *= FLOW_BONUS_SCALE
             except Exception:
@@ -778,31 +780,10 @@ class Player:
         else:
             flow_bonus = 0.0
 
-        # Inject into the last trajectory step's reward fields.
-        # Trajectory tuple layout (from _run_builder):
-        #   [0]  obs
-        #   [1]  h
-        #   [2]  build_type_idx
-        #   [3]  build_dir_idx
-        #   [4]  move_dir_idx
-        #   [5]  value placeholder        <- leave as 0.0
-        #   [6]  n_working
-        #   [7]  conv_reward
-        #   [8]  ti_after
-        #   [9]  harv_reward
-        #   [10] enemy_dmg
-        #   [11] old_log_prob
-        #
-        # We append flow_bonus as a 13th field so the trainer can handle it
-        # separately from the per-step rewards (easier to tune weighting).
-
         log = self._train_log
 
-        # Append flow_bonus only to the terminal step
-        last = log[-1]
-        log[-1] = last + (flow_bonus,)
-
-        # Pad all earlier steps with 0.0 so every tuple has the same length
+        # Append flow_bonus as index 12 on the terminal step; 0.0 on all others.
+        log[-1] = log[-1] + (flow_bonus,)
         for i in range(len(log) - 1):
             log[i] = log[i] + (0.0,)
 
@@ -816,13 +797,11 @@ class Player:
         self._train_log = []
         _LIVE_LOG_PLAYERS.discard(self)
 
-def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
-    """Compute build_type and build_dir action masks.
 
-    Build directions allow both empty tiles and tiles with friendly non-core
-    buildings (the execution layer auto-destroys before building).
+def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], list[bool], list[bool]]:
+    """Compute build_type, build_dir, destroy_dir, and move_dir action masks.
 
-    Returns (bt_mask, bd_mask) as lists of booleans (True = allowed).
+    Returns (bt_mask, bd_mask, dd_mask, md_mask) as lists of booleans (True = allowed).
     """
     g = _GLOBAL_OBS_START
     ti = obs[g + 3] * 500.0
@@ -832,7 +811,7 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
     # Build type mask: can we afford it?
     bt_mask = [True]  # "none" always allowed
     any_affordable = False
-    for i in range(1, len(BUILD_COSTS)):
+    for i in range(1, 12):
         base_ti, base_ax = BUILD_COSTS[i]
         ok = ti >= int(scale * base_ti) and ax >= int(scale * base_ax)
         bt_mask.append(ok)
@@ -841,7 +820,10 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
     # Build dir mask: empty tile OR friendly non-core building (auto-destroyed).
     # Must not be a wall and must not have a unit.
     bd_mask = [False] * 9
-    any_dir = False
+    any_build_dir = False
+    dd_mask = [False] * 9
+    any_destroy_dir = False
+    md_mask = [False] * 9
     for d_idx in range(9):
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
         not_wall = obs[ts] == 0.0
@@ -850,13 +832,23 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
         replaceable = obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0
         if not_wall and no_unit and (empty or replaceable):
             bd_mask[d_idx] = True
-            any_dir = True
+            any_build_dir = True
+            md_mask[d_idx] = True
+        if obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0:
+            dd_mask[d_idx] = True
+            any_destroy_dir = True
+    md_mask[4] = True  # staying in place always allowed
 
-    # If nothing affordable or nowhere to build, force "none" (dir irrelevant)
-    if not any_affordable or not any_dir:
-        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9
+    # destroy action (index 12)
+    bt_mask.append(any_destroy_dir)
 
-    return bt_mask, bd_mask
+    # If nothing affordable/destroyable or no valid direction, force "none"
+    has_build = any_affordable and any_build_dir
+    has_destroy = any_destroy_dir
+    if not has_build and not has_destroy:
+        return [True] + [False] * 12, [True] * 9, [True] * 9, md_mask
+
+    return bt_mask, bd_mask, dd_mask, md_mask
 
 
 def _argmax(data: list[float], mask: list[bool] | None = None) -> int:
