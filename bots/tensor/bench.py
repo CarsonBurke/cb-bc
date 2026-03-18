@@ -11,6 +11,9 @@ in-game neural network dimensions (input ~30-60, hidden 32-64, output 5-10).
 import sys
 import time
 import random
+import gc
+
+gc.disable()
 
 sys.path.insert(0, "bots/tensor")
 from tensor_lib import Tensor, Linear, ReLU, SiLU, LayerNorm, Sequential, MLP, Adam, SGD
@@ -25,7 +28,7 @@ from main import (
 )
 
 
-def bench(fn, n=200, warmup=10, label=""):
+def bench(fn, n=2000, warmup=10, label=""):
     """Run fn n times, report median and p95 in microseconds."""
     for _ in range(warmup):
         fn()
