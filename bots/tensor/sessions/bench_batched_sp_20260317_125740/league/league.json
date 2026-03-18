@@ -1,0 +1,15 @@
+{
+  "models": [
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/bench_batched_sp_20260317_125740/league/gen_0.pkl",
+      "timestamp": 1773777460.4249249,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    }
+  ],
+  "matches": []
+}

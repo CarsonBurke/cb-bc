@@ -1,0 +1,95 @@
+{
+  "models": [
+    {
+      "id": "gen_0",
+      "gen": 0,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_0.pkl",
+      "timestamp": 1773784284.6210632,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_1",
+      "gen": 1,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_1.pkl",
+      "timestamp": 1773784350.2827706,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_2",
+      "gen": 2,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_2.pkl",
+      "timestamp": 1773784648.199816,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_3",
+      "gen": 3,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_3.pkl",
+      "timestamp": 1773785049.7745783,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_4",
+      "gen": 4,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_4.pkl",
+      "timestamp": 1773785469.7939143,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_5",
+      "gen": 5,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_5.pkl",
+      "timestamp": 1773785886.7311687,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_6",
+      "gen": 6,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_6.pkl",
+      "timestamp": 1773786313.0131276,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_7",
+      "gen": 7,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_7.pkl",
+      "timestamp": 1773786742.4257576,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    },
+    {
+      "id": "gen_8",
+      "gen": 8,
+      "elo": 1000,
+      "path": "/home/marvin/Documents/GitHub/cb-bc/bots/tensor/sessions/dummy300_o10_g4/league/gen_8.pkl",
+      "timestamp": 1773787169.7396493,
+      "wins": 0,
+      "losses": 0,
+      "draws": 0
+    }
+  ],
+  "matches": []
+}
