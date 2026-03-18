@@ -1,12 +1,11 @@
 # TODO
 
-## Observations
-- Adding all tile observations to agent input
+## Tooling
+- Ability to continue previous training sessions
 
 ## Rewards
-- Flow fields for conveyor bonus efficiency
-- Global critic (critic sees full map)
+- Revise conveyor bonus
 
 ## Architecture
+- Adding all tile observations to agent input
 - Different network architectures
-- Tensor lib optimizations
