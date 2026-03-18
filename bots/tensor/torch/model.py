@@ -32,8 +32,6 @@ N_DIR = 9
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
-LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.json"
-REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
 
 # ---- Action masking ----
 # Build costs (ti, ax) indexed by BUILD_ACTIONS:

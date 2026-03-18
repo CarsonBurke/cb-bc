@@ -18,6 +18,7 @@ gc.disable()
 from cambc import Controller, Direction, EntityType, Environment, Position
 
 from flow_field import score_conveyor_flow
+from replay_parser import score_conveyor_flow_from_replay
 
 import sys
 
@@ -759,14 +760,31 @@ class Player:
         terminal step. The trainer distributes this bonus across all conveyor-
         placing steps in the episode via _compute_gae.
 
-        Pass `ct` at end of game (round >= 1999). Called from atexit without
-        ct — skips scoring and writes 0.0.
+        Prefers the replay-based scorer (full global map knowledge) when a
+        matching .replay26 file exists. Falls back to the vision-limited
+        Controller scorer, then 0.0 if neither is available.
         """
         if not self._train_log or not _TRAIN_LOG:
             return
 
-        if ct is not None and self.core_center is not None and Player._all_ore:
-            try:
+        flow_bonus = 0.0
+
+        # Derive replay path from log path: same stem, .replay26 extension in REPLAY_DIR.
+        # REPLAY_DIR is imported from model.py at training time; here we reconstruct it.
+        try:
+            from pathlib import Path
+            log_stem = Path(_TRAIN_LOG).stem
+            replay_dir = Path(_TRAIN_LOG).parent.parent / "replays" / "training"
+            replay_path = replay_dir / f"{log_stem}.replay26"
+
+            if replay_path.exists():
+                # Full global scorer — complete wall/ore/conveyor data from replay
+                team_int = 0 if (self.my_team is not None and str(self.my_team) in ("0", "TEAM_A", "a")) else 1
+                flow_bonus = score_conveyor_flow_from_replay(replay_path, team=team_int)
+                FLOW_BONUS_SCALE = 3.0
+                flow_bonus *= FLOW_BONUS_SCALE
+            elif ct is not None and self.core_center is not None and Player._all_ore:
+                # Vision-limited fallback
                 flow_bonus = score_conveyor_flow(
                     ct,
                     team=self.my_team,
@@ -775,9 +793,7 @@ class Player:
                 )
                 FLOW_BONUS_SCALE = 3.0
                 flow_bonus *= FLOW_BONUS_SCALE
-            except Exception:
-                flow_bonus = 0.0
-        else:
+        except Exception:
             flow_bonus = 0.0
 
         log = self._train_log

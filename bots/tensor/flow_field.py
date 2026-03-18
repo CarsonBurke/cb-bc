@@ -1,20 +1,27 @@
 """
 flow_field.py — Post-mortem conveyor alignment scorer for tensor bot.
 
-Call `score_conveyor_flow(ct, team)` at end of game (round >= 1999) from
-_flush_log or wherever you assemble the terminal reward. Returns a float
-bonus to add to the final trajectory step.
+Two entry points:
+  score_conveyor_flow(ct, team, core_pos, ore_positions)
+      Vision-limited fallback using the bot's Controller API.
+      Used at end of game if no replay is available.
+
+  score_conveyor_flow_from_data(
+      wall_set, ore_positions, conv_data, core_xy, map_w, map_h
+  )
+      Pure-data scorer — no Controller dependency. Called by
+      replay_parser.score_conveyor_flow_from_replay() with full
+      global map knowledge extracted from the .replay26 file.
 
 Design:
-  1. Multi-source Dijkstra from core outward over all passable tiles.
-     Each tile gets (distance_to_core, flow_vector_pointing_back_to_core).
-  2. Flow vectors are ore-weighted: tiles near ore get a stronger pull,
-     boosting alignment rewards for conveyors placed near ore.
-  3. Per friendly conveyor: alignment = dot(facing, flow_vec_at_tile).
-  4. Connectivity discount: conveyors not in the chain reachable from core
-     are discounted by 1/(1 + bfs_hops_to_nearest_connected_conveyor).
-  5. Final score = sum of (ore_weight * alignment * connectivity_discount)
-     over all friendly conveyors, normalised by conveyor count.
+  1. Multi-source Dijkstra from core outward over all non-wall tiles.
+     Each tile gets a flow vector pointing back toward core, biased to
+     prefer paths near ore (lower edge cost near ore).
+  2. Per friendly conveyor: alignment = dot(facing, flow_vec_at_tile).
+  3. Connectivity discount: conveyors not reachable from core via the
+     conveyor graph are penalised by 1 / (1 + hops_to_nearest_connected).
+  4. Final score = log1p(sum of ore_weight * alignment * connectivity)
+     clipped per conveyor at MAX_SCORE_PER_CONV.
 """
 
 from __future__ import annotations
@@ -26,11 +33,33 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from cambc import Controller, Direction, EntityType, Position
 
-# Re-import at runtime (cambc is available in the bot environment)
 from cambc import Controller, Direction, EntityType, Environment, Position
 
-# Mirror of DIR_DXY from main.py
-_DIR_DXY: dict[Direction, tuple[int, int]] = {
+# Tuning knobs (shared by both paths)
+ORE_PROXIMITY_RADIUS = 4    # manhattan radius that counts as "near ore"
+ORE_WEIGHT_BASE      = 2.0  # weight for a tile directly on ore
+ORE_WEIGHT_FALLOFF   = 0.4  # additional weight per tile closer to ore
+DISCONNECT_SCALE     = 1.0  # hop penalty steepness
+MAX_SCORE_PER_CONV   = 3.0  # clip per-conveyor contribution
+
+# Cardinal (dx, dy) offsets — shared by both paths
+_CARDINALS = ((0, -1), (0, 1), (-1, 0), (1, 0))
+
+# replay_parser Direction enum int -> (dx, dy)
+_REPLAY_DIR_DXY = {
+    0: ( 0,  0),  # DIR_CENTRE
+    1: ( 0, -1),  # DIR_NORTH
+    2: ( 1, -1),  # DIR_NORTHEAST
+    3: ( 1,  0),  # DIR_EAST
+    4: ( 1,  1),  # DIR_SOUTHEAST
+    5: ( 0,  1),  # DIR_SOUTH
+    6: (-1,  1),  # DIR_SOUTHWEST
+    7: (-1,  0),  # DIR_WEST
+    8: (-1, -1),  # DIR_NORTHWEST
+}
+
+# cambc Direction -> (dx, dy)
+_DIR_DXY: dict = {
     Direction.NORTHWEST: (-1, -1),
     Direction.NORTH:     ( 0, -1),
     Direction.NORTHEAST: ( 1, -1),
@@ -43,78 +72,62 @@ _DIR_DXY: dict[Direction, tuple[int, int]] = {
 }
 
 _CONV_TYPES = (EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR, EntityType.SPLITTER)
-_CARDINAL = (Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST)
-
-# Tuning knobs
-ORE_PROXIMITY_RADIUS = 4      # tiles within this manhattan distance count as "near ore"
-ORE_WEIGHT_BASE      = 2.0    # multiplier for a tile directly on ore
-ORE_WEIGHT_FALLOFF   = 0.4    # weight added per tile closer to ore (linear)
-DISCONNECT_SCALE     = 1.0    # disconnect penalty steepness (higher = harsher)
-MAX_SCORE_PER_CONV   = 3.0    # clip individual conveyor contribution
 
 
 # ---------------------------------------------------------------------------
-# 1. Dijkstra flow field from core
+# Pure-data core algorithms (no Controller dependency)
 # ---------------------------------------------------------------------------
 
-def _build_flow_field(
-    ct: Controller,
-    core_pos: Position,
-    ore_positions: list[Position],
-) -> tuple[dict[tuple[int,int], float], dict[tuple[int,int], tuple[float,float]]]:
-    """
-    Multi-source Dijkstra from core outward.
-
-    Returns:
-        dist   : (x,y) -> float distance from core (0 at core)
-        flow   : (x,y) -> (fx, fy) unit vector pointing TOWARD core
-                 (i.e. the direction a conveyor here should face)
-    """
-    w, h = ct.get_map_width(), ct.get_map_height()
-
-    # Precompute ore weight map (manhattan proximity, capped at radius)
-    ore_weight: dict[tuple[int,int], float] = {}
-    for ore in ore_positions:
+def _build_ore_weights(
+    ore_positions: list[tuple[int, int]],
+) -> dict[tuple[int, int], float]:
+    """Precompute ore proximity weight for every tile within radius of any ore."""
+    ore_weight: dict[tuple[int, int], float] = {}
+    for ox, oy in ore_positions:
         for dy in range(-ORE_PROXIMITY_RADIUS, ORE_PROXIMITY_RADIUS + 1):
             for dx in range(-ORE_PROXIMITY_RADIUS, ORE_PROXIMITY_RADIUS + 1):
                 d = abs(dx) + abs(dy)
                 if d > ORE_PROXIMITY_RADIUS:
                     continue
-                key = (ore.x + dx, ore.y + dy)
+                key = (ox + dx, oy + dy)
                 w_val = ORE_WEIGHT_BASE + ORE_WEIGHT_FALLOFF * (ORE_PROXIMITY_RADIUS - d)
                 if ore_weight.get(key, 0.0) < w_val:
                     ore_weight[key] = w_val
+    return ore_weight
 
-    # Dijkstra: cost = sum of (1 / ore_weight) so high-ore paths are preferred
+
+def _build_flow_field_pure(
+    wall_set: set[tuple[int, int]],
+    ore_positions: list[tuple[int, int]],
+    core_xy: tuple[int, int],
+    map_w: int,
+    map_h: int,
+) -> dict[tuple[int, int], tuple[float, float]]:
+    """Dijkstra from core outward over all non-wall tiles.
+
+    Returns flow: (x,y) -> (fx, fy) unit vector pointing TOWARD core.
+    Edge cost is lower near ore so the field bends toward ore-rich paths.
+    """
+    ore_weight = _build_ore_weights(ore_positions)
+
     INF = float("inf")
-    dist: dict[tuple[int,int], float] = {}
-    parent: dict[tuple[int,int], tuple[int,int] | None] = {}
+    dist: dict[tuple[int, int], float] = {}
+    parent: dict[tuple[int, int], tuple[int, int] | None] = {}
 
-    start = (core_pos.x, core_pos.y)
-    heap: list[tuple[float, tuple[int,int]]] = [(0.0, start)]
-    dist[start] = 0.0
-    parent[start] = None
+    dist[core_xy] = 0.0
+    parent[core_xy] = None
+    heap: list[tuple[float, tuple[int, int]]] = [(0.0, core_xy)]
 
     while heap:
         d, (cx, cy) = heapq.heappop(heap)
         if d > dist.get((cx, cy), INF):
             continue
-        for direction in _CARDINAL:
-            ddx, ddy = _DIR_DXY[direction]
+        for ddx, ddy in _CARDINALS:
             nx, ny = cx + ddx, cy + ddy
-            if nx < 0 or nx >= w or ny < 0 or ny >= h:
+            if nx < 0 or nx >= map_w or ny < 0 or ny >= map_h:
                 continue
-            npos = Position(nx, ny)
-            try:
-                if not ct.is_tile_passable(npos):
-                    # walls block the field — skip
-                    # (conveyors on impassable tiles shouldn't exist anyway)
-                    env = ct.get_tile_env(npos)
-                    if env == Environment.WALL:
-                        continue
-            except Exception:
+            if (nx, ny) in wall_set:
                 continue
-            # Edge cost: lower near ore (encourage routing through ore-rich areas)
             w_val = ore_weight.get((nx, ny), 1.0)
             edge_cost = 1.0 / max(w_val, 0.1)
             nd = d + edge_cost
@@ -123,104 +136,28 @@ def _build_flow_field(
                 parent[(nx, ny)] = (cx, cy)
                 heapq.heappush(heap, (nd, (nx, ny)))
 
-    # Build flow vectors: each tile points toward its parent (toward core)
-    flow: dict[tuple[int,int], tuple[float,float]] = {}
+    # Build flow vectors: each tile points toward its Dijkstra parent (toward core)
+    flow: dict[tuple[int, int], tuple[float, float]] = {}
     for (x, y), par in parent.items():
         if par is None:
-            flow[(x, y)] = (0.0, 0.0)  # core itself
+            flow[(x, y)] = (0.0, 0.0)
             continue
         px, py = par
-        fx, fy = px - x, py - y          # raw vector toward core
+        fx, fy = px - x, py - y
         mag = math.sqrt(fx * fx + fy * fy)
-        if mag > 0:
-            flow[(x, y)] = (fx / mag, fy / mag)
-        else:
-            flow[(x, y)] = (0.0, 0.0)
+        flow[(x, y)] = (fx / mag, fy / mag) if mag > 0 else (0.0, 0.0)
 
-    return dist, flow
-
-
-# ---------------------------------------------------------------------------
-# 2. Connectivity BFS over friendly conveyor graph
-# ---------------------------------------------------------------------------
-
-def _connected_conveyors(
-    ct: Controller,
-    team,
-    core_pos: Position,
-) -> tuple[set[tuple[int,int]], dict[tuple[int,int], list[tuple[int,int]]]]:
-    """
-    BFS from core through adjacent friendly conveyors.
-
-    Returns:
-        connected : set of (x,y) keys reachable from core via conveyor chain
-        adj       : adjacency list for all friendly conveyors (for disconnect dist)
-    """
-    w, h = ct.get_map_width(), ct.get_map_height()
-
-    # Collect all friendly conveyors by scanning the full map
-    # (end-of-game, so we can afford a full sweep)
-    all_conv: set[tuple[int,int]] = set()
-    adj: dict[tuple[int,int], list[tuple[int,int]]] = {}
-
-    for y in range(h):
-        for x in range(w):
-            pos = Position(x, y)
-            try:
-                bid = ct.get_tile_building_id(pos)
-                if bid is None:
-                    continue
-                btype = ct.get_entity_type(bid)
-                if btype not in _CONV_TYPES:
-                    continue
-                if ct.get_team(bid) != team:
-                    continue
-                key = (x, y)
-                all_conv.add(key)
-                adj[key] = []
-            except Exception:
-                continue
-
-    # Build adjacency (cardinal neighbours that are also friendly conveyors)
-    for (x, y) in all_conv:
-        for direction in _CARDINAL:
-            ddx, ddy = _DIR_DXY[direction]
-            nk = (x + ddx, y + ddy)
-            if nk in all_conv:
-                adj[(x, y)].append(nk)
-
-    # BFS from core's cardinal neighbours
-    connected: set[tuple[int,int]] = set()
-    queue: list[tuple[int,int]] = []
-    for direction in _CARDINAL:
-        ddx, ddy = _DIR_DXY[direction]
-        nk = (core_pos.x + ddx, core_pos.y + ddy)
-        if nk in all_conv and nk not in connected:
-            connected.add(nk)
-            queue.append(nk)
-
-    head = 0
-    while head < len(queue):
-        cur = queue[head]; head += 1
-        for nb in adj.get(cur, []):
-            if nb not in connected:
-                connected.add(nb)
-                queue.append(nb)
-
-    return connected, adj
+    return flow
 
 
 def _disconnect_distances(
-    connected: set[tuple[int,int]],
-    adj: dict[tuple[int,int], list[tuple[int,int]]],
-    all_conv: set[tuple[int,int]],
-) -> dict[tuple[int,int], int]:
-    """
-    BFS from all connected conveyors outward to find minimum hop distance
-    to the connected chain for every disconnected conveyor.
-    Returns dist map (0 = in chain, >=1 = hops away).
-    """
-    dist: dict[tuple[int,int], int] = {k: 0 for k in connected}
+    connected: set[tuple[int, int]],
+    adj: dict[tuple[int, int], list[tuple[int, int]]],
+    all_conv: set[tuple[int, int]],
+) -> dict[tuple[int, int], int]:
+    """BFS from the connected chain outward.
+    Returns hop distance to nearest connected conveyor for each conveyor."""
+    dist: dict[tuple[int, int], int] = {k: 0 for k in connected}
     queue = list(connected)
     head = 0
     while head < len(queue):
@@ -229,90 +166,44 @@ def _disconnect_distances(
             if nb not in dist:
                 dist[nb] = dist[cur] + 1
                 queue.append(nb)
-    # Any conveyor not reached gets max distance
+    max_dist = len(all_conv) + 1
     for k in all_conv:
         if k not in dist:
-            dist[k] = len(all_conv) + 1
+            dist[k] = max_dist
     return dist
 
 
-# ---------------------------------------------------------------------------
-# 3. Main scorer
-# ---------------------------------------------------------------------------
-
-def score_conveyor_flow(
-    ct: Controller,
-    team,
-    core_pos: Position,
-    ore_positions: list[Position],
+def _score_from_data(
+    flow: dict[tuple[int, int], tuple[float, float]],
+    ore_positions: list[tuple[int, int]],
+    conv_data: dict[tuple[int, int], tuple[float, float]],
+    core_xy: tuple[int, int],
 ) -> float:
-    """
-    Compute post-mortem flow field alignment score for all friendly conveyors.
+    """Score friendly conveyors against the precomputed flow field.
 
-    Args:
-        ct           : Controller (end-of-game state)
-        team         : the bot's team identifier
-        core_pos     : Position of the friendly core
-        ore_positions: list of known ore tile positions (from Player._all_ore)
-
-    Returns:
-        float bonus score (unnormalised sum, ready to scale before injecting
-        into the terminal trajectory step)
+    conv_data: {(x,y): (facing_dx, facing_dy)} — facing vector should be
+               unit-length (or zero for unknown direction).
+    Returns log1p-compressed total alignment score.
     """
-    if not ore_positions:
+    if not conv_data:
         return 0.0
 
-    # 1. Build flow field
-    _, flow = _build_flow_field(ct, core_pos, ore_positions)
+    all_conv = set(conv_data.keys())
 
-    # 2. Build conveyor connectivity
-    w, h = ct.get_map_width(), ct.get_map_height()
-    all_conv: set[tuple[int,int]] = set()
-    conv_dirs: dict[tuple[int,int], tuple[float,float]] = {}
-    adj: dict[tuple[int,int], list[tuple[int,int]]] = {}
-
-    for y in range(h):
-        for x in range(w):
-            pos = Position(x, y)
-            try:
-                bid = ct.get_tile_building_id(pos)
-                if bid is None:
-                    continue
-                btype = ct.get_entity_type(bid)
-                if btype not in _CONV_TYPES:
-                    continue
-                if ct.get_team(bid) != team:
-                    continue
-                key = (x, y)
-                all_conv.add(key)
-                adj[key] = []
-                try:
-                    cdir = ct.get_direction(bid)
-                    ddx, ddy = _DIR_DXY.get(cdir, (0, 0))
-                    mag = math.sqrt(ddx*ddx + ddy*ddy)
-                    conv_dirs[key] = (ddx/mag, ddy/mag) if mag > 0 else (0.0, 0.0)
-                except Exception:
-                    conv_dirs[key] = (0.0, 0.0)
-            except Exception:
-                continue
-
-    if not all_conv:
-        return 0.0
-
-    # Build adjacency
+    # Build adjacency over the conveyor graph
+    adj: dict[tuple[int, int], list[tuple[int, int]]] = {k: [] for k in all_conv}
     for (x, y) in all_conv:
-        for direction in _CARDINAL:
-            ddx, ddy = _DIR_DXY[direction]
+        for ddx, ddy in _CARDINALS:
             nk = (x + ddx, y + ddy)
             if nk in all_conv:
                 adj[(x, y)].append(nk)
 
-    # BFS connectivity from core
-    connected: set[tuple[int,int]] = set()
-    queue: list[tuple[int,int]] = []
-    for direction in _CARDINAL:
-        ddx, ddy = _DIR_DXY[direction]
-        nk = (core_pos.x + ddx, core_pos.y + ddy)
+    # BFS connectivity from core's cardinal neighbours
+    connected: set[tuple[int, int]] = set()
+    queue: list[tuple[int, int]] = []
+    cx, cy = core_xy
+    for ddx, ddy in _CARDINALS:
+        nk = (cx + ddx, cy + ddy)
         if nk in all_conv and nk not in connected:
             connected.add(nk)
             queue.append(nk)
@@ -325,40 +216,115 @@ def score_conveyor_flow(
                 queue.append(nb)
 
     disconnect_dist = _disconnect_distances(connected, adj, all_conv)
+    ore_weight_map = _build_ore_weights(ore_positions)
 
-    # Precompute ore weight per tile (reuse same logic as flow field)
-    ore_weight_map: dict[tuple[int,int], float] = {}
-    for ore in ore_positions:
-        for dy in range(-ORE_PROXIMITY_RADIUS, ORE_PROXIMITY_RADIUS + 1):
-            for dx in range(-ORE_PROXIMITY_RADIUS, ORE_PROXIMITY_RADIUS + 1):
-                d = abs(dx) + abs(dy)
-                if d > ORE_PROXIMITY_RADIUS:
-                    continue
-                key = (ore.x + dx, ore.y + dy)
-                w_val = ORE_WEIGHT_BASE + ORE_WEIGHT_FALLOFF * (ORE_PROXIMITY_RADIUS - d)
-                if ore_weight_map.get(key, 0.0) < w_val:
-                    ore_weight_map[key] = w_val
-
-    # 3. Score each conveyor
     total = 0.0
-    for key, (cdx, cdy) in conv_dirs.items():
+    for key, (cdx, cdy) in conv_data.items():
         fvec = flow.get(key)
         if fvec is None:
             continue  # tile unreachable from core — no reward
-
         fx, fy = fvec
-        # Dot product: +1 = perfectly aligned toward core, -1 = facing away
         alignment = cdx * fx + cdy * fy
-
-        # Ore proximity weight
         ore_w = ore_weight_map.get(key, 1.0)
-
-        # Connectivity discount
         hops = disconnect_dist.get(key, len(all_conv) + 1)
         connectivity = 1.0 / (1.0 + DISCONNECT_SCALE * hops)
-
         contribution = min(ore_w * alignment * connectivity, MAX_SCORE_PER_CONV)
         total += contribution
 
-    # Incentivise more conveyors
-    return math.log1p(total)
+    return math.log1p(max(total, 0.0))
+
+
+# ---------------------------------------------------------------------------
+# Public entry point: pure-data (replay path)
+# ---------------------------------------------------------------------------
+
+def score_conveyor_flow_from_data(
+    wall_set: set[tuple[int, int]],
+    ore_positions: list[tuple[int, int]],
+    conv_data: dict[tuple[int, int], tuple[float, float]],
+    core_xy: tuple[int, int],
+    map_w: int,
+    map_h: int,
+) -> float:
+    """Score conveyor alignment using globally-accurate data.
+
+    Called by replay_parser.score_conveyor_flow_from_replay() which
+    extracts all inputs from the .replay26 file without vision limits.
+
+    Args:
+        wall_set     : set of (x,y) wall tile coordinates (complete)
+        ore_positions: list of (x,y) ore tile coordinates (complete)
+        conv_data    : {(x,y): (facing_dx, facing_dy)} for all friendly
+                       conveyors — facing vector must be unit-length or zero
+        core_xy      : (x,y) of the friendly core
+        map_w, map_h : full map dimensions
+
+    Returns:
+        float alignment score (log1p-compressed, unscaled)
+    """
+    if not ore_positions or not conv_data:
+        return 0.0
+    flow = _build_flow_field_pure(wall_set, ore_positions, core_xy, map_w, map_h)
+    return _score_from_data(flow, ore_positions, conv_data, core_xy)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point: vision-limited fallback (Controller path)
+# ---------------------------------------------------------------------------
+
+def score_conveyor_flow(
+    ct: Controller,
+    team,
+    core_pos: Position,
+    ore_positions: list[Position],
+) -> float:
+    """Vision-limited fallback scorer using the bot's Controller API.
+
+    Prefer score_conveyor_flow_from_replay() in replay_parser.py when a
+    replay file is available — it has complete global map knowledge and
+    correct wall routing.
+    """
+    if not ore_positions:
+        return 0.0
+
+    w, h = ct.get_map_width(), ct.get_map_height()
+    ore_xy: list[tuple[int, int]] = [(p.x, p.y) for p in ore_positions]
+
+    # Collect walls from visible tiles — non-visible assumed passable
+    wall_set: set[tuple[int, int]] = set()
+    for y in range(h):
+        for x in range(w):
+            pos = Position(x, y)
+            try:
+                if ct.is_in_vision(pos) and ct.get_tile_env(pos) == Environment.WALL:
+                    wall_set.add((x, y))
+            except Exception:
+                pass
+
+    flow = _build_flow_field_pure(wall_set, ore_xy, (core_pos.x, core_pos.y), w, h)
+
+    # Collect friendly conveyors from vision only
+    conv_data: dict[tuple[int, int], tuple[float, float]] = {}
+    for y in range(h):
+        for x in range(w):
+            pos = Position(x, y)
+            try:
+                bid = ct.get_tile_building_id(pos)
+                if bid is None:
+                    continue
+                if ct.get_entity_type(bid) not in _CONV_TYPES:
+                    continue
+                if ct.get_team(bid) != team:
+                    continue
+                cdir = ct.get_direction(bid)
+                ddx, ddy = _DIR_DXY.get(cdir, (0, 0))
+                mag = math.sqrt(ddx * ddx + ddy * ddy)
+                conv_data[(x, y)] = (ddx / mag, ddy / mag) if mag > 0 else (0.0, 0.0)
+            except Exception:
+                continue
+
+    return _score_from_data(flow, ore_xy, conv_data, (core_pos.x, core_pos.y))
+
+
+# Expose for import by replay_parser
+REPLAY_DIR_DXY = _REPLAY_DIR_DXY

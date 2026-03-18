@@ -226,7 +226,6 @@ PROTO_JSON = {
 
 # --- Pure-Python protobuf decoder (no dependencies) ---
 
-# Wire types
 VARINT = 0
 FIXED64 = 1
 LENGTH_DELIMITED = 2
@@ -234,7 +233,6 @@ FIXED32 = 5
 
 
 def _decode_varint(data: bytes, pos: int) -> tuple[int, int]:
-    """Decode a varint, return (value, new_pos)."""
     result = 0
     shift = 0
     while True:
@@ -252,7 +250,6 @@ def _decode_zigzag(n: int) -> int:
 
 
 def _decode_message(data: bytes, start: int, end: int) -> dict[int, list]:
-    """Decode raw protobuf fields into {field_id: [values]}."""
     fields: dict[int, list] = {}
     pos = start
     while pos < end:
@@ -277,7 +274,6 @@ def _decode_message(data: bytes, start: int, end: int) -> dict[int, list]:
     return fields
 
 
-# Type mapping for schema interpretation
 _SCALAR_TYPES = {
     "int32", "int64", "uint32", "uint64", "sint32", "sint64",
     "bool", "fixed32", "fixed64", "sfixed32", "sfixed64",
@@ -294,10 +290,9 @@ def _is_message(type_name: str, schema: dict) -> bool:
 
 
 def _decode_typed(field_type: str, wire_type: int, value, schema: dict):
-    """Decode a single field value according to its schema type."""
     if field_type in ("int32", "int64", "uint32", "uint64"):
         if wire_type == VARINT:
-            return value  # already decoded
+            return value
         return int.from_bytes(value, "little")
     elif field_type in ("sint32", "sint64"):
         return _decode_zigzag(value)
@@ -323,12 +318,9 @@ def _decode_typed(field_type: str, wire_type: int, value, schema: dict):
 
 
 def decode_proto(msg_type: str, data: bytes, schema: dict) -> dict:
-    """Decode a protobuf message using the schema."""
     msg_schema = schema[msg_type]
     field_defs = msg_schema.get("fields", {})
-    oneofs = msg_schema.get("oneofs", {})
 
-    # Build id -> field_name, field_type mapping
     id_to_field = {}
     for fname, fdef in field_defs.items():
         id_to_field[fdef["id"]] = (fname, fdef.get("type", "bytes"), fdef.get("rule", ""))
@@ -343,37 +335,26 @@ def decode_proto(msg_type: str, data: bytes, schema: dict) -> dict:
         if frule == "repeated":
             result[fname] = [_decode_typed(ftype, wt, val, schema) for wt, val in entries]
         else:
-            wt, val = entries[-1]  # last wins for non-repeated
+            wt, val = entries[-1]
             result[fname] = _decode_typed(ftype, wt, val, schema)
 
     return result
 
 
-# --- High-level replay parsing ---
-
 SCHEMA = PROTO_JSON["nested"]
 
 
-def parse_replay(path: str | Path) -> dict:
+def parse_replay(path: "str | Path") -> dict:
     """Parse a .replay26 file and return the decoded Replay message."""
     data = Path(path).read_bytes()
     return decode_proto("Replay", data, SCHEMA)
 
 
 def extract_turn_states(replay: dict) -> list[dict]:
-    """Process replay turns into per-turn game state snapshots.
-
-    Returns list of dicts, one per turn, with:
-    - entities: {id: entity_dict} — current entity states
-    - working_harvesters: {team: count} — harvesters with cooldown > 0
-    - resource_moves: [(from_pos, to_pos)] — resource flow events
-    - player_resources: {team: {ti, ax, collected}} — player totals
-    - core_hp: {team: hp}
-    """
-    entities = {}  # id -> entity state
+    """Process replay turns into per-turn game state snapshots."""
+    entities = {}
     turn_states = []
 
-    # Initialize cores from map data
     if "map" in replay:
         for core in replay["map"].get("cores", []):
             eid = core["id"]
@@ -403,48 +384,40 @@ def extract_turn_states(replay: dict) -> list[dict]:
                         extra = ent[k] if isinstance(ent[k], dict) else {}
                         break
                 entities[eid] = {
-                    "id": eid,
-                    "kind": kind,
+                    "id": eid, "kind": kind,
                     "team": ent.get("team", 0),
                     "position": ent.get("position", {}),
                     "hp": ent.get("hp", 0),
                     "maxHp": ent.get("maxHp", 0),
                     **extra,
                 }
-
             elif "moveBuilderBot" in update:
                 mv = update["moveBuilderBot"]
                 eid = mv.get("id", 0)
                 if eid in entities:
                     entities[eid]["position"] = mv.get("to", {})
-
             elif "removeEntity" in update:
                 eid = update["removeEntity"].get("id", 0)
                 entities.pop(eid, None)
-
             elif "updateHp" in update:
                 hp_update = update["updateHp"]
                 eid = hp_update.get("id", 0)
                 if eid in entities:
                     entities[eid]["hp"] = entities[eid].get("hp", 0) + hp_update.get("delta", 0)
-
             elif "setActionCooldown" in update:
                 cd = update["setActionCooldown"]
                 eid = cd.get("id", 0)
                 if eid in entities:
                     entities[eid]["actionCooldown"] = cd.get("value", 0)
-
             elif "setMoveCooldown" in update:
                 cd = update["setMoveCooldown"]
                 eid = cd.get("id", 0)
                 if eid in entities:
                     entities[eid]["moveCooldown"] = cd.get("value", 0)
-
             elif "distributeResources" in update:
                 dist = update["distributeResources"]
                 for mv in dist.get("moves", []):
                     resource_moves.append((mv.get("from", {}), mv.get("to", {})))
-
             elif "updatePlayers" in update:
                 players = update["updatePlayers"].get("players", {})
                 for team_key in ("a", "b"):
@@ -458,7 +431,6 @@ def extract_turn_states(replay: dict) -> list[dict]:
                             "axioniteCollected": p.get("axioniteCollected", 0),
                         }
 
-        # Count working harvesters per team
         working = {0: 0, 1: 0}
         for ent in entities.values():
             if ent.get("kind") == "harvester":
@@ -466,7 +438,6 @@ def extract_turn_states(replay: dict) -> list[dict]:
                 if cd and cd > 0:
                     working[ent.get("team", 0)] += 1
 
-        # Core HP per team
         core_hp = {}
         for ent in entities.values():
             if ent.get("kind") == "core":
@@ -485,19 +456,10 @@ def extract_turn_states(replay: dict) -> list[dict]:
 
 
 def extract_working_harvesters_from_replay(replay: dict) -> dict[int, dict[int, int]]:
-    """Extract per-turn working harvester counts per team from a parsed replay.
+    """Extract per-turn working harvester counts per team from a parsed replay."""
+    entities = {}
+    harv_positions = {}
 
-    Uses the same logic as the visualiser:
-    - When distributeResources moves FROM a harvester position, set its cooldown to 3
-    - Each turn, decrement all harvester cooldowns
-    - A harvester with cooldown > 0 is "working"
-
-    Returns {turn_number: {team_0_count, team_1_count}}.
-    """
-    entities = {}  # id -> {kind, team, position, cooldown}
-    harv_positions = {}  # (x, y) -> entity
-
-    # Init cores from map
     if "map" in replay:
         for core in replay["map"].get("cores", []):
             entities[core["id"]] = {
@@ -507,14 +469,12 @@ def extract_working_harvesters_from_replay(replay: dict) -> dict[int, dict[int, 
 
     result = {}
     for turn_idx, turn in enumerate(replay.get("turns", [])):
-        # Decrement harvester cooldowns (start of turn, like visualiser)
         for ent in entities.values():
             if ent.get("kind") == "harvester":
                 cd = ent.get("cooldown", 0)
                 if cd > 0:
                     ent["cooldown"] = cd - 1
 
-        # Process updates
         for update in turn.get("updates", []):
             if "placeEntity" in update:
                 ent = update["placeEntity"].get("entity", {})
@@ -536,14 +496,12 @@ def extract_working_harvesters_from_replay(replay: dict) -> dict[int, dict[int, 
                 if kind == "harvester":
                     pos = entity["position"]
                     harv_positions[(pos.get("x", -1), pos.get("y", -1))] = entity
-
             elif "removeEntity" in update:
                 eid = update["removeEntity"].get("id", 0)
                 ent = entities.pop(eid, None)
                 if ent and ent.get("kind") == "harvester":
                     pos = ent.get("position", {})
                     harv_positions.pop((pos.get("x", -1), pos.get("y", -1)), None)
-
             elif "moveBuilderBot" in update:
                 mv = update["moveBuilderBot"]
                 eid = mv.get("id", 0)
@@ -557,7 +515,6 @@ def extract_working_harvesters_from_replay(replay: dict) -> dict[int, dict[int, 
                         harv_positions[(new_pos.get("x", -1), new_pos.get("y", -1))] = ent
                     else:
                         ent["position"] = mv.get("to", {})
-
             elif "distributeResources" in update:
                 for mv in update["distributeResources"].get("moves", []):
                     from_pos = mv.get("from", {})
@@ -566,7 +523,6 @@ def extract_working_harvesters_from_replay(replay: dict) -> dict[int, dict[int, 
                     if ent is not None:
                         ent["cooldown"] = 3
 
-        # Count working harvesters per team
         counts = {0: 0, 1: 0}
         for ent in harv_positions.values():
             if ent.get("cooldown", 0) > 0:
@@ -576,15 +532,14 @@ def extract_working_harvesters_from_replay(replay: dict) -> dict[int, dict[int, 
     return result
 
 
-def extract_working_harvesters(replay_path: str | Path) -> dict[int, dict[int, int]]:
+def extract_working_harvesters(replay_path: "str | Path") -> dict[int, dict[int, int]]:
     """Extract per-turn working harvester counts per team from a replay file."""
     replay = parse_replay(replay_path)
     return extract_working_harvesters_from_replay(replay)
 
 
-# Obs vector layout indices
-_GLOBAL_START = 25 * 17  # GRID_SIZE^2 * TILE_FEATURES = 425
-_ROUND_OBS_IDX = _GLOBAL_START  # first global feature = rnd / 2000.0
+_GLOBAL_START = 25 * 17
+_ROUND_OBS_IDX = _GLOBAL_START
 
 
 def augment_trajectories_with_working_counts(
@@ -592,27 +547,20 @@ def augment_trajectories_with_working_counts(
     working: dict[int, dict[int, int]],
     team: int = 0,
 ) -> list[list]:
-    """Override n_working in trajectory steps with precomputed replay ground truth.
-
-    Each trajectory step is a tuple with n_working at index 6.
-    Round number is extracted from obs[425] (= rnd / 2000.0).
-    """
+    """Override n_working in trajectory steps with precomputed replay ground truth."""
     if not working:
-        return trajectories  # fallback: leave unchanged
+        return trajectories
 
     for traj in trajectories:
         for i, step in enumerate(traj):
             if not isinstance(step, (list, tuple)) or len(step) < 7:
                 continue
-            # Convert to list if tuple
             if isinstance(step, tuple):
                 step = list(step)
                 traj[i] = step
-            # Extract round from obs
             obs = step[0]
             rnd = int(round(obs[_ROUND_OBS_IDX] * 2000.0))
             rnd = max(0, min(rnd, 1999))
-            # Get working harvester count for this team at this round
             counts = working.get(rnd, {})
             n_working = counts.get(team, 0)
             step[6] = n_working
@@ -622,7 +570,7 @@ def augment_trajectories_with_working_counts(
 
 def augment_trajectories_with_replay(
     trajectories: list[list],
-    replay_path: str | Path,
+    replay_path: "str | Path",
     team: int = 0,
 ) -> list[list]:
     """Override n_working in trajectory steps with replay ground truth."""
@@ -631,6 +579,139 @@ def augment_trajectories_with_replay(
     except Exception:
         return trajectories
     return augment_trajectories_with_working_counts(trajectories, working, team)
+
+
+# ---------------------------------------------------------------------------
+# Flow field scorer — uses complete global map data from the replay
+# ---------------------------------------------------------------------------
+
+from flow_field import score_conveyor_flow_from_data, REPLAY_DIR_DXY
+
+# Conveyor-like entity kinds in the replay schema
+_CONV_KINDS = {"conveyor", "splitter", "armouredConveyor"}
+
+# Environment tile values
+_ENV_WALL         = 1
+_ENV_ORE_TITANIUM = 2
+_ENV_ORE_AXIONITE = 3
+
+
+def score_conveyor_flow_from_replay(
+    replay_path: "str | Path",
+    team: int = 0,
+) -> float:
+    """Compute the flow field alignment score from a complete replay file.
+
+    Uses full global map knowledge — no vision limits — giving an accurate
+    score for every friendly conveyor regardless of where bots were standing
+    at end of game.
+
+    Args:
+        replay_path : path to the .replay26 file for this game
+        team        : 0 for TEAM_A, 1 for TEAM_B
+
+    Returns:
+        float alignment score (log1p-compressed, unscaled).
+        Multiply by FLOW_BONUS_SCALE in _flush_log as usual.
+    """
+    replay = parse_replay(replay_path)
+
+    map_data = replay.get("map", {})
+    map_w = map_data.get("width", 0)
+    map_h = map_data.get("height", 0)
+    if map_w == 0 or map_h == 0:
+        return 0.0
+
+    # --- Extract wall and ore positions from the static tile map ---
+    wall_set: set[tuple[int, int]] = set()
+    ore_positions: list[tuple[int, int]] = []
+
+    for y, row in enumerate(map_data.get("rows", [])):
+        for x, tile_env in enumerate(row.get("tiles", [])):
+            if tile_env == _ENV_WALL:
+                wall_set.add((x, y))
+            elif tile_env in (_ENV_ORE_TITANIUM, _ENV_ORE_AXIONITE):
+                ore_positions.append((x, y))
+
+    if not ore_positions:
+        return 0.0
+
+    # --- Reconstruct final entity state by replaying all turns ---
+    entities: dict[int, dict] = {}
+
+    # Seed cores from map metadata
+    for core in map_data.get("cores", []):
+        eid = core["id"]
+        pos = core.get("position", {})
+        entities[eid] = {
+            "id": eid, "kind": "core",
+            "team": core.get("team", 0),
+            "position": pos,
+        }
+
+    for turn in replay.get("turns", []):
+        for update in turn.get("updates", []):
+            if "placeEntity" in update:
+                ent = update["placeEntity"].get("entity", {})
+                eid = ent.get("id", 0)
+                kind = None
+                extra = {}
+                for k in ("builderBot", "conveyor", "splitter", "armouredConveyor",
+                          "bridge", "harvester", "foundry", "road", "barrier",
+                          "marker", "core", "gunner", "sentinel", "breach", "launcher"):
+                    if k in ent:
+                        kind = k
+                        extra = ent[k] if isinstance(ent[k], dict) else {}
+                        break
+                entities[eid] = {
+                    "id": eid, "kind": kind,
+                    "team": ent.get("team", 0),
+                    "position": ent.get("position", {}),
+                    **extra,
+                }
+            elif "removeEntity" in update:
+                entities.pop(update["removeEntity"].get("id", 0), None)
+            elif "moveBuilderBot" in update:
+                mv = update["moveBuilderBot"]
+                eid = mv.get("id", 0)
+                if eid in entities:
+                    entities[eid]["position"] = mv.get("to", {})
+
+    # --- Find friendly core position ---
+    core_xy: tuple[int, int] | None = None
+    for ent in entities.values():
+        if ent.get("kind") == "core" and ent.get("team", -1) == team:
+            pos = ent.get("position", {})
+            core_xy = (pos.get("x", 0), pos.get("y", 0))
+            break
+
+    if core_xy is None:
+        return 0.0
+
+    # --- Collect friendly conveyor facing vectors ---
+    conv_data: dict[tuple[int, int], tuple[float, float]] = {}
+    for ent in entities.values():
+        if ent.get("kind") not in _CONV_KINDS:
+            continue
+        if ent.get("team", -1) != team:
+            continue
+        pos = ent.get("position", {})
+        x, y = pos.get("x", -1), pos.get("y", -1)
+        if x < 0 or y < 0:
+            continue
+        dir_int = ent.get("direction", 0)
+        ddx, ddy = REPLAY_DIR_DXY.get(dir_int, (0, 0))
+        mag = (ddx * ddx + ddy * ddy) ** 0.5
+        conv_data[(x, y)] = (ddx / mag, ddy / mag) if mag > 0 else (0.0, 0.0)
+
+    return score_conveyor_flow_from_data(
+        wall_set=wall_set,
+        ore_positions=ore_positions,
+        conv_data=conv_data,
+        core_xy=core_xy,
+        map_w=map_w,
+        map_h=map_h,
+    )
 
 
 if __name__ == "__main__":

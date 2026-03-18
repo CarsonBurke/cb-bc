@@ -9,7 +9,7 @@ import json
 import os
 import pickle
 
-from replay_parser import extract_working_harvesters, parse_replay, extract_working_harvesters_from_replay
+from bots.tensor.replay_parser import parse_replay, extract_working_harvesters_from_replay
 
 
 def _run_game_proxy(args):

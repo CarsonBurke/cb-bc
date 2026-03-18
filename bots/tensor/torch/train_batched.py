@@ -51,8 +51,6 @@ def _maybe_run_worker_mode() -> None:
 _maybe_run_worker_mode()
 
 import torch
-import torch.nn.functional as F
-
 
 from model import (
     BuilderMLP,
@@ -61,13 +59,11 @@ from model import (
     OBS_SIZE,
     TILE_FEATURES,
     TEACHER_HIDDEN,
-    _parse_trajectories,
     compute_action_masks,
-    distill,
     sample_logits_gumbel,
     train_on_trajectories,
 )
-from replay_parser import augment_trajectories_with_working_counts
+from bots.tensor.replay_parser import augment_trajectories_with_working_counts
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
@@ -75,7 +71,7 @@ WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
 
 from training_utils import (
     League, _init_session, _default_session_name, _read_trajectory_file,
-    ELO_K, ELO_DEFAULT,
+    ELO_DEFAULT,
 )
 
 # Struct-based binary IPC protocol constants
