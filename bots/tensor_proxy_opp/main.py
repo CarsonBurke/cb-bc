@@ -6,6 +6,7 @@ Same as tensor_proxy but:
 - Uses argmax (greedy) actions from server response
 """
 
+from array import array
 import importlib.util
 import math
 import os
@@ -42,12 +43,14 @@ DIR_DXY = _TENSOR_MAIN.DIR_DXY
 _argmax = _TENSOR_MAIN._argmax
 _TensorPlayer = _TENSOR_MAIN.Player
 
-# Struct-based binary IPC protocol (replaces pickle for speed)
+# Struct-based binary IPC protocol
 _OBS_FLOATS = INPUT_SIZE + H_DIM
-_OBS_STRUCT = struct.Struct(f'={_OBS_FLOATS}f')
+_OBS_BYTES = _OBS_FLOATS * 4
+_ACT_HEAD = struct.Struct('=iii')
 _ACT_INTS = 3  # bt, bd, md
 _ACT_B_FLOATS = H_DIM  # h_next only (no log_prob for opponent)
-_ACT_B_STRUCT = struct.Struct(f'={_ACT_INTS}i{_ACT_B_FLOATS}f')
+_ACT_B_SIZE = _ACT_INTS * 4 + _ACT_B_FLOATS * 4
+_H_BYTES = H_DIM * 4
 
 _opened_pipes = {}
 
@@ -69,31 +72,36 @@ def _get_pipes():
 
 
 def _read_exact(fd, n):
-    data = b""
-    while len(data) < n:
-        chunk = os.read(fd, n - len(data))
+    data = bytearray(n)
+    view = memoryview(data)
+    used = 0
+    while used < n:
+        chunk = os.read(fd, n - used)
         if not chunk:
             return None
-        data += chunk
+        end = used + len(chunk)
+        view[used:end] = chunk
+        used = end
     return data
 
 
-def _send_obs(obs_wfd, game_id, unit_id, obs, h_prev):
-    payload = _OBS_STRUCT.pack(*obs, *h_prev)
-    os.write(obs_wfd, struct.pack('=I', len(payload)) + payload)
+def _send_obs(obs_wfd, obs, h_prev):
+    os.writev(
+        obs_wfd,
+        (
+            memoryview(obs).cast("B"),
+            memoryview(h_prev).cast("B"),
+        ),
+    )
 
 
 def _recv_action(act_rfd):
-    raw = _read_exact(act_rfd, 4)
-    if raw is None:
-        return None
-    length = struct.unpack('=I', raw)[0]
-    data = _read_exact(act_rfd, length)
+    data = _read_exact(act_rfd, _ACT_B_SIZE)
     if data is None:
         return None
-    vals = _ACT_B_STRUCT.unpack(data)
-    bt, bd, md = vals[0], vals[1], vals[2]
-    h_next = list(vals[3:3 + H_DIM])
+    bt, bd, md = _ACT_HEAD.unpack_from(data, 0)
+    h_next = array("f")
+    h_next.frombytes(data[12:12 + _H_BYTES])
     return bt, bd, md, h_next
 
 
@@ -104,8 +112,8 @@ class Player:
         self.my_team = None
         self.num_spawned = 0
         self.pos_encoder = SinusoidalPositionEmbedding(POS_EMBED_DIM)
-        self.h_prev = [0.0] * H_DIM
-        self._prev_reward = 0.0
+        self.h_prev = array("f", [0.0] * H_DIM)
+        self._obs_buf = array("f")
         self._prev_resources = None
         self._n_builders_cached = 1
         self._unit_id = id(self) % (2**31)
@@ -141,21 +149,11 @@ class Player:
             self.my_team = ct.get_team()
         if self.core_center is None:
             self._find_core(ct)
-        if self.enemy_core is None:
-            for eid in ct.get_nearby_entities():
-                try:
-                    if ct.get_entity_type(eid) == EntityType.CORE and ct.get_team(eid) != self.my_team:
-                        self.enemy_core = ct.get_position(eid)
-                        break
-                except Exception:
-                    continue
-
-        obs = self._encode_state(ct)
+        obs = self._encode_state_buf(ct)
         obs_wfd, act_rfd = _get_pipes()
-        game_id = int(os.environ.get("TENSOR_GAME_ID", "0"))
 
         if obs_wfd is not None:
-            _send_obs(obs_wfd, game_id, self._unit_id, obs, self.h_prev)
+            _send_obs(obs_wfd, obs, self.h_prev)
             result = _recv_action(act_rfd)
             if result is not None:
                 build_type_idx, build_dir_idx, move_dir_idx, h_next = result
@@ -234,6 +232,11 @@ class Player:
         elif action == "launcher":
             if ct.can_build_launcher(build_pos):
                 ct.build_launcher(build_pos)
+        elif action == "destroy":
+            try:
+                ct.destroy(build_pos)
+            except Exception:
+                pass
 
     def _execute_move(self, ct, direction):
         if direction == Direction.CENTRE:
@@ -255,9 +258,27 @@ class Player:
         _p.enemy_core = self.enemy_core
         _p.my_team = self.my_team
         _p.pos_encoder = self.pos_encoder
-        _p._prev_reward = self._prev_reward
         _p._n_builders_cached = self._n_builders_cached
         _p._prev_resources = self._prev_resources
         result = _TensorPlayer._encode_state(_p, ct)
         self._n_builders_cached = _p._n_builders_cached
         return result
+
+    def _encode_state_buf(self, ct):
+        _TensorPlayer._discover_ore(ct)
+        _TensorPlayer._scan_working_harvesters(ct)
+        _TensorPlayer._scan_enemy_core_dmg(ct)
+        if not hasattr(self, '_proxy'):
+            self._proxy = _new_proxy_player()
+        _p = self._proxy
+        _p.core_center = self.core_center
+        _p.enemy_core = self.enemy_core
+        _p.my_team = self.my_team
+        _p.pos_encoder = self.pos_encoder
+        _p._n_builders_cached = self._n_builders_cached
+        _p._prev_resources = self._prev_resources
+        del self._obs_buf[:]
+        _TensorPlayer._encode_state_into(_p, ct, self._obs_buf)
+        self.enemy_core = _p.enemy_core
+        self._n_builders_cached = _p._n_builders_cached
+        return self._obs_buf

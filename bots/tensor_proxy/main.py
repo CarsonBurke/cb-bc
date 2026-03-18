@@ -10,6 +10,8 @@ Instead of running the NN locally, this bot:
 Pipe FDs passed via env vars: TENSOR_OBS_WFD (write obs), TENSOR_ACT_RFD (read actions)
 """
 
+import atexit
+from array import array
 import importlib.util
 import math
 import os
@@ -50,16 +52,30 @@ _TensorPlayer = _TENSOR_MAIN.Player
 
 _TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
 
-# Struct-based binary IPC protocol (replaces pickle for speed)
+# Struct-based binary IPC protocol
 _OBS_FLOATS = INPUT_SIZE + H_DIM  # obs + h_prev
-_OBS_STRUCT = struct.Struct(f'={_OBS_FLOATS}f')
+_OBS_BYTES = _OBS_FLOATS * 4
+_ACT_HEAD = struct.Struct('=iii')
 _ACT_INTS = 3  # bt, bd, md
 _ACT_FLOATS = H_DIM + 1  # h_next + old_lp
 _ACT_SIZE = _ACT_INTS * 4 + _ACT_FLOATS * 4
-_ACT_STRUCT = struct.Struct(f'={_ACT_INTS}i{_ACT_FLOATS}f')
+_H_BYTES = H_DIM * 4
+_LP_STRUCT = struct.Struct('=f')
 
 # Pipe connections opened lazily per-player
 _opened_pipes = {}
+_live_log_players = set()
+
+
+def _flush_live_logs():
+    for player in list(_live_log_players):
+        try:
+            player._flush_log()
+        except Exception:
+            pass
+
+
+atexit.register(_flush_live_logs)
 
 
 def _new_proxy_player():
@@ -81,34 +97,39 @@ def _get_pipes():
 
 def _read_exact(fd, n):
     """Read exactly n bytes from fd."""
-    data = b""
-    while len(data) < n:
-        chunk = os.read(fd, n - len(data))
+    data = bytearray(n)
+    view = memoryview(data)
+    used = 0
+    while used < n:
+        chunk = os.read(fd, n - used)
         if not chunk:
             return None
-        data += chunk
+        end = used + len(chunk)
+        view[used:end] = chunk
+        used = end
     return data
 
 
-def _send_obs(obs_wfd, game_id, unit_id, obs, h_prev):
-    """Send observation as struct-packed binary via pipe fd."""
-    payload = _OBS_STRUCT.pack(*obs, *h_prev)
-    os.write(obs_wfd, struct.pack('=I', len(payload)) + payload)
+def _send_obs(obs_wfd, obs, h_prev):
+    """Send raw float32 observation + hidden state via pipe fd."""
+    os.writev(
+        obs_wfd,
+        (
+            memoryview(obs).cast("B"),
+            memoryview(h_prev).cast("B"),
+        ),
+    )
 
 
 def _recv_action(act_rfd):
-    """Receive struct-packed action from inference server."""
-    raw = _read_exact(act_rfd, 4)
-    if raw is None:
-        return None
-    length = struct.unpack('=I', raw)[0]
-    data = _read_exact(act_rfd, length)
+    """Receive fixed-size action packet from inference server."""
+    data = _read_exact(act_rfd, _ACT_SIZE)
     if data is None:
         return None
-    vals = _ACT_STRUCT.unpack(data)
-    bt, bd, md = vals[0], vals[1], vals[2]
-    h_next = list(vals[3:3 + H_DIM])
-    old_lp = vals[3 + H_DIM]
+    bt, bd, md = _ACT_HEAD.unpack_from(data, 0)
+    h_next = array("f")
+    h_next.frombytes(data[12:12 + _H_BYTES])
+    old_lp = _LP_STRUCT.unpack_from(data, 12 + _H_BYTES)[0]
     return bt, bd, md, 0.0, h_next, old_lp
 
 
@@ -120,13 +141,15 @@ class Player:
         self.num_spawned = 0
         self.num_builders = 0
         self.pos_encoder = SinusoidalPositionEmbedding(POS_EMBED_DIM)
-        self.h_prev = [0.0] * H_DIM
+        self.h_prev = array("f", [0.0] * H_DIM)
+        self._obs_buf = array("f")
         self._prev_resources = None
         self._n_builders_cached = 1
-        self._prev_reward = 0.0
         self._harv_rewarded_ores = set()
         self._train_log = [] if _TRAIN_LOG else None
         self._unit_id = id(self) % (2**31)  # Unique per player instance
+        if self._train_log is not None:
+            _live_log_players.add(self)
 
     def run(self, ct):
         etype = ct.get_entity_type()
@@ -162,23 +185,14 @@ class Player:
             self.my_team = ct.get_team()
         if self.core_center is None:
             self._find_core(ct)
-        if self.enemy_core is None:
-            for eid in ct.get_nearby_entities():
-                try:
-                    if ct.get_entity_type(eid) == EntityType.CORE and ct.get_team(eid) != self.my_team:
-                        self.enemy_core = ct.get_position(eid)
-                        break
-                except Exception:
-                    continue
-
-        obs = self._encode_state(ct)
+        obs = self._encode_state_buf(ct)
 
         obs_wfd, act_rfd = _get_pipes()
-        game_id = int(os.environ.get("TENSOR_GAME_ID", "0"))
+        h_in = self.h_prev
 
         if obs_wfd is not None:
             # Send obs to inference server, block for action
-            _send_obs(obs_wfd, game_id, self._unit_id, obs, self.h_prev)
+            _send_obs(obs_wfd, obs, h_in)
             result = _recv_action(act_rfd)
             if result is not None:
                 build_type_idx, build_dir_idx, move_dir_idx, value, h_next, old_log_prob = result
@@ -203,21 +217,17 @@ class Player:
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
 
-        # Global rewards (class-level, accumulated from all units' vision)
-        enemy_dmg = _TensorPlayer._enemy_core_dmg
         n_working = _TensorPlayer._working_harv_count
-
-        self._prev_reward = harv_reward + conv_reward + enemy_dmg * 20.0 + n_working * 0.5
         ti_after, ax_after = ct.get_global_resources()
         self._prev_resources = (ti_after, ax_after)
 
         if self._train_log is not None:
             # Tuple: obs, h, bt, bd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp
             self._train_log.append((
-                obs, list(self.h_prev),
+                obs.tolist(), list(h_in),
                 build_type_idx, build_dir_idx, move_dir_idx,
                 value, n_working, conv_reward, ti_after,
-                harv_reward, enemy_dmg, old_log_prob,
+                harv_reward, _TensorPlayer._enemy_core_dmg, old_log_prob,
             ))
             if ct.get_current_round() >= 1999:
                 self._flush_log()
@@ -244,7 +254,6 @@ class Player:
         _p.enemy_core = self.enemy_core
         _p.my_team = self.my_team
         _p.pos_encoder = self.pos_encoder
-        _p._prev_reward = self._prev_reward
         _p._n_builders_cached = self._n_builders_cached
         _p._prev_resources = self._prev_resources
         _p._harv_rewarded_ores = self._harv_rewarded_ores
@@ -253,6 +262,7 @@ class Player:
     def _sync_from_proxy(self, _p):
         self._n_builders_cached = _p._n_builders_cached
         self._harv_rewarded_ores = _p._harv_rewarded_ores
+        self.enemy_core = _p.enemy_core
 
     def _encode_state(self, ct):
         _TensorPlayer._discover_ore(ct)
@@ -262,6 +272,16 @@ class Player:
         result = _TensorPlayer._encode_state(_p, ct)
         self._sync_from_proxy(_p)
         return result
+
+    def _encode_state_buf(self, ct):
+        _TensorPlayer._discover_ore(ct)
+        _TensorPlayer._scan_working_harvesters(ct)
+        _TensorPlayer._scan_enemy_core_dmg(ct)
+        _p = self._get_proxy()
+        del self._obs_buf[:]
+        _TensorPlayer._encode_state_into(_p, ct, self._obs_buf)
+        self._sync_from_proxy(_p)
+        return self._obs_buf
 
     def _execute_build(self, ct, action, direction):
         _p = self._get_proxy()
@@ -320,7 +340,8 @@ class Player:
             return
         try:
             with open(_TRAIN_LOG, "ab") as f:
-                pickle.dump(self._train_log, f)
+                pickle.dump(self._train_log, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception:
             pass
         self._train_log = []
+        _live_log_players.discard(self)
