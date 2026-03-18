@@ -63,13 +63,14 @@ function SingleChart({ episodes, label, dataKey, color, fillColor }) {
           labels: episodes.map(e => e.episode),
           datasets: [{
             label,
-            data: episodes.map(e => e[dataKey]),
+            data: episodes.map(e => e[dataKey] ?? null),
             borderColor: color,
             backgroundColor: fillColor || color + '20',
             fill: !!fillColor,
             tension: 0.3,
             pointRadius: 0,
             borderWidth: 1.5,
+            spanGaps: true,
           }],
         }}
         options={opts}
@@ -100,33 +101,6 @@ function RewardBreakdownChart({ episodes }) {
           scales: {
             x: { ticks: { color: CHART_THEME.subtext, maxTicksLimit: 10 }, grid: { color: CHART_THEME.grid } },
             y: { ticks: { color: CHART_THEME.subtext }, grid: { color: CHART_THEME.grid } },
-          },
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
-    </div>
-  )
-}
-
-function OreStatusChart({ episodes }) {
-  if (!episodes.length || episodes[0].uncapped_frac == null) return null
-  return (
-    <div className="min-h-[200px]">
-      <Line
-        data={{
-          labels: episodes.map(e => e.episode),
-          datasets: [
-            { label: 'Uncapped %', data: episodes.map(e => (e.uncapped_frac || 0) * 100), borderColor: '#fab387', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Idle %', data: episodes.map(e => (e.idle_frac || 0) * 100), borderColor: '#94e2d5', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-          ],
-        }}
-        options={{
-          responsive: true,
-          maintainAspectRatio: false,
-          interaction: { mode: 'index', intersect: false },
-          scales: {
-            x: { ticks: { color: CHART_THEME.subtext, maxTicksLimit: 10 }, grid: { color: CHART_THEME.grid } },
-            y: { ticks: { color: CHART_THEME.subtext }, grid: { color: CHART_THEME.grid }, min: 0, max: 100 },
           },
           plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
         }}
@@ -296,14 +270,14 @@ export default function TrainingView() {
             </Card>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <Card title="Ore Status" id="train-ore-status">
-              <OreStatusChart episodes={episodes} />
-            </Card>
             <Card title="Resources / Episode" id="train-ep-res">
               <SingleChart episodes={episodes} label="Resources" dataKey="resources" color="#89b4fa" />
             </Card>
             <Card title="Win Rate" id="train-winrate">
               <SingleChart episodes={episodes} label="Win Rate" dataKey="winrate" color="#cba6f7" />
+            </Card>
+            <Card title="ELO" id="train-elo">
+              <SingleChart episodes={episodes} label="ELO" dataKey="elo" color="#f9e2af" fillColor="#f9e2af20" />
             </Card>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
