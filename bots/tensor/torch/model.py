@@ -499,13 +499,19 @@ def _parse_trajectories(
     """Parse engine-collected trajectories into flat tensors (no GAE yet).
 
     Returns dict with keys: obs, h, bt, bd, md, old_log_probs, rewards,
-    ep_boundaries. Or None if no data.
+    flow_bonuses, ep_boundaries. Or None if no data.
+
+    flow_bonuses is a (E,) tensor of per-episode terminal bonuses extracted
+    from trajectory index 12. These are kept separate from step rewards so
+    _compute_gae can inject them undiscounted at the terminal step.
     """
     # Pre-count total steps to allocate tensors up front, avoiding
     # 7 large Python lists and the GC pressure they cause.
     N = sum(len(traj) for traj in trajectories)
     if N == 0:
         return None
+
+    n_eps = len(trajectories)
 
     # Pre-allocate CPU tensors, fill in-place, transfer to device once.
     obs_t = torch.empty(N, OBS_SIZE, dtype=torch.float32)
@@ -515,6 +521,9 @@ def _parse_trajectories(
     md_t = torch.empty(N, dtype=torch.long)
     lp_t = torch.empty(N, dtype=torch.float32)
     rw_t = torch.empty(N, dtype=torch.float32)
+    # Per-episode flow bonus (terminal only, injected undiscounted into GAE)
+    flow_t = torch.zeros(n_eps, dtype=torch.float32)
+
     ep_boundaries = []
 
     # Disable cyclic GC — the loop creates no reference cycles, and the
@@ -523,7 +532,7 @@ def _parse_trajectories(
     gc.disable()
     try:
         idx = 0
-        for traj in trajectories:
+        for ep_i, traj in enumerate(trajectories):
             start = idx
             for step in traj:
                 if isinstance(step, (list, tuple)):
@@ -538,6 +547,8 @@ def _parse_trajectories(
                     harv_r = step[9] if n > 9 else 0.0
                     dmg = step[10] if n > 10 else 0.0
                     lp_t[idx] = step[11] if n > 11 else 0.0
+                    # index 12 is flow_bonus — only present on terminal step,
+                    # read once per episode from the last step below.
                 else:
                     obs_t[idx] = torch.tensor(step["obs"], dtype=torch.float32)
                     h_t[idx] = torch.tensor(step["h_prev"], dtype=torch.float32)
@@ -551,7 +562,18 @@ def _parse_trajectories(
                     lp_t[idx] = step.get("old_lp", 0)
                 rw_t[idx] = harv_r + conv_r + n_working * 2.5 + dmg * 20.0
                 idx += 1
+
             ep_boundaries.append((start, idx))
+
+            # Extract flow bonus from the terminal step of this episode.
+            # It's stored at index 12 in tuple format or "flow_r" in dict format.
+            if traj:
+                last_step = traj[-1]
+                if isinstance(last_step, (list, tuple)):
+                    flow_t[ep_i] = last_step[12] if len(last_step) > 12 else 0.0
+                else:
+                    flow_t[ep_i] = last_step.get("flow_r", 0.0)
+
     finally:
         if gc_was_enabled:
             gc.enable()
@@ -564,6 +586,7 @@ def _parse_trajectories(
         "md": md_t.to(DEVICE),
         "old_log_probs": lp_t.to(DEVICE),
         "rewards": rw_t.to(DEVICE),
+        "flow_bonuses": flow_t.to(DEVICE),
         "ep_boundaries": ep_boundaries,
         "n_steps": N,
     }
@@ -580,6 +603,8 @@ def _compute_gae(
     ep_boundaries: list[tuple[int, int]],
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
+    flow_bonuses: torch.Tensor | None = None,
+    bt: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Vectorized GAE on GPU with proper truncation handling.
 
@@ -587,6 +612,20 @@ def _compute_gae(
     then reverse-scans over T (sequential) but vectorized across all E episodes.
     Episodes >= _TRUNCATION_THRESHOLD steps bootstrap with V(s_final);
     shorter episodes (core destroyed / unit killed) bootstrap with 0.
+
+    flow_bonuses: optional (E,) tensor of per-episode terminal bonuses.
+    bt: optional (N,) tensor of build-type actions (indices into BUILD_ACTIONS).
+
+    Credit assignment for flow_bonuses:
+    Rather than injecting the bonus only at the terminal step (which only
+    trains the last action), the bonus is distributed equally across every
+    conveyor-placing step in the episode (bt == 2 for conveyor, bt == 8 for
+    armoured_conveyor). This directly reinforces the actions that built the
+    chain being scored, regardless of when in the episode they occurred.
+    Added to advantages only (not returns) so the critic's value target is
+    unaffected — the critic learns normal episode value without the flow
+    signal mixed in, keeping it stable.
+    If bt is not provided, falls back to terminal-step injection.
     """
     dev = rewards.device
     N = rewards.shape[0]
@@ -638,6 +677,30 @@ def _compute_gae(
     for i, (start, end) in enumerate(ep_boundaries):
         advantages[start:end] = adv_pad[i, :end - start]
 
+    # Distribute flow bonuses across conveyor-placing steps in each episode.
+    # bt indices: 2 = conveyor, 8 = armoured_conveyor (matches BUILD_ACTIONS).
+    # If no bt provided, fall back to terminal-step injection.
+    if flow_bonuses is not None:
+        for i, (start, end) in enumerate(ep_boundaries):
+            bonus = flow_bonuses[i]
+            if bonus == 0.0:
+                continue
+            if bt is not None:
+                ep_bt = bt[start:end]
+                conv_mask = (ep_bt == 2) | (ep_bt == 8)
+                n_conv = int(conv_mask.sum().item())
+                if n_conv > 0:
+                    # Equal share to each conveyor-placing step
+                    per_step = bonus / n_conv
+                    # Scatter add via boolean index
+                    conv_indices = conv_mask.nonzero(as_tuple=True)[0] + start
+                    advantages[conv_indices] += per_step
+                else:
+                    # No conveyors placed — fall back to terminal step
+                    advantages[end - 1] += bonus
+            else:
+                advantages[end - 1] += bonus
+
     returns = advantages + values
     return advantages, returns
 
@@ -661,6 +724,8 @@ def trajectories_to_tensors(
     values = torch.zeros(N, device=DEVICE)
     advantages, returns = _compute_gae(
         data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,
+        flow_bonuses=data["flow_bonuses"],
+        bt=data["bt"],
     )
     return {
         "obs": data["obs"],
@@ -709,6 +774,8 @@ def train_on_trajectories(
     t_phase = time.perf_counter() if profile is not None else 0.0
     advantages, returns = _compute_gae(
         data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,
+        flow_bonuses=data["flow_bonuses"],
+        bt=data["bt"],
     )
     if profile is not None:
         profile["gae_s"] = time.perf_counter() - t_phase
