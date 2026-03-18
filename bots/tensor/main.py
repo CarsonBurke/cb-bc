@@ -17,8 +17,6 @@ gc.disable()
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
-from flow_field import score_conveyor_flow
-from replay_parser import score_conveyor_flow_from_replay
 
 import sys
 
@@ -386,7 +384,7 @@ class Player:
             ))
 
             if ct.get_current_round() >= 1999:
-                self._flush_log(ct)
+                self._flush_log()
 
     @staticmethod
     def _discover_ore(ct: Controller) -> None:
@@ -754,62 +752,15 @@ class Player:
                 return
 
     def _flush_log(self, ct: Controller | None = None) -> None:
-        """Append trajectory log to file specified by TENSOR_TRAIN_LOG (pickle).
-
-        Injects a post-mortem flow field alignment bonus as index 12 on the
-        terminal step. The trainer distributes this bonus across all conveyor-
-        placing steps in the episode via _compute_gae.
-
-        Prefers the replay-based scorer (full global map knowledge) when a
-        matching .replay26 file exists. Falls back to the vision-limited
-        Controller scorer, then 0.0 if neither is available.
-        """
+        """Write trajectory log. Flow bonus is injected by game_worker after run_game."""
         if not self._train_log or not _TRAIN_LOG:
             return
-
-        flow_bonus = 0.0
-
-        # Derive replay path from log path: same stem, .replay26 extension in REPLAY_DIR.
-        # REPLAY_DIR is imported from model.py at training time; here we reconstruct it.
-        try:
-            from pathlib import Path
-            log_stem = Path(_TRAIN_LOG).stem
-            replay_dir = Path(_TRAIN_LOG).parent.parent / "replays" / "training"
-            replay_path = replay_dir / f"{log_stem}.replay26"
-
-            if replay_path.exists():
-                # Full global scorer — complete wall/ore/conveyor data from replay
-                team_int = 0 if (self.my_team is not None and str(self.my_team) in ("0", "TEAM_A", "a")) else 1
-                flow_bonus = score_conveyor_flow_from_replay(replay_path, team=team_int)
-                FLOW_BONUS_SCALE = 3.0
-                flow_bonus *= FLOW_BONUS_SCALE
-            elif ct is not None and self.core_center is not None and Player._all_ore:
-                # Vision-limited fallback
-                flow_bonus = score_conveyor_flow(
-                    ct,
-                    team=self.my_team,
-                    core_pos=self.core_center,
-                    ore_positions=Player._all_ore,
-                )
-                FLOW_BONUS_SCALE = 3.0
-                flow_bonus *= FLOW_BONUS_SCALE
-        except Exception:
-            flow_bonus = 0.0
-
-        log = self._train_log
-
-        # Append flow_bonus as index 12 on the terminal step; 0.0 on all others.
-        log[-1] = log[-1] + (flow_bonus,)
-        for i in range(len(log) - 1):
-            log[i] = log[i] + (0.0,)
-
         try:
             import pickle
             with open(_TRAIN_LOG, "ab") as f:
-                pickle.dump(log, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(self._train_log, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception:
             pass
-
         self._train_log = []
         _LIVE_LOG_PLAYERS.discard(self)
 

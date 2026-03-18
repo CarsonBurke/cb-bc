@@ -704,6 +704,12 @@ def score_conveyor_flow_from_replay(
         mag = (ddx * ddx + ddy * ddy) ** 0.5
         conv_data[(x, y)] = (ddx / mag, ddy / mag) if mag > 0 else (0.0, 0.0)
 
+    count = 0
+    for ent in entities.values():
+        if ent.get("kind") in _CONV_KINDS and count < 5:
+            print(f"DEBUG conveyor: team={ent.get('team')} dir={ent.get('direction')} pos={ent.get('position')}")
+            count += 1
+
     return score_conveyor_flow_from_data(
         wall_set=wall_set,
         ore_positions=ore_positions,
