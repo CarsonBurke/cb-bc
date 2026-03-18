@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, memo, useMemo } from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { viewerAtom, viewerMinimizedAtom, trainSessionAtom } from '../store'
 import { Line, Bar } from 'react-chartjs-2'
@@ -121,7 +121,7 @@ function fmt(v, decimals = 2) {
   return typeof v === 'number' ? v.toFixed(decimals) : String(v)
 }
 
-function SingleChart({ episodes, label, dataKey, color, fillColor }) {
+const SingleChart = memo(function SingleChart({ episodes, label, dataKey, color, fillColor }) {
   if (!episodes.length) return null
   const ds = downsample(episodes)
 
@@ -163,9 +163,9 @@ function SingleChart({ episodes, label, dataKey, color, fillColor }) {
       />
     </div>
   )
-}
+})
 
-function RewardBreakdownChart({ episodes }) {
+const RewardBreakdownChart = memo(function RewardBreakdownChart({ episodes }) {
   if (!episodes.length) return null
   const ds = downsample(episodes)
 
@@ -194,9 +194,9 @@ function RewardBreakdownChart({ episodes }) {
       />
     </div>
   )
-}
+})
 
-function LossChart({ episodes }) {
+const LossChart = memo(function LossChart({ episodes }) {
   if (!episodes.length) return null
   const ds = downsample(episodes)
 
@@ -223,7 +223,7 @@ function LossChart({ episodes }) {
       />
     </div>
   )
-}
+})
 
 function useTrainReplays(session) {
   const [replays, setReplays] = useState([])

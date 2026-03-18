@@ -66,19 +66,38 @@ function replayApiPlugin() {
       }
 
       // Training replays (session-aware)
+      const _replayCache = new Map() // dir -> { mtime, files: Map<name, entry>, json }
       server.middlewares.use('/api/train-replays', (req, res) => {
         res.setHeader('Content-Type', 'application/json')
         const sd = sessionDir(req)
         const dir = sd ? resolve(sd, 'replays') : resolve(PROJECT_ROOT, 'replays/training')
         try {
-          const files = readdirSync(dir)
-            .filter(f => f.endsWith('.replay26'))
-            .map(f => {
+          const dirMtime = statSync(dir).mtimeMs
+          const cached = _replayCache.get(dir)
+          if (cached && cached.mtime === dirMtime) {
+            res.end(cached.json)
+            return
+          }
+          // Incremental: only stat new files
+          const known = cached ? cached.files : new Map()
+          const currentNames = new Set(
+            readdirSync(dir).filter(f => f.endsWith('.replay26'))
+          )
+          // Stat only new files
+          for (const f of currentNames) {
+            if (!known.has(f)) {
               const st = statSync(resolve(dir, f))
-              return { name: f, size: st.size, mtime: st.mtimeMs }
-            })
-            .sort((a, b) => b.mtime - a.mtime)
-          res.end(JSON.stringify(files))
+              known.set(f, { name: f, size: st.size, mtime: st.mtimeMs })
+            }
+          }
+          // Remove deleted files
+          for (const f of known.keys()) {
+            if (!currentNames.has(f)) known.delete(f)
+          }
+          const files = [...known.values()].sort((a, b) => b.mtime - a.mtime)
+          const json = JSON.stringify(files)
+          _replayCache.set(dir, { mtime: dirMtime, files: known, json })
+          res.end(json)
         } catch {
           res.end(JSON.stringify([]))
         }
