@@ -112,7 +112,7 @@ function downsample(arr, max = MAX_CHART_POINTS) {
   for (let i = 0; i < max - 1; i++) {
     result.push(arr[Math.round(i * step)])
   }
-  result.push(arr[arr.length - 1]) // always include latest
+  result.push(arr[arr.length - 1])
   return result
 }
 
@@ -176,9 +176,9 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart({ episodes }) {
           labels: ds.map(e => e.episode),
           datasets: [
             { label: 'Harvester', data: ds.map(e => e.r_harv || 0), borderColor: '#a6e3a1', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-            { label: 'Conveyor', data: ds.map(e => e.r_conv || 0), borderColor: '#89b4fa', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
             { label: 'Working', data: ds.map(e => e.r_work || 0), borderColor: '#f9e2af', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
             { label: 'Damage', data: ds.map(e => e.r_dmg || 0), borderColor: '#f38ba8', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+            { label: 'Flow', data: ds.map(e => e.r_flow || 0), borderColor: '#cba6f7', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
           ],
         }}
         options={{
@@ -341,8 +341,8 @@ export default function TrainingView() {
             <Stat label="Expl. Variance" value={fmt(latest?.explained_var, 3)} />
             <Stat label="Entropy" value={fmt(latest?.entropy, 3)} />
             <Stat label="Approx KL" value={fmt(latest?.approx_kl, 5)} />
+            <Stat label="Flow Score" value={fmt(latest?.r_flow, 4)} />
             <Stat label="Elapsed" value={latest ? `${latest.elapsed}s` : '—'} />
-            {config.lr && <Stat label="LR" value={config.lr} />}
           </div>
         )}
       </Card>
@@ -359,11 +359,14 @@ export default function TrainingView() {
             </Card>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <Card title="Resources / Episode" id="train-ep-res">
-              <SingleChart episodes={episodes} label="Resources" dataKey="resources" color="#89b4fa" />
+            <Card title="Flow Score / Episode" id="train-flow">
+              <SingleChart episodes={episodes} label="Flow Score" dataKey="r_flow" color="#cba6f7" fillColor="#cba6f720" />
             </Card>
             <Card title="Win Rate" id="train-winrate">
               <SingleChart episodes={episodes} label="Win Rate" dataKey="winrate" color="#cba6f7" />
+            </Card>
+            <Card title="Resources / Episode" id="train-ep-res">
+              <SingleChart episodes={episodes} label="Resources" dataKey="resources" color="#89b4fa" />
             </Card>
             <Card title="League ELO" id="train-elo">
               <LeagueEloChart models={leagueModels} />
@@ -399,6 +402,7 @@ export default function TrainingView() {
               <Thead>
                 <Th>Ep</Th>
                 <Th>Reward</Th>
+                <Th>Flow</Th>
                 <Th>Resources</Th>
                 <Th>Pi Loss</Th>
                 <Th>Entropy</Th>
@@ -411,7 +415,8 @@ export default function TrainingView() {
                 {[...episodes].reverse().map(e => (
                   <Tr key={e.episode}>
                     <Td>{e.episode}</Td>
-                    <Td title={`Harv: ${fmt(e.r_harv, 2)}  Conv: ${fmt(e.r_conv, 2)}  Work: ${fmt(e.r_work, 2)}  Dmg: ${fmt(e.r_dmg, 2)}`}>{fmt(e.reward, 3)}</Td>
+                    <Td title={`Harv: ${fmt(e.r_harv, 2)}  Work: ${fmt(e.r_work, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  Flow: ${fmt(e.r_flow, 4)}`}>{fmt(e.reward, 3)}</Td>
+                    <Td>{fmt(e.r_flow, 4)}</Td>
                     <Td>{fmt(e.resources, 1)}</Td>
                     <Td>{fmt(e.pi_loss, 4)}</Td>
                     <Td>{fmt(e.entropy, 3)}</Td>

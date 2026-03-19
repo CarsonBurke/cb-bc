@@ -771,23 +771,26 @@ def main():
 
         # Stats
         def _traj_reward(traj):
-            r_harv, r_conv, r_work, r_dmg = 0.0, 0.0, 0.0, 0.0
+            r_harv, r_work, r_dmg, r_flow = 0.0, 0.0, 0.0, 0.0
             for s in traj:
                 if isinstance(s, (list, tuple)):
                     n = len(s)
                     n_working = s[6] if n > 6 else 0
-                    conv_r = s[7] if n > 7 else 0.0
                     harv_r = s[9] if n > 9 else 0.0
                     dmg = s[10] if n > 10 else 0.0
                 else:
                     n_working = s.get("n_working", 0)
-                    conv_r = s.get("conv_r", 0)
                     harv_r = s.get("harv_r", 0)
                     dmg = s.get("dmg", 0)
-                r_harv += harv_r; r_conv += conv_r
-                r_work += n_working * 2.5; r_dmg += dmg * 20.0
-            total = r_harv + r_conv + r_work + r_dmg
-            return total, r_harv, r_conv, r_work, r_dmg
+                r_harv += harv_r
+                r_work += n_working * 2.5
+                r_dmg += dmg * 20.0
+            # Flow bonus on terminal step at index 12
+            if traj:
+                last = traj[-1]
+                r_flow = last[12] if isinstance(last, (list, tuple)) and len(last) > 12 else last.get("flow_r", 0.0) if isinstance(last, dict) else 0.0
+            total = r_harv + r_work + r_dmg + r_flow
+            return total, r_harv, r_work, r_dmg, r_flow
 
         def _traj_ti(traj):
             last = traj[-1]
@@ -797,16 +800,17 @@ def main():
         rewards = [_traj_reward(t) for t in all_trajs]
         mean_reward = sum(r[0] for r in rewards) / n_trajs
         mean_r_harv = sum(r[1] for r in rewards) / n_trajs
-        mean_r_conv = sum(r[2] for r in rewards) / n_trajs
-        mean_r_work = sum(r[3] for r in rewards) / n_trajs
-        mean_r_dmg = sum(r[4] for r in rewards) / n_trajs
+        mean_r_work = sum(r[2] for r in rewards) / n_trajs
+        mean_r_dmg = sum(r[3] for r in rewards) / n_trajs
+        mean_r_flow = sum(r[4] for r in rewards) / n_trajs
         mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
         elapsed = time.time() - t_start
 
         train_log.append({
             "episode": ep + 1, "reward": round(mean_reward, 4),
-            "r_harv": round(mean_r_harv, 4), "r_conv": round(mean_r_conv, 4),
+            "r_harv": round(mean_r_harv, 4),
             "r_work": round(mean_r_work, 4), "r_dmg": round(mean_r_dmg, 4),
+            "r_flow": round(mean_r_flow, 4),
             "resources": round(mean_ti, 2), "best_resources": round(mean_ti, 2),
             "pi_loss": round(stats["pi_loss"], 5), "vf_loss": round(stats["vf_loss"], 5),
             "entropy": round(stats["entropy"], 4),
@@ -833,7 +837,7 @@ def main():
             print(
                 f"  Ep {ep + 1:3d}/{args.episodes}: "
                 f"W/L={total_wins}/{total_losses}/{total_games}  "
-                f"reward={mean_reward:+.2f}  ti={mean_ti:.0f}  "
+                f"reward={mean_reward:+.2f}  flow={mean_r_flow:.3f}  ti={mean_ti:.0f}  "
                 f"pi={stats['pi_loss']:+.4f}  "
                 f"kl={stats.get('approx_kl', 0):.4f}  "
                 f"ev={stats.get('explained_var', 0):.2f}  "
