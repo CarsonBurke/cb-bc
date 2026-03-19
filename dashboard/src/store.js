@@ -1,71 +1,90 @@
 import { atom } from 'jotai'
 
-// Persisted sidebar mode (code vs tensor)
-const MODE_KEY = 'dashboard-mode'
+// ---- URL-based routing ----
+// Hash format: #/{mode}/{view}?session={id}
+// Examples: #/code/all, #/tensor/training?session=sp_20260318, #/code/3
+
 const MODE_DEFAULTS = { code: 'all', tensor: 'training' }
 
-function loadMode() {
-  try { return localStorage.getItem(MODE_KEY) || 'code' } catch { return 'code' }
+function parseHash() {
+  const hash = location.hash.replace(/^#\/?/, '')
+  const [path, qs] = hash.split('?')
+  const parts = path.split('/')
+  const mode = (parts[0] === 'code' || parts[0] === 'tensor') ? parts[0] : 'code'
+  let view = parts[1] || MODE_DEFAULTS[mode]
+  // Numeric round IDs
+  if (/^\d+$/.test(view)) view = parseInt(view, 10)
+  const params = new URLSearchParams(qs || '')
+  const session = params.get('session') || null
+  return { mode, view, session }
 }
 
-export const modeAtom = atom(loadMode())
+function buildHash(mode, view, session) {
+  let hash = `#/${mode}/${view}`
+  if (session) hash += `?session=${encodeURIComponent(session)}`
+  return hash
+}
 
+function setHash(mode, view, session) {
+  const hash = buildHash(mode, view, session)
+  if (location.hash !== hash) {
+    history.pushState(null, '', hash)
+  }
+}
+
+const initial = parseHash()
+
+// Core atoms (internal)
+export const modeAtom = atom(initial.mode)
+export const currentViewAtom = atom(initial.view)
+export const trainSessionAtom = atom(initial.session)
+
+// Persist atoms that sync to URL
 export const modePersistAtom = atom(
   (get) => get(modeAtom),
   (get, set, next) => {
     set(modeAtom, next)
-    try { localStorage.setItem(MODE_KEY, next) } catch {}
-    // Reset view to mode default when switching
-    const view = get(currentViewAtom)
-    const codeViews = ['all', 'replays']
-    const tensorViews = ['training']
-    if (next === 'code' && !codeViews.includes(view) && typeof view !== 'number') {
-      set(currentViewAtom, MODE_DEFAULTS.code)
-      try { localStorage.setItem(VIEW_KEY, MODE_DEFAULTS.code) } catch {}
-    } else if (next === 'tensor' && !tensorViews.includes(view)) {
-      set(currentViewAtom, MODE_DEFAULTS.tensor)
-      try { localStorage.setItem(VIEW_KEY, MODE_DEFAULTS.tensor) } catch {}
-    }
+    const view = MODE_DEFAULTS[next]
+    set(currentViewAtom, view)
+    setHash(next, view, next === 'tensor' ? get(trainSessionAtom) : null)
   },
 )
-
-// Persisted sidebar tab selection
-const VIEW_KEY = 'dashboard-current-view'
-
-function loadView() {
-  try { return localStorage.getItem(VIEW_KEY) || 'all' } catch { return 'all' }
-}
-
-export const currentViewAtom = atom(loadView())
 
 export const currentViewPersistAtom = atom(
   (get) => get(currentViewAtom),
-  (_get, set, next) => {
+  (get, set, next) => {
     set(currentViewAtom, next)
-    try { localStorage.setItem(VIEW_KEY, next) } catch {}
+    const mode = get(modeAtom)
+    setHash(mode, next, mode === 'tensor' ? get(trainSessionAtom) : null)
   },
 )
+
+export const trainSessionPersistAtom = atom(
+  (get) => get(trainSessionAtom),
+  (get, set, next) => {
+    set(trainSessionAtom, next)
+    setHash(get(modeAtom), get(currentViewAtom), next)
+  },
+)
+
+// Listen for back/forward navigation
+if (typeof window !== 'undefined') {
+  window.addEventListener('popstate', () => {
+    // Atoms won't auto-update from this — the App component handles it
+  })
+}
+
+// Export a hook-friendly updater for popstate
+export const syncFromHash = (set) => {
+  const { mode, view, session } = parseHash()
+  set(modeAtom, mode)
+  set(currentViewAtom, view)
+  set(trainSessionAtom, session)
+}
 
 // Game viewer modal state: { url, title } | null, with minimized flag
 export const viewerAtom = atom(null)
 export const viewerMinimizedAtom = atom(false)
-
-// Active training session (null = most recent)
-const SESSION_KEY = 'dashboard-train-session'
-function loadSession() {
-  try { return localStorage.getItem(SESSION_KEY) || null } catch { return null }
-}
-export const trainSessionAtom = atom(loadSession())
-export const trainSessionPersistAtom = atom(
-  (get) => get(trainSessionAtom),
-  (_get, set, next) => {
-    set(trainSessionAtom, next)
-    try {
-      if (next) localStorage.setItem(SESSION_KEY, next)
-      else localStorage.removeItem(SESSION_KEY)
-    } catch {}
-  },
-)
 
 // Persisted card collapse state: { [cardId]: boolean }
 const STORAGE_KEY = 'dashboard-card-state'
@@ -89,5 +108,49 @@ export const cardOpenAtom = (id, defaultOpen) => atom(
     const state = { ...get(cardStateAtom), [id]: next }
     set(cardStateAtom, state)
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)) } catch {}
+  },
+)
+
+// Persisted card size state: { [cardId]: 'sm' | 'md' | 'lg' | 'xl' }
+const SIZE_KEY = 'dashboard-card-sizes'
+
+function loadSizes() {
+  try {
+    return JSON.parse(localStorage.getItem(SIZE_KEY)) || {}
+  } catch {
+    return {}
+  }
+}
+
+export const cardSizeStateAtom = atom(loadSizes())
+
+export const cardSizeAtom = (id) => atom(
+  (get) => get(cardSizeStateAtom)[id] || 'md',
+  (get, set, next) => {
+    const state = { ...get(cardSizeStateAtom), [id]: next }
+    set(cardSizeStateAtom, state)
+    try { localStorage.setItem(SIZE_KEY, JSON.stringify(state)) } catch {}
+  },
+)
+
+// Persisted card EMA toggle: { [cardId]: boolean }
+const EMA_KEY = 'dashboard-card-ema'
+
+function loadEma() {
+  try {
+    return JSON.parse(localStorage.getItem(EMA_KEY)) || {}
+  } catch {
+    return {}
+  }
+}
+
+export const cardEmaStateAtom = atom(loadEma())
+
+export const cardEmaAtom = (id) => atom(
+  (get) => !!get(cardEmaStateAtom)[id],
+  (get, set, next) => {
+    const state = { ...get(cardEmaStateAtom), [id]: next }
+    set(cardEmaStateAtom, state)
+    try { localStorage.setItem(EMA_KEY, JSON.stringify(state)) } catch {}
   },
 )

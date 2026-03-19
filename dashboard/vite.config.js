@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { spawn, execSync } from 'child_process'
 import { resolve } from 'path'
-import { readdirSync, readFileSync, statSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'fs'
 
 const PROJECT_ROOT = resolve(import.meta.dirname, '..')
 
@@ -39,11 +39,17 @@ function replayApiPlugin() {
               const metaPath = resolve(sessionsDir, d.name, 'meta.json')
               let meta = { name: d.name }
               try { meta = JSON.parse(readFileSync(metaPath, 'utf8')) } catch {}
-              const logPath = resolve(sessionsDir, d.name, 'train_log.json')
               let episodes = 0
               try {
-                const log = JSON.parse(readFileSync(logPath, 'utf8'))
-                episodes = log.episodes?.length || 0
+                const jsonlPath = resolve(sessionsDir, d.name, 'train_log.jsonl')
+                const jsonPath = resolve(sessionsDir, d.name, 'train_log.json')
+                if (existsSync(jsonlPath)) {
+                  const lines = readFileSync(jsonlPath, 'utf8').trimEnd().split('\n')
+                  episodes = Math.max(0, lines.length - 1) // first line is config
+                } else {
+                  const log = JSON.parse(readFileSync(jsonPath, 'utf8'))
+                  episodes = log.episodes?.length || 0
+                }
               } catch {}
               const st = statSync(resolve(sessionsDir, d.name))
               return { id: d.name, ...meta, episodes, mtime: st.mtimeMs }
@@ -130,18 +136,50 @@ function replayApiPlugin() {
         }
       })
 
-      // Training log (session-aware)
+      // Training log (session-aware) — reads JSONL (line 1 = config, rest = episodes)
       server.middlewares.use('/api/train-log', (req, res) => {
         res.setHeader('Content-Type', 'application/json')
         const sd = sessionDir(req)
-        const logPath = sd
-          ? resolve(sd, 'train_log.json')
-          : resolve(PROJECT_ROOT, 'bots/tensor/train_log.json')
+        const base = sd || resolve(PROJECT_ROOT, 'bots/tensor')
+        const jsonlPath = resolve(base, 'train_log.jsonl')
+        const jsonPath = resolve(base, 'train_log.json')
         try {
-          const data = readFileSync(logPath, 'utf8')
-          res.end(data)
+          if (existsSync(jsonlPath)) {
+            const lines = readFileSync(jsonlPath, 'utf8').trimEnd().split('\n')
+            const first = JSON.parse(lines[0])
+            const config = first.config || {}
+            const episodes = lines.slice(1).map(l => JSON.parse(l))
+            res.end(JSON.stringify({ episodes, config }))
+          } else {
+            // Fallback: legacy single-JSON format
+            res.end(readFileSync(jsonPath, 'utf8'))
+          }
         } catch {
           res.end(JSON.stringify({ episodes: [], config: {} }))
+        }
+      })
+
+      // Game log (session-aware) — JSONL, one line per game
+      const _gameLogCache = new Map() // path -> { mtime, json }
+      server.middlewares.use('/api/game-log', (req, res) => {
+        res.setHeader('Content-Type', 'application/json')
+        const sd = sessionDir(req)
+        const base = sd || resolve(PROJECT_ROOT, 'bots/tensor')
+        const logPath = resolve(base, 'game_log.jsonl')
+        try {
+          const mtime = statSync(logPath).mtimeMs
+          const cached = _gameLogCache.get(logPath)
+          if (cached && cached.mtime === mtime) {
+            res.end(cached.json)
+            return
+          }
+          const lines = readFileSync(logPath, 'utf8').trimEnd().split('\n')
+          const games = lines.map(l => JSON.parse(l))
+          const json = JSON.stringify(games)
+          _gameLogCache.set(logPath, { mtime, json })
+          res.end(json)
+        } catch {
+          res.end(JSON.stringify([]))
         }
       })
 

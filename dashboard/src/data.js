@@ -20,8 +20,14 @@ export function getLatestRound() {
   return DATA.rounds[DATA.rounds.length - 1] ?? null
 }
 
+import { formatDistanceToNow } from 'date-fns'
+
 export function formatDate(timestamp, opts) {
   return new Date(timestamp).toLocaleDateString('en-US', opts)
+}
+
+export function relativeTime(ms) {
+  return formatDistanceToNow(new Date(ms), { addSuffix: true })
 }
 
 // Chart theme constants (Catppuccin Mocha)

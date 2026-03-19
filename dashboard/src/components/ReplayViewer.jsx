@@ -3,6 +3,7 @@ import { useSetAtom } from 'jotai'
 import { viewerAtom, viewerMinimizedAtom } from '../store'
 import Card from './Card'
 import { Table, Th, Td, Thead, Tr } from './Table'
+import { relativeTime } from '../data'
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`
@@ -10,12 +11,7 @@ function formatSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function formatTime(ms) {
-  const d = new Date(ms)
-  return d.toLocaleString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  })
-}
+
 
 function parseReplayName(name) {
   const m = name.match(/^match_(\d+)\.replay26$/)
@@ -90,7 +86,7 @@ export default function ReplayViewer() {
               >
                 <Td>{parseReplayName(r.name)}</Td>
                 <Td>{formatSize(r.size)}</Td>
-                <Td>{formatTime(r.mtime)}</Td>
+                <Td>{relativeTime(r.mtime)}</Td>
                 <Td>
                   <button
                     onClick={(e) => { e.stopPropagation(); openReplay(r.name) }}
