@@ -546,8 +546,7 @@ def _parse_trajectories(
                     harv_r = step[9] if n > 9 else 0.0
                     dmg = step[10] if n > 10 else 0.0
                     lp_t[idx] = step[11] if n > 11 else 0.0
-                    # index 12 is flow_bonus — only present on terminal step,
-                    # read once per episode from the last step below.
+                    flow_r = step[12] if n > 12 else 0.0
                 else:
                     obs_t[idx] = torch.tensor(step["obs"], dtype=torch.float32)
                     h_t[idx] = torch.tensor(step["h_prev"], dtype=torch.float32)
@@ -559,7 +558,7 @@ def _parse_trajectories(
                     harv_r = step.get("harv_r", 0)
                     dmg = step.get("dmg", 0)
                     lp_t[idx] = step.get("old_lp", 0)
-                flow_r = step[12] if n > 12 else 0.0
+                    flow_r = step.get("flow_r", 0.0)
                 rw_t[idx] = harv_r + n_working * 2.5 + dmg * 20.0 + flow_r
                 ep_harv += harv_r
                 ep_work += n_working
