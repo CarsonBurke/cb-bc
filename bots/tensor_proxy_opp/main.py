@@ -15,11 +15,14 @@ import sys
 
 _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor")
 sys.path.insert(0, _TENSOR_DIR)
-# Use regular import instead of importlib to avoid engine module tracking issues.
-# The engine's pyo3 runtime tracks the "active Python module" during Controller
-# API calls. Modules loaded via importlib.util.spec_from_file_location corrupt
-# this tracking, causing "'NoneType' object has no attribute 'A'" panics.
-import main as _TENSOR_MAIN
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "tensor_bot_main", os.path.join(_TENSOR_DIR, "main.py"),
+    submodule_search_locations=[],
+)
+_TENSOR_MAIN = _ilu.module_from_spec(_spec)
+sys.modules["tensor_bot_main"] = _TENSOR_MAIN
+_spec.loader.exec_module(_TENSOR_MAIN)
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
@@ -116,6 +119,7 @@ class Player:
         self._obs_buf = array("f")
         self._prev_resources = None
         self._n_builders_cached = 1
+        self._spawn_round: int = -1
         self._unit_id = id(self) % (2**31)
 
     def run(self, ct):
@@ -148,6 +152,8 @@ class Player:
                 return
 
     def _run_builder(self, ct):
+        if self._spawn_round < 0:
+            self._spawn_round = ct.get_current_round()
         if self.my_team is None:
             self.my_team = ct.get_team()
         if self.core_center is None:
@@ -280,6 +286,7 @@ class Player:
         _p.pos_encoder = self.pos_encoder
         _p._n_builders_cached = self._n_builders_cached
         _p._prev_resources = self._prev_resources
+        _p._spawn_round = self._spawn_round
         result = _TensorPlayer._encode_state(_p, ct)
         self._n_builders_cached = _p._n_builders_cached
         return result
@@ -297,6 +304,7 @@ class Player:
         _p.pos_encoder = self.pos_encoder
         _p._n_builders_cached = self._n_builders_cached
         _p._prev_resources = self._prev_resources
+        _p._spawn_round = self._spawn_round
         del self._obs_buf[:]
         _TensorPlayer._encode_state_into(_p, ct, self._obs_buf)
         self.enemy_core = _p.enemy_core

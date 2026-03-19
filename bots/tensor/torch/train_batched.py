@@ -29,6 +29,11 @@ import tempfile
 import time
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+REPLAY_PARSER_PYTHON = PROJECT_ROOT / "packages" / "replay_parser" / "python"
+if str(REPLAY_PARSER_PYTHON) not in sys.path:
+    sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
+
 
 def _maybe_run_worker_mode() -> None:
     if "--worker-result" not in sys.argv:
@@ -59,23 +64,27 @@ from model import (
     DEVICE,
     H_DIM,
     OBS_SIZE,
+    TERMINAL_LOSS_REWARD,
+    TERMINAL_WIN_REWARD,
     TILE_FEATURES,
     TEACHER_HIDDEN,
     _parse_trajectories,
     compute_action_masks,
+    load_centralized_critic_checkpoint,
+    reset_centralized_critic,
+    save_centralized_critic_checkpoint,
     distill,
     sample_logits_gumbel,
     train_on_trajectories,
 )
 from replay_parser import augment_trajectories_with_working_counts
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
+WORKER_PYTHON = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 
 from training_utils import (
     League, _init_session, _default_session_name, _read_trajectory_file,
-    ELO_K, ELO_DEFAULT,
 )
 
 # Struct-based binary IPC protocol constants
@@ -92,6 +101,67 @@ DUMMY_OPP_ID = "dummy"
 _ZERO_H_BYTES = bytes(_H_BYTES)
 _DUMMY_DIR_TILES = (6, 7, 8, 11, 12, 13, 16, 17, 18)
 _dummy_idx_cache = {}
+
+
+def _session_state_path(sess: dict) -> Path:
+    return Path(sess["dir"]) / "train_state.pt"
+
+
+def _atomic_torch_save(payload: object, path: str | Path) -> None:
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _read_last_logged_state(log_path: str | Path) -> tuple[int, float]:
+    path = Path(log_path)
+    if not path.exists():
+        return 0, 0.0
+    last_ep = 0
+    last_elapsed = 0.0
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict) or "episode" not in entry:
+                    continue
+                ep = entry.get("episode", 0)
+                if isinstance(ep, int) and ep > last_ep:
+                    last_ep = ep
+                    elapsed = entry.get("elapsed", 0.0)
+                    if isinstance(elapsed, (int, float)):
+                        last_elapsed = float(elapsed)
+    except OSError:
+        return 0, 0.0
+    return last_ep, last_elapsed
+
+
+def _load_resume_state(
+    state_path: str | Path,
+    *,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+) -> dict | None:
+    path = Path(state_path)
+    if not path.exists():
+        return None
+    payload = torch.load(path, map_location=DEVICE)
+    if not isinstance(payload, dict):
+        return None
+    opt_state = payload.get("optimizer")
+    if opt_state is not None:
+        optimizer.load_state_dict(opt_state)
+    sched_state = payload.get("scheduler")
+    if sched_state is not None:
+        scheduler.load_state_dict(sched_state)
+    return payload
 
 
 def _read_exact(fd, n):
@@ -172,18 +242,20 @@ def _dummy_policy(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
     move_dir = torch.full_like(build_type, 4)
     return build_type, build_dir, move_dir
 
-def _load_worker_result(result_path: str) -> tuple[str | None, dict | None, str | None]:
+def _load_worker_result(result_path: str) -> tuple[str | None, dict | None, str | None, dict | None]:
     try:
         with open(result_path, "rb") as f:
             result = pickle.load(f)
     except (OSError, pickle.PickleError, EOFError):
-        return (None, None, None)
+        return (None, None, None, None)
     if isinstance(result, tuple):
-        if len(result) == 3:
+        if len(result) == 4:
             return result
+        if len(result) == 3:
+            return result[0], result[1], result[2], None
         if len(result) == 2:
-            return result[0], result[1], None
-    return (None, None, None)
+            return result[0], result[1], None, None
+    return (None, None, None, None)
 
 
 def _recommended_worker_count(n_games: int) -> int:
@@ -234,8 +306,8 @@ def collect_games_batched(
     opp_hidden: list[int] | None = None,
     coalesce_ms: float = DEFAULT_COALESCE_MS,
     profile: dict[str, float] | None = None,
-) -> tuple[list[list], list[str | None], dict[str, list[str | None]]]:
-    """Run all games with batched GPU inference via pipes. Returns (trajs, winners, per_opp_winners)."""
+) -> tuple[list[list], list[str | None], dict[str, list[str | None]], list[dict | None], list[int]]:
+    """Run all games with batched GPU inference via pipes. Returns (trajs, winners, per_opp_winners, global_states, traj_game_map)."""
     t_total = time.perf_counter() if profile is not None else 0.0
     bot_a = str(PROJECT_ROOT / "bots" / "tensor_proxy" / "main.py")
     bot_b_proxy = str(PROJECT_ROOT / "bots" / "tensor_proxy_opp" / "main.py")
@@ -312,9 +384,10 @@ def collect_games_batched(
         worker_env = os.environ.copy()
         worker_env["CUDA_VISIBLE_DEVICES"] = ""
         worker_fds = tuple(fd for fd in (obs_w_a, act_r_a, obs_w_b, act_r_b) if fd >= 0)
+        worker_python = WORKER_PYTHON if os.path.exists(WORKER_PYTHON) else sys.executable
         proc = subprocess.Popen(
             [
-                sys.executable,
+                worker_python,
                 str(Path(__file__).resolve()),
                 "--worker-result", result_path,
                 "--worker-pipes", f"{obs_w_a},{act_r_a},{obs_w_b},{act_r_b}",
@@ -600,7 +673,7 @@ def collect_games_batched(
             proc.kill()
     _reap_processes()
     for game_idx in list(processes):
-        results[game_idx] = (None, None)
+        results[game_idx] = (None, None, None, None)
         processes.pop(game_idx, None)
     if profile is not None:
         profile["worker_join_s"] = time.perf_counter() - t_phase
@@ -622,22 +695,36 @@ def collect_games_batched(
     # Read trajectories and augment with replay ground truth
     t_phase = time.perf_counter() if profile is not None else 0.0
     trajectories, winners = [], []
+    all_global_states = []
+    traj_game_map = []  # maps each trajectory index -> game index (for global states)
+    game_counter = 0
+    game_origin = []  # game_counter -> original game index i
     per_opp_winners = {}
     for i, result in enumerate(results):
         oid = opp_ids[i]
-        if isinstance(result, tuple) and len(result) == 3:
+        if isinstance(result, tuple) and len(result) == 4:
+            log_path, working, w, gstates = result
+        elif isinstance(result, tuple) and len(result) == 3:
             log_path, working, w = result
+            gstates = None
         elif isinstance(result, tuple) and len(result) == 2:
             log_path, working = result
-            w = None
+            w, gstates = None, None
         else:
-            log_path, working, w = None, None, None
+            log_path, working, w, gstates = None, None, None, None
         if log_path is None:
             per_opp_winners.setdefault(oid, []).append(None)
             continue
         game_trajs = _read_trajectory_file(log_path)
         game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
+        n_before = len(trajectories)
         trajectories.extend(game_trajs)
+        # Map each new trajectory to this game's global state index
+        for _ in range(len(game_trajs)):
+            traj_game_map.append(game_counter)
+        all_global_states.append(gstates)
+        game_origin.append(i)
+        game_counter += 1
         winners.append(w)
         per_opp_winners.setdefault(oid, []).append(w)
     if profile is not None:
@@ -652,7 +739,7 @@ def collect_games_batched(
 
     shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"    [{n_games} games, {total_inferences} GPU inferences]")
-    return trajectories, winners, per_opp_winners
+    return trajectories, winners, per_opp_winners, all_global_states, traj_game_map, game_origin
 
 
 def main():
@@ -669,6 +756,7 @@ def main():
     parser.add_argument("--distill-lr", type=float, default=1e-3, help="Distillation learning rate")
     parser.add_argument("--coalesce-ms", type=float, default=DEFAULT_COALESCE_MS)
     parser.add_argument("--session", type=str, default="")
+    parser.add_argument("--resume", action="store_true", help="Resume a prior session from saved trainer state")
     parser.add_argument("--worker-result", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--worker-pipes", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--worker-game-args", type=str, default="", help=argparse.SUPPRESS)
@@ -679,6 +767,8 @@ def main():
     weight_path = str(sess["weight_path"])
     log_path = sess["log_path"]
     replay_dir = sess["replay_dir"]
+    state_path = _session_state_path(sess)
+    game_log_path = Path(str(log_path).replace("train_log.jsonl", "game_log.jsonl"))
 
     maps = [f.name for f in (PROJECT_ROOT / "maps").glob("*.map26")]
     league = League(sess["league_dir"], sess["league_json"], args.league_size)
@@ -686,8 +776,26 @@ def main():
     hidden = TEACHER_HIDDEN if args.teacher else None
     model = BuilderMLP(hidden=hidden).to(DEVICE)
     model.load_weights(weight_path) or model.load_weights(str(WEIGHT_PATH))
+    reset_centralized_critic()
+    load_centralized_critic_checkpoint(weight_path, lr=args.lr)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes)
+
+    start_episode = 0
+    elapsed_offset = 0.0
+    resumed_exact = False
+    if args.resume:
+        resume_state = _load_resume_state(
+            state_path,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+        if resume_state is not None:
+            start_episode = int(resume_state.get("episode", 0))
+            elapsed_offset = float(resume_state.get("elapsed_offset_s", 0.0))
+            resumed_exact = True
+        else:
+            start_episode, elapsed_offset = _read_last_logged_state(log_path)
 
     if not league.models:
         ckpt = str(league.league_dir / "gen_0.pkl")
@@ -702,11 +810,45 @@ def main():
     if args.dummy_episodes > 0:
         print(f"Dummy curriculum: first {args.dummy_episodes} episodes use scripted side-B")
     print(f"Workers: auto")
+    if args.resume:
+        if resumed_exact:
+            print(f"Resume: continuing from episode {start_episode + 1}")
+        elif start_episode > 0:
+            print(f"Resume: continuing from episode {start_episode + 1} (optimizer/scheduler reset)")
+        else:
+            print("Resume: no prior trainer state found, starting fresh")
 
-    t_start = time.time()
+    if start_episode >= args.episodes:
+        print(f"Nothing to do: session already reached episode {start_episode}")
+        return
+
+    run_started_at = time.time()
     train_log = []
 
-    for ep in range(args.episodes):
+    _log_config = {
+        "envs": args.opponents * args.games_per_opp,
+        "ep_len": "self-play", "grid": "real", "lr": args.lr,
+        "total_episodes": args.episodes, "mode": "batched-gpu",
+        "session": session_name,
+    }
+    if not args.resume:
+        # A non-resume run reusing a session name should start with a clean
+        # per-run dashboard state instead of inheriting stale game rows/replays.
+        for old_replay in replay_dir.glob("*.replay26"):
+            try:
+                old_replay.unlink()
+            except OSError:
+                pass
+        try:
+            game_log_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    if not args.resume or not Path(log_path).exists():
+        with open(str(log_path), "w") as f:
+            f.write(json.dumps({"config": _log_config}) + "\n")
+
+    for ep in range(start_episode, args.episodes):
         t0 = time.time()
         current_gen = league.latest_gen()
         current_id = f"gen_{current_gen}" if current_gen >= 0 else None
@@ -731,7 +873,7 @@ def main():
                 all_opp_paths.append(opp["path"])
                 all_opp_ids.append(opp["id"])
 
-        all_trajs, all_winners, per_opp_winners = collect_games_batched(
+        all_trajs, all_winners, per_opp_winners, all_global_states, traj_game_map, game_origin = collect_games_batched(
             model, all_opp_paths, all_opp_ids, maps,
             ep + 1, replay_dir,
             opp_hidden=hidden,
@@ -752,7 +894,14 @@ def main():
 
         t1 = time.time()
         model.train()
-        stats = train_on_trajectories(model, optimizer, all_trajs)
+        stats = train_on_trajectories(
+            model, optimizer, all_trajs,
+            global_states_list=all_global_states,
+            traj_game_map=traj_game_map if all_global_states else None,
+            game_winners=all_winners,
+        )
+        model.save_weights(weight_path)
+        save_centralized_critic_checkpoint(weight_path)
         scheduler.step()
         t_train = time.time() - t1
 
@@ -774,7 +923,7 @@ def main():
             league.save()
 
         # Stats
-        def _traj_reward(traj):
+        def _traj_reward(traj, outcome_r=0.0):
             r_harv, r_conv, r_work, r_dmg = 0.0, 0.0, 0.0, 0.0
             for s in traj:
                 if isinstance(s, (list, tuple)):
@@ -790,54 +939,92 @@ def main():
                     dmg = s.get("dmg", 0)
                 r_harv += harv_r; r_conv += conv_r
                 r_work += n_working * 2.5; r_dmg += dmg * 20.0
-            total = r_harv + r_conv + r_work + r_dmg
-            return total, r_harv, r_conv, r_work, r_dmg
+            total = r_harv + r_conv + r_work + r_dmg + outcome_r
+            return total, r_harv, r_conv, r_work, r_dmg, outcome_r
 
         def _traj_ti(traj):
             last = traj[-1]
             return last[8] if isinstance(last, (list, tuple)) else last.get("ti", 0)
 
         n_trajs = max(len(all_trajs), 1)
-        rewards = [_traj_reward(t) for t in all_trajs]
-        mean_reward = sum(r[0] for r in rewards) / n_trajs
+        rewards = []
+        for traj_i, traj in enumerate(all_trajs):
+            game_idx = traj_game_map[traj_i] if traj_i < len(traj_game_map) else 0
+            winner = all_winners[game_idx] if game_idx < len(all_winners) else None
+            outcome_r = TERMINAL_WIN_REWARD if winner == "a" else (
+                TERMINAL_LOSS_REWARD if winner == "b" else 0.0
+            )
+            rewards.append(_traj_reward(traj, outcome_r))
         mean_r_harv = sum(r[1] for r in rewards) / n_trajs
         mean_r_conv = sum(r[2] for r in rewards) / n_trajs
         mean_r_work = sum(r[3] for r in rewards) / n_trajs
         mean_r_dmg = sum(r[4] for r in rewards) / n_trajs
+        mean_r_outcome = sum(r[5] for r in rewards) / n_trajs
+        mean_reward = (mean_r_harv + mean_r_conv + mean_r_work + mean_r_dmg + mean_r_outcome)
         mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
-        elapsed = time.time() - t_start
+        elapsed = elapsed_offset + (time.time() - run_started_at)
 
-        train_log.append({
+        ep_entry = {
             "episode": ep + 1, "reward": round(mean_reward, 4),
             "r_harv": round(mean_r_harv, 4), "r_conv": round(mean_r_conv, 4),
             "r_work": round(mean_r_work, 4), "r_dmg": round(mean_r_dmg, 4),
-            "resources": round(mean_ti, 2), "best_resources": round(mean_ti, 2),
+            "r_outcome": round(mean_r_outcome, 4),
+            "resources": round(mean_ti, 2),
             "pi_loss": round(stats["pi_loss"], 5), "vf_loss": round(stats["vf_loss"], 5),
             "entropy": round(stats["entropy"], 4),
             "approx_kl": round(stats.get("approx_kl", 0), 6),
             "clip_frac": round(stats.get("clip_frac", 0), 4),
             "explained_var": stats.get("explained_var", 0),
-            "lr": round(scheduler.get_last_lr()[0], 8),
             "sps": stats["n_steps"], "elapsed": round(elapsed, 1),
             "winrate": round(total_wins / max(total_games, 1), 3),
-            "league_size": len(league.models),
-            "elo": round(next((m["elo"] for m in league.models if m["id"] == current_id), ELO_DEFAULT), 1),
-        })
+        }
+        train_log.append(ep_entry)
 
-        if (ep + 1) % 5 == 0 or ep == 0 or ep == args.episodes - 1:
-            with open(str(log_path), "w") as f:
-                json.dump({"episodes": train_log, "config": {
-                    "envs": args.opponents * args.games_per_opp,
-                    "ep_len": "self-play", "grid": "real", "lr": args.lr,
-                    "total_episodes": args.episodes, "mode": "batched-gpu",
-                    "session": session_name,
-                }}, f)
+        # Append single line — O(1) per episode instead of O(n) rewrite
+        with open(str(log_path), "a") as f:
+            f.write(json.dumps(ep_entry) + "\n")
+
+        # Per-game log: aggregate trajectories by game index
+        game_rewards = {}  # game_idx -> { total, r_harv, ... }
+        for traj_i, r in enumerate(rewards):
+            gi = traj_game_map[traj_i] if traj_i < len(traj_game_map) else 0
+            if gi not in game_rewards:
+                game_rewards[gi] = [0.0] * 6
+                game_rewards[gi].append(0)  # n_units
+            for k in range(6):
+                game_rewards[gi][k] += r[k]
+            game_rewards[gi][6] += 1
+        with open(game_log_path, "a") as gf:
+            for gi in sorted(game_rewards):
+                gr = game_rewards[gi]
+                w = all_winners[gi] if gi < len(all_winners) else None
+                orig_i = game_origin[gi] if gi < len(game_origin) else gi
+                oid = all_opp_ids[orig_i] if orig_i < len(all_opp_ids) else "?"
+                ti = 0
+                # Sum resources from all trajs in this game
+                for traj_i, traj in enumerate(all_trajs):
+                    if (traj_game_map[traj_i] if traj_i < len(traj_game_map) else 0) == gi and traj:
+                        ti += _traj_ti(traj)
+                gf.write(json.dumps({
+                    "episode": ep + 1, "game": orig_i,
+                    "opp": oid, "winner": w,
+                    "reward": round(gr[0] / max(gr[6], 1), 3), "units": gr[6],
+                    "resources": round(ti, 1),
+                    "replay": f"ep{ep + 1}_{oid}_g{orig_i}.replay26",
+                }) + "\n")
+
+        _atomic_torch_save({
+            "episode": ep + 1,
+            "elapsed_offset_s": elapsed,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        }, state_path)
 
         if (ep + 1) % 5 == 0 or ep == 0:
             print(
                 f"  Ep {ep + 1:3d}/{args.episodes}: "
                 f"W/L={total_wins}/{total_losses}/{total_games}  "
-                f"reward={mean_reward:+.2f}  ti={mean_ti:.0f}  "
+                f"reward/unit={mean_reward:+.2f}  ti={mean_ti:.0f}  "
                 f"pi={stats['pi_loss']:+.4f}  "
                 f"kl={stats.get('approx_kl', 0):.4f}  "
                 f"ev={stats.get('explained_var', 0):.2f}  "
@@ -845,12 +1032,13 @@ def main():
             )
 
     model.save_weights(weight_path)
+    save_centralized_critic_checkpoint(weight_path)
     league.save()
 
     if not args.teacher:
         model.save_weights(str(WEIGHT_PATH))
 
-    print(f"\nDone in {time.time() - t_start:.0f}s")
+    print(f"\nDone in {elapsed_offset + (time.time() - run_started_at):.0f}s")
 
 
 if __name__ == "__main__":

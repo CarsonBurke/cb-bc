@@ -16,7 +16,7 @@ import gc
 gc.disable()
 
 sys.path.insert(0, "bots/tensor")
-from tensor_lib import Tensor, Linear, ReLU, SiLU, LayerNorm, Sequential, MLP, Adam, SGD
+from tensor_lib import Tensor, Linear, ReLU, SiLU, LayerNorm, Sequential, MLP
 from tensor_lib.embed import SinusoidalPositionEmbedding, LearnedPositionEmbedding, RelativeGridEmbedding
 from main import (
     INPUT_SIZE as PROD_INPUT_SIZE,
@@ -58,9 +58,9 @@ def bench_creation():
 
 def bench_elementwise():
     print("\n== Elementwise Ops ==")
-    a = Tensor.randn((8, 32), requires_grad=True)
-    b = Tensor.randn((8, 32), requires_grad=True)
-    bias = Tensor.randn((32,), requires_grad=True)
+    a = Tensor.randn((8, 32))
+    b = Tensor.randn((8, 32))
+    bias = Tensor.randn((32,))
 
     bench(lambda: a + b, label="add (8,32) + (8,32)")
     bench(lambda: a * b, label="mul (8,32) * (8,32)")
@@ -82,8 +82,8 @@ def bench_matmul():
         ((16, 32), (32, 8), "16x32 @ 32x8 (output head)"),
     ]
     for (m, k), (_, n), label in sizes:
-        a = Tensor.randn((m, k), requires_grad=True)
-        b = Tensor.randn((k, n), requires_grad=True)
+        a = Tensor.randn((m, k))
+        b = Tensor.randn((k, n))
         bench(lambda a=a, b=b: a @ b, label=label)
 
 
@@ -91,7 +91,7 @@ def bench_matmul():
 
 def bench_transpose():
     print("\n== Transpose ==")
-    a = Tensor.randn((32, 64), requires_grad=True)
+    a = Tensor.randn((32, 64))
     bench(lambda: a.T(), label="transpose (32, 64)")
     b = Tensor.randn((64, 64))
     bench(lambda: b.T(), label="transpose (64, 64)")
@@ -101,14 +101,14 @@ def bench_transpose():
 
 def bench_activations():
     print("\n== Activations ==")
-    x = Tensor.randn((8, 32), requires_grad=True)
+    x = Tensor.randn((8, 32))
     bench(lambda: x.relu(), label="relu (8, 32)")
     bench(lambda: x.tanh(), label="tanh (8, 32)")
     bench(lambda: x.silu(), label="silu (8, 32)")
     bench(lambda: x.sigmoid(), label="sigmoid (8, 32)")
     bench(lambda: x.softmax(), label="softmax (8, 32)")
 
-    x1 = Tensor.randn((1, 32), requires_grad=True)
+    x1 = Tensor.randn((1, 32))
     bench(lambda: x1.softmax(), label="softmax (1, 32)")
 
 
@@ -116,7 +116,7 @@ def bench_activations():
 
 def bench_reductions():
     print("\n== Reductions ==")
-    x = Tensor.randn((8, 32), requires_grad=True)
+    x = Tensor.randn((8, 32))
     bench(lambda: x.sum(), label="sum (8, 32)")
     bench(lambda: x.mean(), label="mean (8, 32)")
     bench(lambda: x.log(), label="log (8, 32)")
@@ -166,63 +166,6 @@ def bench_mlp():
     mlp_big = MLP(64, [64, 32], {"action": 8, "value": 1}, activation="relu")
     x64 = Tensor.randn((1, 64))
     bench(lambda: mlp_big(x64), label="MLP 64->[64,32]->{8,1} batch=1")
-
-
-# ── Backward pass ────────────────────────────────────────────────
-
-def bench_backward():
-    print("\n== Backward Pass ==")
-
-    def forward_backward_linear():
-        x = Tensor.randn((1, 32), requires_grad=True)
-        lin = Linear(32, 16)
-        out = lin(x)
-        loss = out.sum()
-        loss.backward()
-
-    bench(forward_backward_linear, label="Linear(32->16) fwd+bwd")
-
-    def forward_backward_mlp():
-        x = Tensor.randn((1, 32), requires_grad=True)
-        net = Sequential(Linear(32, 32), ReLU(), Linear(32, 5))
-        out = net(x)
-        loss = out.sum()
-        loss.backward()
-
-    bench(forward_backward_mlp, label="Seq 32->32->5 fwd+bwd")
-
-    def forward_backward_mlp_heads():
-        x = Tensor.randn((1, 32), requires_grad=True)
-        mlp = MLP(32, [32], {"action": 5, "value": 1}, activation="relu")
-        heads = mlp(x)
-        loss = heads["action"].sum() + heads["value"].sum()
-        loss.backward()
-
-    bench(forward_backward_mlp_heads, label="MLP 32->[32]->{5,1} fwd+bwd")
-
-
-# ── Optimizer step ───────────────────────────────────────────────
-
-def bench_optimizers():
-    print("\n== Optimizer Step ==")
-
-    def make_params():
-        return [Tensor.randn((32, 32), requires_grad=True),
-                Tensor.randn((32,), requires_grad=True),
-                Tensor.randn((32, 8), requires_grad=True),
-                Tensor.randn((8,), requires_grad=True)]
-
-    params = make_params()
-    for p in params:
-        p.grad = Tensor.randn(p.shape)
-    sgd = SGD(params, lr=0.01)
-    bench(lambda: sgd.step(), label="SGD step (1280 params)")
-
-    params = make_params()
-    for p in params:
-        p.grad = Tensor.randn(p.shape)
-    adam = Adam(params, lr=0.001)
-    bench(lambda: adam.step(), label="Adam step (1280 params)")
 
 
 # ── Embeddings ───────────────────────────────────────────────────
@@ -343,34 +286,6 @@ def bench_inference():
     )
 
 
-# ── Training step simulation ────────────────────────────────────
-
-def bench_training_step():
-    print("\n== Training Step ==")
-
-    def full_train_step():
-        mlp = MLP(32, [32], {"action": 5}, activation="relu")
-        opt = Adam(mlp.parameters(), lr=0.001)
-        x = Tensor.randn((4, 32), requires_grad=True)
-        target = [random.randint(0, 4) for _ in range(4)]
-
-        opt.zero_grad()
-        heads = mlp(x)
-        logits = heads["action"]
-        probs = logits.softmax()
-        log_probs = probs.log()
-        # Cross-entropy-ish loss
-        loss_val = 0.0
-        for i in range(4):
-            loss_val -= log_probs.data[i * 5 + target[i]]
-        # Use sum as differentiable proxy
-        loss = (probs * -1.0).sum()
-        loss.backward()
-        opt.step()
-
-    bench(full_train_step, n=50, warmup=5, label="Full train step (batch=4)")
-
-
 # ── Multi-unit scaling ───────────────────────────────────────────
 
 def bench_scaling():
@@ -487,12 +402,9 @@ ALL_BENCHMARKS = {
     "reductions": bench_reductions,
     "layers": bench_layers,
     "mlp": bench_mlp,
-    "backward": bench_backward,
-    "optimizers": bench_optimizers,
     "embeddings": bench_embeddings,
     "inference": bench_inference,
     "scaling": bench_scaling,
-    "training": bench_training_step,
 }
 
 if __name__ == "__main__":

@@ -71,7 +71,7 @@ class LearnedPositionEmbedding:
         self.num_positions = num_positions
         self.d_model = d_model
         self.weight = Tensor.randn(
-            (num_positions, d_model), requires_grad=True, scale=0.1
+            (num_positions, d_model), scale=0.1
         )
 
     def __call__(self, indices: list[int]) -> Tensor:
@@ -82,28 +82,7 @@ class LearnedPositionEmbedding:
         for idx in indices:
             start = idx * d
             data.extend(w[start : start + d])
-
-        out = Tensor(data, (len(indices), d))
-        out.requires_grad = self.weight.requires_grad
-        out._prev = (self.weight,)
-
-        _w = self.weight
-        _indices = indices
-
-        def _backward():
-            if _w.requires_grad:
-                from .tensor import _ensure_grad
-
-                _ensure_grad(_w)
-                og = out.grad.data
-                for row, idx in enumerate(_indices):
-                    w_start = idx * d
-                    o_start = row * d
-                    for j in range(d):
-                        _w.grad.data[w_start + j] += og[o_start + j]
-
-        out._backward = _backward
-        return out
+        return Tensor(data, (len(indices), d))
 
     def parameters(self) -> list[Tensor]:
         return [self.weight]
@@ -165,11 +144,7 @@ class RelativeGridEmbedding:
             for j in range(ds):
                 out_data[base + dl + j] = sin_data[s_base + j]
 
-        out = Tensor(out_data, (n, dm))
-        out.requires_grad = offset_emb.requires_grad
-        out._prev = offset_emb._prev  # chain to learned weights
-        out._backward = offset_emb._backward
-        return out
+        return Tensor(out_data, (n, dm))
 
     def parameters(self) -> list[Tensor]:
         return self.offset_embed.parameters()

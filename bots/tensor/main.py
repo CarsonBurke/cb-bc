@@ -31,8 +31,8 @@ GRID_HALF = GRID_SIZE // 2
 #         + has_unit(1) + unit_friendly(1) = 17
 TILE_FEATURES = 17
 # Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy,
-#         n_builders, ti_delta, ax_delta, hp_advantage = 14
-GLOBAL_FEATURES = 14
+#         n_builders, ti_delta, ax_delta, hp_advantage, spawn_round = 15
+GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN_SIZES = [64, 64, 48, 48]
@@ -55,7 +55,6 @@ BUILD_ACTIONS = [
     "barrier",
     "foundry",
     "launcher",
-    "destroy",
 ]
 
 # Maps network output index -> Direction (3x3 grid layout)
@@ -125,7 +124,6 @@ BUILD_COSTS = (
     (3, 0),      # barrier
     (120, 0),    # foundry
     (20, 0),     # launcher
-    (0, 0),      # destroy
 )
 
 # Tile indices in 5x5 grid for each build direction (matches DIR_MAP_9 order)
@@ -216,7 +214,6 @@ class Player:
     _all_ore: list[Position] | None = None  # discovered ore tiles (accumulated)
     _all_ore_keys: set[tuple[int, int]] = set()
     _harv_proximity: dict[tuple[int, int], float] = {}  # ore_key → proximity reward given
-    _conv_proximity: dict[tuple[int, int], float] = {}  # ore_key → conv proximity reward given
     _working_harv_positions: set[tuple[int, int]] = set()  # accumulated per round
     _working_harv_round: int = -1
     _working_harv_count: int = 0  # final count from previous round
@@ -243,6 +240,7 @@ class Player:
         self._train_log: list | None = [] if _TRAIN_LOG else None
         self._prev_resources: tuple[float, float] | None = None
         self._n_builders_cached: int = 1
+        self._spawn_round: int = -1
         if self._train_log is not None:
             _LIVE_LOG_PLAYERS.add(self)
 
@@ -259,7 +257,6 @@ class Player:
         if self.core_center is None:
             self.core_center = ct.get_position()
         self._discover_ore(ct)
-        self._scan_working_harvesters(ct)
         self._scan_enemy_core_dmg(ct)
 
         ti, ax = ct.get_global_resources()
@@ -289,13 +286,16 @@ class Player:
     # ---- Builder: neural network decisions ----
 
     def _run_builder(self, ct: Controller) -> None:
+        if self._spawn_round < 0:
+            self._spawn_round = ct.get_current_round()
         if self.my_team is None:
             self.my_team = ct.get_team()
         if self.core_center is None:
             self._find_core(ct)
-        # Accumulate ore discoveries, working harvesters, and enemy core damage
+        # Accumulate ore discoveries and enemy core damage.
+        # Working-harvester reward is replay-derived during training, so we do
+        # not spend per-turn CPU estimating it from partial vision here.
         self._discover_ore(ct)
-        self._scan_working_harvesters(ct)
         self._scan_enemy_core_dmg(ct)
         # Opportunistically scan for enemy core
         if self.enemy_core is None:
@@ -318,24 +318,21 @@ class Player:
         h_raw = outputs["h_next"]
         self.h_prev = [math.tanh(x) for x in h_raw]
 
-        # Compute action masks (which builds are affordable, which tiles are free/destroyable)
-        bt_mask, bd_mask, dd_mask, md_mask = _compute_masks_from_obs(obs)
+        # Compute action masks (which builds are affordable, which tiles are free)
+        bt_mask, bd_mask = _compute_masks_from_obs(obs)
 
         # Decode each head via argmax (sample in training mode)
         if self._train_log is not None:
             build_type_idx, bt_lp = _sample_from_logits(outputs["build_type"], bt_mask)
-            # Use destroy dir mask when destroy chosen, build dir mask otherwise
-            dir_mask = dd_mask if build_type_idx == 12 else bd_mask
-            build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"], dir_mask)
-            move_dir_idx, md_lp = _sample_from_logits(outputs["move_dir"], md_mask)
+            build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"], bd_mask)
+            move_dir_idx, md_lp = _sample_from_logits(outputs["move_dir"], None)
             # Mask build_dir log_prob when build_type is "none" (idx 0)
             # — the direction is causally irrelevant, so exclude from policy gradient
             old_log_prob = bt_lp + (bd_lp if build_type_idx != 0 else 0.0) + md_lp
         else:
             build_type_idx = _argmax(outputs["build_type"], bt_mask)
-            dir_mask = dd_mask if build_type_idx == 12 else bd_mask
-            build_dir_idx = _argmax(outputs["build_dir"], dir_mask)
-            move_dir_idx = _argmax(outputs["move_dir"], md_mask)
+            build_dir_idx = _argmax(outputs["build_dir"], bd_mask)
+            move_dir_idx = _argmax(outputs["move_dir"], None)
 
         # Snapshot resources before actions to isolate delivery from spending
         ti_before, ax_before = ct.get_global_resources()
@@ -352,9 +349,6 @@ class Player:
         # Enemy core damage (class-level, accumulated from all units' vision)
         enemy_dmg = Player._enemy_core_dmg
 
-        # Global working harvester count (accumulated from all units' vision this round)
-        n_working = Player._working_harv_count
-
         ti_after, ax_after = ct.get_global_resources()
         self._prev_resources = (ti_after, ax_after)
 
@@ -368,7 +362,7 @@ class Player:
                 build_dir_idx,
                 move_dir_idx,
                 0.0,  # value placeholder
-                n_working,
+                0,  # replay augmentation fills in true working-harvester count
                 conv_reward,
                 ti_after,
                 harv_reward,
@@ -477,7 +471,9 @@ class Player:
                 key = (tile_pos.x, tile_pos.y)
                 prev = Player._harv_proximity.get(key, 0.0)
                 d = max(abs(tile_pos.x - pos.x), abs(tile_pos.y - pos.y))
-                reward = min(self._PLACE_HARV / (1.0 + d), self._PLACE_HARV * 0.1)
+                if d > 10:
+                    continue
+                reward = self._PLACE_HARV / (1.0 + d)
                 delta = reward - prev
                 if delta > best_delta:
                     best_delta, best_key, best_reward = delta, key, reward
@@ -488,59 +484,6 @@ class Player:
         Player._harv_proximity[best_key] = best_reward
         return best_delta
 
-    _CARDINAL = (Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST)
-
-    def _conveyor_reward(self, ct: Controller, pos: Position, facing: Direction) -> float:
-        """Reward for successful conveyor placement based on manhattan proximity to ore.
-        Target distance is 1 (cardinally adjacent). Zero-sum with proximity advances.
-        Zero reward if conveyor faces toward the ore (would push into miner)."""
-        best_dist, best_key = None, None
-        best_given = 0.0
-        fdx, fdy = DIR_DXY.get(facing, (0, 0))
-        for ore_pos in (Player._all_ore or []):
-            key = (ore_pos.x, ore_pos.y)
-            prev = Player._conv_proximity.get(key, 0.0)
-            dx, dy = ore_pos.x - pos.x, ore_pos.y - pos.y
-            d = abs(dx) + abs(dy)
-            # Cardinal adjacent: check facing doesn't point at ore
-            if d == 1 and fdx == dx and fdy == dy:
-                continue  # facing into the ore — useless
-            if best_dist is None or d < best_dist:
-                best_dist, best_key = d, key
-                best_given = prev
-        if best_key is None:
-            return 0.0
-        effective_dist = max(0, best_dist - 1)  # target is cardinal adjacent (d=1)
-        reward = self._PLACE_CONV / (1.0 + effective_dist)
-        # Store max so rebuilds get zero (reward - reward = 0)
-        Player._conv_proximity[best_key] = max(best_given, reward)
-        return reward - best_given
-
-    def _proximity_reward_conv(self, ct: Controller) -> float:
-        """Proximity reward for failed conveyor placement.
-        Returns delta improvement: new_advance - old_advance. Improvable on closer approach.
-        Zero-sum with placement: total advance is deducted on successful build."""
-        pos = ct.get_position()
-        best_delta, best_key, best_reward = 0.0, None, 0.0
-        for tile_pos in ct.get_nearby_tiles():
-            try:
-                env = ct.get_tile_env(tile_pos)
-                if env not in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
-                    continue
-                key = (tile_pos.x, tile_pos.y)
-                prev = Player._conv_proximity.get(key, 0.0)
-                d = abs(tile_pos.x - pos.x) + abs(tile_pos.y - pos.y)
-                effective_dist = max(0, d - 1)
-                reward = min(self._PLACE_CONV / (1.0 + effective_dist), self._PLACE_CONV * 0.1)
-                delta = reward - prev
-                if delta > best_delta:
-                    best_delta, best_key, best_reward = delta, key, reward
-            except Exception:
-                continue
-        if best_key is None or best_delta <= 0:
-            return 0.0
-        Player._conv_proximity[best_key] = best_reward
-        return best_delta
 
     def _find_core(self, ct: Controller) -> Position:
         if self.my_team is None:
@@ -669,6 +612,7 @@ class Player:
             core_dx, core_dy, ecore_dx, ecore_dy,
             n_builders / 10.0,
             ti_delta, ax_delta, hp_advantage,
+            self._spawn_round / 2000.0 if self._spawn_round >= 0 else 0.0,
         ])
 
         extend(self.pos_encoder.encode(pos.x, pos.y))
@@ -682,7 +626,6 @@ class Player:
     # ---- Action execution ----
 
     _PLACE_HARV = 5.0
-    _PLACE_CONV = 2.5
 
     def _execute_build(
         self, ct: Controller, action: str, direction: Direction
@@ -729,8 +672,6 @@ class Player:
             if ct.can_build_conveyor(build_pos, conv_dir):
                 ct.build_conveyor(build_pos, conv_dir)
                 Player._conv_count += 1
-                return 0.0, self._conveyor_reward(ct, build_pos, conv_dir)
-            return 0.0, self._proximity_reward_conv(ct)
         elif action == "harvester":
             if ct.can_build_harvester(build_pos):
                 ct.build_harvester(build_pos)
@@ -759,8 +700,6 @@ class Player:
             if ct.can_build_armoured_conveyor(build_pos, direction):
                 ct.build_armoured_conveyor(build_pos, direction)
                 Player._conv_count += 1
-                return 0.0, self._conveyor_reward(ct, build_pos, direction)
-            return 0.0, self._proximity_reward_conv(ct)
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):
                 ct.build_barrier(build_pos)

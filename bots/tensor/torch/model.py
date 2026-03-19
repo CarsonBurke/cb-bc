@@ -20,19 +20,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 # ---- Architecture constants (must match main.py) ----
 
 TILE_FEATURES = 17
-GLOBAL_FEATURES = 14
+GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN = [64, 64, 48, 48]
 TEACHER_HIDDEN = [128, 128, 128, 64]
 H_DIM = 16
 INPUT_SIZE = OBS_SIZE + H_DIM
+ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
+TERMINAL_WIN_REWARD = 10.0
+TERMINAL_LOSS_REWARD = -10.0
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
-LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.json"
+LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
 REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
 
 # ---- Action masking ----
@@ -134,7 +137,221 @@ class RMSNorm(nn.Module):
         return x / rms * self.weight
 
 
-CRITIC_DIM = 128
+# ---- Centralized Critic constants ----
+GLOBAL_MAP_MAX_W = 50
+GLOBAL_MAP_MAX_H = 50
+GLOBAL_MAP_CHANNELS = 19
+GLOBAL_SCALAR_DIM = 12
+UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
+CENTRALIZED_CNN_CHUNK = 248
+
+
+class RMSNorm2d(nn.Module):
+    """RMSNorm for 2D spatial feature maps (B, C, H, W)."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W) — normalize over C dimension per spatial position
+        rms = torch.sqrt(x.pow(2).mean(1, keepdim=True) + self.eps)
+        return x / rms * self.weight.view(1, -1, 1, 1)
+
+
+class CentralizedCritic(nn.Module):
+    """Centralized per-unit critic over full replay-derived map state.
+
+    Takes full map state (omniscient, from replay) and produces per-unit
+    value estimates. Only used during training.
+
+    The CNN encodes the map once per round. Per-unit computation is just
+    an index into the feature map + a small MLP (cheap, O(1) per unit).
+    """
+
+    def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS, conv_dim: int = 64):
+        super().__init__()
+        self.conv_dim = conv_dim
+
+        # Dilated conv stack: full spatial resolution, 31-tile receptive field
+        self.conv = nn.Sequential(
+            nn.Conv2d(map_channels, 32, 3, padding=1, dilation=1),
+            RMSNorm2d(32),
+            nn.SiLU(),
+            nn.Conv2d(32, conv_dim, 3, padding=2, dilation=2),
+            RMSNorm2d(conv_dim),
+            nn.SiLU(),
+            nn.Conv2d(conv_dim, conv_dim, 3, padding=4, dilation=4),
+            RMSNorm2d(conv_dim),
+            nn.SiLU(),
+            nn.Conv2d(conv_dim, conv_dim, 3, padding=8, dilation=8),
+            RMSNorm2d(conv_dim),
+            nn.SiLU(),
+        )
+
+        # Single per-unit value head from tile features + replay/global context.
+        unit_in = conv_dim + UNIT_CONTEXT_DIM + GLOBAL_SCALAR_DIM + ACTOR_LATENT_DIM
+        self.unit_head = nn.Sequential(
+            nn.Linear(unit_in, 128),
+            RMSNorm(128),
+            nn.SiLU(),
+            nn.Linear(128, 64),
+            RMSNorm(64),
+            nn.SiLU(),
+            nn.Linear(64, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        # Small std for final value outputs
+        nn.init.orthogonal_(self.unit_head[-1].weight, gain=1.0)
+
+    def encode_map(
+        self,
+        map_tensor: torch.Tensor,    # (R, C, H, W) — R unique rounds
+        valid_mask: torch.Tensor,     # (R, 1, H, W)
+    ) -> torch.Tensor:
+        """Run CNN once per unique round and return full spatial feature maps.
+
+        valid_mask is applied so padded map area contributes no signal.
+        """
+        return self.conv(map_tensor) * valid_mask
+
+    def unit_values(
+        self,
+        feat: torch.Tensor,          # (R, conv_dim, H, W) — cached from encode_map
+        round_scalars: torch.Tensor,  # (R, GLOBAL_SCALAR_DIM)
+        round_idx: torch.Tensor,      # (B,) — maps each unit-step to its round index
+        unit_xy: torch.Tensor,        # (B, 2) — x, y positions (long)
+        unit_context: torch.Tensor,   # (B, UNIT_CONTEXT_DIM)
+        actor_latent: torch.Tensor,   # (B, ACTOR_LATENT_DIM) — detached rollout latent
+    ) -> torch.Tensor:
+        """Compute per-unit marginal values by indexing cached feature maps.
+
+        Returns:
+            v_unit: (B,) — per-unit marginal value
+        """
+        B = round_idx.shape[0]
+        H, W = feat.shape[2], feat.shape[3]
+        ux = unit_xy[:, 0].clamp(0, W - 1).long()
+        uy = unit_xy[:, 1].clamp(0, H - 1).long()
+        ri = round_idx.long()
+
+        # Index into cached feature maps: (B, conv_dim)
+        unit_tile_feat = feat[ri, :, uy, ux]
+        unit_round_scalars = round_scalars[ri]
+
+        # Per-unit value
+        unit_in = torch.cat(
+            [unit_tile_feat, unit_round_scalars, unit_context, actor_latent],
+            dim=-1,
+        )
+        return self.unit_head(unit_in).squeeze(-1)  # (B,)
+
+    def forward(
+        self,
+        map_tensor: torch.Tensor,    # (B, C, H, W)
+        valid_mask: torch.Tensor,     # (B, 1, H, W)
+        round_scalars: torch.Tensor,  # (B, GLOBAL_SCALAR_DIM)
+        unit_xy: torch.Tensor,        # (B, 2) — x, y positions (long)
+        unit_context: torch.Tensor,   # (B, UNIT_CONTEXT_DIM)
+        actor_latent: torch.Tensor,   # (B, ACTOR_LATENT_DIM)
+    ) -> torch.Tensor:
+        """Full forward pass (non-cached path). Returns per-unit value."""
+        feat = self.encode_map(map_tensor, valid_mask)
+        round_idx = torch.arange(map_tensor.shape[0], device=map_tensor.device)
+        return self.unit_values(
+            feat, round_scalars, round_idx, unit_xy, unit_context, actor_latent,
+        )
+
+
+_critic_stage_obs: torch.Tensor | None = None
+_critic_stage_mask: torch.Tensor | None = None
+_critic_stage_shape = (0, 0, 0)  # n, h, w capacity
+
+
+def _get_critic_staging_buffers(
+    batch_n: int,
+    batch_h: int,
+    batch_w: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reuse pinned CPU staging buffers for critic chunk assembly."""
+    global _critic_stage_obs, _critic_stage_mask, _critic_stage_shape
+
+    cap_n, cap_h, cap_w = _critic_stage_shape
+    if (
+        _critic_stage_obs is None
+        or batch_n > cap_n
+        or batch_h > cap_h
+        or batch_w > cap_w
+    ):
+        alloc_n = max(batch_n, cap_n)
+        alloc_h = max(batch_h, cap_h)
+        alloc_w = max(batch_w, cap_w)
+        _critic_stage_obs = torch.empty(
+            alloc_n, GLOBAL_MAP_CHANNELS, alloc_h, alloc_w, dtype=torch.float32,
+        )
+        _critic_stage_mask = torch.empty(
+            alloc_n, 1, alloc_h, alloc_w, dtype=torch.float32,
+        )
+        if DEVICE.type == "cuda":
+            _critic_stage_obs = _critic_stage_obs.pin_memory()
+            _critic_stage_mask = _critic_stage_mask.pin_memory()
+        _critic_stage_shape = (alloc_n, alloc_h, alloc_w)
+
+    obs = _critic_stage_obs[:batch_n, :, :batch_h, :batch_w]
+    mask = _critic_stage_mask[:batch_n, :, :batch_h, :batch_w]
+    obs.zero_()
+    mask.zero_()
+    return obs, mask
+
+
+def _load_critic_round_batch(
+    centralized_data: dict,
+    round_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fetch a round batch for the centralized critic and move it to DEVICE."""
+    round_ids_cpu = round_ids.detach().to("cpu")
+    round_list = round_ids_cpu.tolist()
+    sizes = centralized_data["global_sizes"][round_ids_cpu]
+    widths = sizes[:, 0]
+    heights = sizes[:, 1]
+    batch_w = int(widths.max().item()) if widths.numel() else 1
+    batch_h = int(heights.max().item()) if heights.numel() else 1
+    batch_n = len(round_list)
+
+    g_obs_cpu, g_mask_cpu = _get_critic_staging_buffers(
+        batch_n, batch_h, batch_w,
+    )
+
+    global_states = centralized_data["global_states"]
+    for batch_i, round_idx in enumerate(round_list):
+        mw = int(widths[batch_i].item())
+        mh = int(heights[batch_i].item())
+        if mw > 0 and mh > 0:
+            buf = global_states[round_idx]
+            state_view = torch.frombuffer(
+                buf, dtype=torch.float32,
+            ).reshape(GLOBAL_MAP_CHANNELS, mh, mw)
+            g_obs_cpu[batch_i, :, :mh, :mw].copy_(state_view)
+            g_mask_cpu[batch_i, 0, :mh, :mw] = 1.0
+
+    return (
+        g_obs_cpu.to(device=DEVICE, non_blocking=True),
+        g_mask_cpu.to(device=DEVICE, non_blocking=True),
+        centralized_data["global_scalars"][round_ids_cpu].to(device=DEVICE, non_blocking=True),
+    )
 
 
 def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
@@ -172,8 +389,21 @@ def action_log_prob_and_entropy(
     return chosen, entropy
 
 
+def _normalize_actor_latent_dim(latent: torch.Tensor) -> torch.Tensor:
+    """Pad/slice actor latents so critic input width is stable across models."""
+    cur_dim = latent.shape[-1]
+    if cur_dim == ACTOR_LATENT_DIM:
+        return latent
+    if cur_dim > ACTOR_LATENT_DIM:
+        return latent[:, :ACTOR_LATENT_DIM]
+    pad = latent.new_zeros(latent.shape[0], ACTOR_LATENT_DIM - cur_dim)
+    return torch.cat([latent, pad], dim=-1)
+
+
 class BuilderMLP(nn.Module):
-    """MLP with shared encoder, separate actor trunk and deep critic.
+    """MLP actor with shared encoder and separate policy heads.
+
+    Value estimation is handled by CentralizedCritic (not part of this model).
 
     Args:
         hidden: Hidden layer sizes. Defaults to HIDDEN (production).
@@ -210,18 +440,6 @@ class BuilderMLP(nn.Module):
         self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
         self.head_h_next = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)
 
-        # Separate deep critic (training-only, not exported)
-        critic_dim = max(CRITIC_DIM, enc_dim * 2)
-        self.critic = nn.Sequential(
-            _ortho_init(nn.Linear(enc_dim, critic_dim)),
-            RMSNorm(critic_dim),
-            nn.SiLU(),
-            _ortho_init(nn.Linear(critic_dim, critic_dim)),
-            RMSNorm(critic_dim),
-            nn.SiLU(),
-            _ortho_init(nn.Linear(critic_dim, 1), std=1.0),
-        )
-
     def train(self, mode=True):
         # Invalidate fused head cache when entering train mode
         if mode and hasattr(self, '_cached_head_w'):
@@ -229,15 +447,14 @@ class BuilderMLP(nn.Module):
             del self._cached_head_b
         return super().train(mode)
 
-    def _forward_from_trunk_in(
-        self,
-        trunk_in: torch.Tensor,
-        *,
-        include_value: bool,
-    ):
+    def actor_latent(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        """Return the pre-head actor latent used for policy logits."""
+        trunk_in = torch.cat([x, h_prev], dim=-1)
         enc = self.encoder(trunk_in)
-        h = self.actor_trunk(enc)
+        return self.actor_trunk(enc)
 
+    def _forward_from_hidden(self, h: torch.Tensor):
+        """Project actor latent to policy heads."""
         # Fuse 4 head matmuls into one kernel launch
         # Cache fused weights in eval mode (inference hot path)
         if self.training:
@@ -264,19 +481,20 @@ class BuilderMLP(nn.Module):
 
         combined = F.linear(h, combined_w, combined_b)
         bt_l, bd_l, md_l, h_raw = combined.split([N_BUILD, N_DIR, N_DIR, H_DIM], dim=-1)
-
-        if include_value:
-            value = self.critic(enc).squeeze(-1)
-            return bt_l, bd_l, md_l, value, torch.tanh(h_raw)
         return bt_l, bd_l, md_l, torch.tanh(h_raw)
+
+    def _forward_from_trunk_in(self, trunk_in: torch.Tensor):
+        enc = self.encoder(trunk_in)
+        h = self.actor_trunk(enc)
+        return self._forward_from_hidden(h)
 
     def forward(self, x, h_prev):
         trunk_in = torch.cat([x, h_prev], dim=-1)
-        return self._forward_from_trunk_in(trunk_in, include_value=True)
+        return self._forward_from_trunk_in(trunk_in)
 
     def infer_packed(self, trunk_in: torch.Tensor):
         """Inference-only path for already-packed [obs, h_prev] batches."""
-        return self._forward_from_trunk_in(trunk_in, include_value=False)
+        return self._forward_from_trunk_in(trunk_in)
 
     def _policy_state_modules(self) -> list[nn.Module]:
         """Policy modules only in tensor_lib serialization order (critic excluded)."""
@@ -351,8 +569,8 @@ class BuilderMLP(nn.Module):
                 with open(path, "rb") as f:
                     data = pickle.load(f)
                 if isinstance(data, dict):
-                    # torch state_dict format (legacy)
-                    self.load_state_dict(data)
+                    # torch state_dict format (legacy, may have extra critic keys)
+                    self.load_state_dict(data, strict=False)
                 else:
                     # list-of-lists format (current + old pickle)
                     self.import_weights(data)
@@ -375,6 +593,7 @@ def ppo_update(
     old_log_probs: torch.Tensor,
     advantages: torch.Tensor,
     returns: torch.Tensor,
+    centralized_data: dict,
     old_values: torch.Tensor | None = None,
     ppo_epochs: int = 4,
     minibatch_size: int = 2048,
@@ -392,6 +611,9 @@ def ppo_update(
     sum_kl, sum_clip_frac = 0.0, 0.0
     n_updates = 0
 
+    critic, critic_opt = get_centralized_critic()
+    critic.train()
+
     # Explained variance: pre-update values vs returns (CleanRL-style, no extra fwd pass)
     if old_values is not None:
         with torch.no_grad():
@@ -408,7 +630,7 @@ def ppo_update(
             idx = perm[start:start + minibatch_size]
 
             t_phase = time.perf_counter() if profile is not None else 0.0
-            bt_l, bd_l, md_l, value, _ = model(obs[idx], h[idx])
+            bt_l, bd_l, md_l, _ = model(obs[idx], h[idx])
             if profile is not None:
                 profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -449,33 +671,71 @@ def ppo_update(
             if profile is not None:
                 profile["ppo_policy_loss_s"] = profile.get("ppo_policy_loss_s", 0.0) + (time.perf_counter() - t_phase)
 
-            # Value loss with optional clipping (CleanRL-style)
             t_phase = time.perf_counter() if profile is not None else 0.0
-            newvalue = value.view(-1)
-            if clip_vloss and old_values is not None:
-                v_loss_unclipped = (newvalue - returns[idx]) ** 2
-                v_clipped = old_values[idx] + torch.clamp(
-                    newvalue - old_values[idx], -clip_eps, clip_eps,
-                )
-                v_loss_clipped = (v_clipped - returns[idx]) ** 2
-                vf_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
-            else:
-                vf_loss = 0.5 * ((newvalue - returns[idx]) ** 2).mean()
+            optimizer.zero_grad(set_to_none=True)
+            critic_opt.zero_grad(set_to_none=True)
+
+            actor_loss = pi_loss - entropy_coeff * entropy.mean()
+            actor_loss.backward()
+
+            vf_loss_sum = 0.0
+            vf_denom = max(idx.shape[0], 1)
+            # Value loss with optional clipping (CleanRL-style), but backpropagated
+            # chunk-by-chunk so the centralized critic never retains a full
+            # minibatch worth of spatial feature maps.
+            t_value = time.perf_counter() if profile is not None else 0.0
+            ri = centralized_data["step_round_idx"][idx]
+            u_xy = centralized_data["step_unit_xy"][idx]
+            u_ctx = centralized_data["step_unit_ctx"][idx]
+            u_latent = centralized_data["step_actor_latent"][idx]
+            mb_returns = returns[idx]
+            mb_old_values = old_values[idx] if old_values is not None else None
+            unique_rounds, inverse = ri.unique(return_inverse=True)
+            _CNN_CHUNK = CENTRALIZED_CNN_CHUNK
+            _UNIT_CHUNK = 4096
+            for c_start in range(0, unique_rounds.shape[0], _CNN_CHUNK):
+                c_end = min(c_start + _CNN_CHUNK, unique_rounds.shape[0])
+                c_rounds = unique_rounds[c_start:c_end]
+                g_obs, g_mask, g_scalars = _load_critic_round_batch(centralized_data, c_rounds)
+                feat = critic.encode_map(g_obs, g_mask)
+                step_mask = (inverse >= c_start) & (inverse < c_end)
+                step_indices = step_mask.nonzero(as_tuple=True)[0]
+                if step_indices.numel() == 0:
+                    continue
+
+                local_round_idx = inverse[step_indices] - c_start
+                for u_start in range(0, step_indices.shape[0], _UNIT_CHUNK):
+                    u_end = min(u_start + _UNIT_CHUNK, step_indices.shape[0])
+                    si = step_indices[u_start:u_end]
+                    lr = local_round_idx[u_start:u_end]
+                    newvalue = critic.unit_values(
+                        feat, g_scalars, lr, u_xy[si], u_ctx[si], u_latent[si],
+                    )
+                    if clip_vloss and mb_old_values is not None:
+                        v_loss_unclipped = (newvalue - mb_returns[si]) ** 2
+                        v_clipped = mb_old_values[si] + torch.clamp(
+                            newvalue - mb_old_values[si], -clip_eps, clip_eps,
+                        )
+                        v_loss_elems = torch.max(v_loss_unclipped, (v_clipped - mb_returns[si]) ** 2)
+                    else:
+                        v_loss_elems = (newvalue - mb_returns[si]) ** 2
+
+                    vf_loss_sum += 0.5 * v_loss_elems.detach().sum().item()
+                    (vf_coeff * 0.5 * v_loss_elems.sum() / vf_denom).backward()
+
+            vf_loss = vf_loss_sum / vf_denom
             if profile is not None:
-                profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_phase)
+                profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_value)
 
-            loss = pi_loss + vf_coeff * vf_loss - entropy_coeff * entropy.mean()
-
-            t_phase = time.perf_counter() if profile is not None else 0.0
-            optimizer.zero_grad()
-            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
             optimizer.step()
+            critic_opt.step()
             if profile is not None:
                 profile["ppo_backward_step_s"] = profile.get("ppo_backward_step_s", 0.0) + (time.perf_counter() - t_phase)
 
             sum_pi += pi_loss.item()
-            sum_vf += vf_loss.item()
+            sum_vf += vf_loss
             sum_ent += entropy.mean().item()
             n_updates += 1
 
@@ -495,11 +755,17 @@ def ppo_update(
 
 def _parse_trajectories(
     trajectories: list[list[dict]],
+    global_states_list: list[dict | None] | None = None,
+    traj_game_map: list[int] | None = None,
+    game_winners: list[str | None] | None = None,
 ) -> dict[str, torch.Tensor | list[tuple[int, int]]] | None:
     """Parse engine-collected trajectories into flat tensors (no GAE yet).
 
     Returns dict with keys: obs, h, bt, bd, md, old_log_probs, rewards,
     ep_boundaries. Or None if no data.
+
+    If global_states_list is provided, also returns centralized critic tensors:
+    round_idx and unit_xy/unit_ctx mappings into replay-derived map states.
     """
     # Pre-count total steps to allocate tensors up front, avoiding
     # 7 large Python lists and the GC pressure they cause.
@@ -515,7 +781,9 @@ def _parse_trajectories(
     md_t = torch.empty(N, dtype=torch.long)
     lp_t = torch.empty(N, dtype=torch.float32)
     rw_t = torch.empty(N, dtype=torch.float32)
+    step_game_t = torch.empty(N, dtype=torch.int32)
     ep_boundaries = []
+    ep_game_idx = []
 
     # Disable cyclic GC — the loop creates no reference cycles, and the
     # collector's O(live_objects) scan is expensive with many live tensors.
@@ -523,8 +791,9 @@ def _parse_trajectories(
     gc.disable()
     try:
         idx = 0
-        for traj in trajectories:
+        for traj_i, traj in enumerate(trajectories):
             start = idx
+            game_idx = traj_game_map[traj_i] if traj_game_map and traj_i < len(traj_game_map) else 0
             for step in traj:
                 if isinstance(step, (list, tuple)):
                     n = len(step)
@@ -550,13 +819,40 @@ def _parse_trajectories(
                     dmg = step.get("dmg", 0)
                     lp_t[idx] = step.get("old_lp", 0)
                 rw_t[idx] = harv_r + conv_r + n_working * 2.5 + dmg * 20.0
+                step_game_t[idx] = game_idx
                 idx += 1
             ep_boundaries.append((start, idx))
+            ep_game_idx.append(game_idx)
     finally:
         if gc_was_enabled:
             gc.enable()
 
-    return {
+    # Share each round's total reward across all unit-steps from that game/round.
+    round_reward: dict[tuple[int, int], float] = {}
+    for i in range(N):
+        rnd = int(round(obs_t[i, _OBS_GLOBAL_START].item() * 2000.0))
+        rnd = max(0, min(rnd, 1999))
+        key = (int(step_game_t[i].item()), rnd)
+        round_reward[key] = round_reward.get(key, 0.0) + float(rw_t[i].item())
+    for i in range(N):
+        rnd = int(round(obs_t[i, _OBS_GLOBAL_START].item() * 2000.0))
+        rnd = max(0, min(rnd, 1999))
+        rw_t[i] = round_reward[(int(step_game_t[i].item()), rnd)]
+
+    # Add a small terminal outcome reward to the final step of every unit
+    # trajectory so dead units can still learn from game outcome.
+    if game_winners:
+        for ep_i, (start, end) in enumerate(ep_boundaries):
+            if end <= start:
+                continue
+            game_idx = ep_game_idx[ep_i]
+            winner = game_winners[game_idx] if game_idx < len(game_winners) else None
+            if winner == "a":
+                rw_t[end - 1] += TERMINAL_WIN_REWARD
+            elif winner == "b":
+                rw_t[end - 1] += TERMINAL_LOSS_REWARD
+
+    result = {
         "obs": obs_t.to(DEVICE),
         "h": h_t.to(DEVICE),
         "bt": bt_t.to(DEVICE),
@@ -566,6 +862,173 @@ def _parse_trajectories(
         "rewards": rw_t.to(DEVICE),
         "ep_boundaries": ep_boundaries,
         "n_steps": N,
+    }
+
+    # Build centralized critic data if global states available
+    if global_states_list and any(gs is not None for gs in global_states_list):
+        result.update(_build_centralized_critic_data(
+            obs_t, trajectories, global_states_list, ep_boundaries, N,
+            traj_game_map=traj_game_map,
+        ))
+
+    return result
+
+
+# Obs feature indices for unit position (x_norm, y_norm at global feature offsets)
+_OBS_X_NORM = _OBS_GLOBAL_START + 1  # x / map_w
+_OBS_Y_NORM = _OBS_GLOBAL_START + 2  # y / map_h
+_OBS_CORE_DX = _OBS_GLOBAL_START + 6
+_OBS_CORE_DY = _OBS_GLOBAL_START + 7
+_OBS_ECORE_DX = _OBS_GLOBAL_START + 8
+_OBS_ECORE_DY = _OBS_GLOBAL_START + 9
+_OBS_SPAWN_ROUND = _OBS_GLOBAL_START + 14  # spawn_round / 2000.0
+
+
+def _build_centralized_critic_data(
+    obs_t: torch.Tensor,
+    trajectories: list[list],
+    global_states_list: list[dict | None],
+    ep_boundaries: list[tuple[int, int]],
+    N: int,
+    traj_game_map: list[int] | None = None,
+) -> dict[str, object]:
+    """Build per-round global state tensors and per-step index mappings.
+
+    De-duplicates global states by (game_idx, round) to save GPU memory.
+    Accepts both contiguous-buffer format (states_buf/scalars_buf) and
+    legacy per-turn dict format (states/scalars dicts).
+
+    Args:
+        traj_game_map: Maps trajectory index -> game index in global_states_list.
+            If None, all trajectories are assigned to game 0.
+    """
+    max_w = GLOBAL_MAP_MAX_W
+    max_h = GLOBAL_MAP_MAX_H
+    n_ch = GLOBAL_MAP_CHANNELS
+    n_sc = GLOBAL_SCALAR_DIM
+
+    # Reserve index 0 as a zero fallback state for games without global states.
+    # Use bytearray so torch.frombuffer works uniformly for all entries.
+    zero_state = bytearray(n_ch * 1 * 1 * 4)
+    zero_scalars = [0.0] * n_sc
+    unique_states: list[object] = [zero_state]  # bytearray or buffer slice
+    unique_valid_masks = [(1, 1)]
+    unique_scalars: list[list[float]] = [zero_scalars]
+    unique_keys = {}  # (game_idx, round) → flat index (starting from 1)
+
+    # Per-step: index into unique states, unit xy, unit context
+    step_round_idx = torch.zeros(N, dtype=torch.long)
+    step_unit_xy = torch.zeros(N, 2, dtype=torch.long)
+    step_unit_ctx = torch.zeros(N, UNIT_CONTEXT_DIM, dtype=torch.float32)
+
+    n_games = len(global_states_list)
+
+    for ep_i, (start, end) in enumerate(ep_boundaries):
+        if end <= start:
+            continue
+
+        game_idx = traj_game_map[ep_i] if traj_game_map and ep_i < len(traj_game_map) else 0
+        gs = global_states_list[game_idx] if game_idx < n_games else None
+        if gs is None:
+            continue
+
+        gs_map_w = gs.get("map_w", max_w)
+        gs_map_h = gs.get("map_h", max_h)
+
+        # Detect format: contiguous buffer or legacy per-turn dicts
+        states_buf = gs.get("states_buf")
+        if states_buf is not None:
+            # Contiguous buffer format — index by byte offset
+            state_stride_bytes = gs.get("state_stride", n_ch * gs_map_h * gs_map_w) * 4
+            scalars_buf = gs.get("scalars_buf", b"")
+            scalar_stride_bytes = gs.get("n_scalars", n_sc) * 4
+            gs_n_turns = gs.get("n_turns", 0)
+
+            def _get_state(rnd):
+                if 0 <= rnd < gs_n_turns:
+                    off = rnd * state_stride_bytes
+                    return bytearray(states_buf[off:off + state_stride_bytes])
+                return zero_state
+
+            def _get_scalars(rnd):
+                if 0 <= rnd < gs_n_turns:
+                    import struct
+                    off = rnd * scalar_stride_bytes
+                    n = scalar_stride_bytes // 4
+                    return list(struct.unpack_from(f"<{n}f", scalars_buf, off))
+                return zero_scalars
+
+            available_rounds = list(range(gs_n_turns)) if gs_n_turns > 0 else []
+        else:
+            # Legacy per-turn dict format
+            gs_states = gs.get("states", {})
+            gs_scalars_d = gs.get("scalars", {})
+            available_rounds = sorted(gs_states.keys()) if gs_states else []
+
+            def _get_state(rnd):
+                s = gs_states.get(rnd)
+                if s is not None:
+                    if isinstance(s, (bytes, bytearray)):
+                        return s
+                    # array.array — convert to bytearray for torch.frombuffer
+                    return bytearray(s.tobytes() if hasattr(s, "tobytes") else bytes(s))
+                return zero_state
+
+            def _get_scalars(rnd):
+                s = gs_scalars_d.get(rnd)
+                if s is not None:
+                    return list(s)
+                return zero_scalars
+
+        for i in range(start, end):
+            rnd = int(round(obs_t[i, _OBS_GLOBAL_START].item() * 2000.0))
+            rnd = max(0, min(rnd, 1999))
+
+            key = (game_idx, rnd)
+            if key not in unique_keys:
+                state = _get_state(rnd)
+                scalars = _get_scalars(rnd)
+                if state is zero_state and available_rounds:
+                    # Round not in replay — find nearest
+                    nearest = min(available_rounds, key=lambda r: abs(r - rnd))
+                    state = _get_state(nearest)
+                    scalars = _get_scalars(nearest)
+                unique_keys[key] = len(unique_states)
+                unique_states.append(state)
+                unique_valid_masks.append((gs_map_w, gs_map_h))
+                unique_scalars.append(scalars)
+
+            step_round_idx[i] = unique_keys[key]
+
+            # Extract unit position from obs (denormalize)
+            x_norm = obs_t[i, _OBS_X_NORM].item()
+            y_norm = obs_t[i, _OBS_Y_NORM].item()
+            ux = int(round(x_norm * gs_map_w))
+            uy = int(round(y_norm * gs_map_h))
+            step_unit_xy[i, 0] = max(0, min(ux, max_w - 1))
+            step_unit_xy[i, 1] = max(0, min(uy, max_h - 1))
+
+            step_unit_ctx[i, 0] = obs_t[i, _OBS_X_NORM]
+            step_unit_ctx[i, 1] = obs_t[i, _OBS_Y_NORM]
+            step_unit_ctx[i, 2] = obs_t[i, _OBS_CORE_DX]
+            step_unit_ctx[i, 3] = obs_t[i, _OBS_CORE_DY]
+            step_unit_ctx[i, 4] = obs_t[i, _OBS_ECORE_DX]
+            step_unit_ctx[i, 5] = obs_t[i, _OBS_ECORE_DY]
+            rnd_norm = obs_t[i, _OBS_GLOBAL_START].item()
+            spawn_norm = obs_t[i, _OBS_SPAWN_ROUND].item()
+            step_unit_ctx[i, 6] = rnd_norm - spawn_norm
+
+    global_sizes = torch.tensor(unique_valid_masks, dtype=torch.int16)
+    global_scalars = torch.tensor(unique_scalars, dtype=torch.float32)
+
+    return {
+        "global_states": unique_states,
+        "global_sizes": global_sizes,
+        "global_scalars": global_scalars,
+        "step_round_idx": step_round_idx.to(DEVICE),
+        "step_unit_xy": step_unit_xy.to(DEVICE),
+        "step_unit_ctx": step_unit_ctx.to(DEVICE),
+        "has_centralized": True,
     }
 
 
@@ -642,37 +1105,125 @@ def _compute_gae(
     return advantages, returns
 
 
-def trajectories_to_tensors(
-    trajectories: list[list[dict]],
-    gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-) -> dict[str, torch.Tensor] | None:
-    """Convert engine-collected trajectories to flat tensors with GAE advantages.
 
-    DEPRECATED: Prefer train_on_trajectories() which computes values via model
-    forward pass instead of using the zero-placeholder values from the bot.
-    """
-    data = _parse_trajectories(trajectories)
-    if data is None:
+_centralized_critic: CentralizedCritic | None = None
+_centralized_optimizer: torch.optim.Optimizer | None = None
+
+
+def critic_checkpoint_path(weight_path: str | Path = WEIGHT_PATH) -> Path:
+    """Sidecar path used to persist centralized critic state for training resumes."""
+    path = Path(weight_path)
+    return path.with_name(f"{path.stem}.critic.pt")
+
+
+def reset_centralized_critic() -> None:
+    """Drop the singleton critic/optimizer so a fresh instance is created on demand."""
+    global _centralized_critic, _centralized_optimizer
+    _centralized_critic = None
+    _centralized_optimizer = None
+
+
+def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.optim.Optimizer]:
+    """Get or create the singleton centralized critic and its optimizer."""
+    global _centralized_critic, _centralized_optimizer
+    if _centralized_critic is None:
+        _centralized_critic = CentralizedCritic().to(DEVICE)
+        _centralized_optimizer = torch.optim.Adam(
+            _centralized_critic.parameters(), lr=lr, eps=1e-5,
+        )
+        n_params = sum(p.numel() for p in _centralized_critic.parameters())
+        print(f"  CentralizedCritic: {n_params:,} params on {DEVICE}")
+    return _centralized_critic, _centralized_optimizer
+
+
+def load_centralized_critic_checkpoint(
+    weight_path: str | Path = WEIGHT_PATH,
+    *,
+    lr: float = 3e-4,
+) -> bool:
+    """Load centralized critic state from the session sidecar, if present."""
+    ckpt_path = critic_checkpoint_path(weight_path)
+    if not ckpt_path.exists():
+        return False
+
+    try:
+        reset_centralized_critic()
+        critic, critic_opt = get_centralized_critic(lr=lr)
+        payload = torch.load(ckpt_path, map_location=DEVICE)
+        critic_state = payload.get("critic") if isinstance(payload, dict) else None
+        opt_state = payload.get("optimizer") if isinstance(payload, dict) else None
+        if critic_state is None:
+            raise ValueError("checkpoint missing critic state")
+        critic.load_state_dict(critic_state)
+        if opt_state is not None:
+            critic_opt.load_state_dict(opt_state)
+        return True
+    except Exception as e:
+        print(f"Could not load centralized critic from {ckpt_path}: {e}")
+        reset_centralized_critic()
+        return False
+
+
+def save_centralized_critic_checkpoint(weight_path: str | Path = WEIGHT_PATH) -> Path | None:
+    """Persist centralized critic state alongside the actor session weights."""
+    if _centralized_critic is None or _centralized_optimizer is None:
         return None
 
-    # Legacy path: use zero values (same as before for backward compat)
-    N = data["n_steps"]
-    values = torch.zeros(N, device=DEVICE)
-    advantages, returns = _compute_gae(
-        data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,
-    )
-    return {
-        "obs": data["obs"],
-        "h": data["h"],
-        "bt": data["bt"],
-        "bd": data["bd"],
-        "md": data["md"],
-        "old_log_probs": data["old_log_probs"],
-        "advantages": advantages,
-        "returns": returns,
-        "n_steps": N,
+    ckpt_path = critic_checkpoint_path(weight_path)
+    payload = {
+        "critic": _centralized_critic.state_dict(),
+        "optimizer": _centralized_optimizer.state_dict(),
     }
+    torch.save(payload, ckpt_path)
+    return ckpt_path
+
+
+def _compute_all_values(
+    critic: CentralizedCritic,
+    data: dict,
+    cnn_chunk_size: int = CENTRALIZED_CNN_CHUNK,
+    unit_chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Compute per-unit critic values for all steps using chunked CNN.
+
+    Processes rounds in chunks to bound memory. Feature maps are not retained
+    across chunks — only the per-step values are accumulated.
+    """
+    round_idx = data["step_round_idx"]    # (N,) long
+    unit_xy = data["step_unit_xy"]        # (N, 2) long
+    unit_ctx = data["step_unit_ctx"]      # (N, UNIT_CONTEXT_DIM)
+    actor_latent = data["step_actor_latent"]  # (N, ACTOR_LATENT_DIM)
+    R = len(data["global_states"])
+    N = data["n_steps"]
+
+    values = torch.zeros(N, device=DEVICE)
+
+    # Process rounds in chunks; for each chunk, compute CNN features,
+    # then scatter V_team + V_unit to the steps that reference those rounds.
+    for r_start in range(0, R, cnn_chunk_size):
+        r_end = min(r_start + cnn_chunk_size, R)
+        round_ids = torch.arange(r_start, r_end, dtype=torch.long)
+        g_obs, g_mask, g_scalars = _load_critic_round_batch(data, round_ids)
+        feat = critic.encode_map(g_obs, g_mask)
+
+        # Find all steps that reference rounds in this chunk
+        step_mask = (round_idx >= r_start) & (round_idx < r_end)
+        step_indices = step_mask.nonzero(as_tuple=True)[0]
+        if step_indices.shape[0] == 0:
+            continue
+
+        # Compute per-unit values for these steps
+        local_ri = round_idx[step_indices] - r_start  # remap to chunk-local index
+        for u_start in range(0, step_indices.shape[0], unit_chunk_size):
+            u_end = min(u_start + unit_chunk_size, step_indices.shape[0])
+            si = step_indices[u_start:u_end]
+            lr = local_ri[u_start:u_end]
+            values[si] = critic.unit_values(
+                feat, g_scalars, lr, unit_xy[si], unit_ctx[si], actor_latent[si],
+            )
+
+    return values
+
 
 
 def train_on_trajectories(
@@ -682,27 +1233,48 @@ def train_on_trajectories(
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     profile: dict[str, float] | None = None,
+    global_states_list: list[dict | None] | None = None,
+    traj_game_map: list[int] | None = None,
+    game_winners: list[str | None] | None = None,
     **ppo_kwargs,
 ) -> dict[str, float]:
     """End-to-end: trajectories -> model values -> GAE -> PPO update."""
     t_phase = time.perf_counter() if profile is not None else 0.0
-    data = _parse_trajectories(trajectories)
+    data = _parse_trajectories(
+        trajectories,
+        global_states_list=global_states_list,
+        traj_game_map=traj_game_map,
+        game_winners=game_winners,
+    )
     if profile is not None:
         profile["parse_s"] = time.perf_counter() - t_phase
     if data is None:
         return {"pi_loss": 0, "vf_loss": 0, "entropy": 0, "n_updates": 0, "n_steps": 0}
 
     obs, h = data["obs"], data["h"]
-
-    # Compute value estimates with the current model (replaces zero placeholders)
-    # Chunked to avoid OOM on large trajectory batches
     N = data["n_steps"]
-    values = torch.empty(N, device=DEVICE)
+
+    if not data.get("has_centralized", False):
+        return {"pi_loss": 0, "vf_loss": 0, "entropy": 0, "n_updates": 0, "n_steps": N,
+                "error": "no global states available for centralized critic"}
+
+    # Freeze actor-side unit summaries once so the critic sees a stable
+    # per-step latent throughout PPO updates.
     t_phase = time.perf_counter() if profile is not None else 0.0
+    model.eval()
     with torch.no_grad():
-        for i in range(0, N, 8192):
-            _, _, _, v, _ = model(obs[i:i + 8192], h[i:i + 8192])
-            values[i:i + 8192] = v.view(-1)
+        data["step_actor_latent"] = _normalize_actor_latent_dim(
+            model.actor_latent(obs, h).detach(),
+        )
+    if profile is not None:
+        profile["critic_latent_s"] = time.perf_counter() - t_phase
+
+    # Compute value estimates via centralized critic (chunked, memory-bounded)
+    t_phase = time.perf_counter() if profile is not None else 0.0
+    critic, critic_opt = get_centralized_critic()
+    critic.eval()
+    with torch.no_grad():
+        values = _compute_all_values(critic, data)
     if profile is not None:
         profile["value_forward_s"] = time.perf_counter() - t_phase
 
@@ -714,11 +1286,13 @@ def train_on_trajectories(
         profile["gae_s"] = time.perf_counter() - t_phase
 
     ppo_profile = profile if profile is not None else None
+    model.train()
     stats = ppo_update(
         model, optimizer,
         obs, h, data["bt"], data["bd"], data["md"],
         data["old_log_probs"], advantages, returns,
         old_values=values,
+        centralized_data=data,
         profile=ppo_profile,
         **ppo_kwargs,
     )
@@ -766,7 +1340,7 @@ def distill(
         perm = torch.randperm(N, device=DEVICE)
         for start in range(0, N, minibatch_size):
             idx = perm[start:start + minibatch_size]
-            s_bt, s_bd, s_md, _, _ = student(obs[idx], h[idx])
+            s_bt, s_bd, s_md, _ = student(obs[idx], h[idx])
 
             # KL(teacher || student) on softened logits
             loss = (
