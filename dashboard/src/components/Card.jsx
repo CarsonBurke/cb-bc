@@ -1,12 +1,12 @@
 import { useMemo, useRef, createContext, useContext } from 'react'
 import { useAtom } from 'jotai'
-import { cardOpenAtom, cardSizeAtom, cardEmaAtom } from '../store'
+import { cardOpenAtom, cardSizeAtom, cardEmaAtom, cardBandsAtom } from '../store'
 
 const SIZES = ['sm', 'md', 'lg', 'xl']
 const SIZE_LABELS = { sm: 'S', md: 'M', lg: 'L', xl: 'XL' }
 const SIZE_HEIGHTS = { sm: 150, md: null, lg: 450, xl: 800 }
 
-const CardSettingsCtx = createContext({ ema: false })
+const CardSettingsCtx = createContext({ ema: false, bands: false })
 export function useCardSettings() { return useContext(CardSettingsCtx) }
 
 export default function Card({ title, subtitle, children, className = '', defaultOpen = true, id, dragHandleProps, hasEma }) {
@@ -14,9 +14,11 @@ export default function Card({ title, subtitle, children, className = '', defaul
   const openAtom = useMemo(() => cardOpenAtom(cardId, defaultOpen), [cardId, defaultOpen])
   const sizeAtom = useMemo(() => cardSizeAtom(cardId), [cardId])
   const emaAtom = useMemo(() => cardEmaAtom(cardId), [cardId])
+  const bandsAtom = useMemo(() => cardBandsAtom(cardId), [cardId])
   const [open, setOpen] = useAtom(openAtom)
   const [size, setSize] = useAtom(sizeAtom)
   const [ema, setEma] = useAtom(emaAtom)
+  const [bands, setBands] = useAtom(bandsAtom)
   const didDrag = useRef(false)
 
   const headerDragProps = dragHandleProps ? {
@@ -46,6 +48,11 @@ export default function Card({ title, subtitle, children, className = '', defaul
     setEma(!ema)
   }
 
+  const toggleBands = (e) => {
+    e.stopPropagation()
+    setBands(!bands)
+  }
+
   return (
     <div className={`bg-base border border-surface0 mb-3 rounded-md overflow-hidden ${className}`}>
       {title && (
@@ -68,17 +75,32 @@ export default function Card({ title, subtitle, children, className = '', defaul
             {subtitle && <span className="text-[11px] font-normal text-overlay0 ml-2">{subtitle}</span>}
           </span>
           {open && hasEma && (
-            <button
-              onClick={toggleEma}
-              className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-colors ${
-                ema ? 'text-blue bg-blue/10' : 'text-overlay0 hover:text-subtext0 hover:bg-surface0/50'
-              }`}
-              title={ema ? 'EMA smoothing on (click to disable)' : 'Enable EMA smoothing'}
-            >
-              <svg className="w-3.5 h-3" viewBox="0 0 16 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                <path d="M1 10C3 10 4 2 8 2S13 10 15 10" />
-              </svg>
-            </button>
+            <>
+              <button
+                onClick={toggleBands}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-colors ${
+                  bands ? 'text-blue bg-blue/10' : 'text-overlay0 hover:text-subtext0 hover:bg-surface0/50'
+                }`}
+                title={bands ? 'P5/P95 bands on (click to disable)' : 'Show P5/P95 bands'}
+              >
+                <svg className="w-3.5 h-3" viewBox="0 0 16 12" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round">
+                  <path d="M1 3h14" strokeDasharray="2 2" />
+                  <path d="M1 6h14" />
+                  <path d="M1 9h14" strokeDasharray="2 2" />
+                </svg>
+              </button>
+              <button
+                onClick={toggleEma}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-colors ${
+                  ema ? 'text-blue bg-blue/10' : 'text-overlay0 hover:text-subtext0 hover:bg-surface0/50'
+                }`}
+                title={ema ? 'EMA smoothing on (click to disable)' : 'Enable EMA smoothing'}
+              >
+                <svg className="w-3.5 h-3" viewBox="0 0 16 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                  <path d="M1 10C3 10 4 2 8 2S13 10 15 10" />
+                </svg>
+              </button>
+            </>
           )}
           {open && (
             <button
@@ -106,7 +128,7 @@ export default function Card({ title, subtitle, children, className = '', defaul
           open ? 'max-h-[2000px] opacity-100' : 'max-h-0 opacity-0'
         }`}
       >
-        <CardSettingsCtx.Provider value={{ ema }}>
+        <CardSettingsCtx.Provider value={{ ema, bands }}>
           <div
             className={`${title ? 'px-5 pt-4 pb-5' : 'p-5'} ${
               SIZE_HEIGHTS[size] ? 'flex flex-col overflow-hidden [&>div]:flex-1 [&>div]:min-h-0 [&>div]:max-h-none' : ''

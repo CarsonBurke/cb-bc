@@ -158,6 +158,35 @@ function ema(data, span = 10) {
   return result
 }
 
+function rollingPercentile(data, p, window = 20) {
+  const result = []
+  for (let i = 0; i < data.length; i++) {
+    const start = Math.max(0, i - window + 1)
+    const slice = []
+    for (let j = start; j <= i; j++) {
+      if (data[j] != null) slice.push(data[j])
+    }
+    if (!slice.length) { result.push(null); continue }
+    slice.sort((a, b) => a - b)
+    const idx = Math.min(Math.floor(p * slice.length), slice.length - 1)
+    result.push(slice[idx])
+  }
+  return result
+}
+
+function addBands(datasets, raw, color, label) {
+  datasets.push({
+    label: `${label} P95`, data: rollingPercentile(raw, 0.95),
+    borderColor: color + '30', backgroundColor: color + '10',
+    fill: '+1', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, tension: 0.3,
+  })
+  datasets.push({
+    label: `${label} P5`, data: rollingPercentile(raw, 0.05),
+    borderColor: color + '30', backgroundColor: color + '10',
+    fill: false, borderWidth: 1, borderDash: [3, 3], pointRadius: 0, tension: 0.3,
+  })
+}
+
 function chartScales() {
   return {
     x: { ticks: { color: CHART_THEME.subtext, maxTicksLimit: 10 }, grid: { color: CHART_THEME.grid } },
@@ -211,15 +240,16 @@ function StatusPanel() {
 
 const RewardChart = memo(function RewardChart() {
   const { episodes } = useTrainCtx()
-  const { ema: emaOn } = useCardSettings()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
   const raw = ds.map(e => e.reward)
   const datasets = [{
     label: 'Reward', data: raw,
-    borderColor: emaOn ? '#a6e3a140' : '#a6e3a1', backgroundColor: '#a6e3a120',
-    tension: 0, pointRadius: 0, borderWidth: emaOn ? 1 : 1.5, spanGaps: true,
+    borderColor: (emaOn || bandsOn) ? '#a6e3a140' : '#a6e3a1', backgroundColor: '#a6e3a120',
+    tension: 0, pointRadius: 0, borderWidth: (emaOn || bandsOn) ? 1 : 1.5, spanGaps: true,
   }]
+  if (bandsOn) addBands(datasets, raw, '#a6e3a1', 'Reward')
   if (emaOn) datasets.push({
     label: 'EMA', data: ema(raw),
     borderColor: '#a6e3a1', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
@@ -233,9 +263,10 @@ const RewardChart = memo(function RewardChart() {
 
 const RewardBreakdownChart = memo(function RewardBreakdownChart() {
   const { episodes } = useTrainCtx()
-  const { ema: emaOn } = useCardSettings()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
+  const dim = emaOn || bandsOn
   const series = [
     { key: 'r_harv', label: 'Harvester', color: '#a6e3a1' },
     { key: 'r_work', label: 'Working', color: '#f9e2af' },
@@ -244,15 +275,16 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
   ]
   const datasets = series.flatMap(({ key, label, color }) => {
     const raw = ds.map(e => e[key] || 0)
-    const base = {
-      label, data: raw, borderColor: emaOn ? color + '40' : color,
-      tension: 0, pointRadius: 0, borderWidth: emaOn ? 1 : 1.5,
-    }
-    if (!emaOn) return [base]
-    return [base, {
+    const result = [{
+      label, data: raw, borderColor: dim ? color + '40' : color,
+      tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
+    }]
+    if (bandsOn) addBands(result, raw, color, label)
+    if (emaOn) result.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3,
-    }]
+    })
+    return result
   })
   return (
     <div className="min-h-[200px]">
@@ -270,17 +302,19 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
 function makeSimpleChart(label, dataKey, color, opts = {}) {
   return memo(function SimpleChart() {
     const { episodes } = useTrainCtx()
-    const { ema: emaOn } = useCardSettings()
+    const { ema: emaOn, bands: bandsOn } = useCardSettings()
     if (episodes.length <= 1) return <NoData />
     const ds = downsample(episodes)
     const raw = ds.map(e => e[dataKey] ?? e[opts.altKey] ?? null)
+    const dim = emaOn || bandsOn
     const datasets = [{
       label, data: raw,
-      borderColor: emaOn ? color + '40' : color,
+      borderColor: dim ? color + '40' : color,
       backgroundColor: opts.fill || color + '20',
       fill: !!opts.fill,
-      tension: 0, pointRadius: 0, borderWidth: emaOn ? 1 : 1.5, spanGaps: true,
+      tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
     }]
+    if (bandsOn) addBands(datasets, raw, color, label)
     if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw),
       borderColor: color, borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
@@ -302,8 +336,9 @@ const ClipChart = makeSimpleChart('Clip Frac', 'clip_frac', '#f9e2af')
 
 const LossChart = memo(function LossChart() {
   const { episodes } = useTrainCtx()
-  const { ema: emaOn } = useCardSettings()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
+  const dim = emaOn || bandsOn
   const ds = downsample(episodes)
   const series = [
     { key: 'pi_loss', label: 'Policy Loss', color: '#f38ba8' },
@@ -311,15 +346,16 @@ const LossChart = memo(function LossChart() {
   ]
   const datasets = series.flatMap(({ key, label, color }) => {
     const raw = ds.map(e => e[key])
-    const base = {
-      label, data: raw, borderColor: emaOn ? color + '40' : color,
-      tension: 0, pointRadius: 0, borderWidth: emaOn ? 1 : 1.5,
-    }
-    if (!emaOn) return [base]
-    return [base, {
+    const result = [{
+      label, data: raw, borderColor: dim ? color + '40' : color,
+      tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
+    }]
+    if (bandsOn) addBands(result, raw, color, label)
+    if (emaOn) result.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3,
-    }]
+    })
+    return result
   })
   return (
     <div className="min-h-[200px]">

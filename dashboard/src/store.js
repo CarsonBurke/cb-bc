@@ -154,3 +154,25 @@ export const cardEmaAtom = (id) => atom(
     try { localStorage.setItem(EMA_KEY, JSON.stringify(state)) } catch {}
   },
 )
+
+// Persisted card bands toggle (p5/p95): { [cardId]: boolean }
+const BANDS_KEY = 'dashboard-card-bands'
+
+function loadBands() {
+  try {
+    return JSON.parse(localStorage.getItem(BANDS_KEY)) || {}
+  } catch {
+    return {}
+  }
+}
+
+export const cardBandsStateAtom = atom(loadBands())
+
+export const cardBandsAtom = (id) => atom(
+  (get) => !!get(cardBandsStateAtom)[id],
+  (get, set, next) => {
+    const state = { ...get(cardBandsStateAtom), [id]: next }
+    set(cardBandsStateAtom, state)
+    try { localStorage.setItem(BANDS_KEY, JSON.stringify(state)) } catch {}
+  },
+)
