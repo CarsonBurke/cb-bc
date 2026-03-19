@@ -33,7 +33,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from cambc import Controller, Direction, EntityType, Position
 
-from cambc import Controller, Direction, EntityType, Environment, Position
+try:
+    from cambc import Controller, Direction, EntityType, Environment, Position
+    _CAMBC_AVAILABLE = True
+except ImportError:
+    _CAMBC_AVAILABLE = False
 
 # Tuning knobs (shared by both paths)
 ORE_PROXIMITY_RADIUS = 4    # manhattan radius that counts as "near ore"
@@ -41,6 +45,7 @@ ORE_WEIGHT_BASE      = 2.0  # weight for a tile directly on ore
 ORE_WEIGHT_FALLOFF   = 0.4  # additional weight per tile closer to ore
 DISCONNECT_SCALE     = 1.0  # hop penalty steepness
 MAX_SCORE_PER_CONV   = 3.0  # clip per-conveyor contribution
+WALL_PENALTY         = 1.0  # penalty for conveyor facing into a wall
 
 # Cardinal (dx, dy) offsets — shared by both paths
 _CARDINALS = ((0, -1), (0, 1), (-1, 0), (1, 0))
@@ -58,20 +63,23 @@ _REPLAY_DIR_DXY = {
     8: (-1, -1),  # DIR_NORTHWEST
 }
 
-# cambc Direction -> (dx, dy)
-_DIR_DXY: dict = {
-    Direction.NORTHWEST: (-1, -1),
-    Direction.NORTH:     ( 0, -1),
-    Direction.NORTHEAST: ( 1, -1),
-    Direction.WEST:      (-1,  0),
-    Direction.CENTRE:    ( 0,  0),
-    Direction.EAST:      ( 1,  0),
-    Direction.SOUTHWEST: (-1,  1),
-    Direction.SOUTH:     ( 0,  1),
-    Direction.SOUTHEAST: ( 1,  1),
-}
-
-_CONV_TYPES = (EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR, EntityType.SPLITTER)
+# cambc Direction -> (dx, dy) — only populated when cambc is available
+if _CAMBC_AVAILABLE:
+    _DIR_DXY: dict = {
+        Direction.NORTHWEST: (-1, -1),
+        Direction.NORTH:     ( 0, -1),
+        Direction.NORTHEAST: ( 1, -1),
+        Direction.WEST:      (-1,  0),
+        Direction.CENTRE:    ( 0,  0),
+        Direction.EAST:      ( 1,  0),
+        Direction.SOUTHWEST: (-1,  1),
+        Direction.SOUTH:     ( 0,  1),
+        Direction.SOUTHEAST: ( 1,  1),
+    }
+    _CONV_TYPES = (EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR, EntityType.SPLITTER)
+else:
+    _DIR_DXY = {}
+    _CONV_TYPES = ()
 
 
 # ---------------------------------------------------------------------------
@@ -178,11 +186,14 @@ def _score_from_data(
     ore_positions: list[tuple[int, int]],
     conv_data: dict[tuple[int, int], tuple[float, float]],
     core_xy: tuple[int, int],
+    wall_set: set[tuple[int, int]] | None = None,
 ) -> float:
     """Score friendly conveyors against the precomputed flow field.
 
     conv_data: {(x,y): (facing_dx, facing_dy)} — facing vector should be
                unit-length (or zero for unknown direction).
+    wall_set:  optional set of wall tile coords. Conveyors facing into a wall
+               receive a negative WALL_PENALTY instead of an alignment score.
     Returns log1p-compressed total alignment score.
     """
     if not conv_data:
@@ -220,12 +231,20 @@ def _score_from_data(
 
     total = 0.0
     for key, (cdx, cdy) in conv_data.items():
+        x, y = key
+        ore_w = ore_weight_map.get(key, 1.0)
+
+        # Penalise conveyors whose output faces directly into a wall
+        facing_tile = (x + int(round(cdx)), y + int(round(cdy)))
+        if wall_set is not None and facing_tile in wall_set:
+            total -= ore_w * WALL_PENALTY
+            continue
+
         fvec = flow.get(key)
         if fvec is None:
             continue  # tile unreachable from core — no reward
         fx, fy = fvec
         alignment = cdx * fx + cdy * fy
-        ore_w = ore_weight_map.get(key, 1.0)
         hops = disconnect_dist.get(key, len(all_conv) + 1)
         connectivity = 1.0 / (1.0 + DISCONNECT_SCALE * hops)
         contribution = min(ore_w * alignment * connectivity, MAX_SCORE_PER_CONV)
@@ -265,7 +284,7 @@ def score_conveyor_flow_from_data(
     if not ore_positions or not conv_data:
         return 0.0
     flow = _build_flow_field_pure(wall_set, ore_positions, core_xy, map_w, map_h)
-    return _score_from_data(flow, ore_positions, conv_data, core_xy)
+    return _score_from_data(flow, ore_positions, conv_data, core_xy, wall_set=wall_set)
 
 
 # ---------------------------------------------------------------------------
@@ -273,10 +292,10 @@ def score_conveyor_flow_from_data(
 # ---------------------------------------------------------------------------
 
 def score_conveyor_flow(
-    ct: Controller,
+    ct,
     team,
-    core_pos: Position,
-    ore_positions: list[Position],
+    core_pos,
+    ore_positions,
 ) -> float:
     """Vision-limited fallback scorer using the bot's Controller API.
 
@@ -284,7 +303,7 @@ def score_conveyor_flow(
     replay file is available — it has complete global map knowledge and
     correct wall routing.
     """
-    if not ore_positions:
+    if not _CAMBC_AVAILABLE or not ore_positions:
         return 0.0
 
     w, h = ct.get_map_width(), ct.get_map_height()

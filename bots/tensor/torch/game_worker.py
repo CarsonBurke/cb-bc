@@ -68,7 +68,7 @@ def _run_game_proxy(args):
             from flow_field import score_conveyor_flow_from_data, REPLAY_DIR_DXY
             from replay_parser import score_conveyor_flow_from_replay
             flow_bonus = score_conveyor_flow_from_replay(replay_path, team=0)
-            flow_bonus *= 2.0  # FLOW_BONUS_SCALE
+            flow_bonus *= 3.0  # FLOW_BONUS_SCALE
             _inject_flow_bonus(actual_log, flow_bonus)
         except Exception:
             pass
