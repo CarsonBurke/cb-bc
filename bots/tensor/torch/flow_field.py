@@ -46,6 +46,8 @@ ORE_WEIGHT_FALLOFF   = 0.4  # additional weight per tile closer to ore
 DISCONNECT_SCALE     = 1.0  # hop penalty steepness
 MAX_SCORE_PER_CONV   = 3.0  # clip per-conveyor contribution
 WALL_PENALTY         = 1.0  # penalty for conveyor facing into a wall
+FEED_BONUS           = 0.5  # bonus per upstream feeder (capped at flow rate limit)
+FLOW_RATE_LIMIT      = 2    # max feeders that contribute bonus (game flow rate cap)
 
 # Cardinal (dx, dy) offsets — shared by both paths
 _CARDINALS = ((0, -1), (0, 1), (-1, 0), (1, 0))
@@ -229,6 +231,17 @@ def _score_from_data(
     disconnect_dist = _disconnect_distances(connected, adj, all_conv)
     ore_weight_map = _build_ore_weights(ore_positions)
 
+    # Precompute feed counts: for each conveyor, count upstream neighbours
+    # pointing toward it (capped at FLOW_RATE_LIMIT).
+    # Conveyor at (nx, ny) feeds into (x, y) if its facing vector (ndx, ndy)
+    # points from (nx, ny) toward (x, y), i.e. (ndx, ndy) == (x-nx, y-ny).
+    feed_counts: dict[tuple[int, int], int] = {k: 0 for k in all_conv}
+    for (nx, ny), (ndx, ndy) in conv_data.items():
+        # The tile this conveyor is pointing at
+        target = (nx + int(round(ndx)), ny + int(round(ndy)))
+        if target in feed_counts:
+            feed_counts[target] = min(feed_counts[target] + 1, FLOW_RATE_LIMIT)
+
     total = 0.0
     for key, (cdx, cdy) in conv_data.items():
         x, y = key
@@ -248,6 +261,13 @@ def _score_from_data(
         hops = disconnect_dist.get(key, len(all_conv) + 1)
         connectivity = 1.0 / (1.0 + DISCONNECT_SCALE * hops)
         contribution = min(ore_w * alignment * connectivity, MAX_SCORE_PER_CONV)
+
+        # Feed bonus: reward conveyors that receive input from upstream neighbours.
+        # Purely additive — no penalty for conveyors with no feeders.
+        # Scales with ore proximity so downstream conveyors near ore matter more.
+        feeders = feed_counts.get(key, 0)
+        contribution += ore_w * FEED_BONUS * feeders
+
         total += contribution
 
     return math.log1p(max(total, 0.0))
