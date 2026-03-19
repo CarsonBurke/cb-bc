@@ -365,5 +365,86 @@ def score_conveyor_flow(
     return _score_from_data(flow, ore_xy, conv_data, (core_pos.x, core_pos.y))
 
 
+def score_conveyor_flow_from_data_detailed(
+    wall_set: set[tuple[int, int]],
+    ore_positions: list[tuple[int, int]],
+    conv_data: dict[tuple[int, int], tuple[float, float]],
+    core_xy: tuple[int, int],
+    map_w: int,
+    map_h: int,
+) -> tuple[float, dict[tuple[int, int], float]]:
+    """Like score_conveyor_flow_from_data but also returns per-conveyor scores.
+
+    Returns:
+        (total_score, {(x,y): individual_score}) where individual scores are
+        the raw per-conveyor contributions before log1p compression.
+        Negative scores (wall penalty) are included.
+    """
+    if not ore_positions or not conv_data:
+        return 0.0, {}
+
+    flow = _build_flow_field_pure(wall_set, ore_positions, core_xy, map_w, map_h)
+
+    all_conv = set(conv_data.keys())
+    adj: dict[tuple[int, int], list[tuple[int, int]]] = {k: [] for k in all_conv}
+    for (x, y) in all_conv:
+        for ddx, ddy in _CARDINALS:
+            nk = (x + ddx, y + ddy)
+            if nk in all_conv:
+                adj[(x, y)].append(nk)
+
+    connected: set[tuple[int, int]] = set()
+    queue: list[tuple[int, int]] = []
+    cx, cy = core_xy
+    for ddx, ddy in _CARDINALS:
+        nk = (cx + ddx, cy + ddy)
+        if nk in all_conv and nk not in connected:
+            connected.add(nk)
+            queue.append(nk)
+    head = 0
+    while head < len(queue):
+        cur = queue[head]; head += 1
+        for nb in adj.get(cur, []):
+            if nb not in connected:
+                connected.add(nb)
+                queue.append(nb)
+
+    disconnect_dist = _disconnect_distances(connected, adj, all_conv)
+    ore_weight_map = _build_ore_weights(ore_positions)
+
+    feed_counts: dict[tuple[int, int], int] = {k: 0 for k in all_conv}
+    for (nx, ny), (ndx, ndy) in conv_data.items():
+        target = (nx + int(round(ndx)), ny + int(round(ndy)))
+        if target in feed_counts:
+            feed_counts[target] = min(feed_counts[target] + 1, FLOW_RATE_LIMIT)
+
+    per_conv: dict[tuple[int, int], float] = {}
+    total = 0.0
+    for key, (cdx, cdy) in conv_data.items():
+        x, y = key
+        ore_w = ore_weight_map.get(key, 1.0)
+        facing_tile = (x + int(round(cdx)), y + int(round(cdy)))
+        if facing_tile in wall_set:
+            score = -ore_w * WALL_PENALTY
+            per_conv[key] = score
+            total += score
+            continue
+        fvec = flow.get(key)
+        if fvec is None:
+            per_conv[key] = 0.0
+            continue
+        fx, fy = fvec
+        alignment = cdx * fx + cdy * fy
+        hops = disconnect_dist.get(key, len(all_conv) + 1)
+        connectivity = 1.0 / (1.0 + DISCONNECT_SCALE * hops)
+        score = min(ore_w * alignment * connectivity, MAX_SCORE_PER_CONV)
+        feeders = feed_counts.get(key, 0)
+        score += ore_w * FEED_BONUS * feeders
+        per_conv[key] = score
+        total += score
+
+    return math.log1p(max(total, 0.0)), per_conv
+
+
 # Expose for import by replay_parser
 REPLAY_DIR_DXY = _REPLAY_DIR_DXY

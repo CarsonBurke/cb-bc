@@ -521,8 +521,6 @@ def _parse_trajectories(
     md_t = torch.empty(N, dtype=torch.long)
     lp_t = torch.empty(N, dtype=torch.float32)
     rw_t = torch.empty(N, dtype=torch.float32)
-    # Per-episode flow bonus (terminal only, injected undiscounted into GAE)
-    flow_t = torch.zeros(n_eps, dtype=torch.float32)
 
     ep_boundaries = []
 
@@ -534,7 +532,7 @@ def _parse_trajectories(
         idx = 0
         for ep_i, traj in enumerate(trajectories):
             start = idx
-            ep_harv = ep_work = ep_dmg = 0.0
+            ep_harv = ep_work = ep_dmg = ep_flow = 0.0
             for step in traj:
                 if isinstance(step, (list, tuple)):
                     n = len(step)
@@ -561,28 +559,23 @@ def _parse_trajectories(
                     harv_r = step.get("harv_r", 0)
                     dmg = step.get("dmg", 0)
                     lp_t[idx] = step.get("old_lp", 0)
-                rw_t[idx] = harv_r + n_working * 2.5 + dmg * 20.0
+                flow_r = step[12] if n > 12 else 0.0
+                rw_t[idx] = harv_r + n_working * 2.5 + dmg * 20.0 + flow_r
                 ep_harv += harv_r
                 ep_work += n_working
                 ep_dmg += dmg
+                ep_flow += flow_r
                 idx += 1
 
             ep_boundaries.append((start, idx))
 
-            # Extract flow bonus from the terminal step of this episode.
-            # It's stored at index 12 in tuple format or "flow_r" in dict format.
-            if traj:
-                last_step = traj[-1]
-                if isinstance(last_step, (list, tuple)):
-                    flow_t[ep_i] = last_step[12] if len(last_step) > 12 else 0.0
-                else:
-                    flow_t[ep_i] = last_step.get("flow_r", 0.0)
+            # flow bonus is pre-baked per step in rw_t (injected by game_worker)
 
             print(
                 f"  [traj {ep_i:3d}] steps={idx - start:4d} "
                 f"harv={ep_harv:.2f} "
                 f"work_sum={ep_work:.0f} dmg={ep_dmg:.2f} "
-                f"flow={float(flow_t[ep_i]):.3f}"
+                f"flow={ep_flow:.3f}"
             )
 
     finally:
@@ -597,7 +590,7 @@ def _parse_trajectories(
         "md": md_t.to(DEVICE),
         "old_log_probs": lp_t.to(DEVICE),
         "rewards": rw_t.to(DEVICE),
-        "flow_bonuses": flow_t.to(DEVICE),
+        "flow_bonuses": torch.zeros(n_eps, dtype=torch.float32).to(DEVICE),
         "ep_boundaries": ep_boundaries,
         "n_steps": N,
     }

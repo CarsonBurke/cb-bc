@@ -734,6 +734,49 @@ def score_conveyor_flow_from_replay(
     )
 
 
+def extract_conveyor_scores_by_turn(
+    replay: dict,
+    team: int,
+    conv_scores: dict[tuple[int, int], float],
+) -> dict[int, float]:
+    """Map each turn a friendly conveyor was placed to its individual flow score.
+
+    Args:
+        replay      : parsed replay dict
+        team        : 0 for TEAM_A, 1 for TEAM_B
+        conv_scores : {(x, y): score} from _score_from_data per-conveyor scores
+
+    Returns:
+        {turn_index: score} for each turn a friendly conveyor was placed.
+        If multiple conveyors placed same turn (unlikely but possible), scores sum.
+    """
+    result: dict[int, float] = {}
+    if not conv_scores:
+        return result
+
+    for turn_idx, turn in enumerate(replay.get("turns", [])):
+        for update in turn.get("updates", []):
+            if "placeEntity" not in update:
+                continue
+            ent = update["placeEntity"].get("entity", {})
+            if ent.get("team", -1) != team:
+                continue
+            kind = None
+            for k in ("conveyor", "splitter", "armouredConveyor"):
+                if k in ent:
+                    kind = k
+                    break
+            if kind is None:
+                continue
+            pos = ent.get("position", {})
+            x, y = pos.get("x", -1), pos.get("y", -1)
+            score = conv_scores.get((x, y), 0.0)
+            if score != 0.0:
+                result[turn_idx] = result.get(turn_idx, 0.0) + score
+
+    return result
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
