@@ -325,7 +325,9 @@ class Player:
                 _TensorPlayer._harv_proximity[ore_key] = _p._PLACE_HARV
                 self._sync_from_proxy(_p)
                 return _p._PLACE_HARV - given, 0.0
-            reward = _TensorPlayer._proximity_reward(_p, ct)
+            reward = 0.0
+            if _TensorPlayer._should_reward_harvester_proximity(_p, ct, build_pos):
+                reward = _TensorPlayer._proximity_reward(_p, ct)
             self._sync_from_proxy(_p)
             return reward, 0.0
         if action == "road":

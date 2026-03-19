@@ -64,6 +64,8 @@ from model import (
     DEVICE,
     H_DIM,
     OBS_SIZE,
+    REWARD_ENEMY_CORE_DAMAGE,
+    REWARD_WORKING_HARVESTER,
     TERMINAL_LOSS_REWARD,
     TERMINAL_WIN_REWARD,
     TILE_FEATURES,
@@ -937,8 +939,10 @@ def main():
                     conv_r = s.get("conv_r", 0)
                     harv_r = s.get("harv_r", 0)
                     dmg = s.get("dmg", 0)
-                r_harv += harv_r; r_conv += conv_r
-                r_work += n_working * 2.5; r_dmg += dmg * 20.0
+                r_harv += harv_r
+                r_conv += conv_r
+                r_work += n_working * REWARD_WORKING_HARVESTER
+                r_dmg += dmg * REWARD_ENEMY_CORE_DAMAGE
             total = r_harv + r_conv + r_work + r_dmg + outcome_r
             return total, r_harv, r_conv, r_work, r_dmg, outcome_r
 

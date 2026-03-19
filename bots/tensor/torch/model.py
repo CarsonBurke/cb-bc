@@ -31,6 +31,8 @@ ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
+REWARD_WORKING_HARVESTER = 12.5
+REWARD_ENEMY_CORE_DAMAGE = 20.0
 TERMINAL_WIN_REWARD = 10.0
 TERMINAL_LOSS_REWARD = -10.0
 
@@ -818,7 +820,12 @@ def _parse_trajectories(
                     harv_r = step.get("harv_r", 0)
                     dmg = step.get("dmg", 0)
                     lp_t[idx] = step.get("old_lp", 0)
-                rw_t[idx] = harv_r + conv_r + n_working * 2.5 + dmg * 20.0
+                rw_t[idx] = (
+                    harv_r
+                    + conv_r
+                    + n_working * REWARD_WORKING_HARVESTER
+                    + dmg * REWARD_ENEMY_CORE_DAMAGE
+                )
                 step_game_t[idx] = game_idx
                 idx += 1
             ep_boundaries.append((start, idx))

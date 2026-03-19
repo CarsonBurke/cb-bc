@@ -473,7 +473,7 @@ class Player:
                 d = max(abs(tile_pos.x - pos.x), abs(tile_pos.y - pos.y))
                 if d > 10:
                     continue
-                reward = self._PLACE_HARV / (1.0 + d)
+                reward = self._PLACE_HARV * 0.2 / (1.0 + d)
                 delta = reward - prev
                 if delta > best_delta:
                     best_delta, best_key, best_reward = delta, key, reward
@@ -483,6 +483,32 @@ class Player:
             return 0.0
         Player._harv_proximity[best_key] = best_reward
         return best_delta
+
+    def _should_reward_harvester_proximity(
+        self,
+        ct: Controller,
+        build_pos: Position,
+    ) -> bool:
+        """Only reward harvester proximity when the attempted tile is otherwise valid.
+
+        The shaping is meant to say "good harvester intent, wrong tile type",
+        not "good job attempting an impossible build". So the target must be an
+        empty, unit-free, non-wall tile, and the only missing property should be
+        that it is not an ore tile.
+        """
+        try:
+            env = ct.get_tile_env(build_pos)
+            if env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
+                return False
+            if env == Environment.WALL:
+                return False
+            if ct.get_tile_building_id(build_pos) is not None:
+                return False
+            if ct.get_tile_builder_bot_id(build_pos) is not None:
+                return False
+            return ct.is_tile_passable(build_pos)
+        except Exception:
+            return False
 
 
     def _find_core(self, ct: Controller) -> Position:
@@ -679,8 +705,9 @@ class Player:
                 given = Player._harv_proximity.get(ore_key, 0.0)
                 Player._harv_proximity[ore_key] = self._PLACE_HARV
                 return self._PLACE_HARV - given, 0.0
-            # Failed — proximity reward toward nearest ore (one-time per ore)
-            return self._proximity_reward(ct), 0.0
+            if self._should_reward_harvester_proximity(ct, build_pos):
+                return self._proximity_reward(ct), 0.0
+            return 0.0, 0.0
         elif action == "road":
             if ct.can_build_road(build_pos):
                 ct.build_road(build_pos)
