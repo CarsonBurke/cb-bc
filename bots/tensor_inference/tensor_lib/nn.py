@@ -511,22 +511,39 @@ class MLP:
     def load(self, state: list[list[float]]) -> None:
         """Load parameters from nested lists.
 
-        Supports legacy MLP states saved before RMSNorm parameters were added.
+        Supports legacy MLP states saved before RMSNorm parameters were added
+        and before optional newer heads such as `conv_dir` existed.
         """
         full_params = self.parameters()
+        no_conv_params: list[Tensor] = []
+        for layer in self.trunk.layers:
+            no_conv_params.extend(layer.parameters())
+        for name, head in self.heads.items():
+            if name != "conv_dir":
+                no_conv_params.extend(head.parameters())
+
         legacy_params: list[Tensor] = []
+        legacy_no_conv_params: list[Tensor] = []
         for layer in self.trunk.layers:
             if isinstance(layer, Linear):
                 legacy_params.extend(layer.parameters())
+                legacy_no_conv_params.extend(layer.parameters())
             elif isinstance(layer, LayerNorm):
                 legacy_params.extend(layer.parameters())
-        for head in self.heads.values():
+                legacy_no_conv_params.extend(layer.parameters())
+        for name, head in self.heads.items():
+            if name != "conv_dir":
+                legacy_no_conv_params.extend(head.parameters())
             legacy_params.extend(head.parameters())
 
         if len(state) == len(full_params):
             params = full_params
+        elif len(state) == len(no_conv_params):
+            params = no_conv_params
         elif len(state) == len(legacy_params):
             params = legacy_params
+        elif len(state) == len(legacy_no_conv_params):
+            params = legacy_no_conv_params
         else:
             raise AssertionError(
                 f"State has {len(state)} entries, model has {len(full_params)} params "
