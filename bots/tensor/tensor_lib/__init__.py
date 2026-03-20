@@ -1,10 +1,11 @@
 """tensor_lib — Lightweight neural network library using only Python stdlib.
 
 Provides:
-- Tensor: N-dimensional tensor with reverse-mode autograd
+- Tensor: N-dimensional tensor (forward-pass only)
 - Neural network layers: Linear, ReLU, Tanh, Sigmoid, LayerNorm, Dropout, MLP
-- Optimizers: SGD, Adam, RMSProp
-- Position embeddings: Sinusoidal, Learned, RelativeGrid
+- Position embeddings: Sinusoidal
+
+Training is done in PyTorch (bots/tensor/torch/).
 """
 
 from .tensor import Tensor
@@ -20,12 +21,7 @@ from .nn import (
     Sequential,
     MLP,
 )
-from .optim import SGD, Adam, RMSProp
-from .embed import (
-    SinusoidalPositionEmbedding,
-    LearnedPositionEmbedding,
-    RelativeGridEmbedding,
-)
+from .embed import SinusoidalPositionEmbedding
 
 __all__ = [
     "Tensor",
@@ -39,10 +35,5 @@ __all__ = [
     "Dropout",
     "Sequential",
     "MLP",
-    "SGD",
-    "Adam",
-    "RMSProp",
     "SinusoidalPositionEmbedding",
-    "LearnedPositionEmbedding",
-    "RelativeGridEmbedding",
 ]

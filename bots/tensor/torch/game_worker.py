@@ -8,8 +8,12 @@ import ast  # noqa: F401 - engine startup can expect ast in sys.modules
 import json
 import os
 import pickle
+import sys
+from pathlib import Path
 
-from replay_parser import extract_working_harvesters, parse_replay, extract_working_harvesters_from_replay
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+from replay_parser import ReplayData
 
 
 def _run_game_proxy(args):
@@ -19,17 +23,26 @@ def _run_game_proxy(args):
         from cambc.cambc_engine import run_game
 
         run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
-        replay = parse_replay(replay_path)
-        working = extract_working_harvesters_from_replay(replay)
-        # Winner: 0 = TEAM_A, 1 = TEAM_B
-        winner_val = replay.get("winner")
-        winner = "a" if winner_val == 0 else ("b" if winner_val == 1 else None)
+        rd = ReplayData.from_file(replay_path, team=0)
+        working = rd.working_harvesters_dict()
+        ti_delivered = rd.titanium_delivered_dict()
+        winner = rd.winner_str
+        global_states = {
+            "states_buf": rd.states_bytes,
+            "scalars_buf": rd.scalars_bytes,
+            "state_stride": rd.state_stride,
+            "map_w": rd.map_w,
+            "map_h": rd.map_h,
+            "n_turns": rd.n_turns,
+            "n_channels": rd.n_channels,
+            "n_scalars": rd.n_scalars,
+        }
     except BaseException as e:
         print(f"  Game error: {e}")
-        return None, None, None
+        return None, None, None, None, None
     finally:
         os.environ.pop("TENSOR_TRAIN_LOG", None)
-    return (log_path if os.path.exists(log_path) else None), working, winner
+    return (log_path if os.path.exists(log_path) else None), working, winner, global_states, ti_delivered
 
 
 def main(argv=None):

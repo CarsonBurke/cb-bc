@@ -69,7 +69,7 @@ def _load_model_compat(model, *paths: str | Path) -> bool:
             continue
         try:
             if isinstance(data, dict):
-                model.load_state_dict(data)
+                model.load_state_dict(data, strict=False)
             else:
                 model.import_weights(data)
             return True
@@ -91,6 +91,9 @@ def _benchmark_batched(args) -> dict:
         _default_session_name,
         _init_session,
         collect_games_batched,
+        load_centralized_critic_checkpoint,
+        reset_centralized_critic,
+        save_centralized_critic_checkpoint,
         torch,
         train_on_trajectories,
     )
@@ -108,6 +111,8 @@ def _benchmark_batched(args) -> dict:
     hidden = TEACHER_HIDDEN if args.teacher else None
     model = BuilderMLP(hidden=hidden).to(DEVICE)
     _load_model_compat(model, weight_path, WEIGHT_PATH)
+    reset_centralized_critic()
+    load_centralized_critic_checkpoint(weight_path, lr=args.lr)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
     if DEVICE.type == "cuda":
@@ -146,7 +151,7 @@ def _benchmark_batched(args) -> dict:
             opp_ids.append(opp["id"])
 
     collection_profile: dict[str, float] = {}
-    all_trajs, all_winners, per_opp_winners = collect_games_batched(
+    all_trajs, all_winners, per_opp_winners, all_global_states, traj_game_map, _game_origin = collect_games_batched(
         model,
         opp_paths,
         opp_ids,
@@ -163,7 +168,17 @@ def _benchmark_batched(args) -> dict:
     train_profile: dict[str, float] = {}
     train_start = time.perf_counter()
     model.train()
-    stats = train_on_trajectories(model, optimizer, all_trajs, profile=train_profile)
+    stats = train_on_trajectories(
+        model,
+        optimizer,
+        all_trajs,
+        profile=train_profile,
+        global_states_list=all_global_states,
+        traj_game_map=traj_game_map if all_global_states else None,
+        game_winners=all_winners,
+    )
+    model.save_weights(weight_path)
+    save_centralized_critic_checkpoint(weight_path)
     scheduler.step()
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()

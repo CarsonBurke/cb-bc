@@ -1,6 +1,7 @@
-"""Neural network layers built on the Tensor autograd engine.
+"""Neural network layers for inference.
 
 All layers follow the pattern: __call__(x) -> Tensor, parameters() -> list[Tensor].
+Training is done in PyTorch — these layers are forward-pass only.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ class Linear:
         self.out_features = out_features
         self.weight = Tensor.xavier(in_features, out_features)
         self.bias = (
-            Tensor.zeros((out_features,), requires_grad=True) if bias else None
+            Tensor.zeros((out_features,)) if bias else None
         )
 
     def __call__(self, x: Tensor) -> Tensor:
@@ -89,8 +90,8 @@ class LayerNorm:
     def __init__(self, dim: int, eps: float = 1e-5):
         self.dim = dim
         self.eps = eps
-        self.gamma = Tensor([1.0] * dim, (dim,), requires_grad=True)
-        self.beta = Tensor([0.0] * dim, (dim,), requires_grad=True)
+        self.gamma = Tensor([1.0] * dim, (dim,))
+        self.beta = Tensor([0.0] * dim, (dim,))
 
     def __call__(self, x: Tensor) -> Tensor:
         # Normalize last dim. Supports 1D (N,) and 2D (M, N).
@@ -99,12 +100,11 @@ class LayerNorm:
             mu = sum(x.data) / N
             var = sum((v - mu) ** 2 for v in x.data) / N
             inv_std = 1.0 / (var + self.eps) ** 0.5
-            normed = [(v - mu) * inv_std for v in x.data]
             out_data = [
-                normed[i] * self.gamma.data[i] + self.beta.data[i]
-                for i in range(N)
+                (v - mu) * inv_std * self.gamma.data[i] + self.beta.data[i]
+                for i, v in enumerate(x.data)
             ]
-            out = Tensor(out_data, x.shape)
+            return Tensor(out_data, x.shape)
         else:
             M, N = x.shape
             out_data = [0.0] * (M * N)
@@ -119,88 +119,7 @@ class LayerNorm:
                     out_data[base + j] = (
                         normed * self.gamma.data[j] + self.beta.data[j]
                     )
-            out = Tensor(out_data, x.shape)
-
-        out.requires_grad = (
-            x.requires_grad or self.gamma.requires_grad or self.beta.requires_grad
-        )
-        out._prev = (x, self.gamma, self.beta)
-
-        # Store for backward
-        _x = x
-        _gamma = self.gamma
-        _beta = self.beta
-        _eps = self.eps
-
-        def _backward():
-            from .tensor import _ensure_grad
-
-            if not any(
-                t.requires_grad for t in (_x, _gamma, _beta)
-            ):
-                return
-
-            og = out.grad.data
-
-            if len(_x.shape) == 1:
-                N = _x.shape[0]
-                mu = sum(_x.data) / N
-                var = sum((v - mu) ** 2 for v in _x.data) / N
-                inv_std = 1.0 / (var + _eps) ** 0.5
-                normed = [(v - mu) * inv_std for v in _x.data]
-
-                if _gamma.requires_grad:
-                    _ensure_grad(_gamma)
-                    for i in range(N):
-                        _gamma.grad.data[i] += og[i] * normed[i]
-                if _beta.requires_grad:
-                    _ensure_grad(_beta)
-                    for i in range(N):
-                        _beta.grad.data[i] += og[i]
-                if _x.requires_grad:
-                    _ensure_grad(_x)
-                    # dx = gamma * inv_std * (dout - mean(dout) - normed * mean(dout * normed)) / 1
-                    dout_g = [og[i] * _gamma.data[i] for i in range(N)]
-                    mean_dg = sum(dout_g) / N
-                    mean_dgn = sum(dout_g[i] * normed[i] for i in range(N)) / N
-                    for i in range(N):
-                        _x.grad.data[i] += inv_std * (
-                            dout_g[i] - mean_dg - normed[i] * mean_dgn
-                        )
-            else:
-                M, N = _x.shape
-                for m in range(M):
-                    base = m * N
-                    row = _x.data[base : base + N]
-                    mu = sum(row) / N
-                    var = sum((v - mu) ** 2 for v in row) / N
-                    inv_std = 1.0 / (var + _eps) ** 0.5
-                    normed = [(v - mu) * inv_std for v in row]
-
-                    if _gamma.requires_grad:
-                        _ensure_grad(_gamma)
-                        for j in range(N):
-                            _gamma.grad.data[j] += og[base + j] * normed[j]
-                    if _beta.requires_grad:
-                        _ensure_grad(_beta)
-                        for j in range(N):
-                            _beta.grad.data[j] += og[base + j]
-                    if _x.requires_grad:
-                        _ensure_grad(_x)
-                        dout_g = [
-                            og[base + j] * _gamma.data[j] for j in range(N)
-                        ]
-                        mean_dg = sum(dout_g) / N
-                        mean_dgn = (
-                            sum(dout_g[j] * normed[j] for j in range(N)) / N
-                        )
-                        for j in range(N):
-                            _x.grad.data[base + j] += inv_std * (
-                                dout_g[j] - mean_dg - normed[j] * mean_dgn
-                            )
-
-        out._backward = _backward
-        return out
+            return Tensor(out_data, x.shape)
 
     def parameters(self) -> list[Tensor]:
         return [self.gamma, self.beta]
@@ -214,7 +133,7 @@ class RMSNorm:
     def __init__(self, dim: int, eps: float = 1e-6):
         self.dim = dim
         self.eps = eps
-        self.gamma = Tensor([1.0] * dim, (dim,), requires_grad=True)
+        self.gamma = Tensor([1.0] * dim, (dim,))
 
     def __call__(self, x: Tensor) -> Tensor:
         if len(x.shape) == 1:
@@ -225,82 +144,18 @@ class RMSNorm:
                 x.data[i] * inv_rms * self.gamma.data[i]
                 for i in range(N)
             ]
-            out = Tensor(out_data, x.shape)
+            return Tensor(out_data, x.shape)
         else:
             M, N = x.shape
             out_data = [0.0] * (M * N)
-            inv_rms_rows = [0.0] * M
             for m in range(M):
                 base = m * N
                 row = x.data[base : base + N]
                 mean_sq = sum(v * v for v in row) / N
                 inv_rms = 1.0 / (mean_sq + self.eps) ** 0.5
-                inv_rms_rows[m] = inv_rms
                 for j in range(N):
                     out_data[base + j] = row[j] * inv_rms * self.gamma.data[j]
-            out = Tensor(out_data, x.shape)
-
-        out.requires_grad = x.requires_grad or self.gamma.requires_grad
-        out._prev = (x, self.gamma)
-
-        _x = x
-        _gamma = self.gamma
-        _eps = self.eps
-
-        def _backward():
-            from .tensor import _ensure_grad
-
-            if not any(t.requires_grad for t in (_x, _gamma)):
-                return
-
-            if len(_x.shape) == 1:
-                N = _x.shape[0]
-                x_data = _x.data
-                og = out.grad.data
-                gamma = _gamma.data
-                mean_sq = sum(v * v for v in x_data) / N
-                inv_rms = 1.0 / (mean_sq + _eps) ** 0.5
-                dot = sum(og[i] * gamma[i] * x_data[i] for i in range(N))
-
-                if _gamma.requires_grad:
-                    _ensure_grad(_gamma)
-                    for i in range(N):
-                        _gamma.grad.data[i] += og[i] * x_data[i] * inv_rms
-
-                if _x.requires_grad:
-                    _ensure_grad(_x)
-                    coeff = (inv_rms ** 3) / N
-                    for i in range(N):
-                        _x.grad.data[i] += og[i] * gamma[i] * inv_rms - x_data[i] * coeff * dot
-            else:
-                M, N = _x.shape
-                x_data = _x.data
-                og = out.grad.data
-                gamma = _gamma.data
-
-                if _gamma.requires_grad:
-                    _ensure_grad(_gamma)
-                if _x.requires_grad:
-                    _ensure_grad(_x)
-
-                for m in range(M):
-                    base = m * N
-                    row = x_data[base : base + N]
-                    mean_sq = sum(v * v for v in row) / N
-                    inv_rms = 1.0 / (mean_sq + _eps) ** 0.5
-                    dot = sum(og[base + j] * gamma[j] * row[j] for j in range(N))
-                    coeff = (inv_rms ** 3) / N
-                    for j in range(N):
-                        if _gamma.requires_grad:
-                            _gamma.grad.data[j] += og[base + j] * row[j] * inv_rms
-                        if _x.requires_grad:
-                            _x.grad.data[base + j] += (
-                                og[base + j] * gamma[j] * inv_rms
-                                - row[j] * coeff * dot
-                            )
-
-        out._backward = _backward
-        return out
+            return Tensor(out_data, x.shape)
 
     def parameters(self) -> list[Tensor]:
         return [self.gamma]
@@ -322,22 +177,9 @@ class Dropout:
 
         scale = 1.0 / (1.0 - self.p)
         mask = [scale if random.random() > self.p else 0.0 for _ in x.data]
-        out = Tensor(
+        return Tensor(
             [a * m for a, m in zip(x.data, mask)], x.shape
         )
-        out.requires_grad = x.requires_grad
-        out._prev = (x,)
-
-        def _backward():
-            if x.requires_grad:
-                from .tensor import _ensure_grad
-
-                _ensure_grad(x)
-                for i in range(len(x.data)):
-                    x.grad.data[i] += out.grad.data[i] * mask[i]
-
-        out._backward = _backward
-        return out
 
     def parameters(self) -> list[Tensor]:
         return []
@@ -522,8 +364,8 @@ class MLP:
         """Fast inference for a single input — bypasses Tensor overhead.
 
         Takes a flat list of floats (length == input_size), returns
-        raw logits as {head_name: list[float]}. No autograd, no Tensor
-        allocation. Uses precomputed transposed weight rows and fused
+        raw logits as {head_name: list[float]}. No Tensor allocation.
+        Uses precomputed transposed weight rows and fused
         linear+activation for ~15% speedup over naive path.
         """
         if self._infer_cache is None:
@@ -669,22 +511,39 @@ class MLP:
     def load(self, state: list[list[float]]) -> None:
         """Load parameters from nested lists.
 
-        Supports legacy MLP states saved before RMSNorm parameters were added.
+        Supports legacy MLP states saved before RMSNorm parameters were added
+        and before optional newer heads such as `conv_dir` existed.
         """
         full_params = self.parameters()
+        no_conv_params: list[Tensor] = []
+        for layer in self.trunk.layers:
+            no_conv_params.extend(layer.parameters())
+        for name, head in self.heads.items():
+            if name != "conv_dir":
+                no_conv_params.extend(head.parameters())
+
         legacy_params: list[Tensor] = []
+        legacy_no_conv_params: list[Tensor] = []
         for layer in self.trunk.layers:
             if isinstance(layer, Linear):
                 legacy_params.extend(layer.parameters())
+                legacy_no_conv_params.extend(layer.parameters())
             elif isinstance(layer, LayerNorm):
                 legacy_params.extend(layer.parameters())
-        for head in self.heads.values():
+                legacy_no_conv_params.extend(layer.parameters())
+        for name, head in self.heads.items():
+            if name != "conv_dir":
+                legacy_no_conv_params.extend(head.parameters())
             legacy_params.extend(head.parameters())
 
         if len(state) == len(full_params):
             params = full_params
+        elif len(state) == len(no_conv_params):
+            params = no_conv_params
         elif len(state) == len(legacy_params):
             params = legacy_params
+        elif len(state) == len(legacy_no_conv_params):
+            params = legacy_no_conv_params
         else:
             raise AssertionError(
                 f"State has {len(state)} entries, model has {len(full_params)} params "

@@ -1,5 +1,8 @@
+import { useEffect } from 'react'
 import { useAtom } from 'jotai'
-import { currentViewPersistAtom } from './store'
+import { useAtomValue } from 'jotai'
+import { useStore } from 'jotai'
+import { currentViewPersistAtom, syncFromHash, trainSessionAtom } from './store'
 import { DATA } from './data'
 import Sidebar from './components/Sidebar'
 import AllRoundsView from './components/AllRoundsView'
@@ -10,6 +13,17 @@ import GameViewer from './components/GameViewer'
 
 export default function App() {
   const [currentView, setCurrentView] = useAtom(currentViewPersistAtom)
+  const trainSession = useAtomValue(trainSessionAtom)
+  const store = useStore()
+
+  // Sync atoms from URL on back/forward navigation
+  useEffect(() => {
+    const onPop = () => {
+      syncFromHash((atom, val) => store.set(atom, val))
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [store])
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -18,15 +32,15 @@ export default function App() {
         currentView={currentView}
         onSelect={setCurrentView}
       />
-      <main className="flex-1 overflow-y-auto p-6 lg:p-8">
+      <main className={`flex-1 ${currentView === 'training' ? 'overflow-hidden p-3' : 'overflow-y-auto p-6 lg:p-8'}`}>
         {currentView === 'training' ? (
-          <TrainingView />
+          <TrainingView key={`training:${trainSession || 'default'}`} />
         ) : currentView === 'replays' ? (
-          <ReplayViewer />
+          <ReplayViewer key="replays" />
         ) : currentView === 'all' ? (
-          <AllRoundsView />
+          <AllRoundsView key="all" />
         ) : (
-          <RoundView roundId={currentView} />
+          <RoundView key={`round:${currentView}`} roundId={currentView} />
         )}
       </main>
       <GameViewer />

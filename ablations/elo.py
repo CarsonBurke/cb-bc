@@ -59,44 +59,11 @@ class MatchResult:
     match_id: int = -1
 
 
-def _decode_varint(data: bytes, pos: int) -> tuple[int, int]:
-    result, shift = 0, 0
-    while True:
-        b = data[pos]
-        result |= (b & 0x7F) << shift
-        pos += 1
-        if not (b & 0x80):
-            break
-        shift += 7
-    return result, pos
-
-
 def parse_replay_winner(replay_path: str, bot_a: str, bot_b: str) -> str:
-    """Parse the replay protobuf to extract the winner.
-
-    Field 4 (varint) at the top level: 0 = Team A wins, 1 = Team B wins.
-    """
-    data = Path(replay_path).read_bytes()
-    pos = 0
-    end = len(data)
-    winner_val = None
-    while pos < end:
-        tag, pos = _decode_varint(data, pos)
-        field_num = tag >> 3
-        wire_type = tag & 0x7
-        if wire_type == 0:  # varint
-            val, pos = _decode_varint(data, pos)
-            if field_num == 4:
-                winner_val = val
-        elif wire_type == 2:  # length-delimited
-            length, pos = _decode_varint(data, pos)
-            pos += length
-        elif wire_type == 5:  # fixed32
-            pos += 4
-        elif wire_type == 1:  # fixed64
-            pos += 8
-        else:
-            break
+    """Parse the replay protobuf to extract the winner."""
+    from replay_parser import parse_replay_working
+    result = parse_replay_working(replay_path)
+    winner_val = result.get("winner")
     if winner_val == 0:
         return bot_a
     elif winner_val == 1:

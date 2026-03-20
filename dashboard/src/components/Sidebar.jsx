@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useAtom } from 'jotai'
 import { modePersistAtom, trainSessionPersistAtom } from '../store'
-import { formatDate } from '../data'
+import { formatDate, relativeTime } from '../data'
 
 function useTrainSessions() {
   const [sessions, setSessions] = useState([])
@@ -22,9 +22,7 @@ function useTrainSessions() {
 
 function formatSessionDate(ts) {
   if (!ts) return ''
-  return new Date(ts * 1000).toLocaleString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  })
+  return relativeTime(ts * 1000)
 }
 
 export default function Sidebar({ rounds, currentView, onSelect }) {
@@ -75,7 +73,7 @@ export default function Sidebar({ rounds, currentView, onSelect }) {
                 active={currentView === r.round_id}
                 onClick={() => onSelect(r.round_id)}
                 title={`Round ${r.round_id}`}
-                meta={`${formatDate(r.timestamp, { month: 'short', day: 'numeric' })} · ${Object.keys(r.bots).length} bots`}
+                meta={`${relativeTime(r.timestamp)} · ${Object.keys(r.bots).length} bots`}
               />
             ))}
           </>
