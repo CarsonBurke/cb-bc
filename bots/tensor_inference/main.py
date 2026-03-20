@@ -409,11 +409,9 @@ class Player:
         Zero-sum with placement: total advance is deducted on successful build."""
         pos = ct.get_position()
         best_delta, best_key, best_reward = 0.0, None, 0.0
-        for tile_pos in ct.get_nearby_tiles():
+        ore_tiles = Player._all_ore or ()
+        for tile_pos in ore_tiles:
             try:
-                env = ct.get_tile_env(tile_pos)
-                if env not in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
-                    continue
                 key = (tile_pos.x, tile_pos.y)
                 prev = Player._harv_proximity.get(key, 0.0)
                 d = max(abs(tile_pos.x - pos.x), abs(tile_pos.y - pos.y))

@@ -69,6 +69,8 @@ DIR_MAP_9 = [
     Direction.SOUTH,
     Direction.SOUTHEAST,
 ]
+_CONV_DIR_MASK = [d != Direction.CENTRE for d in DIR_MAP_9]
+_HARVESTER_BUILD_TYPE = 1
 
 # Environment type -> one-hot index
 ENV_IDX = {
@@ -178,6 +180,7 @@ def _build_model() -> MLP:
         output_heads={
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
+            "conv_dir": 9,
             "move_dir": 9,
             "h_next": H_DIM,
         },
@@ -214,6 +217,7 @@ class Player:
     _all_ore: list[Position] | None = None  # discovered ore tiles (accumulated)
     _all_ore_keys: set[tuple[int, int]] = set()
     _harv_proximity: dict[tuple[int, int], float] = {}  # ore_key → proximity reward given
+    _harv_placed_ores: set[tuple[int, int]] = set()  # ore tiles already rewarded for placement
     _working_harv_positions: set[tuple[int, int]] = set()  # accumulated per round
     _working_harv_round: int = -1
     _working_harv_count: int = 0  # final count from previous round
@@ -241,6 +245,10 @@ class Player:
         self._prev_resources: tuple[float, float] | None = None
         self._n_builders_cached: int = 1
         self._spawn_round: int = -1
+        self._dbg_harv_attempts: int = 0
+        self._dbg_harv_failures: int = 0
+        self._dbg_harv_prox_gate: int = 0
+        self._dbg_harv_prox_paid: int = 0
         if self._train_log is not None:
             _LIVE_LOG_PLAYERS.add(self)
 
@@ -319,19 +327,29 @@ class Player:
         self.h_prev = [math.tanh(x) for x in h_raw]
 
         # Compute action masks (which builds are affordable, which tiles are free)
-        bt_mask, bd_mask = _compute_masks_from_obs(obs)
+        bt_mask, bd_mask, harv_bd_mask = _compute_masks_from_obs(obs)
 
         # Decode each head via argmax (sample in training mode)
         if self._train_log is not None:
             build_type_idx, bt_lp = _sample_from_logits(outputs["build_type"], bt_mask)
-            build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"], bd_mask)
+            build_dir_mask = _compute_conditional_build_dir_mask_from_obs(obs, build_type_idx, bd_mask, harv_bd_mask)
+            build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"], build_dir_mask)
+            conv_dir_idx, cd_lp = _sample_from_logits(outputs["conv_dir"], _CONV_DIR_MASK)
             move_dir_idx, md_lp = _sample_from_logits(outputs["move_dir"], None)
             # Mask build_dir log_prob when build_type is "none" (idx 0)
             # — the direction is causally irrelevant, so exclude from policy gradient
-            old_log_prob = bt_lp + (bd_lp if build_type_idx != 0 else 0.0) + md_lp
+            conv_causal = build_type_idx in (2, 8)
+            old_log_prob = (
+                bt_lp
+                + (bd_lp if build_type_idx != 0 else 0.0)
+                + (cd_lp if conv_causal else 0.0)
+                + md_lp
+            )
         else:
             build_type_idx = _argmax(outputs["build_type"], bt_mask)
-            build_dir_idx = _argmax(outputs["build_dir"], bd_mask)
+            build_dir_mask = _compute_conditional_build_dir_mask_from_obs(obs, build_type_idx, bd_mask, harv_bd_mask)
+            build_dir_idx = _argmax(outputs["build_dir"], build_dir_mask)
+            conv_dir_idx = _argmax(outputs["conv_dir"], _CONV_DIR_MASK)
             move_dir_idx = _argmax(outputs["move_dir"], None)
 
         # Snapshot resources before actions to isolate delivery from spending
@@ -340,7 +358,12 @@ class Player:
         # Execute actions
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir)
+        conv_dir = DIR_MAP_9[conv_dir_idx]
+        self._dbg_harv_attempts = 0
+        self._dbg_harv_failures = 0
+        self._dbg_harv_prox_gate = 0
+        self._dbg_harv_prox_paid = 0
+        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
         place_reward = harv_reward + conv_reward
 
         move_dir = DIR_MAP_9[move_dir_idx]
@@ -354,12 +377,14 @@ class Player:
 
         # Log trajectory step
         if self._train_log is not None:
-            # Tuple: obs, h, bt, bd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp
+            # Tuple: obs, h, bt, bd, cd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp,
+            #        harv_attempt, harv_fail, harv_gate, harv_paid
             self._train_log.append((
                 obs,
                 list(h_in),
                 build_type_idx,
                 build_dir_idx,
+                conv_dir_idx,
                 move_dir_idx,
                 0.0,  # value placeholder
                 0,  # replay augmentation fills in true working-harvester count
@@ -368,6 +393,10 @@ class Player:
                 harv_reward,
                 enemy_dmg,
                 old_log_prob,
+                self._dbg_harv_attempts,
+                self._dbg_harv_failures,
+                self._dbg_harv_prox_gate,
+                self._dbg_harv_prox_paid,
             ))
 
             if ct.get_current_round() >= 1999:
@@ -457,20 +486,17 @@ class Player:
             except Exception:
                 pass
 
-    def _proximity_reward(self, ct: Controller) -> float:
+    def _proximity_reward(self, ct: Controller, build_pos: Position) -> float:
         """Proximity reward for failed harvester placement.
         Returns delta improvement: new_advance - old_advance. Improvable on closer approach.
         Zero-sum with placement: total advance is deducted on successful build."""
-        pos = ct.get_position()
         best_delta, best_key, best_reward = 0.0, None, 0.0
-        for tile_pos in ct.get_nearby_tiles():
+        ore_tiles = Player._all_ore or ()
+        for tile_pos in ore_tiles:
             try:
-                env = ct.get_tile_env(tile_pos)
-                if env not in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
-                    continue
                 key = (tile_pos.x, tile_pos.y)
                 prev = Player._harv_proximity.get(key, 0.0)
-                d = max(abs(tile_pos.x - pos.x), abs(tile_pos.y - pos.y))
+                d = max(abs(tile_pos.x - build_pos.x), abs(tile_pos.y - build_pos.y))
                 if d > 10:
                     continue
                 reward = self._PLACE_HARV * 0.2 / (1.0 + d)
@@ -488,13 +514,16 @@ class Player:
         self,
         ct: Controller,
         build_pos: Position,
+        tile_building_id: int | None = None,
+        tile_building_type: EntityType | None = None,
     ) -> bool:
         """Only reward harvester proximity when the attempted tile is otherwise valid.
 
         The shaping is meant to say "good harvester intent, wrong tile type",
-        not "good job attempting an impossible build". So the target must be an
-        empty, unit-free, non-wall tile, and the only missing property should be
-        that it is not an ore tile.
+        not "good job attempting an impossible build". Match build-dir validity:
+        non-wall, unit-free, and either empty or occupied by a friendly non-core
+        building that could be replaced. The only missing property should be that
+        the tile is not an ore tile.
         """
         try:
             env = ct.get_tile_env(build_pos)
@@ -502,11 +531,17 @@ class Player:
                 return False
             if env == Environment.WALL:
                 return False
-            if ct.get_tile_building_id(build_pos) is not None:
-                return False
             if ct.get_tile_builder_bot_id(build_pos) is not None:
                 return False
-            return ct.is_tile_passable(build_pos)
+            bid = tile_building_id
+            btype = tile_building_type
+            if bid is None:
+                bid = ct.get_tile_building_id(build_pos)
+                if bid is not None:
+                    btype = ct.get_entity_type(bid)
+            if bid is None:
+                return True
+            return ct.get_team(bid) == self.my_team and btype != EntityType.CORE
         except Exception:
             return False
 
@@ -654,7 +689,11 @@ class Player:
     _PLACE_HARV = 5.0
 
     def _execute_build(
-        self, ct: Controller, action: str, direction: Direction
+        self,
+        ct: Controller,
+        action: str,
+        direction: Direction,
+        conv_direction: Direction,
     ) -> tuple[float, float]:
         """Execute build action. Returns (harv_reward, conv_reward).
 
@@ -675,38 +714,48 @@ class Player:
         # Auto-destroy friendly non-core building to make room.
         # Check affordability first to avoid destroying for nothing.
         bid = ct.get_tile_building_id(build_pos)
+        btype = None
         if bid is not None:
             try:
-                if ct.get_team(bid) == self.my_team and ct.get_entity_type(bid) != EntityType.CORE:
+                btype = ct.get_entity_type(bid)
+                if ct.get_team(bid) == self.my_team:
+                    if action == "conveyor" and btype == EntityType.CONVEYOR and ct.get_direction(bid) == conv_direction:
+                        return 0.0, 0.0
+                    if action == "armoured_conveyor" and btype == EntityType.ARMOURED_CONVEYOR and ct.get_direction(bid) == conv_direction:
+                        return 0.0, 0.0
+                if ct.get_team(bid) == self.my_team and btype != EntityType.CORE:
                     idx = BUILD_ACTIONS.index(action)
                     base_ti, base_ax = BUILD_COSTS[idx]
                     scale = ct.get_scale_percent() / 100.0
                     ti, ax = ct.get_global_resources()
                     if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
                         ct.destroy(build_pos)
+                        bid, btype = None, None
                     else:
                         return 0.0, 0.0
             except Exception:
                 pass
 
         if action == "conveyor":
-            conv_dir = direction
-            if self.core_center:
-                conv_dir = build_pos.direction_to(self.core_center)
-                if conv_dir == Direction.CENTRE:
-                    conv_dir = direction
-            if ct.can_build_conveyor(build_pos, conv_dir):
-                ct.build_conveyor(build_pos, conv_dir)
+            if ct.can_build_conveyor(build_pos, conv_direction):
+                ct.build_conveyor(build_pos, conv_direction)
                 Player._conv_count += 1
         elif action == "harvester":
+            self._dbg_harv_attempts = 1
             if ct.can_build_harvester(build_pos):
                 ct.build_harvester(build_pos)
                 ore_key = (build_pos.x, build_pos.y)
-                given = Player._harv_proximity.get(ore_key, 0.0)
-                Player._harv_proximity[ore_key] = self._PLACE_HARV
-                return self._PLACE_HARV - given, 0.0
-            if self._should_reward_harvester_proximity(ct, build_pos):
-                return self._proximity_reward(ct), 0.0
+                if ore_key in Player._harv_placed_ores:
+                    return 0.0, 0.0
+                Player._harv_placed_ores.add(ore_key)
+                return self._PLACE_HARV, 0.0
+            self._dbg_harv_failures = 1
+            if self._should_reward_harvester_proximity(ct, build_pos, bid, btype):
+                self._dbg_harv_prox_gate = 1
+                reward = self._proximity_reward(ct, build_pos)
+                if reward > 0.0:
+                    self._dbg_harv_prox_paid = 1
+                return reward, 0.0
             return 0.0, 0.0
         elif action == "road":
             if ct.can_build_road(build_pos):
@@ -724,8 +773,8 @@ class Player:
             if ct.can_build_splitter(build_pos, direction):
                 ct.build_splitter(build_pos, direction)
         elif action == "armoured_conveyor":
-            if ct.can_build_armoured_conveyor(build_pos, direction):
-                ct.build_armoured_conveyor(build_pos, direction)
+            if ct.can_build_armoured_conveyor(build_pos, conv_direction):
+                ct.build_armoured_conveyor(build_pos, conv_direction)
                 Player._conv_count += 1
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):
@@ -781,13 +830,45 @@ class Player:
         _LIVE_LOG_PLAYERS.discard(self)
 
 
-def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
+def _compute_harvester_build_dir_mask_from_obs(obs: list[float], bd_mask: list[bool]) -> list[bool]:
+    has_visible_ore = False
+    for tile in range(GRID_SIZE * GRID_SIZE):
+        ts = tile * TILE_FEATURES
+        if obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0:
+            has_visible_ore = True
+            break
+
+    harv_bd_mask = [False] * 9
+    for d_idx in range(9):
+        if not bd_mask[d_idx]:
+            continue
+        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
+        is_ore = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
+        empty = obs[ts + 4] == 1.0
+        harv_bd_mask[d_idx] = (is_ore and empty) or ((not is_ore) and has_visible_ore)
+    return harv_bd_mask
+
+
+def _compute_conditional_build_dir_mask_from_obs(
+    obs: list[float],
+    build_type_idx: int,
+    bd_mask: list[bool],
+    harv_bd_mask: list[bool] | None = None,
+) -> list[bool]:
+    if build_type_idx != _HARVESTER_BUILD_TYPE:
+        return bd_mask
+    if harv_bd_mask is None:
+        harv_bd_mask = _compute_harvester_build_dir_mask_from_obs(obs, bd_mask)
+    return harv_bd_mask
+
+
+def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], list[bool]]:
     """Compute build_type and build_dir action masks.
 
     Build directions allow both empty tiles and tiles with friendly non-core
     buildings (the execution layer auto-destroys before building).
 
-    Returns (bt_mask, bd_mask) as lists of booleans (True = allowed).
+    Returns (bt_mask, bd_mask, harv_bd_mask) as lists of booleans (True = allowed).
     """
     g = _GLOBAL_OBS_START
     ti = obs[g + 3] * 500.0
@@ -817,11 +898,15 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
             bd_mask[d_idx] = True
             any_dir = True
 
+    harv_bd_mask = _compute_harvester_build_dir_mask_from_obs(obs, bd_mask)
+    if not any(harv_bd_mask):
+        bt_mask[_HARVESTER_BUILD_TYPE] = False
+
     # If nothing affordable or nowhere to build, force "none" (dir irrelevant)
     if not any_affordable or not any_dir:
-        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9
+        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9, [True] * 9
 
-    return bt_mask, bd_mask
+    return bt_mask, bd_mask, harv_bd_mask
 
 
 def _argmax(data: list[float], mask: list[bool] | None = None) -> int:

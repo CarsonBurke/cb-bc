@@ -3,7 +3,7 @@
 Provides:
 - Tensor: N-dimensional tensor (forward-pass only)
 - Neural network layers: Linear, ReLU, Tanh, Sigmoid, LayerNorm, Dropout, MLP
-- Position embeddings: Sinusoidal, Learned, RelativeGrid
+- Position embeddings: Sinusoidal
 
 Training is done in PyTorch (bots/tensor/torch/).
 """
@@ -21,11 +21,7 @@ from .nn import (
     Sequential,
     MLP,
 )
-from .embed import (
-    SinusoidalPositionEmbedding,
-    LearnedPositionEmbedding,
-    RelativeGridEmbedding,
-)
+from .embed import SinusoidalPositionEmbedding
 
 __all__ = [
     "Tensor",
@@ -40,6 +36,4 @@ __all__ = [
     "Sequential",
     "MLP",
     "SinusoidalPositionEmbedding",
-    "LearnedPositionEmbedding",
-    "RelativeGridEmbedding",
 ]

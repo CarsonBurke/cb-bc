@@ -17,7 +17,7 @@ gc.disable()
 
 sys.path.insert(0, "bots/tensor")
 from tensor_lib import Tensor, Linear, ReLU, SiLU, LayerNorm, Sequential, MLP
-from tensor_lib.embed import SinusoidalPositionEmbedding, LearnedPositionEmbedding, RelativeGridEmbedding
+from tensor_lib.embed import SinusoidalPositionEmbedding
 from main import (
     INPUT_SIZE as PROD_INPUT_SIZE,
     HIDDEN_SIZES as PROD_HIDDEN_SIZES,
@@ -177,12 +177,6 @@ def bench_embeddings():
     bench(lambda: sin_emb.encode_batch([(i, j) for i in range(3) for j in range(3)]),
           label="Sinusoidal batch 9 pos (d=16)")
 
-    learned = LearnedPositionEmbedding(25, 16)
-    bench(lambda: learned(list(range(25))), label="Learned embed 25 indices (d=16)")
-
-    grid = RelativeGridEmbedding(5, 16)
-    bench(lambda: grid.encode(10, 10), label="RelativeGrid 5x5 (d=16)")
-
 
 # ── Full inference simulation ────────────────────────────────────
 
@@ -246,6 +240,7 @@ def bench_inference():
     prod_heads = {
         "build_type": len(PROD_BUILD_ACTIONS),
         "build_dir": 9,
+        "conv_dir": 9,
         "move_dir": 9,
         "h_next": PROD_H_DIM,
     }
