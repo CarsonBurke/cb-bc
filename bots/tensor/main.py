@@ -218,6 +218,7 @@ class Player:
     _all_ore_keys: set[tuple[int, int]] = set()
     _harv_proximity: dict[tuple[int, int], float] = {}  # ore_key → proximity reward given
     _harv_placed_ores: set[tuple[int, int]] = set()  # ore tiles already rewarded for placement
+    _conv_proximity: dict[tuple[int, int], float] = {}  # ore_key → conv proximity reward given
     _working_harv_positions: set[tuple[int, int]] = set()  # accumulated per round
     _working_harv_round: int = -1
     _working_harv_count: int = 0  # final count from previous round
@@ -225,6 +226,8 @@ class Player:
     _own_core_hp: float = 500.0  # shared own core HP tracking
     _enemy_core_dmg: float = 0.0  # damage dealt this round
     _enemy_core_dmg_round: int = -1
+    _own_core_dmg: float = 0.0  # damage taken this round
+    _own_core_dmg_round: int = -1
 
     def __init__(self):
         self.core_center: Position | None = None
@@ -249,6 +252,10 @@ class Player:
         self._dbg_harv_failures: int = 0
         self._dbg_harv_prox_gate: int = 0
         self._dbg_harv_prox_paid: int = 0
+        self._dbg_conv_attempts: int = 0
+        self._dbg_conv_failures: int = 0
+        self._dbg_conv_prox_gate: int = 0
+        self._dbg_conv_prox_paid: int = 0
         if self._train_log is not None:
             _LIVE_LOG_PLAYERS.add(self)
 
@@ -266,6 +273,7 @@ class Player:
             self.core_center = ct.get_position()
         self._discover_ore(ct)
         self._scan_enemy_core_dmg(ct)
+        self._scan_own_core_dmg(ct)
 
         ti, ax = ct.get_global_resources()
         rnd = ct.get_current_round()
@@ -305,6 +313,7 @@ class Player:
         # not spend per-turn CPU estimating it from partial vision here.
         self._discover_ore(ct)
         self._scan_enemy_core_dmg(ct)
+        self._scan_own_core_dmg(ct)
         # Opportunistically scan for enemy core
         if self.enemy_core is None:
             for eid in ct.get_nearby_entities():
@@ -363,14 +372,19 @@ class Player:
         self._dbg_harv_failures = 0
         self._dbg_harv_prox_gate = 0
         self._dbg_harv_prox_paid = 0
+        self._dbg_conv_attempts = 0
+        self._dbg_conv_failures = 0
+        self._dbg_conv_prox_gate = 0
+        self._dbg_conv_prox_paid = 0
         harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
         place_reward = harv_reward + conv_reward
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
 
-        # Enemy core damage (class-level, accumulated from all units' vision)
+        # Core damage (class-level, accumulated from all units' vision)
         enemy_dmg = Player._enemy_core_dmg
+        own_dmg = Player._own_core_dmg
 
         ti_after, ax_after = ct.get_global_resources()
         self._prev_resources = (ti_after, ax_after)
@@ -378,7 +392,8 @@ class Player:
         # Log trajectory step
         if self._train_log is not None:
             # Tuple: obs, h, bt, bd, cd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp,
-            #        harv_attempt, harv_fail, harv_gate, harv_paid
+            #        harv_attempt, harv_fail, harv_gate, harv_paid,
+            #        conv_attempt, conv_fail, conv_gate, conv_paid, own_dmg
             self._train_log.append((
                 obs,
                 list(h_in),
@@ -397,6 +412,11 @@ class Player:
                 self._dbg_harv_failures,
                 self._dbg_harv_prox_gate,
                 self._dbg_harv_prox_paid,
+                self._dbg_conv_attempts,
+                self._dbg_conv_failures,
+                self._dbg_conv_prox_gate,
+                self._dbg_conv_prox_paid,
+                own_dmg,
             ))
 
             if ct.get_current_round() >= 1999:
@@ -486,6 +506,26 @@ class Player:
             except Exception:
                 pass
 
+    @staticmethod
+    def _scan_own_core_dmg(ct: Controller) -> None:
+        """Track own core HP changes. Any unit seeing our core updates shared state."""
+        rnd = ct.get_current_round()
+        if Player._own_core_dmg_round != rnd:
+            Player._own_core_dmg = 0.0
+            Player._own_core_dmg_round = rnd
+        team = ct.get_team()
+        for eid in ct.get_nearby_entities():
+            try:
+                if ct.get_entity_type(eid) == EntityType.CORE and ct.get_team(eid) == team:
+                    hp = ct.get_hp(eid)
+                    dmg = max(0.0, Player._own_core_hp - hp)
+                    if dmg > Player._own_core_dmg:
+                        Player._own_core_dmg = dmg
+                    Player._own_core_hp = hp
+                    break
+            except Exception:
+                pass
+
     def _proximity_reward(self, ct: Controller, build_pos: Position) -> float:
         """Proximity reward for failed harvester placement.
         Returns delta improvement: new_advance - old_advance. Improvable on closer approach.
@@ -545,6 +585,73 @@ class Player:
         except Exception:
             return False
 
+
+    def _conv_proximity_reward(self, ct: Controller, build_pos: Position, conv_direction: Direction) -> float:
+        """Proximity reward for successful conveyor placement near ore.
+        Uses manhattan distance with target=1 (adjacent to ore).
+        Returns delta improvement so repeated placements at the same
+        distance don't stack."""
+        best_delta, best_key, best_reward = 0.0, None, 0.0
+        ore_tiles = Player._all_ore or ()
+        fdx, fdy = DIR_DXY.get(conv_direction, (0, 0))
+        for tile_pos in ore_tiles:
+            try:
+                key = (tile_pos.x, tile_pos.y)
+                prev = Player._conv_proximity.get(key, 0.0)
+                dx = tile_pos.x - build_pos.x
+                dy = tile_pos.y - build_pos.y
+                d = abs(dx) + abs(dy)
+                if d > 10:
+                    continue
+                # Skip if conv_dir faces directly into the ore (would push away from harvester)
+                if d == 1 and fdx == dx and fdy == dy:
+                    continue
+                if d <= 1:
+                    reward = self._PLACE_CONV
+                else:
+                    reward = self._PLACE_CONV * 0.1 / (d - 1)
+                delta = reward - prev
+                if delta > best_delta:
+                    best_delta, best_key, best_reward = delta, key, reward
+            except Exception:
+                continue
+        if best_key is None or best_delta <= 0:
+            return 0.0
+        Player._conv_proximity[best_key] = best_reward
+        return best_delta
+
+    def _should_reward_conv_proximity(
+        self,
+        ct: Controller,
+        build_pos: Position,
+        conv_direction: Direction,
+        tile_building_id: int | None = None,
+        tile_building_type: EntityType | None = None,
+    ) -> bool:
+        """Only reward conveyor proximity when the attempted tile is otherwise valid.
+        Non-wall, non-ore, unit-free, empty or friendly non-core building.
+        Conv dir must not be CENTRE."""
+        if conv_direction == Direction.CENTRE:
+            return False
+        try:
+            env = ct.get_tile_env(build_pos)
+            if env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
+                return False
+            if env == Environment.WALL:
+                return False
+            if ct.get_tile_builder_bot_id(build_pos) is not None:
+                return False
+            bid = tile_building_id
+            btype = tile_building_type
+            if bid is None:
+                bid = ct.get_tile_building_id(build_pos)
+                if bid is not None:
+                    btype = ct.get_entity_type(bid)
+            if bid is None:
+                return True
+            return ct.get_team(bid) == self.my_team and btype != EntityType.CORE
+        except Exception:
+            return False
 
     def _find_core(self, ct: Controller) -> Position:
         if self.my_team is None:
@@ -687,6 +794,7 @@ class Player:
     # ---- Action execution ----
 
     _PLACE_HARV = 5.0
+    _PLACE_CONV = 5.0
 
     def _execute_build(
         self,
@@ -731,15 +839,23 @@ class Player:
                     if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
                         ct.destroy(build_pos)
                         bid, btype = None, None
-                    else:
-                        return 0.0, 0.0
             except Exception:
                 pass
 
         if action == "conveyor":
+            self._dbg_conv_attempts = 1
             if ct.can_build_conveyor(build_pos, conv_direction):
                 ct.build_conveyor(build_pos, conv_direction)
                 Player._conv_count += 1
+                if self._should_reward_conv_proximity(ct, build_pos, conv_direction, bid, btype):
+                    self._dbg_conv_prox_gate = 1
+                    reward = self._conv_proximity_reward(ct, build_pos, conv_direction)
+                    if reward > 0.0:
+                        self._dbg_conv_prox_paid = 1
+                    return 0.0, reward
+            else:
+                self._dbg_conv_failures = 1
+            return 0.0, 0.0
         elif action == "harvester":
             self._dbg_harv_attempts = 1
             if ct.can_build_harvester(build_pos):
@@ -773,9 +889,19 @@ class Player:
             if ct.can_build_splitter(build_pos, direction):
                 ct.build_splitter(build_pos, direction)
         elif action == "armoured_conveyor":
+            self._dbg_conv_attempts = 1
             if ct.can_build_armoured_conveyor(build_pos, conv_direction):
                 ct.build_armoured_conveyor(build_pos, conv_direction)
                 Player._conv_count += 1
+                if self._should_reward_conv_proximity(ct, build_pos, conv_direction, bid, btype):
+                    self._dbg_conv_prox_gate = 1
+                    reward = self._conv_proximity_reward(ct, build_pos, conv_direction)
+                    if reward > 0.0:
+                        self._dbg_conv_prox_paid = 1
+                    return 0.0, reward
+            else:
+                self._dbg_conv_failures = 1
+            return 0.0, 0.0
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):
                 ct.build_barrier(build_pos)

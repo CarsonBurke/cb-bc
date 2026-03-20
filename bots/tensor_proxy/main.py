@@ -151,6 +151,10 @@ class Player:
         self._dbg_harv_failures: int = 0
         self._dbg_harv_prox_gate: int = 0
         self._dbg_harv_prox_paid: int = 0
+        self._dbg_conv_attempts: int = 0
+        self._dbg_conv_failures: int = 0
+        self._dbg_conv_prox_gate: int = 0
+        self._dbg_conv_prox_paid: int = 0
         self._train_log = [] if _TRAIN_LOG else None
         self._unit_id = id(self) % (2**31)
         if self._train_log is not None:
@@ -225,6 +229,10 @@ class Player:
         self._dbg_harv_failures = 0
         self._dbg_harv_prox_gate = 0
         self._dbg_harv_prox_paid = 0
+        self._dbg_conv_attempts = 0
+        self._dbg_conv_failures = 0
+        self._dbg_conv_prox_gate = 0
+        self._dbg_conv_prox_paid = 0
         harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
 
         move_dir = DIR_MAP_9[move_dir_idx]
@@ -241,6 +249,8 @@ class Player:
                 harv_reward, _TensorPlayer._enemy_core_dmg, old_log_prob,
                 self._dbg_harv_attempts, self._dbg_harv_failures,
                 self._dbg_harv_prox_gate, self._dbg_harv_prox_paid,
+                self._dbg_conv_attempts, self._dbg_conv_failures,
+                self._dbg_conv_prox_gate, self._dbg_conv_prox_paid,
             ))
             if ct.get_current_round() >= 1999:
                 self._flush_log()
@@ -322,15 +332,25 @@ class Player:
                     if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
                         ct.destroy(build_pos)
                         bid, btype = None, None
-                    else:
-                        return 0.0, 0.0
             except Exception:
                 pass
 
         if action == "conveyor":
+            self._dbg_conv_attempts = 1
             if ct.can_build_conveyor(build_pos, conv_direction):
                 ct.build_conveyor(build_pos, conv_direction)
                 _TensorPlayer._conv_count += 1
+                if _TensorPlayer._should_reward_conv_proximity(_p, ct, build_pos, conv_direction, bid, btype):
+                    self._dbg_conv_prox_gate = 1
+                    reward = _TensorPlayer._conv_proximity_reward(_p, ct, build_pos, conv_direction)
+                    if reward > 0.0:
+                        self._dbg_conv_prox_paid = 1
+                    self._sync_from_proxy(_p)
+                    return 0.0, reward
+            else:
+                self._dbg_conv_failures = 1
+            self._sync_from_proxy(_p)
+            return 0.0, 0.0
         if action == "harvester":
             self._dbg_harv_attempts = 1
             if ct.can_build_harvester(build_pos):
@@ -367,9 +387,21 @@ class Player:
             if ct.can_build_splitter(build_pos, direction):
                 ct.build_splitter(build_pos, direction)
         elif action == "armoured_conveyor":
+            self._dbg_conv_attempts = 1
             if ct.can_build_armoured_conveyor(build_pos, conv_direction):
                 ct.build_armoured_conveyor(build_pos, conv_direction)
                 _TensorPlayer._conv_count += 1
+                if _TensorPlayer._should_reward_conv_proximity(_p, ct, build_pos, conv_direction, bid, btype):
+                    self._dbg_conv_prox_gate = 1
+                    reward = _TensorPlayer._conv_proximity_reward(_p, ct, build_pos, conv_direction)
+                    if reward > 0.0:
+                        self._dbg_conv_prox_paid = 1
+                    self._sync_from_proxy(_p)
+                    return 0.0, reward
+            else:
+                self._dbg_conv_failures = 1
+            self._sync_from_proxy(_p)
+            return 0.0, 0.0
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):
                 ct.build_barrier(build_pos)
