@@ -286,7 +286,7 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
     { key: 'r_conv', label: 'Conveyor', color: '#89b4fa' },
     { key: 'r_work', altKey: 'r_deliv', label: 'Working', color: '#f9e2af' },
     { key: 'r_dmg', label: 'Damage', color: '#f38ba8' },
-    { key: 'r_outcome', label: 'Outcome', color: '#cba6f7' },
+    { key: 'r_own_dmg', label: 'Own Core Dmg', color: '#cba6f7' },
   ]
   const datasets = series.flatMap(({ key, altKey, label, color }) => {
     const raw = ds.map(e => e[key] ?? e[altKey] ?? 0)
@@ -519,7 +519,7 @@ function EpisodeLogTable() {
           {[...episodes].reverse().map(e => (
             <Tr key={e.episode}>
               <Td>{e.episode}</Td>
-              <Td title={`Harv: ${fmt(e.r_harv, 2)}  Work: ${fmt(e.r_work ?? e.r_deliv, 2)}  Conv: ${fmt(e.r_conv, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  Outcome: ${fmt(e.r_outcome, 2)}  |  H a/f/g/p: ${fmt(e.harv_attempts, 2)}/${fmt(e.harv_failures, 2)}/${fmt(e.harv_prox_gate, 2)}/${fmt(e.harv_prox_paid, 2)}  C a/f/g/p: ${fmt(e.conv_attempts, 2)}/${fmt(e.conv_failures, 2)}/${fmt(e.conv_prox_gate, 2)}/${fmt(e.conv_prox_paid, 2)}`}>{fmt(e.reward, 3)}</Td>
+              <Td title={`Harv: ${fmt(e.r_harv, 2)}  Work: ${fmt(e.r_work ?? e.r_deliv, 2)}  Conv: ${fmt(e.r_conv, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  OwnDmg: ${fmt(e.r_own_dmg, 2)}  |  H a/f/g/p: ${fmt(e.harv_attempts, 2)}/${fmt(e.harv_failures, 2)}/${fmt(e.harv_prox_gate, 2)}/${fmt(e.harv_prox_paid, 2)}  C a/f/g/p: ${fmt(e.conv_attempts, 2)}/${fmt(e.conv_failures, 2)}/${fmt(e.conv_prox_gate, 2)}/${fmt(e.conv_prox_paid, 2)}`}>{fmt(e.reward, 3)}</Td>
               <Td>{fmt(e.resources, 1)}</Td>
               <Td>{fmt(e.pi_loss, 4)}</Td>
               <Td>{fmt(e.entropy, 3)}</Td>
