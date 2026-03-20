@@ -8,6 +8,7 @@ Primary API:
     # replay["states"]  — bytes, f32[n_turns, 18, map_h, map_w]
     # replay["scalars"] — bytes, f32[n_turns, 12]
     # replay["working_harvesters"] — bytes, i32[n_turns, 2]
+    # replay["titanium_delivered"] — bytes, i32[n_turns, 2]
     # replay["map_w"], ["map_h"], ["n_turns"], ["state_stride"], ["winner"]
 """
 
@@ -32,6 +33,7 @@ __all__ = [
     "extract_global_states",
     "augment_trajectories_with_working_counts",
     "augment_trajectories_with_replay",
+    "augment_trajectories_with_ti_delivery",
 ]
 
 
@@ -106,6 +108,11 @@ class ReplayData:
         """Contiguous i32[n_turns, 2] — (team_a, team_b) per turn."""
         return self._raw["working_harvesters"]
 
+    @property
+    def titanium_delivered_bytes(self) -> bytes:
+        """Contiguous i32[n_turns, 2] — per-turn ti delivered delta."""
+        return self._raw.get("titanium_delivered", b"")
+
     # ── Per-turn slice access (zero-copy with torch) ──
 
     def state_bytes_for_turn(self, turn: int) -> memoryview:
@@ -131,6 +138,19 @@ class ReplayData:
     def working_harvesters_dict(self) -> dict[int, dict[int, int]]:
         """Return {turn: {0: team_a, 1: team_b}} for all turns."""
         buf = self._raw["working_harvesters"]
+        n = self._raw["n_turns"]
+        result = {}
+        for t in range(n):
+            off = t * 8
+            a, b = struct.unpack_from("<ii", buf, off)
+            result[t] = {0: a, 1: b}
+        return result
+
+    def titanium_delivered_dict(self) -> dict[int, dict[int, int]]:
+        """Return {turn: {0: team_a, 1: team_b}} per-turn ti delivered delta."""
+        buf = self._raw.get("titanium_delivered", b"")
+        if not buf:
+            return {}
         n = self._raw["n_turns"]
         result = {}
         for t in range(n):
@@ -201,6 +221,11 @@ _GLOBAL_START = 25 * 17  # GRID_SIZE^2 * TILE_FEATURES = 425
 _ROUND_OBS_IDX = _GLOBAL_START
 
 
+def _replay_aug_index(step: list | tuple, legacy_index: int, new_index: int) -> int:
+    """Choose the correct mutable slot for old vs new trajectory tuple layouts."""
+    return new_index if len(step) > 12 else legacy_index
+
+
 def augment_trajectories_with_working_counts(
     trajectories: list[list],
     working: dict[int, dict[int, int]],
@@ -222,7 +247,7 @@ def augment_trajectories_with_working_counts(
             rnd = max(0, min(rnd, 1999))
             counts = working.get(rnd, {})
             n_working = counts.get(team, 0)
-            step[6] = n_working
+            step[_replay_aug_index(step, legacy_index=6, new_index=7)] = n_working
 
     return trajectories
 
@@ -238,3 +263,34 @@ def augment_trajectories_with_replay(
     except Exception:
         return trajectories
     return augment_trajectories_with_working_counts(trajectories, working, team)
+
+
+def augment_trajectories_with_ti_delivery(
+    trajectories: list[list],
+    ti_delivered: dict[int, dict[int, int]],
+    team: int = 0,
+    step_index: int = 6,
+) -> list[list]:
+    """Write per-round titanium delivered delta into trajectory steps."""
+    if not ti_delivered:
+        return trajectories
+
+    for traj in trajectories:
+        for i, step in enumerate(traj):
+            if not isinstance(step, (list, tuple)) or len(step) <= step_index:
+                continue
+            if isinstance(step, tuple):
+                step = list(step)
+                traj[i] = step
+            obs = step[0]
+            rnd = int(round(obs[_ROUND_OBS_IDX] * 2000.0))
+            rnd = max(0, min(rnd, 1999))
+            counts = ti_delivered.get(rnd, {})
+            target_index = (
+                _replay_aug_index(step, legacy_index=step_index, new_index=7)
+                if step_index == 6
+                else step_index
+            )
+            step[target_index] = counts.get(team, 0)
+
+    return trajectories
