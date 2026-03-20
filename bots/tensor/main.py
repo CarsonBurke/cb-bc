@@ -839,6 +839,8 @@ class Player:
                     if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
                         ct.destroy(build_pos)
                         bid, btype = None, None
+                    else:
+                        return 0.0, 0.0
             except Exception:
                 pass
 
