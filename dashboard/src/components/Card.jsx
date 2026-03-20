@@ -4,7 +4,7 @@ import { cardOpenAtom, cardSizeAtom, cardEmaAtom, cardBandsAtom } from '../store
 
 const SIZES = ['sm', 'md', 'lg', 'xl']
 const SIZE_LABELS = { sm: 'S', md: 'M', lg: 'L', xl: 'XL' }
-const SIZE_HEIGHTS = { sm: 150, md: null, lg: 450, xl: 800 }
+const SIZE_HEIGHTS = { sm: 150, md: null, lg: 450, xl: 780 }
 
 const CardSettingsCtx = createContext({ ema: false, bands: false })
 export function useCardSettings() { return useContext(CardSettingsCtx) }
@@ -81,7 +81,7 @@ export default function Card({ title, subtitle, children, className = '', defaul
                 className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-colors ${
                   bands ? 'text-blue bg-blue/10' : 'text-overlay0 hover:text-subtext0 hover:bg-surface0/50'
                 }`}
-                title={bands ? 'P5/P95 bands on (click to disable)' : 'Show P5/P95 bands'}
+                title={bands ? 'P5/P95 viewport on (click to disable)' : 'Scale viewport to current P5-P95'}
               >
                 <svg className="w-3.5 h-3" viewBox="0 0 16 12" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round">
                   <path d="M1 3h14" strokeDasharray="2 2" />

@@ -158,33 +158,26 @@ function ema(data, span = 10) {
   return result
 }
 
-function rollingPercentile(data, p, window = 20) {
-  const result = []
-  for (let i = 0; i < data.length; i++) {
-    const start = Math.max(0, i - window + 1)
-    const slice = []
-    for (let j = start; j <= i; j++) {
-      if (data[j] != null) slice.push(data[j])
-    }
-    if (!slice.length) { result.push(null); continue }
-    slice.sort((a, b) => a - b)
-    const idx = Math.min(Math.floor(p * slice.length), slice.length - 1)
-    result.push(slice[idx])
-  }
-  return result
+function percentileValue(data, p) {
+  const values = data.filter(v => v != null).sort((a, b) => a - b)
+  if (!values.length) return null
+  const pos = Math.max(0, Math.min(values.length - 1, (values.length - 1) * p))
+  const lo = Math.floor(pos)
+  const hi = Math.ceil(pos)
+  const frac = pos - lo
+  return values[lo] + (values[hi] - values[lo]) * frac
 }
 
-function addBands(datasets, raw, color, label) {
-  datasets.push({
-    label: `${label} P95`, data: rollingPercentile(raw, 0.95),
-    borderColor: color + '30', backgroundColor: color + '10',
-    fill: '+1', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, tension: 0.3,
-  })
-  datasets.push({
-    label: `${label} P5`, data: rollingPercentile(raw, 0.05),
-    borderColor: color + '30', backgroundColor: color + '10',
-    fill: false, borderWidth: 1, borderDash: [3, 3], pointRadius: 0, tension: 0.3,
-  })
+function percentileViewport(data, low = 0.05, high = 0.95) {
+  const min = percentileValue(data, low)
+  const max = percentileValue(data, high)
+  if (min == null || max == null) return null
+  if (min === max) {
+    const pad = Math.abs(min || 1) * 0.05 || 1
+    return { min: min - pad, max: max + pad }
+  }
+  const pad = (max - min) * 0.05
+  return { min: min - pad, max: max + pad }
 }
 
 function chartScales() {
@@ -194,12 +187,16 @@ function chartScales() {
   }
 }
 
-function chartBase() {
+function chartBase(yViewport = null) {
+  const scales = chartScales()
+  if (yViewport) {
+    scales.y = { ...scales.y, min: yViewport.min, max: yViewport.max }
+  }
   return {
     responsive: true,
     maintainAspectRatio: false,
     interaction: { mode: 'index', intersect: false },
-    scales: chartScales(),
+    scales,
     plugins: { legend: { display: false } },
   }
 }
@@ -244,19 +241,19 @@ const RewardChart = memo(function RewardChart() {
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
   const raw = ds.map(e => e.reward)
+  const yViewport = bandsOn ? percentileViewport(raw) : null
   const datasets = [{
     label: 'Reward', data: raw,
-    borderColor: (emaOn || bandsOn) ? '#a6e3a140' : '#a6e3a1', backgroundColor: '#a6e3a120',
-    tension: 0, pointRadius: 0, borderWidth: (emaOn || bandsOn) ? 1 : 1.5, spanGaps: true,
+    borderColor: emaOn ? '#a6e3a140' : '#a6e3a1', backgroundColor: '#a6e3a120',
+    tension: 0, pointRadius: 0, borderWidth: emaOn ? 1 : 1.5, spanGaps: true,
   }]
-  if (bandsOn) addBands(datasets, raw, '#a6e3a1', 'Reward')
   if (emaOn) datasets.push({
     label: 'EMA', data: ema(raw),
     borderColor: '#a6e3a1', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
   })
   return (
     <div className="min-h-[200px]">
-      <Line data={{ labels: ds.map(e => e.episode), datasets }} options={chartBase()} />
+      <Line data={{ labels: ds.map(e => e.episode), datasets }} options={chartBase(yViewport)} />
     </div>
   )
 })
@@ -266,32 +263,74 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
-  const dim = emaOn || bandsOn
+  const dim = emaOn
   const series = [
     { key: 'r_harv', label: 'Harvester', color: '#a6e3a1' },
-    { key: 'r_work', label: 'Working', color: '#f9e2af' },
+    { key: 'r_work', altKey: 'r_deliv', label: 'Working', color: '#f9e2af' },
     { key: 'r_dmg', label: 'Damage', color: '#f38ba8' },
     { key: 'r_outcome', label: 'Outcome', color: '#cba6f7' },
   ]
-  const datasets = series.flatMap(({ key, label, color }) => {
-    const raw = ds.map(e => e[key] || 0)
+  const datasets = series.flatMap(({ key, altKey, label, color }) => {
+    const raw = ds.map(e => e[key] ?? e[altKey] ?? 0)
     const result = [{
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
     }]
-    if (bandsOn) addBands(result, raw, color, label)
     if (emaOn) result.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3,
     })
     return result
   })
+  const yViewport = bandsOn
+    ? percentileViewport(series.flatMap(({ key, altKey }) => ds.map(e => e[key] ?? e[altKey] ?? 0)))
+    : null
   return (
     <div className="min-h-[200px]">
       <Line
         data={{ labels: ds.map(e => e.episode), datasets }}
         options={{
-          ...chartBase(),
+          ...chartBase(yViewport),
+          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+})
+
+const HarvesterDebugChart = memo(function HarvesterDebugChart() {
+  const { episodes } = useTrainCtx()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  if (episodes.length <= 1) return <NoData />
+  const ds = downsample(episodes)
+  const dim = emaOn
+  const series = [
+    { key: 'harv_attempts', label: 'Attempts', color: '#89b4fa' },
+    { key: 'harv_failures', label: 'Failures', color: '#f38ba8' },
+    { key: 'harv_prox_gate', label: 'Gate', color: '#f9e2af' },
+    { key: 'harv_prox_paid', label: 'Paid', color: '#a6e3a1' },
+  ]
+  const datasets = series.flatMap(({ key, label, color }) => {
+    const raw = ds.map(e => e[key] ?? 0)
+    const result = [{
+      label, data: raw, borderColor: dim ? color + '40' : color,
+      tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
+    }]
+    if (emaOn) result.push({
+      label: `${label} EMA`, data: ema(raw), borderColor: color,
+      borderWidth: 2, pointRadius: 0, tension: 0.3,
+    })
+    return result
+  })
+  const yViewport = bandsOn
+    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key] ?? 0)))
+    : null
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels: ds.map(e => e.episode), datasets }}
+        options={{
+          ...chartBase(yViewport),
           plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
         }}
       />
@@ -306,7 +345,8 @@ function makeSimpleChart(label, dataKey, color, opts = {}) {
     if (episodes.length <= 1) return <NoData />
     const ds = downsample(episodes)
     const raw = ds.map(e => e[dataKey] ?? e[opts.altKey] ?? null)
-    const dim = emaOn || bandsOn
+    const yViewport = bandsOn ? percentileViewport(raw) : null
+    const dim = emaOn
     const datasets = [{
       label, data: raw,
       borderColor: dim ? color + '40' : color,
@@ -314,14 +354,13 @@ function makeSimpleChart(label, dataKey, color, opts = {}) {
       fill: !!opts.fill,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
     }]
-    if (bandsOn) addBands(datasets, raw, color, label)
     if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw),
       borderColor: color, borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
     })
     return (
       <div className="min-h-[200px]">
-        <Line data={{ labels: ds.map(e => e.episode), datasets }} options={chartBase()} />
+        <Line data={{ labels: ds.map(e => e.episode), datasets }} options={chartBase(yViewport)} />
       </div>
     )
   })
@@ -338,7 +377,7 @@ const LossChart = memo(function LossChart() {
   const { episodes } = useTrainCtx()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
-  const dim = emaOn || bandsOn
+  const dim = emaOn
   const ds = downsample(episodes)
   const series = [
     { key: 'pi_loss', label: 'Policy Loss', color: '#f38ba8' },
@@ -350,19 +389,21 @@ const LossChart = memo(function LossChart() {
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
     }]
-    if (bandsOn) addBands(result, raw, color, label)
     if (emaOn) result.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3,
     })
     return result
   })
+  const yViewport = bandsOn
+    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key])))
+    : null
   return (
     <div className="min-h-[200px]">
       <Line
         data={{ labels: ds.map(e => e.episode), datasets }}
         options={{
-          ...chartBase(),
+          ...chartBase(yViewport),
           plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
         }}
       />
@@ -419,7 +460,7 @@ function EpisodeLogTable() {
           {[...episodes].reverse().map(e => (
             <Tr key={e.episode}>
               <Td>{e.episode}</Td>
-              <Td title={`Harv: ${fmt(e.r_harv, 2)}  Work: ${fmt(e.r_work, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  Outcome: ${fmt(e.r_outcome, 2)}`}>{fmt(e.reward, 3)}</Td>
+              <Td title={`Harv: ${fmt(e.r_harv, 2)}  Work: ${fmt(e.r_work ?? e.r_deliv, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  Outcome: ${fmt(e.r_outcome, 2)}  |  Attempts: ${fmt(e.harv_attempts, 2)}  Fail: ${fmt(e.harv_failures, 2)}  Gate: ${fmt(e.harv_prox_gate, 2)}  Paid: ${fmt(e.harv_prox_paid, 2)}`}>{fmt(e.reward, 3)}</Td>
               <Td>{fmt(e.resources, 1)}</Td>
               <Td>{fmt(e.pi_loss, 4)}</Td>
               <Td>{fmt(e.entropy, 3)}</Td>
@@ -520,6 +561,7 @@ const TRAINING_CARDS = {
   'train-status':           { title: 'Training Status',     render: () => <StatusPanel /> },
   'train-ep-reward':        { title: 'Reward / Episode',    subtitle: 'per unit', hasEma: true, render: () => <RewardChart /> },
   'train-reward-breakdown': { title: 'Reward Breakdown',    subtitle: 'per unit', hasEma: true, render: () => <RewardBreakdownChart /> },
+  'train-harv-debug':       { title: 'Harvester Debug',     subtitle: 'per unit', hasEma: true, render: () => <HarvesterDebugChart /> },
   'train-ep-res':           { title: 'Resources / Episode', hasEma: true, render: () => <ResourcesChart /> },
   'train-winrate':          { title: 'Win Rate',            hasEma: true, render: () => <WinRateChart /> },
   'train-elo':              { title: 'League ELO',          render: () => <LeagueEloCard /> },

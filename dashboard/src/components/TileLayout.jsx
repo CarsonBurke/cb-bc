@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback, useRef, useEffect, memo } from 'react'
+import { createContext, useContext, useState, useCallback, useRef, useEffect, useMemo, memo } from 'react'
 import Card from './Card'
 
 // ---- Tree helpers (pure) ----
@@ -107,12 +107,28 @@ function usePersisted(key, defaultValue) {
     } catch { return defaultValue }
   })
   const ref = useRef(state)
+
+  useEffect(() => {
+    ref.current = state
+  }, [state])
+
   const setState = useCallback((updater) => {
     const next = typeof updater === 'function' ? updater(ref.current) : updater
     ref.current = next
     _setState(next)
-    try { localStorage.setItem(key, JSON.stringify(next)) } catch {}
-  }, [key])
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        localStorage.setItem(key, JSON.stringify(state))
+      } catch (err) {
+        void err
+      }
+    }, 150)
+    return () => window.clearTimeout(timer)
+  }, [key, state])
+
   return [state, setState]
 }
 
@@ -128,49 +144,54 @@ export default function TileLayout({ cards, storageKey, defaultLayout }) {
   const [dragCardId, setDragCardId] = useState(null)
 
   // Sync card registry with persisted layout
-  const root = syncLayout(state.root, cards)
-  if (root !== state.root) {
-    // Defer state update to avoid setState during render
-    Promise.resolve().then(() => setState(s => ({ ...s, root: syncLayout(s.root, cards) })))
-  }
+  const root = useMemo(() => syncLayout(state.root, cards), [state.root, cards])
+  useEffect(() => {
+    if (root !== state.root) {
+      setState(s => ({ ...s, root: syncLayout(s.root, cards) }))
+    }
+  }, [cards, root, setState, state.root])
 
   const isOnly = root.type === 'leaf'
 
-  const actions = {
-    split: useCallback((leafId, direction) => {
+  const split = useCallback((leafId, direction) => {
       const newId = `v${nextIdRef.current++}`
       const sId = `s${nextIdRef.current++}`
       setState(s => ({
         root: splitLeaf(s.root, leafId, direction, newId, sId),
         nextId: nextIdRef.current,
       }))
-    }, [setState]),
+    }, [setState])
 
-    resize: useCallback((splitId, ratio) => {
+  const resize = useCallback((splitId, ratio) => {
       setState(s => ({ ...s, root: resizeSplit(s.root, splitId, ratio) }))
-    }, [setState]),
+    }, [setState])
 
-    close: useCallback((leafId) => {
+  const close = useCallback((leafId) => {
       setState(s => ({ ...s, root: closeLeaf(s.root, leafId) }))
-    }, [setState]),
+    }, [setState])
 
-    move: useCallback((cardId, fromId, toId, toIndex) => {
+  const move = useCallback((cardId, fromId, toId, toIndex) => {
       setState(s => ({
         ...s,
         root: fromId === toId
           ? reorderCard(s.root, fromId, cardId, toIndex)
           : moveCard(s.root, cardId, fromId, toId, toIndex),
       }))
-    }, [setState]),
+    }, [setState])
 
-    reset: useCallback(() => {
+  const reset = useCallback(() => {
       nextIdRef.current = defaultLayout.nextId || 1
       setState(defaultLayout)
-    }, [setState, defaultLayout]),
-  }
+    }, [setState, defaultLayout])
+
+  const actions = useMemo(() => ({ split, resize, close, move, reset }), [split, resize, close, move, reset])
+  const ctxValue = useMemo(
+    () => ({ cards, actions, isOnly, dragCardId, setDragCardId }),
+    [cards, actions, isOnly, dragCardId],
+  )
 
   return (
-    <TileCtx.Provider value={{ cards, actions, isOnly, dragCardId, setDragCardId }}>
+    <TileCtx.Provider value={ctxValue}>
       <div className="h-full">
         <TileNode node={root} />
       </div>
@@ -382,6 +403,8 @@ function ResizeHandle({ splitId, direction }) {
   const { actions } = useContext(TileCtx)
   const [active, setActive] = useState(false)
   const handleRef = useRef()
+  const frameRef = useRef(0)
+  const latestRatioRef = useRef(null)
   const isH = direction === 'h'
 
   const onPointerDown = useCallback((e) => {
@@ -391,13 +414,25 @@ function ResizeHandle({ splitId, direction }) {
     const rect = parent.getBoundingClientRect()
 
     const onMove = (e) => {
-      const ratio = isH
+      latestRatioRef.current = isH
         ? (e.clientX - rect.left) / rect.width
         : (e.clientY - rect.top) / rect.height
-      actions.resize(splitId, ratio)
+      if (frameRef.current) return
+      frameRef.current = requestAnimationFrame(() => {
+        frameRef.current = 0
+        actions.resize(splitId, latestRatioRef.current)
+      })
     }
 
     const onUp = () => {
+      if (frameRef.current) {
+        cancelAnimationFrame(frameRef.current)
+        frameRef.current = 0
+      }
+      if (latestRatioRef.current != null) {
+        actions.resize(splitId, latestRatioRef.current)
+        latestRatioRef.current = null
+      }
       setActive(false)
       document.removeEventListener('pointermove', onMove)
       document.removeEventListener('pointerup', onUp)

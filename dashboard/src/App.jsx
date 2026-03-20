@@ -1,7 +1,8 @@
 import { useEffect } from 'react'
 import { useAtom } from 'jotai'
+import { useAtomValue } from 'jotai'
 import { useStore } from 'jotai'
-import { currentViewPersistAtom, syncFromHash } from './store'
+import { currentViewPersistAtom, syncFromHash, trainSessionAtom } from './store'
 import { DATA } from './data'
 import Sidebar from './components/Sidebar'
 import AllRoundsView from './components/AllRoundsView'
@@ -12,6 +13,7 @@ import GameViewer from './components/GameViewer'
 
 export default function App() {
   const [currentView, setCurrentView] = useAtom(currentViewPersistAtom)
+  const trainSession = useAtomValue(trainSessionAtom)
   const store = useStore()
 
   // Sync atoms from URL on back/forward navigation
@@ -32,13 +34,13 @@ export default function App() {
       />
       <main className={`flex-1 ${currentView === 'training' ? 'overflow-hidden p-3' : 'overflow-y-auto p-6 lg:p-8'}`}>
         {currentView === 'training' ? (
-          <TrainingView />
+          <TrainingView key={`training:${trainSession || 'default'}`} />
         ) : currentView === 'replays' ? (
-          <ReplayViewer />
+          <ReplayViewer key="replays" />
         ) : currentView === 'all' ? (
-          <AllRoundsView />
+          <AllRoundsView key="all" />
         ) : (
-          <RoundView roundId={currentView} />
+          <RoundView key={`round:${currentView}`} roundId={currentView} />
         )}
       </main>
       <GameViewer />

@@ -28,6 +28,9 @@ function replayApiPlugin() {
     configureServer(server) {
       const replaysDir = resolve(PROJECT_ROOT, 'replays')
       const sessionsDir = resolve(PROJECT_ROOT, 'bots/tensor/sessions')
+      const _trainSessionLogCache = new Map() // path -> { mtime, size, episodes }
+      const _trainLogCache = new Map() // path -> { mtime, size, json }
+      const _leagueCache = new Map() // path -> { mtime, size, data }
 
       // List training sessions
       server.middlewares.use('/api/train-sessions', (_req, res) => {
@@ -44,8 +47,15 @@ function replayApiPlugin() {
                 const jsonlPath = resolve(sessionsDir, d.name, 'train_log.jsonl')
                 const jsonPath = resolve(sessionsDir, d.name, 'train_log.json')
                 if (existsSync(jsonlPath)) {
-                  const lines = readFileSync(jsonlPath, 'utf8').trimEnd().split('\n')
-                  episodes = Math.max(0, lines.length - 1) // first line is config
+                  const st = statSync(jsonlPath)
+                  const cached = _trainSessionLogCache.get(jsonlPath)
+                  if (cached && cached.mtime === st.mtimeMs && cached.size === st.size) {
+                    episodes = cached.episodes
+                  } else {
+                    const lines = readFileSync(jsonlPath, 'utf8').trimEnd().split('\n')
+                    episodes = Math.max(0, lines.length - 1) // first line is config
+                    _trainSessionLogCache.set(jsonlPath, { mtime: st.mtimeMs, size: st.size, episodes })
+                  }
                 } else {
                   const log = JSON.parse(readFileSync(jsonPath, 'utf8'))
                   episodes = log.episodes?.length || 0
@@ -145,11 +155,19 @@ function replayApiPlugin() {
         const jsonPath = resolve(base, 'train_log.json')
         try {
           if (existsSync(jsonlPath)) {
+            const st = statSync(jsonlPath)
+            const cached = _trainLogCache.get(jsonlPath)
+            if (cached && cached.mtime === st.mtimeMs && cached.size === st.size) {
+              res.end(cached.json)
+              return
+            }
             const lines = readFileSync(jsonlPath, 'utf8').trimEnd().split('\n')
             const first = JSON.parse(lines[0])
             const config = first.config || {}
             const episodes = lines.slice(1).map(l => JSON.parse(l))
-            res.end(JSON.stringify({ episodes, config }))
+            const json = JSON.stringify({ episodes, config })
+            _trainLogCache.set(jsonlPath, { mtime: st.mtimeMs, size: st.size, json })
+            res.end(json)
           } else {
             // Fallback: legacy single-JSON format
             res.end(readFileSync(jsonPath, 'utf8'))
@@ -191,7 +209,14 @@ function replayApiPlugin() {
           ? resolve(sd, 'league', 'league.json')
           : resolve(PROJECT_ROOT, 'bots/tensor/league/league.json')
         try {
-          const data = readFileSync(leaguePath, 'utf8')
+          const st = statSync(leaguePath)
+          const cached = _leagueCache.get(leaguePath)
+          const data = (cached && cached.mtime === st.mtimeMs && cached.size === st.size)
+            ? cached.data
+            : readFileSync(leaguePath, 'utf8')
+          if (!cached || cached.mtime !== st.mtimeMs || cached.size !== st.size) {
+            _leagueCache.set(leaguePath, { mtime: st.mtimeMs, size: st.size, data })
+          }
           res.end(data)
         } catch {
           res.end(JSON.stringify([]))
