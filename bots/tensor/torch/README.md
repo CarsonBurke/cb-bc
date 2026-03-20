@@ -21,6 +21,22 @@ python bots/tensor/torch/bench_episode.py --dummy-opponent --json
 python bots/tensor/torch/distill.py --session <session_name>
 ```
 
+## Exporting Weights
+
+Training auto-exports to `bots/tensor/weights.json` on completion (unless `--teacher`).
+To deploy weights to `tensor_inference` from a session checkpoint:
+
+```bash
+python3.13 -c "
+import json, pickle
+w = pickle.load(open('bots/tensor/sessions/<session>/weights.pkl', 'rb'))
+json.dump(w, open('bots/tensor_inference/weights.json', 'w'))
+"
+```
+
+Only the policy weights are exported — the critic is excluded.
+For running and submitting, use `bots/tensor_inference` (see its README).
+
 ## Notes
 
 - `--opponents` and `--games-per-opp` control total games per episode.
