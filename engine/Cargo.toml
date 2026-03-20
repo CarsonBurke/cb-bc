@@ -1,0 +1,27 @@
+[package]
+name = "battlecode_titan"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "battlecode_titan"
+path = "src/lib.rs"
+
+[[bin]]
+name = "titan_runner"
+path = "src/main.rs"
+
+[features]
+default = ["tle", "pyo3/auto-initialize"]
+tle = ["libc"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3-ffi = { version = "0.23", features = ["extension-module"] }
+rand = { version = "0.8", features = ["std", "std_rng"] }
+paste = "1.0.15"
+prost = "0.12"
+libc = { version = "0.2", optional = true }
+
+[build-dependencies]
+prost-build = "0.12"
