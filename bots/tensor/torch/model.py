@@ -31,6 +31,8 @@ ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
+HARVESTER_BUILD_TYPE = 1
+CONVEYOR_BUILD_TYPES = (2, 8)
 REWARD_WORKING_HARVESTER = 12.5
 REWARD_ENEMY_CORE_DAMAGE = 20.0
 TERMINAL_WIN_REWARD = 10.0
@@ -49,6 +51,9 @@ _MASK_COSTS_AX = [0, 0, 0, 0, 0, 0, 10, 0, 5, 0, 0, 0]
 
 # Tile indices in 5x5 grid for the 9 build directions (NW,N,NE,W,C,E,SW,S,SE)
 _MASK_BD_TILES = [6, 7, 8, 11, 12, 13, 16, 17, 18]
+_MASK_BD_DX = [-1.0, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0]
+_MASK_BD_DY = [-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+_CONV_DIR_MASK = [True, True, True, True, False, True, True, True, True]
 
 # Observation feature indices for resources/scale
 _OBS_GLOBAL_START = 5 * 5 * TILE_FEATURES  # 425
@@ -116,12 +121,91 @@ def compute_action_masks(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return bt_mask, bd_mask
 
 
-# Sinusoidal position embedding frequencies
-_POS_QUARTER = POS_EMBED_DIM // 4
-_POS_FREQS = torch.tensor(
-    [1.0 / (10000.0 ** (2.0 * i / POS_EMBED_DIM)) for i in range(_POS_QUARTER)],
-    device=DEVICE,
-)
+def compute_harvester_build_dir_mask(obs: torch.Tensor, bd_mask: torch.Tensor) -> torch.Tensor:
+    """Harvester-specific direction mask.
+
+    Allow:
+    - empty ore tiles for real harvester placement
+    - otherwise-valid non-ore tiles when at least one ore tile is visible in the
+      local observation, so failed harvester attempts can enter proximity shaping
+    """
+    _, _, _, nobld_idx, _, _, _ = _mask_indices(obs.device)
+    tile_base = torch.tensor([t * TILE_FEATURES for t in _MASK_BD_TILES], dtype=torch.long, device=obs.device)
+    ore_ti_idx = tile_base + 1
+    ore_ax_idx = tile_base + 2
+    ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
+    empty = obs[:, nobld_idx] == 1.0
+
+    obs_tiles = obs[:, :25 * TILE_FEATURES].reshape(obs.shape[0], 25, TILE_FEATURES)
+    has_visible_ore = (obs_tiles[:, :, 1] == 1.0) | (obs_tiles[:, :, 2] == 1.0)
+    has_visible_ore = has_visible_ore.any(dim=1, keepdim=True)
+
+    place_mask = bd_mask & ore_here & empty
+    prox_mask = bd_mask & (~ore_here) & has_visible_ore
+    return place_mask | prox_mask
+
+
+def compute_build_dir_mask_for_type(
+    obs: torch.Tensor,
+    bt_act: torch.Tensor,
+    bd_mask: torch.Tensor,
+    harv_bd_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Refine build_dir mask using the chosen build type."""
+    if harv_bd_mask is None:
+        harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
+    mask = bd_mask.clone()
+    harv_rows = bt_act.to(torch.long) == HARVESTER_BUILD_TYPE
+    if harv_rows.any():
+        mask[harv_rows] = harv_bd_mask[harv_rows]
+    return mask
+
+
+def conveyor_dir_mask(device: torch.device, batch_size: int) -> torch.Tensor:
+    mask = torch.tensor(_CONV_DIR_MASK, dtype=torch.bool, device=device)
+    return mask.unsqueeze(0).expand(batch_size, -1)
+
+
+def compute_conditional_build_type_mask(
+    obs: torch.Tensor,
+    bd_act: torch.Tensor,
+    bt_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Refine build_type mask using the chosen build_dir.
+
+    Observations collapse CONVEYOR and ARMOURED_CONVEYOR into one channel, so
+    the conditional mask can only conservatively suppress regular conveyor
+    rebuilds on same-dir friendly conveyor-family tiles. Exact armoured-vs-
+    armoured no-op filtering remains enforced in the execution layer.
+    """
+    bt_mask = bt_mask.clone()
+    bd_act = bd_act.to(torch.long)
+
+    tile_lut = torch.tensor(_MASK_BD_TILES, dtype=torch.long, device=obs.device)
+    dx_lut = torch.tensor(_MASK_BD_DX, dtype=obs.dtype, device=obs.device)
+    dy_lut = torch.tensor(_MASK_BD_DY, dtype=obs.dtype, device=obs.device)
+
+    tile_base = tile_lut[bd_act] * TILE_FEATURES
+    conveyor_idx = (tile_base + 6).unsqueeze(1)
+    friendly_idx = (tile_base + 12).unsqueeze(1)
+    dir_x_idx = (tile_base + 13).unsqueeze(1)
+    dir_y_idx = (tile_base + 14).unsqueeze(1)
+
+    has_conveyor_family = obs.gather(1, conveyor_idx).squeeze(1) == 1.0
+    is_friendly = obs.gather(1, friendly_idx).squeeze(1) == 1.0
+    same_dir = (
+        (obs.gather(1, dir_x_idx).squeeze(1) == dx_lut[bd_act])
+        & (obs.gather(1, dir_y_idx).squeeze(1) == dy_lut[bd_act])
+    )
+    same_dir_conv = has_conveyor_family & is_friendly & same_dir
+    bt_mask[same_dir_conv, 2] = False
+
+    force_none = ~bt_mask[:, 1:].any(dim=1)
+    if force_none.any():
+        bt_mask[force_none, 1:] = False
+        bt_mask[force_none, 0] = True
+
+    return bt_mask
 
 
 # ---- Model ----
@@ -439,6 +523,7 @@ class BuilderMLP(nn.Module):
         # Policy heads: small std for near-uniform initial policy
         self.head_build_type = _ortho_init(nn.Linear(prev, N_BUILD), std=0.01)
         self.head_build_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
+        self.head_conv_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
         self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
         self.head_h_next = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)
 
@@ -462,28 +547,32 @@ class BuilderMLP(nn.Module):
         if self.training:
             combined_w = torch.cat([
                 self.head_build_type.weight, self.head_build_dir.weight,
+                self.head_conv_dir.weight,
                 self.head_move_dir.weight, self.head_h_next.weight,
             ], dim=0)
             combined_b = torch.cat([
                 self.head_build_type.bias, self.head_build_dir.bias,
+                self.head_conv_dir.bias,
                 self.head_move_dir.bias, self.head_h_next.bias,
             ])
         else:
             if not hasattr(self, '_cached_head_w'):
                 self._cached_head_w = torch.cat([
                     self.head_build_type.weight, self.head_build_dir.weight,
+                    self.head_conv_dir.weight,
                     self.head_move_dir.weight, self.head_h_next.weight,
                 ], dim=0)
                 self._cached_head_b = torch.cat([
                     self.head_build_type.bias, self.head_build_dir.bias,
+                    self.head_conv_dir.bias,
                     self.head_move_dir.bias, self.head_h_next.bias,
                 ])
             combined_w = self._cached_head_w
             combined_b = self._cached_head_b
 
         combined = F.linear(h, combined_w, combined_b)
-        bt_l, bd_l, md_l, h_raw = combined.split([N_BUILD, N_DIR, N_DIR, H_DIM], dim=-1)
-        return bt_l, bd_l, md_l, torch.tanh(h_raw)
+        bt_l, bd_l, cd_l, md_l, h_raw = combined.split([N_BUILD, N_DIR, N_DIR, N_DIR, H_DIM], dim=-1)
+        return bt_l, bd_l, cd_l, md_l, torch.tanh(h_raw)
 
     def _forward_from_trunk_in(self, trunk_in: torch.Tensor):
         enc = self.encoder(trunk_in)
@@ -503,7 +592,7 @@ class BuilderMLP(nn.Module):
         enc_modules = [m for m in self.encoder if isinstance(m, (nn.Linear, RMSNorm))]
         actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
         return enc_modules + actor_modules + [
-            self.head_build_type, self.head_build_dir, self.head_move_dir,
+            self.head_build_type, self.head_build_dir, self.head_conv_dir, self.head_move_dir,
             self.head_h_next,
         ]
 
@@ -523,10 +612,20 @@ class BuilderMLP(nn.Module):
         modules = self._policy_state_modules()
         full_entries = sum(2 if isinstance(layer, nn.Linear) else 1 for layer in modules)
         legacy_entries = sum(2 for layer in modules if isinstance(layer, nn.Linear))
+        legacy_no_conv_entries = full_entries - 2
+        legacy_no_conv_no_rms_entries = legacy_entries - 2
         if len(state) == full_entries:
             load_rmsnorm = True
+            load_conv_dir = True
+        elif len(state) == legacy_no_conv_entries:
+            load_rmsnorm = True
+            load_conv_dir = False
         elif len(state) == legacy_entries:
             load_rmsnorm = False
+            load_conv_dir = True
+        elif len(state) == legacy_no_conv_no_rms_entries:
+            load_rmsnorm = False
+            load_conv_dir = False
         else:
             raise AssertionError(
                 f"State has {len(state)} entries, expected {full_entries} "
@@ -536,6 +635,8 @@ class BuilderMLP(nn.Module):
         idx = 0
         dev = next(self.parameters()).device
         for layer in modules:
+            if layer is self.head_conv_dir and not load_conv_dir:
+                continue
             if isinstance(layer, nn.Linear):
                 w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
                 in_f, out_f = layer.in_features, layer.out_features
@@ -591,6 +692,7 @@ def ppo_update(
     h: torch.Tensor,
     bt_act: torch.Tensor,
     bd_act: torch.Tensor,
+    cd_act: torch.Tensor,
     md_act: torch.Tensor,
     old_log_probs: torch.Tensor,
     advantages: torch.Tensor,
@@ -632,23 +734,31 @@ def ppo_update(
             idx = perm[start:start + minibatch_size]
 
             t_phase = time.perf_counter() if profile is not None else 0.0
-            bt_l, bd_l, md_l, _ = model(obs[idx], h[idx])
+            bt_l, bd_l, cd_l, md_l, _ = model(obs[idx], h[idx])
             if profile is not None:
                 profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
 
             t_phase = time.perf_counter() if profile is not None else 0.0
             # Apply action masks to logits (affordability + spatial validity)
             bt_m, bd_m = compute_action_masks(obs[idx])
+            harv_bd_m = compute_harvester_build_dir_mask(obs[idx], bd_m)
+            bt_m = bt_m.clone()
+            bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
+            bd_m = compute_build_dir_mask_for_type(obs[idx], bt_act[idx], bd_m, harv_bd_m)
+            cd_m = conveyor_dir_mask(obs[idx].device, idx.shape[0])
             bt_l = bt_l.masked_fill(~bt_m, -1e9)
             bd_l = bd_l.masked_fill(~bd_m, -1e9)
+            cd_l = cd_l.masked_fill(~cd_m, -1e9)
 
             # Mask build_dir when build_type is "none" (idx 0) — causally irrelevant
             bd_causal = (bt_act[idx] != 0).float()
+            cd_causal = ((bt_act[idx] == CONVEYOR_BUILD_TYPES[0]) | (bt_act[idx] == CONVEYOR_BUILD_TYPES[1])).float()
             bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[idx])
             bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[idx])
+            cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act[idx])
             md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[idx])
-            new_lp = bt_lp + bd_lp * bd_causal + md_lp
-            entropy = bt_ent + bd_ent * bd_causal + md_ent
+            new_lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
+            entropy = bt_ent + bd_ent * bd_causal + cd_ent * cd_causal + md_ent
 
             logratio = new_lp - old_log_probs[idx]
             ratio = logratio.exp()
@@ -763,7 +873,7 @@ def _parse_trajectories(
 ) -> dict[str, torch.Tensor | list[tuple[int, int]]] | None:
     """Parse engine-collected trajectories into flat tensors (no GAE yet).
 
-    Returns dict with keys: obs, h, bt, bd, md, old_log_probs, rewards,
+    Returns dict with keys: obs, h, bt, bd, cd, md, old_log_probs, rewards,
     ep_boundaries. Or None if no data.
 
     If global_states_list is provided, also returns centralized critic tensors:
@@ -780,6 +890,7 @@ def _parse_trajectories(
     h_t = torch.empty(N, H_DIM, dtype=torch.float32)
     bt_t = torch.empty(N, dtype=torch.long)
     bd_t = torch.empty(N, dtype=torch.long)
+    cd_t = torch.empty(N, dtype=torch.long)
     md_t = torch.empty(N, dtype=torch.long)
     lp_t = torch.empty(N, dtype=torch.float32)
     rw_t = torch.empty(N, dtype=torch.float32)
@@ -803,19 +914,30 @@ def _parse_trajectories(
                     h_t[idx] = torch.tensor(step[1], dtype=torch.float32)
                     bt_t[idx] = step[2]
                     bd_t[idx] = step[3]
-                    md_t[idx] = step[4]
-                    n_working = step[6] if n > 6 else 0
-                    conv_r = step[7] if n > 7 else 0.0
-                    harv_r = step[9] if n > 9 else 0.0
-                    dmg = step[10] if n > 10 else 0.0
-                    lp_t[idx] = step[11] if n > 11 else 0.0
+                    if n > 12:
+                        cd_t[idx] = step[4]
+                        md_t[idx] = step[5]
+                        n_working = step[7] if n > 7 else 0
+                        conv_r = step[8] if n > 8 else 0.0
+                        harv_r = step[10] if n > 10 else 0.0
+                        dmg = step[11] if n > 11 else 0.0
+                        lp_t[idx] = step[12] if n > 12 else 0.0
+                    else:
+                        cd_t[idx] = step[3]
+                        md_t[idx] = step[4]
+                        n_working = step[6] if n > 6 else 0
+                        conv_r = step[7] if n > 7 else 0.0
+                        harv_r = step[9] if n > 9 else 0.0
+                        dmg = step[10] if n > 10 else 0.0
+                        lp_t[idx] = step[11] if n > 11 else 0.0
                 else:
                     obs_t[idx] = torch.tensor(step["obs"], dtype=torch.float32)
                     h_t[idx] = torch.tensor(step["h_prev"], dtype=torch.float32)
                     bt_t[idx] = step["bt"]
                     bd_t[idx] = step["bd"]
+                    cd_t[idx] = step.get("cd", step["bd"])
                     md_t[idx] = step["md"]
-                    n_working = step.get("n_working", 0)
+                    n_working = step.get("n_working", step.get("ti_delivered", 0))
                     conv_r = step.get("conv_r", 0)
                     harv_r = step.get("harv_r", 0)
                     dmg = step.get("dmg", 0)
@@ -864,6 +986,7 @@ def _parse_trajectories(
         "h": h_t.to(DEVICE),
         "bt": bt_t.to(DEVICE),
         "bd": bd_t.to(DEVICE),
+        "cd": cd_t.to(DEVICE),
         "md": md_t.to(DEVICE),
         "old_log_probs": lp_t.to(DEVICE),
         "rewards": rw_t.to(DEVICE),
@@ -1296,7 +1419,7 @@ def train_on_trajectories(
     model.train()
     stats = ppo_update(
         model, optimizer,
-        obs, h, data["bt"], data["bd"], data["md"],
+        obs, h, data["bt"], data["bd"], data["cd"], data["md"],
         data["old_log_probs"], advantages, returns,
         old_values=values,
         centralized_data=data,
@@ -1327,16 +1450,18 @@ def distill(
     student.train()
 
     # Get teacher logits (no grad needed)
-    t_bt, t_bd, t_md = [], [], []
+    t_bt, t_bd, t_cd, t_md = [], [], [], []
     with torch.no_grad():
         for i in range(0, N, 8192):
             packed = torch.cat([obs[i:i + 8192], h[i:i + 8192]], dim=-1)
-            bt_l, bd_l, md_l, _ = teacher.infer_packed(packed)
+            bt_l, bd_l, cd_l, md_l, _ = teacher.infer_packed(packed)
             t_bt.append(bt_l)
             t_bd.append(bd_l)
+            t_cd.append(cd_l)
             t_md.append(md_l)
     t_bt = torch.cat(t_bt)
     t_bd = torch.cat(t_bd)
+    t_cd = torch.cat(t_cd)
     t_md = torch.cat(t_md)
 
     sum_loss = 0.0
@@ -1347,12 +1472,13 @@ def distill(
         perm = torch.randperm(N, device=DEVICE)
         for start in range(0, N, minibatch_size):
             idx = perm[start:start + minibatch_size]
-            s_bt, s_bd, s_md, _ = student(obs[idx], h[idx])
+            s_bt, s_bd, s_cd, s_md, _ = student(obs[idx], h[idx])
 
             # KL(teacher || student) on softened logits
             loss = (
                 F.kl_div(F.log_softmax(s_bt / T, dim=-1), F.softmax(t_bt[idx] / T, dim=-1), reduction='batchmean')
                 + F.kl_div(F.log_softmax(s_bd / T, dim=-1), F.softmax(t_bd[idx] / T, dim=-1), reduction='batchmean')
+                + F.kl_div(F.log_softmax(s_cd / T, dim=-1), F.softmax(t_cd[idx] / T, dim=-1), reduction='batchmean')
                 + F.kl_div(F.log_softmax(s_md / T, dim=-1), F.softmax(t_md[idx] / T, dim=-1), reduction='batchmean')
             ) * (T * T)
 

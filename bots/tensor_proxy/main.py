@@ -46,6 +46,7 @@ BLD_IDX = _TENSOR_MAIN.BLD_IDX
 N_BLD_TYPES = _TENSOR_MAIN.N_BLD_TYPES
 DIR_DXY = _TENSOR_MAIN.DIR_DXY
 BUILD_COSTS = _TENSOR_MAIN.BUILD_COSTS
+_CONV_DIR_MASK = _TENSOR_MAIN._CONV_DIR_MASK
 _argmax = _TENSOR_MAIN._argmax
 _sample_from_logits = _TENSOR_MAIN._sample_from_logits
 _TensorPlayer = _TENSOR_MAIN.Player
@@ -55,8 +56,8 @@ _TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
 # Struct-based binary IPC protocol
 _OBS_FLOATS = INPUT_SIZE + H_DIM  # obs + h_prev
 _OBS_BYTES = _OBS_FLOATS * 4
-_ACT_HEAD = struct.Struct('=iii')
-_ACT_INTS = 3  # bt, bd, md
+_ACT_HEAD = struct.Struct('=iiii')
+_ACT_INTS = 4  # bt, bd, cd, md
 _ACT_FLOATS = H_DIM + 1  # h_next + old_lp
 _ACT_SIZE = _ACT_INTS * 4 + _ACT_FLOATS * 4
 _H_BYTES = H_DIM * 4
@@ -126,11 +127,11 @@ def _recv_action(act_rfd):
     data = _read_exact(act_rfd, _ACT_SIZE)
     if data is None:
         return None
-    bt, bd, md = _ACT_HEAD.unpack_from(data, 0)
+    bt, bd, cd, md = _ACT_HEAD.unpack_from(data, 0)
     h_next = array("f")
-    h_next.frombytes(data[12:12 + _H_BYTES])
-    old_lp = _LP_STRUCT.unpack_from(data, 12 + _H_BYTES)[0]
-    return bt, bd, md, 0.0, h_next, old_lp
+    h_next.frombytes(data[_ACT_INTS * 4:_ACT_INTS * 4 + _H_BYTES])
+    old_lp = _LP_STRUCT.unpack_from(data, _ACT_INTS * 4 + _H_BYTES)[0]
+    return bt, bd, cd, md, 0.0, h_next, old_lp
 
 
 class Player:
@@ -146,7 +147,10 @@ class Player:
         self._prev_resources = None
         self._n_builders_cached = 1
         self._spawn_round: int = -1
-        self._harv_rewarded_ores = set()
+        self._dbg_harv_attempts: int = 0
+        self._dbg_harv_failures: int = 0
+        self._dbg_harv_prox_gate: int = 0
+        self._dbg_harv_prox_paid: int = 0
         self._train_log = [] if _TRAIN_LOG else None
         self._unit_id = id(self) % (2**31)
         if self._train_log is not None:
@@ -199,22 +203,29 @@ class Player:
             _send_obs(obs_wfd, obs, h_in)
             result = _recv_action(act_rfd)
             if result is not None:
-                build_type_idx, build_dir_idx, move_dir_idx, value, h_next, old_log_prob = result
+                build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx, value, h_next, old_log_prob = result
                 self.h_prev = h_next
             else:
                 build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
                 build_dir_idx = random.randint(0, 8)
+                conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
                 move_dir_idx = random.randint(0, 8)
                 value, old_log_prob = 0.0, 0.0
         else:
             build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
             build_dir_idx = random.randint(0, 8)
+            conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
             move_dir_idx = random.randint(0, 8)
             value, old_log_prob = 0.0, 0.0
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir)
+        conv_dir = DIR_MAP_9[conv_dir_idx]
+        self._dbg_harv_attempts = 0
+        self._dbg_harv_failures = 0
+        self._dbg_harv_prox_gate = 0
+        self._dbg_harv_prox_paid = 0
+        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
@@ -225,9 +236,11 @@ class Player:
         if self._train_log is not None:
             self._train_log.append((
                 obs.tolist(), list(h_in),
-                build_type_idx, build_dir_idx, move_dir_idx,
+                build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx,
                 value, 0, conv_reward, ti_after,
                 harv_reward, _TensorPlayer._enemy_core_dmg, old_log_prob,
+                self._dbg_harv_attempts, self._dbg_harv_failures,
+                self._dbg_harv_prox_gate, self._dbg_harv_prox_paid,
             ))
             if ct.get_current_round() >= 1999:
                 self._flush_log()
@@ -256,12 +269,10 @@ class Player:
         _p._n_builders_cached = self._n_builders_cached
         _p._prev_resources = self._prev_resources
         _p._spawn_round = self._spawn_round
-        _p._harv_rewarded_ores = self._harv_rewarded_ores
         return _p
 
     def _sync_from_proxy(self, _p):
         self._n_builders_cached = _p._n_builders_cached
-        self._harv_rewarded_ores = _p._harv_rewarded_ores
         self.enemy_core = _p.enemy_core
 
     def _encode_state(self, ct):
@@ -281,7 +292,7 @@ class Player:
         self._sync_from_proxy(_p)
         return self._obs_buf
 
-    def _execute_build(self, ct, action, direction):
+    def _execute_build(self, ct, action, direction, conv_direction):
         """Execute build directly (avoids cross-module Controller calls that can panic)."""
         if action == "none":
             return 0.0, 0.0
@@ -294,40 +305,50 @@ class Player:
             return 0.0, 0.0
 
         bid = ct.get_tile_building_id(build_pos)
+        btype = None
         if bid is not None:
             try:
-                if ct.get_team(bid) == self.my_team and ct.get_entity_type(bid) != EntityType.CORE:
+                btype = ct.get_entity_type(bid)
+                if ct.get_team(bid) == self.my_team:
+                    if action == "conveyor" and btype == EntityType.CONVEYOR and ct.get_direction(bid) == conv_direction:
+                        return 0.0, 0.0
+                    if action == "armoured_conveyor" and btype == EntityType.ARMOURED_CONVEYOR and ct.get_direction(bid) == conv_direction:
+                        return 0.0, 0.0
+                if ct.get_team(bid) == self.my_team and btype != EntityType.CORE:
                     idx = BUILD_ACTIONS.index(action)
                     base_ti, base_ax = BUILD_COSTS[idx]
                     scale = ct.get_scale_percent() / 100.0
                     ti, ax = ct.get_global_resources()
                     if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
                         ct.destroy(build_pos)
+                        bid, btype = None, None
                     else:
                         return 0.0, 0.0
             except Exception:
                 pass
 
         if action == "conveyor":
-            conv_dir = direction
-            if self.core_center:
-                conv_dir = build_pos.direction_to(self.core_center)
-                if conv_dir == Direction.CENTRE:
-                    conv_dir = direction
-            if ct.can_build_conveyor(build_pos, conv_dir):
-                ct.build_conveyor(build_pos, conv_dir)
+            if ct.can_build_conveyor(build_pos, conv_direction):
+                ct.build_conveyor(build_pos, conv_direction)
                 _TensorPlayer._conv_count += 1
         if action == "harvester":
+            self._dbg_harv_attempts = 1
             if ct.can_build_harvester(build_pos):
                 ct.build_harvester(build_pos)
                 ore_key = (build_pos.x, build_pos.y)
-                given = _TensorPlayer._harv_proximity.get(ore_key, 0.0)
-                _TensorPlayer._harv_proximity[ore_key] = _p._PLACE_HARV
+                if ore_key in _TensorPlayer._harv_placed_ores:
+                    self._sync_from_proxy(_p)
+                    return 0.0, 0.0
+                _TensorPlayer._harv_placed_ores.add(ore_key)
                 self._sync_from_proxy(_p)
-                return _p._PLACE_HARV - given, 0.0
+                return _p._PLACE_HARV, 0.0
+            self._dbg_harv_failures = 1
             reward = 0.0
-            if _TensorPlayer._should_reward_harvester_proximity(_p, ct, build_pos):
-                reward = _TensorPlayer._proximity_reward(_p, ct)
+            if _TensorPlayer._should_reward_harvester_proximity(_p, ct, build_pos, bid, btype):
+                self._dbg_harv_prox_gate = 1
+                reward = _TensorPlayer._proximity_reward(_p, ct, build_pos)
+                if reward > 0.0:
+                    self._dbg_harv_prox_paid = 1
             self._sync_from_proxy(_p)
             return reward, 0.0
         if action == "road":
@@ -346,8 +367,8 @@ class Player:
             if ct.can_build_splitter(build_pos, direction):
                 ct.build_splitter(build_pos, direction)
         elif action == "armoured_conveyor":
-            if ct.can_build_armoured_conveyor(build_pos, direction):
-                ct.build_armoured_conveyor(build_pos, direction)
+            if ct.can_build_armoured_conveyor(build_pos, conv_direction):
+                ct.build_armoured_conveyor(build_pos, conv_direction)
                 _TensorPlayer._conv_count += 1
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):

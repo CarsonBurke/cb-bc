@@ -30,9 +30,6 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-REPLAY_PARSER_PYTHON = PROJECT_ROOT / "packages" / "replay_parser" / "python"
-if str(REPLAY_PARSER_PYTHON) not in sys.path:
-    sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 
 
 def _maybe_run_worker_mode() -> None:
@@ -61,17 +58,23 @@ import torch.nn.functional as F
 
 from model import (
     BuilderMLP,
+    CONVEYOR_BUILD_TYPES,
     DEVICE,
+    HARVESTER_BUILD_TYPE,
     H_DIM,
     OBS_SIZE,
-    REWARD_ENEMY_CORE_DAMAGE,
     REWARD_WORKING_HARVESTER,
+    REWARD_ENEMY_CORE_DAMAGE,
     TERMINAL_LOSS_REWARD,
     TERMINAL_WIN_REWARD,
     TILE_FEATURES,
     TEACHER_HIDDEN,
     _parse_trajectories,
+    compute_build_dir_mask_for_type,
+    conveyor_dir_mask,
     compute_action_masks,
+    compute_harvester_build_dir_mask,
+    compute_conditional_build_type_mask,
     load_centralized_critic_checkpoint,
     reset_centralized_critic,
     save_centralized_critic_checkpoint,
@@ -92,7 +95,7 @@ from training_utils import (
 # Struct-based binary IPC protocol constants
 _OBS_FLOATS = OBS_SIZE + H_DIM
 _OBS_FLOAT_BYTES = _OBS_FLOATS * 4
-_ACT_HEAD = struct.Struct('=iii')
+_ACT_HEAD = struct.Struct('=iiii')
 _H_STRUCT = struct.Struct(f'={H_DIM}f')
 _LP_STRUCT = struct.Struct('=f')
 _H_BYTES = H_DIM * 4
@@ -186,14 +189,14 @@ def _pipe_read_obs(fd):
     return _read_exact(fd, _OBS_FLOAT_BYTES)
 
 
-def _pipe_write_action_a(fd, bt, bd, md, h_next_bytes, old_lp):
+def _pipe_write_action_a(fd, bt, bd, cd, md, h_next_bytes, old_lp):
     """Write fixed-size action packet for training bot (A)."""
-    os.writev(fd, (_ACT_HEAD.pack(bt, bd, md), h_next_bytes, _LP_STRUCT.pack(old_lp)))
+    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, md), h_next_bytes, _LP_STRUCT.pack(old_lp)))
 
 
-def _pipe_write_action_b(fd, bt, bd, md, h_next_bytes):
+def _pipe_write_action_b(fd, bt, bd, cd, md, h_next_bytes):
     """Write fixed-size action packet for opponent bot (B)."""
-    os.writev(fd, (_ACT_HEAD.pack(bt, bd, md), h_next_bytes))
+    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, md), h_next_bytes))
 
 
 def _dummy_indices(device: torch.device):
@@ -215,12 +218,15 @@ def _dummy_indices(device: torch.device):
     return cached
 
 
-def _dummy_policy(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _dummy_policy(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Cheap scripted opponent for early curriculum episodes."""
     bt_mask, bd_mask = compute_action_masks(obs)
+    harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
+    bt_mask = bt_mask.clone()
+    bt_mask[:, HARVESTER_BUILD_TYPE] &= harv_bd_mask.any(dim=1)
     ore_ti_idx, ore_ax_idx = _dummy_indices(obs.device)
     ore_score = obs.index_select(1, ore_ti_idx) + obs.index_select(1, ore_ax_idx)
-    has_ore_dir = bd_mask & (ore_score > 0.0)
+    has_ore_dir = harv_bd_mask & (ore_score > 0.0)
     fallback_dir = bd_mask.to(torch.int64).argmax(dim=1)
     ore_dir = torch.where(
         has_ore_dir,
@@ -228,36 +234,40 @@ def _dummy_policy(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
         torch.full_like(ore_score, -1.0),
     ).argmax(dim=1)
 
+    build_dir = torch.full((obs.shape[0],), 4, dtype=torch.int64, device=obs.device)
+    has_ore = has_ore_dir.any(dim=1)
+    build_dir[has_ore] = ore_dir[has_ore]
+    build_dir[~has_ore] = fallback_dir[~has_ore]
+
+    bt_mask = compute_conditional_build_type_mask(obs, build_dir, bt_mask)
     build_type = torch.zeros(obs.shape[0], dtype=torch.int64, device=obs.device)
-    can_harv = bt_mask[:, 1] & has_ore_dir.any(dim=1)
-    can_conv = bt_mask[:, 2] & bd_mask.any(dim=1)
-    can_road = bt_mask[:, 3] & bd_mask.any(dim=1)
+    can_harv = bt_mask[:, 1] & has_ore
+    can_conv = bt_mask[:, 2]
+    can_road = bt_mask[:, 3]
     build_type[can_harv] = 1
     build_type[~can_harv & can_conv] = 2
     build_type[~can_harv & ~can_conv & can_road] = 3
 
-    build_dir = torch.full_like(build_type, 4)
-    use_fallback = build_type > 1
-    build_dir[can_harv] = ore_dir[can_harv]
-    build_dir[use_fallback] = fallback_dir[use_fallback]
-
+    conv_dir = build_dir.clone()
     move_dir = torch.full_like(build_type, 4)
-    return build_type, build_dir, move_dir
+    return build_type, build_dir, conv_dir, move_dir
 
-def _load_worker_result(result_path: str) -> tuple[str | None, dict | None, str | None, dict | None]:
+def _load_worker_result(result_path: str) -> tuple[str | None, dict | None, str | None, dict | None, dict | None]:
     try:
         with open(result_path, "rb") as f:
             result = pickle.load(f)
     except (OSError, pickle.PickleError, EOFError):
-        return (None, None, None, None)
+        return (None, None, None, None, None)
     if isinstance(result, tuple):
-        if len(result) == 4:
+        if len(result) == 5:
             return result
+        if len(result) == 4:
+            return result[0], result[1], result[2], result[3], None
         if len(result) == 3:
-            return result[0], result[1], result[2], None
+            return result[0], result[1], result[2], None, None
         if len(result) == 2:
-            return result[0], result[1], None, None
-    return (None, None, None, None)
+            return result[0], result[1], None, None, None
+    return (None, None, None, None, None)
 
 
 def _recommended_worker_count(n_games: int) -> int:
@@ -510,7 +520,7 @@ def collect_games_batched(
                     profile["infer_a_s"] = profile.get("infer_a_s", 0.0) + dt
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                bt_l, bd_l, md_l, h_next = model.infer_packed(all_t)
+                bt_l, bd_l, cd_l, md_l, h_next = model.infer_packed(all_t)
                 if profile is not None:
                     dt = time.perf_counter() - t_phase
                     profile["forward_a_s"] = profile.get("forward_a_s", 0.0) + dt
@@ -519,14 +529,22 @@ def collect_games_batched(
                 t_phase = time.perf_counter() if profile is not None else 0.0
                 # Apply action masks before sampling
                 bt_m, bd_m = compute_action_masks(obs_t)
+                harv_bd_m = compute_harvester_build_dir_mask(obs_t, bd_m)
+                bt_m = bt_m.clone()
+                bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
+                cd_m = conveyor_dir_mask(obs_t.device, obs_t.shape[0])
                 bt_l.masked_fill_(~bt_m, -1e9)
-                bd_l.masked_fill_(~bd_m, -1e9)
+                cd_l.masked_fill_(~cd_m, -1e9)
                 bt_act, bt_lp = sample_logits_gumbel(bt_l)
+                bd_m = compute_build_dir_mask_for_type(obs_t, bt_act, bd_m, harv_bd_m)
+                bd_l.masked_fill_(~bd_m, -1e9)
                 bd_act, bd_lp = sample_logits_gumbel(bd_l)
+                cd_act, cd_lp = sample_logits_gumbel(cd_l)
                 md_act, md_lp = sample_logits_gumbel(md_l)
                 # Mask build_dir log_prob when build_type is "none" (idx 0)
                 bd_causal = (bt_act != 0).float()
-                lp = bt_lp + bd_lp * bd_causal + md_lp
+                cd_causal = ((bt_act == CONVEYOR_BUILD_TYPES[0]) | (bt_act == CONVEYOR_BUILD_TYPES[1])).float()
+                lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
                 if profile is not None:
                     dt = time.perf_counter() - t_phase
                     profile["sample_a_s"] = profile.get("sample_a_s", 0.0) + dt
@@ -536,7 +554,7 @@ def collect_games_batched(
                 # Single bulk transfer to CPU — one sync point
                 # h_next is already tanh'd by model.forward()
                 results_cpu = torch.stack([
-                    bt_act.float(), bd_act.float(), md_act.float(), lp,
+                    bt_act.float(), bd_act.float(), cd_act.float(), md_act.float(), lp,
                 ]).cpu()
                 h_cpu = h_next.cpu().contiguous()
                 if profile is not None:
@@ -553,7 +571,7 @@ def collect_games_batched(
                     _pipe_write_action_a(
                         act_fds[(game_idx, "a")],
                         int(results_cpu[0, i]), int(results_cpu[1, i]), int(results_cpu[2, i]),
-                        h_view[h_start:h_start + _H_BYTES], float(results_cpu[3, i]),
+                        int(results_cpu[3, i]), h_view[h_start:h_start + _H_BYTES], float(results_cpu[4, i]),
                     )
                 except OSError:
                     pass
@@ -581,7 +599,7 @@ def collect_games_batched(
                 if wp == DUMMY_OPP_PATH:
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     obs_t = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_b, _OBS_FLOATS)[:, :OBS_SIZE]
-                    bt_act, bd_act, md_act = _dummy_policy(obs_t)
+                    bt_act, bd_act, cd_act, md_act = _dummy_policy(obs_t)
                     if profile is not None:
                         profile["dummy_b_s"] = profile.get("dummy_b_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -590,7 +608,7 @@ def collect_games_batched(
                         try:
                             _pipe_write_action_b(
                                 act_fds[(game_idx, "b")],
-                                int(bt_act[i]), int(bd_act[i]), int(md_act[i]),
+                                int(bt_act[i]), int(bd_act[i]), int(cd_act[i]), int(md_act[i]),
                                 _ZERO_H_BYTES,
                             )
                         except OSError:
@@ -610,7 +628,7 @@ def collect_games_batched(
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    bt_l, bd_l, md_l, h_next = opp_m.infer_packed(all_t)
+                    bt_l, bd_l, cd_l, md_l, h_next = opp_m.infer_packed(all_t)
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
                         profile["forward_b_s"] = profile.get("forward_b_s", 0.0) + dt
@@ -618,10 +636,17 @@ def collect_games_batched(
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     bt_m, bd_m = compute_action_masks(obs_t)
+                    harv_bd_m = compute_harvester_build_dir_mask(obs_t, bd_m)
+                    bt_m = bt_m.clone()
+                    bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
+                    cd_m = conveyor_dir_mask(obs_t.device, obs_t.shape[0])
                     bt_l.masked_fill_(~bt_m, -1e9)
-                    bd_l.masked_fill_(~bd_m, -1e9)
+                    cd_l.masked_fill_(~cd_m, -1e9)
                     bt_act, _ = sample_logits_gumbel(bt_l, OPP_TEMP, return_log_prob=False)
+                    bd_m = compute_build_dir_mask_for_type(obs_t, bt_act, bd_m, harv_bd_m)
+                    bd_l.masked_fill_(~bd_m, -1e9)
                     bd_act, _ = sample_logits_gumbel(bd_l, OPP_TEMP, return_log_prob=False)
+                    cd_act, _ = sample_logits_gumbel(cd_l, OPP_TEMP, return_log_prob=False)
                     md_act, _ = sample_logits_gumbel(md_l, OPP_TEMP, return_log_prob=False)
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
@@ -629,7 +654,7 @@ def collect_games_batched(
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    acts_cpu = torch.stack([bt_act, bd_act, md_act]).cpu()
+                    acts_cpu = torch.stack([bt_act, bd_act, cd_act, md_act]).cpu()
                     h_cpu = h_next.cpu().contiguous()
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
@@ -644,7 +669,7 @@ def collect_games_batched(
                         h_start = i * _H_BYTES
                         _pipe_write_action_b(
                             act_fds[(game_idx, "b")],
-                            int(acts_cpu[0, i]), int(acts_cpu[1, i]), int(acts_cpu[2, i]),
+                            int(acts_cpu[0, i]), int(acts_cpu[1, i]), int(acts_cpu[2, i]), int(acts_cpu[3, i]),
                             h_view[h_start:h_start + _H_BYTES],
                         )
                     except OSError:
@@ -704,7 +729,9 @@ def collect_games_batched(
     per_opp_winners = {}
     for i, result in enumerate(results):
         oid = opp_ids[i]
-        if isinstance(result, tuple) and len(result) == 4:
+        if isinstance(result, tuple) and len(result) == 5:
+            log_path, working, w, gstates, _ti_delivered = result
+        elif isinstance(result, tuple) and len(result) == 4:
             log_path, working, w, gstates = result
         elif isinstance(result, tuple) and len(result) == 3:
             log_path, working, w = result
@@ -765,6 +792,11 @@ def main():
     args = parser.parse_args()
 
     session_name = args.session or _default_session_name()
+    session_dir = SESSIONS_DIR / session_name
+    if session_dir.exists() and not args.resume:
+        raise SystemExit(
+            f"Session '{session_name}' already exists. Use --resume or choose a new --session."
+        )
     sess = _init_session(session_name)
     weight_path = str(sess["weight_path"])
     log_path = sess["log_path"]
@@ -777,9 +809,10 @@ def main():
 
     hidden = TEACHER_HIDDEN if args.teacher else None
     model = BuilderMLP(hidden=hidden).to(DEVICE)
-    model.load_weights(weight_path) or model.load_weights(str(WEIGHT_PATH))
     reset_centralized_critic()
-    load_centralized_critic_checkpoint(weight_path, lr=args.lr)
+    if args.resume:
+        model.load_weights(weight_path)
+        load_centralized_critic_checkpoint(weight_path, lr=args.lr)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes)
 
@@ -927,28 +960,53 @@ def main():
         # Stats
         def _traj_reward(traj, outcome_r=0.0):
             r_harv, r_conv, r_work, r_dmg = 0.0, 0.0, 0.0, 0.0
+            harv_attempts = harv_failures = harv_prox_gate = harv_prox_paid = 0
             for s in traj:
                 if isinstance(s, (list, tuple)):
                     n = len(s)
-                    n_working = s[6] if n > 6 else 0
-                    conv_r = s[7] if n > 7 else 0.0
-                    harv_r = s[9] if n > 9 else 0.0
-                    dmg = s[10] if n > 10 else 0.0
+                    if n > 12:
+                        n_working = s[7] if n > 7 else 0
+                        conv_r = s[8] if n > 8 else 0.0
+                        harv_r = s[10] if n > 10 else 0.0
+                        dmg = s[11] if n > 11 else 0.0
+                        harv_attempt = s[13] if n > 13 else 0
+                        harv_fail = s[14] if n > 14 else 0
+                        harv_gate = s[15] if n > 15 else 0
+                        harv_paid = s[16] if n > 16 else 0
+                    else:
+                        n_working = s[6] if n > 6 else 0
+                        conv_r = s[7] if n > 7 else 0.0
+                        harv_r = s[9] if n > 9 else 0.0
+                        dmg = s[10] if n > 10 else 0.0
+                        harv_attempt = harv_fail = harv_gate = harv_paid = 0
                 else:
-                    n_working = s.get("n_working", 0)
+                    n_working = s.get("n_working", s.get("ti_delivered", 0))
                     conv_r = s.get("conv_r", 0)
                     harv_r = s.get("harv_r", 0)
                     dmg = s.get("dmg", 0)
+                    harv_attempt = s.get("harv_attempt", 0)
+                    harv_fail = s.get("harv_fail", 0)
+                    harv_gate = s.get("harv_gate", 0)
+                    harv_paid = s.get("harv_paid", 0)
                 r_harv += harv_r
                 r_conv += conv_r
                 r_work += n_working * REWARD_WORKING_HARVESTER
                 r_dmg += dmg * REWARD_ENEMY_CORE_DAMAGE
+                harv_attempts += harv_attempt
+                harv_failures += harv_fail
+                harv_prox_gate += harv_gate
+                harv_prox_paid += harv_paid
             total = r_harv + r_conv + r_work + r_dmg + outcome_r
-            return total, r_harv, r_conv, r_work, r_dmg, outcome_r
+            return (
+                total, r_harv, r_conv, r_work, r_dmg, outcome_r,
+                harv_attempts, harv_failures, harv_prox_gate, harv_prox_paid,
+            )
 
         def _traj_ti(traj):
             last = traj[-1]
-            return last[8] if isinstance(last, (list, tuple)) else last.get("ti", 0)
+            if isinstance(last, (list, tuple)):
+                return last[9] if len(last) > 12 else last[8]
+            return last.get("ti", 0)
 
         n_trajs = max(len(all_trajs), 1)
         rewards = []
@@ -964,6 +1022,10 @@ def main():
         mean_r_work = sum(r[3] for r in rewards) / n_trajs
         mean_r_dmg = sum(r[4] for r in rewards) / n_trajs
         mean_r_outcome = sum(r[5] for r in rewards) / n_trajs
+        mean_harv_attempts = sum(r[6] for r in rewards) / n_trajs
+        mean_harv_failures = sum(r[7] for r in rewards) / n_trajs
+        mean_harv_prox_gate = sum(r[8] for r in rewards) / n_trajs
+        mean_harv_prox_paid = sum(r[9] for r in rewards) / n_trajs
         mean_reward = (mean_r_harv + mean_r_conv + mean_r_work + mean_r_dmg + mean_r_outcome)
         mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
         elapsed = elapsed_offset + (time.time() - run_started_at)
@@ -973,6 +1035,10 @@ def main():
             "r_harv": round(mean_r_harv, 4), "r_conv": round(mean_r_conv, 4),
             "r_work": round(mean_r_work, 4), "r_dmg": round(mean_r_dmg, 4),
             "r_outcome": round(mean_r_outcome, 4),
+            "harv_attempts": round(mean_harv_attempts, 3),
+            "harv_failures": round(mean_harv_failures, 3),
+            "harv_prox_gate": round(mean_harv_prox_gate, 3),
+            "harv_prox_paid": round(mean_harv_prox_paid, 3),
             "resources": round(mean_ti, 2),
             "pi_loss": round(stats["pi_loss"], 5), "vf_loss": round(stats["vf_loss"], 5),
             "entropy": round(stats["entropy"], 4),
@@ -993,11 +1059,11 @@ def main():
         for traj_i, r in enumerate(rewards):
             gi = traj_game_map[traj_i] if traj_i < len(traj_game_map) else 0
             if gi not in game_rewards:
-                game_rewards[gi] = [0.0] * 6
+                game_rewards[gi] = [0.0] * 10
                 game_rewards[gi].append(0)  # n_units
-            for k in range(6):
+            for k in range(10):
                 game_rewards[gi][k] += r[k]
-            game_rewards[gi][6] += 1
+            game_rewards[gi][10] += 1
         with open(game_log_path, "a") as gf:
             for gi in sorted(game_rewards):
                 gr = game_rewards[gi]
@@ -1012,7 +1078,11 @@ def main():
                 gf.write(json.dumps({
                     "episode": ep + 1, "game": orig_i,
                     "opp": oid, "winner": w,
-                    "reward": round(gr[0] / max(gr[6], 1), 3), "units": gr[6],
+                    "reward": round(gr[0] / max(gr[10], 1), 3), "units": gr[10],
+                    "harv_attempts": round(gr[6] / max(gr[10], 1), 3),
+                    "harv_failures": round(gr[7] / max(gr[10], 1), 3),
+                    "harv_prox_gate": round(gr[8] / max(gr[10], 1), 3),
+                    "harv_prox_paid": round(gr[9] / max(gr[10], 1), 3),
                     "resources": round(ti, 1),
                     "replay": f"ep{ep + 1}_{oid}_g{orig_i}.replay26",
                 }) + "\n")
@@ -1028,7 +1098,8 @@ def main():
             print(
                 f"  Ep {ep + 1:3d}/{args.episodes}: "
                 f"W/L={total_wins}/{total_losses}/{total_games}  "
-                f"reward/unit={mean_reward:+.2f}  ti={mean_ti:.0f}  "
+                f"reward/unit={mean_reward:+.2f}  work={mean_r_work:+.2f}  ti={mean_ti:.0f}  "
+                f"harv a/f/g/p={mean_harv_attempts:.2f}/{mean_harv_failures:.2f}/{mean_harv_prox_gate:.2f}/{mean_harv_prox_paid:.2f}  "
                 f"pi={stats['pi_loss']:+.4f}  "
                 f"kl={stats.get('approx_kl', 0):.4f}  "
                 f"ev={stats.get('explained_var', 0):.2f}  "
