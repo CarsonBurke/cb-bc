@@ -38,7 +38,7 @@ REWARD_WORKING_HARVESTER = 2.5
 REWARD_ENEMY_CORE_DAMAGE = 20.0
 REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
 
-WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
+WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
 REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
 

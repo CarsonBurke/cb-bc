@@ -85,7 +85,7 @@ from model import (
 from replay_parser import augment_trajectories_with_working_counts
 
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
-WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
+WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 WORKER_PYTHON = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 
 from training_utils import (
