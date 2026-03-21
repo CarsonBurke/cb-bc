@@ -32,8 +32,9 @@ ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
+assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
-CONVEYOR_BUILD_TYPES = (2, 8)
+CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
 REWARD_WORKING_HARVESTER = 2.5
 REWARD_ENEMY_CORE_DAMAGE = 20.0
 REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
@@ -230,14 +231,20 @@ def compute_conditional_build_type_mask(
 # ---- Model ----
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (no bias, no mean centering)."""
+    """Root Mean Square Layer Normalization (no bias, no mean centering).
+
+    Uses F.rms_norm (fused CUDA kernel) when available.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            return F.rms_norm(x, (self.dim,), self.weight, self.eps)
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps) * self.weight
 
 
@@ -251,15 +258,25 @@ CENTRALIZED_CNN_CHUNK = 248
 
 
 class RMSNorm2d(nn.Module):
-    """RMSNorm for 2D spatial feature maps (B, C, H, W)."""
+    """RMSNorm for 2D spatial feature maps (B, C, H, W).
+
+    Uses F.rms_norm (fused CUDA kernel) via NHWC permutation for faster
+    forward+backward.  Falls back to manual implementation on CPU.
+    """
 
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
+        self.num_channels = num_channels
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(num_channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W) — normalize over C dimension per spatial position
+        if x.is_cuda:
+            # F.rms_norm needs C as the last dim.  When x is channels_last the
+            # permute is a free stride relabel; for contiguous NCHW it copies.
+            xp = x.permute(0, 2, 3, 1)  # (B, H, W, C)
+            return F.rms_norm(xp, (self.num_channels,), self.weight, self.eps).permute(0, 3, 1, 2)
         return x * torch.rsqrt(x.square().mean(1, keepdim=True) + self.eps) * self.weight.view(1, -1, 1, 1)
 
 
@@ -582,7 +599,7 @@ class GraphedInference:
                 s_md_lp = md_l.gather(1, s_md_act.unsqueeze(1)).squeeze(1) - md_l.logsumexp(dim=-1)
 
                 bd_causal = (s_bt_act != 0).float()
-                cd_causal = ((s_bt_act == CONVEYOR_BUILD_TYPES[0]) | (s_bt_act == CONVEYOR_BUILD_TYPES[1])).float()
+                cd_causal = ((s_bt_act == CONVEYOR_BUILD_TYPES[0]) | (s_bt_act == CONVEYOR_BUILD_TYPES[1]) | (s_bt_act == CONVEYOR_BUILD_TYPES[2])).float()
                 s_lp = s_bt_lp + s_bd_lp * bd_causal + s_cd_lp * cd_causal + s_md_lp
 
         self._s_bt_act = s_bt_act
@@ -876,7 +893,7 @@ def ppo_update(
 
             # Mask build_dir when build_type is "none" (idx 0) — causally irrelevant
             bd_causal = (bt_act[idx] != 0).float()
-            cd_causal = ((bt_act[idx] == CONVEYOR_BUILD_TYPES[0]) | (bt_act[idx] == CONVEYOR_BUILD_TYPES[1])).float()
+            cd_causal = ((bt_act[idx] == CONVEYOR_BUILD_TYPES[0]) | (bt_act[idx] == CONVEYOR_BUILD_TYPES[1]) | (bt_act[idx] == CONVEYOR_BUILD_TYPES[2])).float()
             bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[idx])
             bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[idx])
             cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act[idx])
