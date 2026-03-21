@@ -907,6 +907,7 @@ def main():
             global_states_list=all_global_states,
             traj_game_map=traj_game_map if all_global_states else None,
             game_winners=all_winners,
+            target_kl=0.03,
         )
         model.save_weights(weight_path)
         save_centralized_critic_checkpoint(weight_path)
