@@ -7,41 +7,28 @@ Same architecture as tensor bot but:
 """
 
 import json
-import importlib.util
 import math
 import os
 import random
 import sys
 
-# Reuse all code from tensor bot
+# Import shared constants and encoding from tensor/shared.py
 _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor")
 sys.path.insert(0, _TENSOR_DIR)
-_TENSOR_MAIN_PATH = os.path.join(_TENSOR_DIR, "main.py")
-_TENSOR_SPEC = importlib.util.spec_from_file_location("_tensor_main_opp", _TENSOR_MAIN_PATH)
-_TENSOR_MAIN = importlib.util.module_from_spec(_TENSOR_SPEC)
-_TENSOR_SPEC.loader.exec_module(_TENSOR_MAIN)
+
+from shared import (
+    INPUT_SIZE, HIDDEN_SIZES, H_DIM, RMSNORM_LAYERS, POS_EMBED_DIM,
+    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9,
+    SinusoidalPositionEmbedding,
+    encode_state_into, argmax,
+)
+
+# Import MLP from tensor_inference's tensor_lib
+_INFERENCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor_inference")
+sys.path.insert(0, _INFERENCE_DIR)
+from tensor_lib import MLP
 
 from cambc import Controller, Direction, EntityType, Environment, Position
-from tensor_lib import MLP, SinusoidalPositionEmbedding
-
-GRID_SIZE = _TENSOR_MAIN.GRID_SIZE
-GRID_HALF = _TENSOR_MAIN.GRID_HALF
-TILE_FEATURES = _TENSOR_MAIN.TILE_FEATURES
-GLOBAL_FEATURES = _TENSOR_MAIN.GLOBAL_FEATURES
-POS_EMBED_DIM = _TENSOR_MAIN.POS_EMBED_DIM
-INPUT_SIZE = _TENSOR_MAIN.INPUT_SIZE
-HIDDEN_SIZES = _TENSOR_MAIN.HIDDEN_SIZES
-H_DIM = _TENSOR_MAIN.H_DIM
-RMSNORM_LAYERS = _TENSOR_MAIN.RMSNORM_LAYERS
-DIRECTIONS = _TENSOR_MAIN.DIRECTIONS
-BUILD_ACTIONS = _TENSOR_MAIN.BUILD_ACTIONS
-DIR_MAP_9 = _TENSOR_MAIN.DIR_MAP_9
-ENV_IDX = _TENSOR_MAIN.ENV_IDX
-BLD_IDX = _TENSOR_MAIN.BLD_IDX
-N_BLD_TYPES = _TENSOR_MAIN.N_BLD_TYPES
-DIR_DXY = _TENSOR_MAIN.DIR_DXY
-_argmax = _TENSOR_MAIN._argmax
-_TensorPlayer = _TENSOR_MAIN.Player
 
 _MODEL_CACHE = {}
 
@@ -97,16 +84,13 @@ class Player:
         self.my_team = None
         self.num_spawned = 0
         self.num_builders = 0
-        self._prev_reward = 0.0
         self._prev_resources = None
-        self._prev_enemy_core_hp = 500.0
-        self._own_core_hp = 500.0
         self._n_builders_cached = 1
+        self._spawn_round: int = -1
 
         self.pos_encoder = SinusoidalPositionEmbedding(POS_EMBED_DIM)
         self.h_prev = [0.0] * H_DIM
 
-        # Load opponent weights from env var
         opp_path = os.environ.get("TENSOR_OPP_WEIGHTS", "")
         self.model = _get_shared_model(opp_path)
 
@@ -137,6 +121,8 @@ class Player:
                 return
 
     def _run_builder(self, ct):
+        if self._spawn_round < 0:
+            self._spawn_round = ct.get_current_round()
         if self.my_team is None:
             self.my_team = ct.get_team()
         if self.core_center is None:
@@ -157,9 +143,9 @@ class Player:
         h_raw = outputs["h_next"]
         self.h_prev = [math.tanh(x) for x in h_raw]
 
-        build_type_idx = _argmax(outputs["build_type"])
-        build_dir_idx = _argmax(outputs["build_dir"])
-        move_dir_idx = _argmax(outputs["move_dir"])
+        build_type_idx = argmax(outputs["build_type"])
+        build_dir_idx = argmax(outputs["build_dir"])
+        move_dir_idx = argmax(outputs["move_dir"])
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
@@ -168,7 +154,6 @@ class Player:
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
 
-        # Update resource snapshot for delta features
         self._prev_resources = ct.get_global_resources()
 
     def _find_core(self, ct):
@@ -186,30 +171,19 @@ class Player:
         return self.core_center or ct.get_position()
 
     def _encode_state(self, ct):
-        _P, _p = self._proxy()
-        result = _P._encode_state(_p, ct)
-        # Sync back cached values
-        self._n_builders_cached = _p._n_builders_cached
-        self._own_core_hp = _p._own_core_hp
-        return result
-
-    def _proxy(self):
-        _P = _TensorPlayer
-        _p = object.__new__(_P)
-        _p.core_center = self.core_center
-        _p.enemy_core = self.enemy_core
-        _p.my_team = self.my_team
-        _p.pos_encoder = self.pos_encoder
-        _p._prev_reward = self._prev_reward
-        _p._prev_resources = self._prev_resources
-        _p._prev_enemy_core_hp = self._prev_enemy_core_hp
-        _p._own_core_hp = self._own_core_hp
-        _p._n_builders_cached = self._n_builders_cached
-        _p._conv_count = 0  # opponent doesn't track this
-        return _P, _p
+        features: list[float] = []
+        n_builders_out = [0]
+        result = encode_state_into(
+            ct, features, self.core_center, self.enemy_core,
+            self.my_team, self.pos_encoder, self._prev_resources,
+            self._spawn_round, n_builders_out,
+        )
+        if result is not None:
+            self.core_center, self.enemy_core = result
+        self._n_builders_cached = n_builders_out[0]
+        return features
 
     def _execute_build(self, ct, action, direction):
-        """Opponent build — no rewards needed, just execute."""
         pos = ct.get_position()
         build_pos = pos.add(direction)
         if action == "conveyor":
@@ -252,7 +226,6 @@ class Player:
                 ct.build_launcher(build_pos)
 
     def _execute_move(self, ct, direction):
-        """Opponent move — simplified, no road auto-build."""
         if direction == Direction.CENTRE:
             return
         if ct.can_move(direction):

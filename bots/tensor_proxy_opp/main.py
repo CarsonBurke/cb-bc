@@ -7,7 +7,6 @@ Same as tensor_proxy but:
 """
 
 from array import array
-import math
 import os
 import random
 import struct
@@ -15,36 +14,17 @@ import sys
 
 _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor")
 sys.path.insert(0, _TENSOR_DIR)
-import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location(
-    "tensor_bot_main", os.path.join(_TENSOR_DIR, "main.py"),
-    submodule_search_locations=[],
+
+from shared import (
+    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES, POS_EMBED_DIM,
+    INPUT_SIZE, HIDDEN_SIZES, H_DIM,
+    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, DIR_DXY, BUILD_COSTS,
+    SinusoidalPositionEmbedding, GameState,
+    discover_ore, scan_enemy_core_dmg, scan_working_harvesters,
+    encode_state_into,
 )
-_TENSOR_MAIN = _ilu.module_from_spec(_spec)
-sys.modules["tensor_bot_main"] = _TENSOR_MAIN
-_spec.loader.exec_module(_TENSOR_MAIN)
 
 from cambc import Controller, Direction, EntityType, Environment, Position
-
-from tensor_lib import SinusoidalPositionEmbedding
-
-GRID_SIZE = _TENSOR_MAIN.GRID_SIZE
-GRID_HALF = _TENSOR_MAIN.GRID_HALF
-TILE_FEATURES = _TENSOR_MAIN.TILE_FEATURES
-GLOBAL_FEATURES = _TENSOR_MAIN.GLOBAL_FEATURES
-POS_EMBED_DIM = _TENSOR_MAIN.POS_EMBED_DIM
-INPUT_SIZE = _TENSOR_MAIN.INPUT_SIZE
-HIDDEN_SIZES = _TENSOR_MAIN.HIDDEN_SIZES
-H_DIM = _TENSOR_MAIN.H_DIM
-DIRECTIONS = _TENSOR_MAIN.DIRECTIONS
-BUILD_ACTIONS = _TENSOR_MAIN.BUILD_ACTIONS
-DIR_MAP_9 = _TENSOR_MAIN.DIR_MAP_9
-ENV_IDX = _TENSOR_MAIN.ENV_IDX
-BLD_IDX = _TENSOR_MAIN.BLD_IDX
-N_BLD_TYPES = _TENSOR_MAIN.N_BLD_TYPES
-DIR_DXY = _TENSOR_MAIN.DIR_DXY
-_argmax = _TENSOR_MAIN._argmax
-_TensorPlayer = _TENSOR_MAIN.Player
 
 # Struct-based binary IPC protocol
 _OBS_FLOATS = INPUT_SIZE + H_DIM
@@ -56,11 +36,6 @@ _ACT_B_SIZE = _ACT_INTS * 4 + _ACT_B_FLOATS * 4
 _H_BYTES = H_DIM * 4
 
 _opened_pipes = {}
-
-
-def _new_proxy_player():
-    """Create a bare tensor Player without model construction or weight I/O."""
-    return object.__new__(_TensorPlayer)
 
 
 def _get_pipes():
@@ -184,7 +159,6 @@ class Player:
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
 
-        # Update resource snapshot for delta features
         self._prev_resources = ct.get_global_resources()
 
     def _find_core(self, ct):
@@ -204,12 +178,10 @@ class Player:
         pos = ct.get_position()
         build_pos = pos.add(direction)
 
-        # Bounds check
         w, h = ct.get_map_width(), ct.get_map_height()
         if build_pos.x < 0 or build_pos.x >= w or build_pos.y < 0 or build_pos.y >= h:
             return
 
-        # Auto-destroy friendly non-core building if affordable
         bid = ct.get_tile_building_id(build_pos)
         if bid is not None:
             try:
@@ -275,38 +247,18 @@ class Player:
                 ct.move(alt)
                 return
 
-    def _encode_state(self, ct):
-        _TensorPlayer._discover_ore(ct)
-        if not hasattr(self, '_proxy'):
-            self._proxy = _new_proxy_player()
-        _p = self._proxy
-        _p.core_center = self.core_center
-        _p.enemy_core = self.enemy_core
-        _p.my_team = self.my_team
-        _p.pos_encoder = self.pos_encoder
-        _p._n_builders_cached = self._n_builders_cached
-        _p._prev_resources = self._prev_resources
-        _p._spawn_round = self._spawn_round
-        result = _TensorPlayer._encode_state(_p, ct)
-        self._n_builders_cached = _p._n_builders_cached
-        return result
-
     def _encode_state_buf(self, ct):
-        _TensorPlayer._discover_ore(ct)
-        _TensorPlayer._scan_working_harvesters(ct)
-        _TensorPlayer._scan_enemy_core_dmg(ct)
-        if not hasattr(self, '_proxy'):
-            self._proxy = _new_proxy_player()
-        _p = self._proxy
-        _p.core_center = self.core_center
-        _p.enemy_core = self.enemy_core
-        _p.my_team = self.my_team
-        _p.pos_encoder = self.pos_encoder
-        _p._n_builders_cached = self._n_builders_cached
-        _p._prev_resources = self._prev_resources
-        _p._spawn_round = self._spawn_round
+        discover_ore(ct)
+        scan_working_harvesters(ct)
+        scan_enemy_core_dmg(ct)
         del self._obs_buf[:]
-        _TensorPlayer._encode_state_into(_p, ct, self._obs_buf)
-        self.enemy_core = _p.enemy_core
-        self._n_builders_cached = _p._n_builders_cached
+        n_builders_out = [0]
+        result = encode_state_into(
+            ct, self._obs_buf, self.core_center, self.enemy_core,
+            self.my_team, self.pos_encoder, self._prev_resources,
+            self._spawn_round, n_builders_out,
+        )
+        if result is not None:
+            self.core_center, self.enemy_core = result
+        self._n_builders_cached = n_builders_out[0]
         return self._obs_buf

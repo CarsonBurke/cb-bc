@@ -64,6 +64,7 @@ DIR_MAP_9 = [
     Direction.SOUTH,
     Direction.SOUTHEAST,
 ]
+CONV_DIR_MASK = [d != Direction.CENTRE for d in DIR_MAP_9]
 
 # Environment type -> one-hot index
 ENV_IDX = {
@@ -298,10 +299,9 @@ class Player:
         # Compute action masks (which builds are affordable, which tiles are free)
         bt_mask, bd_mask = _compute_masks_from_obs(obs)
 
-        _CONV_DIR_MASK = [d != Direction.CENTRE for d in DIR_MAP_9]
         build_type_idx = _argmax(outputs["build_type"], bt_mask)
         build_dir_idx = _argmax(outputs["build_dir"], bd_mask)
-        conv_dir_idx = _argmax(outputs["conv_dir"], _CONV_DIR_MASK)
+        conv_dir_idx = _argmax(outputs["conv_dir"], CONV_DIR_MASK)
         move_dir_idx = _argmax(outputs["move_dir"], None)
 
         # Snapshot resources before actions to isolate delivery from spending
