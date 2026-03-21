@@ -843,6 +843,7 @@ def ppo_update(
     ppo_epochs: int = 4,
     minibatch_size: int = 2048,
     clip_eps: float = 0.2,
+    clip_eps_higher: float | None = 0.28,
     vf_coeff: float = 0.5,
     entropy_coeff: float = 0.01,
     max_grad_norm: float = 0.5,
@@ -907,7 +908,8 @@ def ppo_update(
             with torch.no_grad():
                 approx_kl = ((ratio - 1) - logratio).mean()
                 approx_kl_acc += approx_kl.item()
-                clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean()
+                _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
+                clip_frac = ((ratio < (1 - clip_eps)) | (ratio > (1 + _hi))).float().mean()
                 sum_kl += approx_kl.item()
                 sum_clip_frac += clip_frac.item()
                 n_mb += 1
@@ -919,7 +921,8 @@ def ppo_update(
             mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
             pg1 = -mb_adv * ratio
-            pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+            _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
+            pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_eps, 1 + _hi)
             pi_loss = torch.max(pg1, pg2).mean()
             if profile is not None:
                 profile["ppo_policy_loss_s"] = profile.get("ppo_policy_loss_s", 0.0) + (time.perf_counter() - t_phase)
@@ -966,8 +969,9 @@ def ppo_update(
                     )
                     if clip_vloss and mb_old_values is not None:
                         v_loss_unclipped = (newvalue - mb_returns[si]) ** 2
+                        _vhi = clip_eps_higher if clip_eps_higher is not None else clip_eps
                         v_clipped = mb_old_values[si] + torch.clamp(
-                            newvalue - mb_old_values[si], -clip_eps, clip_eps,
+                            newvalue - mb_old_values[si], -clip_eps, _vhi,
                         )
                         v_loss_elems = torch.max(v_loss_unclipped, (v_clipped - mb_returns[si]) ** 2)
                     else:
