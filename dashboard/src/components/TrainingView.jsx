@@ -148,12 +148,30 @@ const MAX_CHART_POINTS = 200
 
 function downsample(arr, max = MAX_CHART_POINTS) {
   if (arr.length <= max) return arr
-  const step = arr.length / max
+  // Use fixed-width buckets so existing buckets stay stable as data grows.
+  // Bucket width is ceil(length/max) — only the last bucket changes size.
+  const bucketSize = Math.ceil(arr.length / max)
   const result = []
-  for (let i = 0; i < max - 1; i++) {
-    result.push(arr[Math.round(i * step)])
+  for (let i = 0; i < arr.length; i += bucketSize) {
+    const end = Math.min(i + bucketSize, arr.length)
+    // Average numeric fields, keep structure from the midpoint element
+    const mid = arr[Math.floor((i + end - 1) / 2)]
+    const bucket = arr.slice(i, end)
+    const averaged = { ...mid }
+    for (const key of Object.keys(mid)) {
+      if (typeof mid[key] === 'number') {
+        let sum = 0, count = 0
+        for (let j = 0; j < bucket.length; j++) {
+          const v = bucket[j][key]
+          if (v != null) { sum += v; count++ }
+        }
+        averaged[key] = count > 0 ? sum / count : mid[key]
+      }
+    }
+    // Preserve episode number from the last element in the bucket for x-axis
+    averaged.episode = bucket[bucket.length - 1].episode
+    result.push(averaged)
   }
-  result.push(arr[arr.length - 1])
   return result
 }
 
