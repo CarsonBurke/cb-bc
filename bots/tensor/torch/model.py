@@ -47,6 +47,13 @@ WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
 REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
 
+# Precomputed (dx/2, dy/2) for each tile in the 5x5 local grid.
+# Tile index i -> grid position (i%5 - 2, i//5 - 2), normalized by /2.
+_TILE_DXDY = torch.tensor(
+    [[float((i % 5) - 2) / 2.0, float((i // 5) - 2) / 2.0] for i in range(TILE_GRID_N)],
+    dtype=torch.float32,
+)
+
 # ---- Action masking ----
 # Build costs (ti, ax) indexed by BUILD_ACTIONS:
 # none, harvester, conveyor, road, gunner, sentinel, breach, splitter,
@@ -1700,6 +1707,38 @@ def train_on_trajectories(
 
     ppo_profile = profile if profile is not None else None
     model.train()
+
+    # Recompute old_log_probs via eager forward pass — CUDA-graphed rollout
+    # log_probs can diverge from eager due to graph replay numerics (different
+    # cuBLAS algo selection, memory reuse across replays, etc.).
+    t_phase = time.perf_counter() if profile is not None else 0.0
+    with torch.no_grad():
+        _recomp_lp = torch.empty(N, device=DEVICE)
+        _RECOMP_CHUNK = 4096
+        for _rc_start in range(0, N, _RECOMP_CHUNK):
+            _rc_end = min(_rc_start + _RECOMP_CHUNK, N)
+            _rc_idx = slice(_rc_start, _rc_end)
+            _rc_bt_l, _rc_bd_l, _rc_cd_l, _rc_md_l, _ = model(obs[_rc_idx], h[_rc_idx])
+            _rc_bt_m, _rc_bd_m = compute_action_masks(obs[_rc_idx])
+            _rc_harv = compute_harvester_build_dir_mask(obs[_rc_idx], _rc_bd_m)
+            _rc_bt_m = _rc_bt_m.clone()
+            _rc_bt_m[:, HARVESTER_BUILD_TYPE] &= _rc_harv.any(dim=1)
+            _rc_bd_m = compute_build_dir_mask_for_type(obs[_rc_idx], data["bt"][_rc_idx], _rc_bd_m, _rc_harv)
+            _rc_cd_m = conveyor_dir_mask(DEVICE, _rc_end - _rc_start)
+            _rc_bt_l = _rc_bt_l.masked_fill(~_rc_bt_m, -1e9)
+            _rc_bd_l = _rc_bd_l.masked_fill(~_rc_bd_m, -1e9)
+            _rc_cd_l = _rc_cd_l.masked_fill(~_rc_cd_m, -1e9)
+            _rc_bt_lp, _ = action_log_prob_and_entropy(_rc_bt_l, data["bt"][_rc_idx])
+            _rc_bd_lp, _ = action_log_prob_and_entropy(_rc_bd_l, data["bd"][_rc_idx])
+            _rc_cd_lp, _ = action_log_prob_and_entropy(_rc_cd_l, data["cd"][_rc_idx])
+            _rc_md_lp, _ = action_log_prob_and_entropy(_rc_md_l, data["md"][_rc_idx])
+            _rc_bd_c = (data["bt"][_rc_idx] != 0).float()
+            _rc_cd_c = ((data["bt"][_rc_idx] == CONVEYOR_BUILD_TYPES[0]) | (data["bt"][_rc_idx] == CONVEYOR_BUILD_TYPES[1]) | (data["bt"][_rc_idx] == CONVEYOR_BUILD_TYPES[2])).float()
+            _recomp_lp[_rc_idx] = _rc_bt_lp + _rc_bd_lp * _rc_bd_c + _rc_cd_lp * _rc_cd_c + _rc_md_lp
+        data["old_log_probs"] = _recomp_lp
+    if profile is not None:
+        profile["recompute_lp_s"] = time.perf_counter() - t_phase
+
     stats = ppo_update(
         model, optimizer,
         obs, h, data["bt"], data["bd"], data["cd"], data["md"],
