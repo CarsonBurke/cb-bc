@@ -76,6 +76,7 @@ from model import (
     compute_conditional_build_type_mask,
     load_centralized_critic_checkpoint,
     reset_centralized_critic,
+    reset_reward_normalizer,
     save_centralized_critic_checkpoint,
     distill,
     sample_logits_gumbel,
@@ -780,6 +781,7 @@ def main():
     hidden = TEACHER_HIDDEN if args.teacher else None
     model = BuilderMLP(hidden=hidden).to(DEVICE)
     reset_centralized_critic()
+    reset_reward_normalizer()
     if args.resume:
         model.load_weights(weight_path)
         load_centralized_critic_checkpoint(weight_path, lr=args.lr)
@@ -1037,6 +1039,8 @@ def main():
             "approx_kl": round(stats.get("approx_kl", 0), 6),
             "clip_frac": round(stats.get("clip_frac", 0), 4),
             "explained_var": stats.get("explained_var", 0),
+            "reward_raw_std": round(stats.get("reward_raw_std", 0), 4),
+            "reward_norm_var": round(stats.get("reward_norm_var", 1), 4),
             "sps": stats["n_steps"], "elapsed": round(elapsed, 1),
             "winrate": round(total_wins / max(total_games, 1), 3),
         }

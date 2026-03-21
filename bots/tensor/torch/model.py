@@ -1348,6 +1348,84 @@ def _compute_gae(
     return advantages, returns
 
 
+# ---- Reward normalizer (running variance of discounted returns) ----
+# Inspired by gym.wrappers.NormalizeReward. Tracks Var(discounted_return) via
+# Welford's online algorithm over full episode returns, divides each reward
+# by sqrt(var + eps), clips to [-clip, clip].
+
+class RewardNormalizer:
+    """Running reward normalizer using discounted return variance."""
+
+    def __init__(self, gamma: float = 0.99, eps: float = 1e-8):
+        self.gamma = gamma
+        self.eps = eps
+        # Welford running stats
+        self.mean: float = 0.0
+        self.var: float = 1.0
+        self.count: float = 1e-4  # avoid div-by-zero on first call
+
+    def normalize(
+        self,
+        rewards: torch.Tensor,
+        ep_boundaries: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        """Normalize rewards in-place using running return variance.
+
+        Updates running stats from the discounted returns of each episode,
+        then divides all rewards by sqrt(running_var + eps) and clips.
+        """
+        gamma = self.gamma
+
+        # 1. Compute discounted returns per episode and update running stats
+        all_returns: list[float] = []
+        for start, end in ep_boundaries:
+            ep_rewards = rewards[start:end]
+            # Compute discounted return for each timestep
+            disc_return = 0.0
+            for t in range(ep_rewards.shape[0] - 1, -1, -1):
+                disc_return = float(ep_rewards[t].item()) + gamma * disc_return
+                all_returns.append(disc_return)
+
+        # Batch Welford update
+        for ret in all_returns:
+            self.count += 1.0
+            delta = ret - self.mean
+            self.mean += delta / self.count
+            delta2 = ret - self.mean
+            self.var += (delta * delta2 - self.var) / self.count
+        self.var = max(self.var, 0.0)  # guard against float rounding
+
+        # 2. Normalize rewards by sqrt(var)
+        std = max(self.var, 0.0) ** 0.5 + self.eps
+        rewards = rewards / std
+        return rewards
+
+    def state_dict(self) -> dict:
+        return {"mean": self.mean, "var": self.var, "count": self.count,
+                "gamma": self.gamma, "eps": self.eps}
+
+    def load_state_dict(self, d: dict) -> None:
+        self.mean = d.get("mean", 0.0)
+        self.var = d.get("var", 1.0)
+        self.count = d.get("count", 1e-4)
+        self.gamma = d.get("gamma", self.gamma)
+        self.eps = d.get("eps", self.eps)
+
+
+_reward_normalizer: RewardNormalizer | None = None
+
+
+def get_reward_normalizer(gamma: float = 0.99) -> RewardNormalizer:
+    global _reward_normalizer
+    if _reward_normalizer is None:
+        _reward_normalizer = RewardNormalizer(gamma=gamma)
+    return _reward_normalizer
+
+
+def reset_reward_normalizer() -> None:
+    global _reward_normalizer
+    _reward_normalizer = None
+
 
 _centralized_critic: CentralizedCritic | None = None
 _centralized_optimizer: torch.optim.Optimizer | None = None
@@ -1400,10 +1478,16 @@ def load_centralized_critic_checkpoint(
         critic.load_state_dict(critic_state)
         if opt_state is not None:
             critic_opt.load_state_dict(opt_state)
+        # Restore reward normalizer state if present
+        rn_state = payload.get("reward_normalizer")
+        if rn_state is not None:
+            rn = get_reward_normalizer()
+            rn.load_state_dict(rn_state)
         return True
     except Exception as e:
         print(f"Could not load centralized critic from {ckpt_path}: {e}")
         reset_centralized_critic()
+        reset_reward_normalizer()
         return False
 
 
@@ -1417,6 +1501,8 @@ def save_centralized_critic_checkpoint(weight_path: str | Path = WEIGHT_PATH) ->
         "critic": _centralized_critic.state_dict(),
         "optimizer": _centralized_optimizer.state_dict(),
     }
+    if _reward_normalizer is not None:
+        payload["reward_normalizer"] = _reward_normalizer.state_dict()
     torch.save(payload, ckpt_path)
     return ckpt_path
 
@@ -1527,6 +1613,11 @@ def train_on_trajectories(
     if profile is not None:
         profile["value_forward_s"] = time.perf_counter() - t_phase
 
+    # Normalize rewards using running return variance (like gym.NormalizeReward)
+    rn = get_reward_normalizer(gamma=gamma)
+    raw_reward_std = data["rewards"].std().item()
+    data["rewards"] = rn.normalize(data["rewards"], data["ep_boundaries"])
+
     t_phase = time.perf_counter() if profile is not None else 0.0
     advantages, returns = _compute_gae(
         data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,
@@ -1546,6 +1637,9 @@ def train_on_trajectories(
         **ppo_kwargs,
     )
     stats["n_steps"] = data["n_steps"]
+    stats["reward_raw_std"] = raw_reward_std
+    stats["reward_norm_var"] = rn.var
+    stats["reward_norm_count"] = rn.count
     return stats
 
 
