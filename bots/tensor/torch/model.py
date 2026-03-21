@@ -28,6 +28,10 @@ HIDDEN = [64, 64, 48, 48]
 TEACHER_HIDDEN = [128, 128, 128, 64]
 H_DIM = 16
 INPUT_SIZE = OBS_SIZE + H_DIM
+TILE_EMBED_DIM = 8
+TILE_INPUT_DIM = TILE_FEATURES + 2  # 19: raw features + (dx/2, dy/2)
+TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
+TRUNK_INPUT_SIZE = TILE_GRID_N * TILE_EMBED_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 239
 ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
@@ -663,10 +667,17 @@ class BuilderMLP(nn.Module):
         hidden = hidden or HIDDEN
         self._hidden = hidden
 
+        # Shared tile encoder: per-tile MLP applied to each of the 25 tiles
+        self.tile_encoder = nn.Sequential(
+            _ortho_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM)),
+            nn.SiLU(),
+        )
+        self.register_buffer('_tile_dxdy', _TILE_DXDY.clone())
+
         # Shared encoder: first hidden layer only
         enc_dim = hidden[0]
         self.encoder = nn.Sequential(
-            _ortho_init(nn.Linear(INPUT_SIZE, enc_dim)),
+            _ortho_init(nn.Linear(TRUNK_INPUT_SIZE, enc_dim)),
             RMSNorm(enc_dim),
             nn.SiLU(),
         )
@@ -696,9 +707,25 @@ class BuilderMLP(nn.Module):
             del self._cached_head_b
         return super().train(mode)
 
+    def _encode_tiles(self, obs: torch.Tensor) -> torch.Tensor:
+        """Extract tiles from flat obs, prepend dx/dy, run shared encoder."""
+        B = obs.shape[0]
+        tile_flat = obs[:, :TILE_GRID_N * TILE_FEATURES]  # (B, 425)
+        tiles = tile_flat.reshape(B, TILE_GRID_N, TILE_FEATURES)  # (B, 25, 17)
+        dxdy = self._tile_dxdy.unsqueeze(0).expand(B, -1, -1)  # (B, 25, 2)
+        tile_in = torch.cat([dxdy, tiles], dim=-1)  # (B, 25, 19)
+        tile_emb = self.tile_encoder(tile_in)  # (B, 25, 8)
+        return tile_emb.reshape(B, TILE_GRID_N * TILE_EMBED_DIM)  # (B, 200)
+
+    def _build_trunk_input(self, obs: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        """Build trunk input: encoded tiles + globals + pos_embed + h_prev."""
+        tile_enc = self._encode_tiles(obs)  # (B, 200)
+        globals_pos = obs[:, TILE_GRID_N * TILE_FEATURES:]  # (B, 23) globals+pos_embed
+        return torch.cat([tile_enc, globals_pos, h_prev], dim=-1)  # (B, 239)
+
     def actor_latent(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         """Return the pre-head actor latent used for policy logits."""
-        trunk_in = torch.cat([x, h_prev], dim=-1)
+        trunk_in = self._build_trunk_input(x, h_prev)
         enc = self.encoder(trunk_in)
         return self.actor_trunk(enc)
 
@@ -742,18 +769,22 @@ class BuilderMLP(nn.Module):
         return self._forward_from_hidden(h)
 
     def forward(self, x, h_prev):
-        trunk_in = torch.cat([x, h_prev], dim=-1)
+        trunk_in = self._build_trunk_input(x, h_prev)
         return self._forward_from_trunk_in(trunk_in)
 
-    def infer_packed(self, trunk_in: torch.Tensor):
+    def infer_packed(self, packed: torch.Tensor):
         """Inference-only path for already-packed [obs, h_prev] batches."""
+        obs = packed[:, :OBS_SIZE]
+        h_prev = packed[:, OBS_SIZE:]
+        trunk_in = self._build_trunk_input(obs, h_prev)
         return self._forward_from_trunk_in(trunk_in)
 
     def _policy_state_modules(self) -> list[nn.Module]:
         """Policy modules only in tensor_lib serialization order (critic excluded)."""
+        tile_modules = [m for m in self.tile_encoder if isinstance(m, (nn.Linear, RMSNorm))]
         enc_modules = [m for m in self.encoder if isinstance(m, (nn.Linear, RMSNorm))]
         actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
-        return enc_modules + actor_modules + [
+        return tile_modules + enc_modules + actor_modules + [
             self.head_build_type, self.head_build_dir, self.head_conv_dir, self.head_move_dir,
             self.head_h_next,
         ]

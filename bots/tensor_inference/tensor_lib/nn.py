@@ -220,7 +220,7 @@ class MLP:
     Each head produces independent logits for a different decision.
     """
 
-    __slots__ = ("trunk", "heads", "_infer_cache")
+    __slots__ = ("trunk", "heads", "_infer_cache", "tile_encoder", "tile_grid_n", "tile_raw_features", "tile_embed_dim", "_tile_dxdy")
 
     def __init__(
         self,
@@ -231,6 +231,8 @@ class MLP:
         use_layernorm: bool = False,
         rmsnorm_layers: list[bool] | tuple[bool, ...] | None = None,
         dropout: float = 0.0,
+        tile_encoder_sizes: tuple[int, int] | None = None,
+        tile_grid_n: int = 25,
     ):
         act_cls = {"relu": ReLU, "tanh": Tanh, "sigmoid": Sigmoid, "silu": SiLU}[activation]
         if rmsnorm_layers is None:
@@ -261,6 +263,20 @@ class MLP:
         for name, size in output_heads.items():
             self.heads[name] = Linear(prev, size)
 
+        if tile_encoder_sizes is not None:
+            te_in, te_out = tile_encoder_sizes
+            self.tile_encoder = Sequential(Linear(te_in, te_out), SiLU())
+            self.tile_grid_n = tile_grid_n
+            self.tile_raw_features = te_in - 2  # 17 raw features per tile
+            self.tile_embed_dim = te_out
+            self._tile_dxdy = [(float((i % 5) - 2) / 2.0, float((i // 5) - 2) / 2.0) for i in range(tile_grid_n)]
+        else:
+            self.tile_encoder = None
+            self.tile_grid_n = 0
+            self.tile_raw_features = 0
+            self.tile_embed_dim = 0
+            self._tile_dxdy = None
+
         self._infer_cache: list | None = None
 
     def __call__(self, x: Tensor) -> dict[str, Tensor]:
@@ -268,7 +284,10 @@ class MLP:
         return {name: head(h) for name, head in self.heads.items()}
 
     def parameters(self) -> list[Tensor]:
-        params = list(self.trunk.parameters())
+        params: list[Tensor] = []
+        if self.tile_encoder is not None:
+            params.extend(self.tile_encoder.parameters())
+        params.extend(self.trunk.parameters())
         for head in self.heads.values():
             params.extend(head.parameters())
         return params
@@ -358,7 +377,18 @@ class MLP:
                     fused_bias.extend([0.0] * N)
             offset += N
 
-        return [ops, (head_names, head_slices, fused_w_rows, fused_bias, offset)]
+        # Build tile encoder cache
+        tile_cache = None
+        if self.tile_encoder is not None:
+            te_layers = self.tile_encoder.layers
+            te_linear = te_layers[0]  # Linear layer
+            te_w = te_linear.weight.data
+            te_out_dim = te_linear.out_features
+            te_w_rows = [te_w[j::te_out_dim] for j in range(te_out_dim)]
+            te_bias = list(te_linear.bias.data) if te_linear.bias is not None else None
+            tile_cache = (te_w_rows, te_bias, te_out_dim)
+
+        return [ops, (head_names, head_slices, fused_w_rows, fused_bias, offset), tile_cache]
 
     def infer(self, features: list[float]) -> dict[str, list[float]]:
         """Fast inference for a single input — bypasses Tensor overhead.
@@ -373,8 +403,32 @@ class MLP:
 
         _exp = math.exp
         _dot = _DOT
-        ops, fused_heads = self._infer_cache
-        h = features
+        ops, fused_heads, tile_cache = self._infer_cache
+
+        if tile_cache is not None:
+            te_w_rows, te_bias, te_out = tile_cache
+            n_tiles = self.tile_grid_n
+            raw_feat = self.tile_raw_features
+            dxdy = self._tile_dxdy
+            tile_end = n_tiles * raw_feat
+
+            encoded = [0.0] * (n_tiles * te_out)
+            idx = 0
+            for t in range(n_tiles):
+                base = t * raw_feat
+                tile_in = [dxdy[t][0], dxdy[t][1]] + features[base:base + raw_feat]
+                for j in range(te_out):
+                    x = (_dot(tile_in, te_w_rows[j]) if _dot else sum(map(_mul, tile_in, te_w_rows[j]))) + te_bias[j]
+                    if x >= 0:
+                        encoded[idx] = x / (1.0 + _exp(-x))
+                    else:
+                        e = _exp(x)
+                        encoded[idx] = x * e / (1.0 + e)
+                    idx += 1
+
+            h = encoded + features[tile_end:]
+        else:
+            h = features
 
         for op in ops:
             tag = op[0]
@@ -515,7 +569,21 @@ class MLP:
         and before optional newer heads such as `conv_dir` existed.
         """
         full_params = self.parameters()
+
+        # Params without tile encoder (trunk + heads only)
+        no_tile_params: list[Tensor] = list(self.trunk.parameters())
+        for head in self.heads.values():
+            no_tile_params.extend(head.parameters())
+
+        # Without tile encoder AND without conv_dir head
+        no_tile_no_conv_params: list[Tensor] = list(self.trunk.parameters())
+        for name, head in self.heads.items():
+            if name != "conv_dir":
+                no_tile_no_conv_params.extend(head.parameters())
+
         no_conv_params: list[Tensor] = []
+        if self.tile_encoder is not None:
+            no_conv_params.extend(self.tile_encoder.parameters())
         for layer in self.trunk.layers:
             no_conv_params.extend(layer.parameters())
         for name, head in self.heads.items():
@@ -536,8 +604,25 @@ class MLP:
                 legacy_no_conv_params.extend(head.parameters())
             legacy_params.extend(head.parameters())
 
+        # When tile_encoder is present, no_conv_params and no_tile_params
+        # can have the same count (tile_enc adds 2 params, conv_dir adds 2).
+        # Disambiguate by checking the first entry's size: tile encoder weight
+        # is much smaller than the trunk's first Linear weight.
+        _first_sz = len(state[0]) if state else 0
+        _has_tile_first = (
+            self.tile_encoder is not None
+            and len(self.tile_encoder.parameters()) > 0
+            and _first_sz == len(self.tile_encoder.parameters()[0].data)
+        )
+
         if len(state) == len(full_params):
             params = full_params
+        elif len(state) == len(no_conv_params) and _has_tile_first:
+            params = no_conv_params
+        elif len(state) == len(no_tile_params):
+            params = no_tile_params
+        elif len(state) == len(no_tile_no_conv_params):
+            params = no_tile_no_conv_params
         elif len(state) == len(no_conv_params):
             params = no_conv_params
         elif len(state) == len(legacy_params):

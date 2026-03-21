@@ -38,6 +38,8 @@ INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED
 HIDDEN_SIZES = [64, 64, 48, 48]
 H_DIM = 16  # Recurrent hidden state size
 RMSNORM_LAYERS = [True, True, True, True]
+TILE_EMBED_DIM = 8
+TILE_INPUT_DIM = TILE_FEATURES + 2  # 19: raw features + (dx/2, dy/2)
 
 DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
 
@@ -175,7 +177,7 @@ def _weight_cache_key(path: str) -> tuple[str, int, int] | None:
 
 def _build_model() -> MLP:
     model = MLP(
-        input_size=INPUT_SIZE + H_DIM,
+        input_size=GRID_SIZE * GRID_SIZE * TILE_EMBED_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM,
         hidden_sizes=HIDDEN_SIZES,
         output_heads={
             "build_type": len(BUILD_ACTIONS),
@@ -186,6 +188,8 @@ def _build_model() -> MLP:
         },
         activation="silu",
         rmsnorm_layers=RMSNORM_LAYERS,
+        tile_encoder_sizes=(TILE_INPUT_DIM, TILE_EMBED_DIM),
+        tile_grid_n=GRID_SIZE * GRID_SIZE,
     )
     model.eval()
     return model
