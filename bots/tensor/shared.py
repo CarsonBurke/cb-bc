@@ -753,6 +753,10 @@ def execute_build(ct: Controller, action: str, direction: Direction,
     elif action == "launcher":
         if ct.can_build_launcher(build_pos):
             ct.build_launcher(build_pos)
+    # Punish placing non-harvester on ore (wasted tile)
+    ore_key = (build_pos.x, build_pos.y)
+    if ore_key in GameState.all_ore_keys:
+        return -PLACE_HARV, 0.0, dbg
     return 0.0, 0.0, dbg
 
 

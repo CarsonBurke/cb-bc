@@ -652,6 +652,10 @@ class Player:
         elif action == "launcher":
             if ct.can_build_launcher(build_pos):
                 ct.build_launcher(build_pos)
+        # Punish placing non-harvester on ore (wasted tile)
+        ore_key = (build_pos.x, build_pos.y)
+        if ore_key in Player._all_ore_keys:
+            return -self._PLACE_HARV, 0.0
         return 0.0, 0.0
 
     def _execute_move(self, ct: Controller, direction: Direction) -> None:
