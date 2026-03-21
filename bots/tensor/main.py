@@ -184,7 +184,8 @@ def _build_model() -> MLP:
             "build_dir": 9,
             "conv_dir": 9,
             "move_dir": 9,
-            "h_next": H_DIM,
+            "h_gate": H_DIM,
+            "h_cand": H_DIM,
         },
         activation="silu",
         rmsnorm_layers=RMSNORM_LAYERS,
@@ -222,7 +223,7 @@ class Player:
     _all_ore_keys: set[tuple[int, int]] = set()
     _harv_proximity: dict[tuple[int, int], float] = {}  # ore_key → proximity reward given
     _harv_placed_ores: set[tuple[int, int]] = set()  # ore tiles already rewarded for placement
-    _conv_proximity: dict[tuple[int, int], float] = {}  # ore_key → conv proximity reward given
+
     _working_harv_positions: set[tuple[int, int]] = set()  # accumulated per round
     _working_harv_round: int = -1
     _working_harv_count: int = 0  # final count from previous round
@@ -258,8 +259,6 @@ class Player:
         self._dbg_harv_prox_paid: int = 0
         self._dbg_conv_attempts: int = 0
         self._dbg_conv_failures: int = 0
-        self._dbg_conv_prox_gate: int = 0
-        self._dbg_conv_prox_paid: int = 0
         if self._train_log is not None:
             _LIVE_LOG_PLAYERS.add(self)
 
@@ -335,9 +334,20 @@ class Player:
         features = obs + h_in
         outputs = self.model.infer(features)
 
-        # Update recurrent hidden state (tanh-bounded)
-        h_raw = outputs["h_next"]
-        self.h_prev = [math.tanh(x) for x in h_raw]
+        # minGRU: gated recurrent update
+        h_gate_raw = outputs["h_gate"]
+        h_cand = outputs["h_cand"]
+        h_in = self.h_prev
+        h_new = [0.0] * len(h_in)
+        for i in range(len(h_in)):
+            g = h_gate_raw[i]
+            if g >= 0:
+                z = 1.0 / (1.0 + math.exp(-g))
+            else:
+                e = math.exp(g)
+                z = e / (1.0 + e)
+            h_new[i] = (1.0 - z) * h_in[i] + z * h_cand[i]
+        self.h_prev = h_new
 
         # Compute action masks (which builds are affordable, which tiles are free)
         bt_mask, bd_mask = _compute_masks_from_obs(obs)
@@ -376,8 +386,6 @@ class Player:
         self._dbg_harv_prox_paid = 0
         self._dbg_conv_attempts = 0
         self._dbg_conv_failures = 0
-        self._dbg_conv_prox_gate = 0
-        self._dbg_conv_prox_paid = 0
         harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
         place_reward = harv_reward + conv_reward
 
@@ -416,8 +424,8 @@ class Player:
                 self._dbg_harv_prox_paid,
                 self._dbg_conv_attempts,
                 self._dbg_conv_failures,
-                self._dbg_conv_prox_gate,
-                self._dbg_conv_prox_paid,
+                0,  # conv_prox_gate (deprecated, flow reward replaces)
+                0,  # conv_prox_paid (deprecated, flow reward replaces)
                 own_dmg,
             ))
 
@@ -588,73 +596,6 @@ class Player:
             return False
 
 
-    def _conv_proximity_reward(self, ct: Controller, build_pos: Position, conv_direction: Direction) -> float:
-        """Proximity reward for successful conveyor placement near ore.
-        Uses manhattan distance with target=1 (adjacent to ore).
-        Returns delta improvement so repeated placements at the same
-        distance don't stack."""
-        best_delta, best_key, best_reward = 0.0, None, 0.0
-        ore_tiles = Player._all_ore or ()
-        fdx, fdy = DIR_DXY.get(conv_direction, (0, 0))
-        for tile_pos in ore_tiles:
-            try:
-                key = (tile_pos.x, tile_pos.y)
-                prev = Player._conv_proximity.get(key, 0.0)
-                dx = tile_pos.x - build_pos.x
-                dy = tile_pos.y - build_pos.y
-                d = abs(dx) + abs(dy)
-                if d > 10:
-                    continue
-                # Skip if conv_dir faces directly into the ore (would push away from harvester)
-                if d == 1 and fdx == dx and fdy == dy:
-                    continue
-                if d <= 1:
-                    reward = self._PLACE_CONV
-                else:
-                    reward = self._PLACE_CONV * 0.1 / (d - 1)
-                delta = reward - prev
-                if delta > best_delta:
-                    best_delta, best_key, best_reward = delta, key, reward
-            except Exception:
-                continue
-        if best_key is None or best_delta <= 0:
-            return 0.0
-        Player._conv_proximity[best_key] = best_reward
-        return best_delta
-
-    def _should_reward_conv_proximity(
-        self,
-        ct: Controller,
-        build_pos: Position,
-        conv_direction: Direction,
-        tile_building_id: int | None = None,
-        tile_building_type: EntityType | None = None,
-    ) -> bool:
-        """Only reward conveyor proximity when the attempted tile is otherwise valid.
-        Non-wall, non-ore, unit-free, empty or friendly non-core building.
-        Conv dir must not be CENTRE."""
-        if conv_direction == Direction.CENTRE:
-            return False
-        try:
-            env = ct.get_tile_env(build_pos)
-            if env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
-                return False
-            if env == Environment.WALL:
-                return False
-            if ct.get_tile_builder_bot_id(build_pos) is not None:
-                return False
-            bid = tile_building_id
-            btype = tile_building_type
-            if bid is None:
-                bid = ct.get_tile_building_id(build_pos)
-                if bid is not None:
-                    btype = ct.get_entity_type(bid)
-            if bid is None:
-                return True
-            return ct.get_team(bid) == self.my_team and btype != EntityType.CORE
-        except Exception:
-            return False
-
     def _find_core(self, ct: Controller) -> Position:
         if self.my_team is None:
             self.my_team = ct.get_team()
@@ -796,7 +737,6 @@ class Player:
     # ---- Action execution ----
 
     _PLACE_HARV = 5.0
-    _PLACE_CONV = 3.0
 
     def _execute_build(
         self,
@@ -851,12 +791,6 @@ class Player:
             if ct.can_build_conveyor(build_pos, conv_direction):
                 ct.build_conveyor(build_pos, conv_direction)
                 Player._conv_count += 1
-                if self._should_reward_conv_proximity(ct, build_pos, conv_direction, bid, btype):
-                    self._dbg_conv_prox_gate = 1
-                    reward = self._conv_proximity_reward(ct, build_pos, conv_direction)
-                    if reward > 0.0:
-                        self._dbg_conv_prox_paid = 1
-                    return 0.0, reward
             else:
                 self._dbg_conv_failures = 1
             return 0.0, 0.0
@@ -890,19 +824,13 @@ class Player:
             if ct.can_build_breach(build_pos, direction):
                 ct.build_breach(build_pos, direction)
         elif action == "splitter":
-            if ct.can_build_splitter(build_pos, direction):
-                ct.build_splitter(build_pos, direction)
+            if ct.can_build_splitter(build_pos, conv_direction):
+                ct.build_splitter(build_pos, conv_direction)
         elif action == "armoured_conveyor":
             self._dbg_conv_attempts = 1
             if ct.can_build_armoured_conveyor(build_pos, conv_direction):
                 ct.build_armoured_conveyor(build_pos, conv_direction)
                 Player._conv_count += 1
-                if self._should_reward_conv_proximity(ct, build_pos, conv_direction, bid, btype):
-                    self._dbg_conv_prox_gate = 1
-                    reward = self._conv_proximity_reward(ct, build_pos, conv_direction)
-                    if reward > 0.0:
-                        self._dbg_conv_prox_paid = 1
-                    return 0.0, reward
             else:
                 self._dbg_conv_failures = 1
             return 0.0, 0.0

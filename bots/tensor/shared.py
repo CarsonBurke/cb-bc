@@ -157,7 +157,7 @@ class GameState:
     all_ore_keys: set[tuple[int, int]] = set()
     harv_proximity: dict[tuple[int, int], float] = {}
     harv_placed_ores: set[tuple[int, int]] = set()
-    conv_proximity: dict[tuple[int, int], float] = {}
+
     working_harv_positions: set[tuple[int, int]] = set()
     working_harv_round: int = -1
     working_harv_count: int = 0
@@ -175,7 +175,7 @@ class GameState:
         cls.all_ore_keys = set()
         cls.harv_proximity = {}
         cls.harv_placed_ores = set()
-        cls.conv_proximity = {}
+
         cls.working_harv_positions = set()
         cls.working_harv_round = -1
         cls.working_harv_count = 0
@@ -465,7 +465,6 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
 # ---------------------------------------------------------------------------
 
 PLACE_HARV = 5.0
-PLACE_CONV = 5.0
 
 
 def proximity_reward(ct: Controller, build_pos: Position, my_team) -> float:
@@ -514,62 +513,6 @@ def should_reward_harvester_proximity(
     except Exception:
         return False
 
-
-def conv_proximity_reward(ct: Controller, build_pos: Position, conv_direction: Direction) -> float:
-    best_delta, best_key, best_reward = 0.0, None, 0.0
-    ore_tiles = GameState.all_ore or ()
-    fdx, fdy = DIR_DXY.get(conv_direction, (0, 0))
-    for tile_pos in ore_tiles:
-        try:
-            key = (tile_pos.x, tile_pos.y)
-            prev = GameState.conv_proximity.get(key, 0.0)
-            dx = tile_pos.x - build_pos.x
-            dy = tile_pos.y - build_pos.y
-            d = abs(dx) + abs(dy)
-            if d > 10:
-                continue
-            if d == 1 and fdx == dx and fdy == dy:
-                continue
-            if d <= 1:
-                reward = PLACE_CONV
-            else:
-                reward = PLACE_CONV * 0.1 / (d - 1)
-            delta = reward - prev
-            if delta > best_delta:
-                best_delta, best_key, best_reward = delta, key, reward
-        except Exception:
-            continue
-    if best_key is None or best_delta <= 0:
-        return 0.0
-    GameState.conv_proximity[best_key] = best_reward
-    return best_delta
-
-
-def should_reward_conv_proximity(
-    ct: Controller, build_pos: Position, conv_direction: Direction, my_team,
-    tile_building_id=None, tile_building_type=None,
-) -> bool:
-    if conv_direction == Direction.CENTRE:
-        return False
-    try:
-        env = ct.get_tile_env(build_pos)
-        if env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
-            return False
-        if env == Environment.WALL:
-            return False
-        if ct.get_tile_builder_bot_id(build_pos) is not None:
-            return False
-        bid = tile_building_id
-        btype = tile_building_type
-        if bid is None:
-            bid = ct.get_tile_building_id(build_pos)
-            if bid is not None:
-                btype = ct.get_entity_type(bid)
-        if bid is None:
-            return True
-        return ct.get_team(bid) == my_team and btype != EntityType.CORE
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------

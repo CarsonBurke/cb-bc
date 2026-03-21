@@ -162,7 +162,8 @@ def _build_model() -> MLP:
             "build_dir": 9,
             "conv_dir": 9,
             "move_dir": 9,
-            "h_next": H_DIM,
+            "h_gate": H_DIM,
+            "h_cand": H_DIM,
         },
         activation="silu",
         rmsnorm_layers=RMSNORM_LAYERS,
@@ -292,9 +293,20 @@ class Player:
         features = obs + h_in
         outputs = self.model.infer(features)
 
-        # Update recurrent hidden state (tanh-bounded)
-        h_raw = outputs["h_next"]
-        self.h_prev = [math.tanh(x) for x in h_raw]
+        # minGRU: gated recurrent update
+        h_gate_raw = outputs["h_gate"]
+        h_cand = outputs["h_cand"]
+        h_in = self.h_prev
+        h_new = [0.0] * len(h_in)
+        for i in range(len(h_in)):
+            g = h_gate_raw[i]
+            if g >= 0:
+                z = 1.0 / (1.0 + math.exp(-g))
+            else:
+                e = math.exp(g)
+                z = e / (1.0 + e)
+            h_new[i] = (1.0 - z) * h_in[i] + z * h_cand[i]
+        self.h_prev = h_new
 
         # Compute action masks (which builds are affordable, which tiles are free)
         bt_mask, bd_mask, harv_bd_mask = _compute_masks_from_obs(obs)
