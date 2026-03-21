@@ -14,7 +14,7 @@ from cambc import Controller, Direction, EntityType, Environment, Position
 
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ".")
 from tensor_lib import MLP, SinusoidalPositionEmbedding
 
 # -- Layout constants --
@@ -64,6 +64,7 @@ DIR_MAP_9 = [
     Direction.SOUTH,
     Direction.SOUTHEAST,
 ]
+CONV_DIR_MASK = [d != Direction.CENTRE for d in DIR_MAP_9]
 
 # Environment type -> one-hot index
 ENV_IDX = {
@@ -138,7 +139,7 @@ _BLD_ONE_HOTS = tuple(
 )
 
 # Weights file path (adjacent to main.py)
-WEIGHT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.json")
+WEIGHT_PATH = "weights.json"
 
 _SHARED_MODEL = None
 _SHARED_MODEL_KEY = None
@@ -159,6 +160,7 @@ def _build_model() -> MLP:
         output_heads={
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
+            "conv_dir": 9,
             "move_dir": 9,
             "h_next": H_DIM,
         },
@@ -299,6 +301,7 @@ class Player:
 
         build_type_idx = _argmax(outputs["build_type"], bt_mask)
         build_dir_idx = _argmax(outputs["build_dir"], bd_mask)
+        conv_dir_idx = _argmax(outputs["conv_dir"], CONV_DIR_MASK)
         move_dir_idx = _argmax(outputs["move_dir"], None)
 
         # Snapshot resources before actions to isolate delivery from spending
@@ -307,7 +310,8 @@ class Player:
         # Execute actions
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir)
+        conv_dir = DIR_MAP_9[conv_dir_idx]
+        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
         place_reward = harv_reward + conv_reward
 
         move_dir = DIR_MAP_9[move_dir_idx]
@@ -570,7 +574,7 @@ class Player:
     _PLACE_HARV = 5.0
 
     def _execute_build(
-        self, ct: Controller, action: str, direction: Direction
+        self, ct: Controller, action: str, direction: Direction, conv_direction: Direction | None = None
     ) -> tuple[float, float]:
         """Execute build action. Returns (harv_reward, conv_reward).
 
@@ -606,11 +610,7 @@ class Player:
                 pass
 
         if action == "conveyor":
-            conv_dir = direction
-            if self.core_center:
-                conv_dir = build_pos.direction_to(self.core_center)
-                if conv_dir == Direction.CENTRE:
-                    conv_dir = direction
+            conv_dir = conv_direction if conv_direction is not None else direction
             if ct.can_build_conveyor(build_pos, conv_dir):
                 ct.build_conveyor(build_pos, conv_dir)
                 Player._conv_count += 1
@@ -639,8 +639,9 @@ class Player:
             if ct.can_build_splitter(build_pos, direction):
                 ct.build_splitter(build_pos, direction)
         elif action == "armoured_conveyor":
-            if ct.can_build_armoured_conveyor(build_pos, direction):
-                ct.build_armoured_conveyor(build_pos, direction)
+            ac_dir = conv_direction if conv_direction is not None else direction
+            if ct.can_build_armoured_conveyor(build_pos, ac_dir):
+                ct.build_armoured_conveyor(build_pos, ac_dir)
                 Player._conv_count += 1
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):

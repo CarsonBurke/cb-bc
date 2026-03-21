@@ -86,6 +86,13 @@ export const syncFromHash = (set) => {
 export const viewerAtom = atom(null)
 export const viewerMinimizedAtom = atom(false)
 
+// Training data atoms — granular so consumers only re-render on their slice
+export const trainEpisodesAtom = atom([])
+export const trainConfigAtom = atom({})
+export const trainLoadingAtom = atom(true)
+export const trainLeagueModelsAtom = atom([])
+export const trainGameLogAtom = atom({})
+
 // Persisted card collapse state: { [cardId]: boolean }
 const STORAGE_KEY = 'dashboard-card-state'
 

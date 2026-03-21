@@ -14,7 +14,7 @@ import trueskill
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
-WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
+WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 
 # TrueSkill environment — matches ablation system settings
 TS_ENV = trueskill.TrueSkill(draw_probability=0.02)

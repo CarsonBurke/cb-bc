@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { spawn, execSync } from 'child_process'
 import { resolve } from 'path'
-import { existsSync, readdirSync, readFileSync, statSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs'
 
 const PROJECT_ROOT = resolve(import.meta.dirname, '..')
 
@@ -146,10 +146,14 @@ function replayApiPlugin() {
         }
       })
 
-      // Training log (session-aware) — reads JSONL (line 1 = config, rest = episodes)
+      // Training log (session-aware) — incremental JSONL reading + delta responses
+      // Cache stores parsed episodes + byte offset so we only read new bytes on append
+      // Clients send ?after=N to receive only episodes after index N
       server.middlewares.use('/api/train-log', (req, res) => {
         res.setHeader('Content-Type', 'application/json')
         const sd = sessionDir(req)
+        const url = new URL(req.url, 'http://localhost')
+        const after = parseInt(url.searchParams.get('after') || '0', 10)
         const base = sd || resolve(PROJECT_ROOT, 'bots/tensor')
         const jsonlPath = resolve(base, 'train_log.jsonl')
         const jsonPath = resolve(base, 'train_log.json')
@@ -157,47 +161,109 @@ function replayApiPlugin() {
           if (existsSync(jsonlPath)) {
             const st = statSync(jsonlPath)
             const cached = _trainLogCache.get(jsonlPath)
-            if (cached && cached.mtime === st.mtimeMs && cached.size === st.size) {
-              res.end(cached.json)
-              return
+
+            // Update cache if file changed
+            const canIncr = cached && st.size > cached.size && cached.offset > 0
+            if (!cached || cached.size !== st.size) {
+              let didIncr = false
+              if (canIncr) {
+                // File grew — try incremental read; fall back to full read on parse error
+                try {
+                  const newBytes = Buffer.alloc(st.size - cached.offset)
+                  const fd = openSync(jsonlPath, 'r')
+                  try {
+                    readSync(fd, newBytes, 0, newBytes.length, cached.offset)
+                  } finally {
+                    closeSync(fd)
+                  }
+                  const tail = newBytes.toString('utf8').trimEnd()
+                  if (tail) {
+                    const newEpisodes = tail.split('\n').map(l => JSON.parse(l))
+                    cached.episodes.push(...newEpisodes)
+                  }
+                  cached.offset = st.size
+                  cached.size = st.size
+                  didIncr = true
+                } catch { /* parse failed — file was rewritten, do full read below */ }
+              }
+              if (!didIncr) {
+                // Full read (first load, file rewritten, or truncated)
+                const lines = readFileSync(jsonlPath, 'utf8').trimEnd().split('\n')
+                const first = JSON.parse(lines[0])
+                const config = first.config || {}
+                const episodes = lines.slice(1).map(l => JSON.parse(l))
+                _trainLogCache.set(jsonlPath, { size: st.size, offset: st.size, episodes, config })
+              }
             }
-            const lines = readFileSync(jsonlPath, 'utf8').trimEnd().split('\n')
-            const first = JSON.parse(lines[0])
-            const config = first.config || {}
-            const episodes = lines.slice(1).map(l => JSON.parse(l))
-            const json = JSON.stringify({ episodes, config })
-            _trainLogCache.set(jsonlPath, { mtime: st.mtimeMs, size: st.size, json })
-            res.end(json)
+
+            // Respond with delta or full payload
+            const entry = _trainLogCache.get(jsonlPath)
+            if (after > 0 && after <= entry.episodes.length) {
+              const delta = entry.episodes.slice(after)
+              res.end(JSON.stringify({ episodes: delta, config: entry.config, total: entry.episodes.length }))
+            } else {
+              res.end(JSON.stringify({ episodes: entry.episodes, config: entry.config, total: entry.episodes.length }))
+            }
           } else {
             // Fallback: legacy single-JSON format
             res.end(readFileSync(jsonPath, 'utf8'))
           }
         } catch {
-          res.end(JSON.stringify({ episodes: [], config: {} }))
+          res.end(JSON.stringify({ episodes: [], config: {}, total: 0 }))
         }
       })
 
-      // Game log (session-aware) — JSONL, one line per game
-      const _gameLogCache = new Map() // path -> { mtime, json }
+      // Game log (session-aware) — incremental JSONL reading + delta responses
+      const _gameLogCache = new Map() // path -> { size, offset, games }
       server.middlewares.use('/api/game-log', (req, res) => {
         res.setHeader('Content-Type', 'application/json')
         const sd = sessionDir(req)
+        const url = new URL(req.url, 'http://localhost')
+        const after = parseInt(url.searchParams.get('after') || '0', 10)
         const base = sd || resolve(PROJECT_ROOT, 'bots/tensor')
         const logPath = resolve(base, 'game_log.jsonl')
         try {
-          const mtime = statSync(logPath).mtimeMs
+          const st = statSync(logPath)
           const cached = _gameLogCache.get(logPath)
-          if (cached && cached.mtime === mtime) {
-            res.end(cached.json)
-            return
+
+          // Update cache if file changed
+          const canIncr = cached && st.size > cached.size && cached.offset > 0
+          if (!cached || cached.size !== st.size) {
+            let didIncr = false
+            if (canIncr) {
+              try {
+                const newBytes = Buffer.alloc(st.size - cached.offset)
+                const fd = openSync(logPath, 'r')
+                try {
+                  readSync(fd, newBytes, 0, newBytes.length, cached.offset)
+                } finally {
+                  closeSync(fd)
+                }
+                const tail = newBytes.toString('utf8').trimEnd()
+                if (tail) {
+                  const newGames = tail.split('\n').map(l => JSON.parse(l))
+                  cached.games.push(...newGames)
+                }
+                cached.offset = st.size
+                cached.size = st.size
+                didIncr = true
+              } catch { /* parse failed — file was rewritten, do full read below */ }
+            }
+            if (!didIncr) {
+              const lines = readFileSync(logPath, 'utf8').trimEnd().split('\n')
+              const games = lines.map(l => JSON.parse(l))
+              _gameLogCache.set(logPath, { size: st.size, offset: st.size, games })
+            }
           }
-          const lines = readFileSync(logPath, 'utf8').trimEnd().split('\n')
-          const games = lines.map(l => JSON.parse(l))
-          const json = JSON.stringify(games)
-          _gameLogCache.set(logPath, { mtime, json })
-          res.end(json)
+
+          const entry = _gameLogCache.get(logPath)
+          if (after > 0 && after <= entry.games.length) {
+            res.end(JSON.stringify({ games: entry.games.slice(after), total: entry.games.length }))
+          } else {
+            res.end(JSON.stringify({ games: entry.games, total: entry.games.length }))
+          }
         } catch {
-          res.end(JSON.stringify([]))
+          res.end(JSON.stringify({ games: [], total: 0 }))
         }
       })
 
@@ -373,5 +439,9 @@ function replayApiPlugin() {
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), replayApiPlugin()],
+  plugins: [
+    react({ babel: { plugins: [['babel-plugin-react-compiler']] } }),
+    tailwindcss(),
+    replayApiPlugin(),
+  ],
 })

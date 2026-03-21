@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_USE_BF16 = DEVICE.type == "cuda" and torch.cuda.is_bf16_supported()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # ---- Architecture constants (must match main.py) ----
@@ -33,12 +34,11 @@ N_DIR = 9
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 HARVESTER_BUILD_TYPE = 1
 CONVEYOR_BUILD_TYPES = (2, 8)
-REWARD_WORKING_HARVESTER = 12.5
+REWARD_WORKING_HARVESTER = 2.5
 REWARD_ENEMY_CORE_DAMAGE = 20.0
-TERMINAL_WIN_REWARD = 10.0
-TERMINAL_LOSS_REWARD = -10.0
+REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
 
-WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor" / "weights.json"
+WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
 REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
 
@@ -112,13 +112,24 @@ def compute_action_masks(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     replaceable = (obs[:, nobld_idx] == 0.0) & (obs[:, friendly_idx] == 1.0) & (obs[:, core_idx] == 0.0)
     bd_mask = not_wall & no_unit & (empty | replaceable)
 
-    # Force none-only when nothing affordable or no valid direction
+    # Force none-only when nothing affordable or no valid direction.
+    # Apply unconditionally (no .any() branch) to avoid CPU-GPU sync.
     force_none = ~bt_mask[:, 1:].any(dim=1) | ~bd_mask.any(dim=1)
-    if force_none.any():
-        bt_mask[force_none, 1:] = False
-        bd_mask[force_none] = True  # dir is irrelevant, avoid NaN
+    bt_mask[:, 1:] &= ~force_none.unsqueeze(1)
+    bd_mask |= force_none.unsqueeze(1)  # dir is irrelevant, avoid NaN
 
     return bt_mask, bd_mask
+
+
+_harv_idx_cache: dict = {}
+
+
+def _harv_mask_indices(device: torch.device):
+    """Get or create cached harvester mask index tensors."""
+    if device not in _harv_idx_cache:
+        tile_base = torch.tensor([t * TILE_FEATURES for t in _MASK_BD_TILES], dtype=torch.long, device=device)
+        _harv_idx_cache[device] = (tile_base + 1, tile_base + 2)
+    return _harv_idx_cache[device]
 
 
 def compute_harvester_build_dir_mask(obs: torch.Tensor, bd_mask: torch.Tensor) -> torch.Tensor:
@@ -130,9 +141,7 @@ def compute_harvester_build_dir_mask(obs: torch.Tensor, bd_mask: torch.Tensor) -
       local observation, so failed harvester attempts can enter proximity shaping
     """
     _, _, _, nobld_idx, _, _, _ = _mask_indices(obs.device)
-    tile_base = torch.tensor([t * TILE_FEATURES for t in _MASK_BD_TILES], dtype=torch.long, device=obs.device)
-    ore_ti_idx = tile_base + 1
-    ore_ax_idx = tile_base + 2
+    ore_ti_idx, ore_ax_idx = _harv_mask_indices(obs.device)
     ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
     empty = obs[:, nobld_idx] == 1.0
 
@@ -154,16 +163,28 @@ def compute_build_dir_mask_for_type(
     """Refine build_dir mask using the chosen build type."""
     if harv_bd_mask is None:
         harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
-    mask = bd_mask.clone()
+    # Use where() instead of conditional indexing to avoid CPU-GPU sync
     harv_rows = bt_act.to(torch.long) == HARVESTER_BUILD_TYPE
-    if harv_rows.any():
-        mask[harv_rows] = harv_bd_mask[harv_rows]
-    return mask
+    return torch.where(harv_rows.unsqueeze(1), harv_bd_mask, bd_mask)
 
 
 def conveyor_dir_mask(device: torch.device, batch_size: int) -> torch.Tensor:
     mask = torch.tensor(_CONV_DIR_MASK, dtype=torch.bool, device=device)
     return mask.unsqueeze(0).expand(batch_size, -1)
+
+
+_cond_bt_cache: dict = {}
+
+
+def _cond_bt_indices(device: torch.device):
+    """Get or create cached conditional build type index tensors."""
+    if device not in _cond_bt_cache:
+        _cond_bt_cache[device] = (
+            torch.tensor(_MASK_BD_TILES, dtype=torch.long, device=device),
+            torch.tensor(_MASK_BD_DX, dtype=torch.float32, device=device),
+            torch.tensor(_MASK_BD_DY, dtype=torch.float32, device=device),
+        )
+    return _cond_bt_cache[device]
 
 
 def compute_conditional_build_type_mask(
@@ -181,9 +202,7 @@ def compute_conditional_build_type_mask(
     bt_mask = bt_mask.clone()
     bd_act = bd_act.to(torch.long)
 
-    tile_lut = torch.tensor(_MASK_BD_TILES, dtype=torch.long, device=obs.device)
-    dx_lut = torch.tensor(_MASK_BD_DX, dtype=obs.dtype, device=obs.device)
-    dy_lut = torch.tensor(_MASK_BD_DY, dtype=obs.dtype, device=obs.device)
+    tile_lut, dx_lut, dy_lut = _cond_bt_indices(obs.device)
 
     tile_base = tile_lut[bd_act] * TILE_FEATURES
     conveyor_idx = (tile_base + 6).unsqueeze(1)
@@ -200,10 +219,10 @@ def compute_conditional_build_type_mask(
     same_dir_conv = has_conveyor_family & is_friendly & same_dir
     bt_mask[same_dir_conv, 2] = False
 
+    # Apply unconditionally to avoid CPU-GPU sync
     force_none = ~bt_mask[:, 1:].any(dim=1)
-    if force_none.any():
-        bt_mask[force_none, 1:] = False
-        bt_mask[force_none, 0] = True
+    bt_mask[:, 1:] &= ~force_none.unsqueeze(1)
+    bt_mask[:, 0] |= force_none
 
     return bt_mask
 
@@ -219,8 +238,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x / rms * self.weight
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps) * self.weight
 
 
 # ---- Centralized Critic constants ----
@@ -242,8 +260,7 @@ class RMSNorm2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W) — normalize over C dimension per spatial position
-        rms = torch.sqrt(x.pow(2).mean(1, keepdim=True) + self.eps)
-        return x / rms * self.weight.view(1, -1, 1, 1)
+        return x * torch.rsqrt(x.square().mean(1, keepdim=True) + self.eps) * self.weight.view(1, -1, 1, 1)
 
 
 class CentralizedCritic(nn.Module):
@@ -290,6 +307,11 @@ class CentralizedCritic(nn.Module):
 
         self._init_weights()
 
+        # Cast conv stack to bf16 for native bf16 execution (no autocast overhead).
+        # unit_head stays fp32 for value precision.
+        if _USE_BF16:
+            self.conv = self.conv.to(dtype=torch.bfloat16)
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -310,6 +332,7 @@ class CentralizedCritic(nn.Module):
     ) -> torch.Tensor:
         """Run CNN once per unique round and return full spatial feature maps.
 
+        Conv stack runs in bf16 natively (weights are bf16).
         valid_mask is applied so padded map area contributes no signal.
         """
         return self.conv(map_tensor) * valid_mask
@@ -335,7 +358,8 @@ class CentralizedCritic(nn.Module):
         ri = round_idx.long()
 
         # Index into cached feature maps: (B, conv_dim)
-        unit_tile_feat = feat[ri, :, uy, ux]
+        # feat may be bf16 from conv stack; cast to fp32 for the value MLP
+        unit_tile_feat = feat[ri, :, uy, ux].float()
         unit_round_scalars = round_scalars[ri]
 
         # Per-unit value
@@ -362,81 +386,62 @@ class CentralizedCritic(nn.Module):
         )
 
 
-_critic_stage_obs: torch.Tensor | None = None
-_critic_stage_mask: torch.Tensor | None = None
-_critic_stage_shape = (0, 0, 0)  # n, h, w capacity
+def _materialize_critic_inputs(centralized_data: dict) -> None:
+    """Pre-materialize all round tensors on GPU as bf16.
 
+    Replaces the per-chunk CPU→GPU copy in _load_critic_round_batch with a
+    single bulk transfer. Stores results in centralized_data so subsequent
+    calls just index into the pre-built tensors.
+    """
+    global_states = centralized_data["global_states"]
+    sizes = centralized_data["global_sizes"]
+    R = len(global_states)
+    if R == 0:
+        return
 
-def _get_critic_staging_buffers(
-    batch_n: int,
-    batch_h: int,
-    batch_w: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reuse pinned CPU staging buffers for critic chunk assembly."""
-    global _critic_stage_obs, _critic_stage_mask, _critic_stage_shape
+    max_w = int(sizes[:, 0].max().item())
+    max_h = int(sizes[:, 1].max().item())
+    gpu_dtype = torch.bfloat16 if _USE_BF16 else torch.float32
 
-    cap_n, cap_h, cap_w = _critic_stage_shape
-    if (
-        _critic_stage_obs is None
-        or batch_n > cap_n
-        or batch_h > cap_h
-        or batch_w > cap_w
-    ):
-        alloc_n = max(batch_n, cap_n)
-        alloc_h = max(batch_h, cap_h)
-        alloc_w = max(batch_w, cap_w)
-        _critic_stage_obs = torch.empty(
-            alloc_n, GLOBAL_MAP_CHANNELS, alloc_h, alloc_w, dtype=torch.float32,
-        )
-        _critic_stage_mask = torch.empty(
-            alloc_n, 1, alloc_h, alloc_w, dtype=torch.float32,
-        )
-        if DEVICE.type == "cuda":
-            _critic_stage_obs = _critic_stage_obs.pin_memory()
-            _critic_stage_mask = _critic_stage_mask.pin_memory()
-        _critic_stage_shape = (alloc_n, alloc_h, alloc_w)
+    # Build on CPU then transfer once
+    obs_cpu = torch.zeros(R, GLOBAL_MAP_CHANNELS, max_h, max_w, dtype=torch.float32)
+    mask_cpu = torch.zeros(R, 1, max_h, max_w, dtype=torch.float32)
 
-    obs = _critic_stage_obs[:batch_n, :, :batch_h, :batch_w]
-    mask = _critic_stage_mask[:batch_n, :, :batch_h, :batch_w]
-    obs.zero_()
-    mask.zero_()
-    return obs, mask
+    for i in range(R):
+        mw = int(sizes[i, 0].item())
+        mh = int(sizes[i, 1].item())
+        if mw > 0 and mh > 0:
+            buf = global_states[i]
+            state_view = torch.frombuffer(
+                buf, dtype=torch.float32,
+            ).reshape(GLOBAL_MAP_CHANNELS, mh, mw)
+            obs_cpu[i, :, :mh, :mw].copy_(state_view)
+            mask_cpu[i, 0, :mh, :mw] = 1.0
+
+    centralized_data["gpu_obs"] = obs_cpu.to(device=DEVICE, dtype=gpu_dtype)
+    centralized_data["gpu_mask"] = mask_cpu.to(device=DEVICE, dtype=gpu_dtype)
+    centralized_data["gpu_scalars"] = centralized_data["global_scalars"].to(device=DEVICE)
+
+    # Free CPU-side bytearrays — no longer needed
+    centralized_data["global_states"] = None
+
+    vram_mb = (centralized_data["gpu_obs"].nbytes
+               + centralized_data["gpu_mask"].nbytes
+               + centralized_data["gpu_scalars"].nbytes) / (1024 * 1024)
+    print(f"  Critic inputs materialized on GPU: {R} rounds, "
+          f"{max_h}x{max_w} maps, {gpu_dtype}, {vram_mb:.0f} MB")
 
 
 def _load_critic_round_batch(
     centralized_data: dict,
     round_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fetch a round batch for the centralized critic and move it to DEVICE."""
-    round_ids_cpu = round_ids.detach().to("cpu")
-    round_list = round_ids_cpu.tolist()
-    sizes = centralized_data["global_sizes"][round_ids_cpu]
-    widths = sizes[:, 0]
-    heights = sizes[:, 1]
-    batch_w = int(widths.max().item()) if widths.numel() else 1
-    batch_h = int(heights.max().item()) if heights.numel() else 1
-    batch_n = len(round_list)
-
-    g_obs_cpu, g_mask_cpu = _get_critic_staging_buffers(
-        batch_n, batch_h, batch_w,
-    )
-
-    global_states = centralized_data["global_states"]
-    for batch_i, round_idx in enumerate(round_list):
-        mw = int(widths[batch_i].item())
-        mh = int(heights[batch_i].item())
-        if mw > 0 and mh > 0:
-            buf = global_states[round_idx]
-            state_view = torch.frombuffer(
-                buf, dtype=torch.float32,
-            ).reshape(GLOBAL_MAP_CHANNELS, mh, mw)
-            g_obs_cpu[batch_i, :, :mh, :mw].copy_(state_view)
-            g_mask_cpu[batch_i, 0, :mh, :mw] = 1.0
-
+    """Fetch a round batch from pre-materialized GPU tensors."""
+    ids = round_ids.long()
     return (
-        g_obs_cpu.to(device=DEVICE, non_blocking=True),
-        g_mask_cpu.to(device=DEVICE, non_blocking=True),
-        centralized_data["global_scalars"][round_ids_cpu].to(device=DEVICE, non_blocking=True),
+        centralized_data["gpu_obs"][ids],
+        centralized_data["gpu_mask"][ids],
+        centralized_data["gpu_scalars"][ids],
     )
 
 
@@ -484,6 +489,125 @@ def _normalize_actor_latent_dim(latent: torch.Tensor) -> torch.Tensor:
         return latent[:, :ACTOR_LATENT_DIM]
     pad = latent.new_zeros(latent.shape[0], ACTOR_LATENT_DIM - cur_dim)
     return torch.cat([latent, pad], dim=-1)
+
+
+class GraphedInference:
+    """CUDA-graphed full inference pipeline: model forward + masks + sampling.
+
+    Captures the entire forward+mask+sample path in a CUDA graph, eliminating
+    all CPU kernel launch overhead (~100 launches → 1 graph replay).
+    Pads inputs to MAX_B and slices outputs to the actual batch size.
+    """
+
+    def __init__(self, model: nn.Module, max_batch: int = 16):
+        self.max_batch = max_batch
+        self._model = model
+        self._graph: torch.cuda.CUDAGraph | None = None
+        # Static buffers (set during capture)
+        self._static_input: torch.Tensor | None = None
+        # Output references (point into graph memory)
+        self._s_bt_act = self._s_bd_act = self._s_cd_act = self._s_md_act = None
+        self._s_lp = self._s_h = None
+
+    def capture(self) -> None:
+        """Capture the CUDA graph. Call once after model is on device."""
+        M = self.max_batch
+        costs_ti, costs_ax, wall_idx, nobld_idx, unit_idx, friendly_idx, core_idx = _mask_indices(DEVICE)
+        ore_ti_idx, ore_ax_idx = _harv_mask_indices(DEVICE)
+        cd_mask = torch.tensor(_CONV_DIR_MASK, dtype=torch.bool, device=DEVICE)
+
+        # Match model dtype for all buffers
+        mdtype = next(self._model.parameters()).dtype
+        self._dtype = mdtype
+        self._static_input = torch.zeros(M, OBS_SIZE + H_DIM, device=DEVICE, dtype=mdtype)
+        static_g_bt = torch.empty(M, N_BUILD, device=DEVICE, dtype=mdtype)
+        static_g_bd = torch.empty(M, N_DIR, device=DEVICE, dtype=mdtype)
+        static_g_cd = torch.empty(M, N_DIR, device=DEVICE, dtype=mdtype)
+        static_g_md = torch.empty(M, N_DIR, device=DEVICE, dtype=mdtype)
+
+        # Warmup
+        with torch.no_grad():
+            self._model.infer_packed(self._static_input)
+        torch.cuda.synchronize()
+
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
+            with torch.no_grad():
+                bt_l, bd_l, cd_l, md_l, s_h = self._model.infer_packed(self._static_input)
+                obs = self._static_input[:, :OBS_SIZE]
+
+                ti = obs[:, _OBS_TI] * 500.0
+                ax = obs[:, _OBS_AX] * 500.0
+                scale = obs[:, _OBS_SCALE] * 5.0
+                actual_ti = (scale.unsqueeze(1) * costs_ti.unsqueeze(0)).floor()
+                actual_ax = (scale.unsqueeze(1) * costs_ax.unsqueeze(0)).floor()
+                bt_m = (ti.unsqueeze(1) >= actual_ti) & (ax.unsqueeze(1) >= actual_ax)
+                bt_m[:, 0] = True
+                not_wall = obs[:, wall_idx] == 0.0
+                no_unit = obs[:, unit_idx] == 0.0
+                empty = obs[:, nobld_idx] == 1.0
+                replaceable = (obs[:, nobld_idx] == 0.0) & (obs[:, friendly_idx] == 1.0) & (obs[:, core_idx] == 0.0)
+                bd_m = not_wall & no_unit & (empty | replaceable)
+                force_none = ~bt_m[:, 1:].any(dim=1) | ~bd_m.any(dim=1)
+                bt_m[:, 1:] &= ~force_none.unsqueeze(1)
+                bd_m |= force_none.unsqueeze(1)
+
+                ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
+                empty_dir = obs[:, nobld_idx] == 1.0
+                obs_tiles = obs[:, :25 * TILE_FEATURES].reshape(M, 25, TILE_FEATURES)
+                has_ore = ((obs_tiles[:, :, 1] == 1.0) | (obs_tiles[:, :, 2] == 1.0)).any(dim=1, keepdim=True)
+                harv_bd_m = (bd_m & ore_here & empty_dir) | (bd_m & ~ore_here & has_ore)
+                bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
+
+                bt_l.masked_fill_(~bt_m, -1e9)
+                cd_l.masked_fill_(~cd_mask, -1e9)
+
+                static_g_bt.exponential_()
+                s_bt_act = (bt_l - static_g_bt.log_()).argmax(dim=-1)
+
+                harv_rows = s_bt_act == HARVESTER_BUILD_TYPE
+                bd_m_final = torch.where(harv_rows.unsqueeze(1), harv_bd_m, bd_m)
+                bd_l.masked_fill_(~bd_m_final, -1e9)
+
+                static_g_bd.exponential_()
+                static_g_cd.exponential_()
+                static_g_md.exponential_()
+                s_bd_act = (bd_l - static_g_bd.log_()).argmax(dim=-1)
+                s_cd_act = (cd_l - static_g_cd.log_()).argmax(dim=-1)
+                s_md_act = (md_l - static_g_md.log_()).argmax(dim=-1)
+
+                s_bt_lp = bt_l.gather(1, s_bt_act.unsqueeze(1)).squeeze(1) - bt_l.logsumexp(dim=-1)
+                s_bd_lp = bd_l.gather(1, s_bd_act.unsqueeze(1)).squeeze(1) - bd_l.logsumexp(dim=-1)
+                s_cd_lp = cd_l.gather(1, s_cd_act.unsqueeze(1)).squeeze(1) - cd_l.logsumexp(dim=-1)
+                s_md_lp = md_l.gather(1, s_md_act.unsqueeze(1)).squeeze(1) - md_l.logsumexp(dim=-1)
+
+                bd_causal = (s_bt_act != 0).float()
+                cd_causal = ((s_bt_act == CONVEYOR_BUILD_TYPES[0]) | (s_bt_act == CONVEYOR_BUILD_TYPES[1])).float()
+                s_lp = s_bt_lp + s_bd_lp * bd_causal + s_cd_lp * cd_causal + s_md_lp
+
+        self._s_bt_act = s_bt_act
+        self._s_bd_act = s_bd_act
+        self._s_cd_act = s_cd_act
+        self._s_md_act = s_md_act
+        self._s_lp = s_lp
+        self._s_h = s_h
+
+    @torch.no_grad()
+    def __call__(self, trunk_in: torch.Tensor):
+        """Run graphed inference. Returns (bt, bd, cd, md, lp, h_next) sliced to B."""
+        B = trunk_in.shape[0]
+        self._static_input[:B].copy_(trunk_in)
+        if B < self.max_batch:
+            self._static_input[B:].zero_()
+        self._graph.replay()
+        return (
+            self._s_bt_act[:B], self._s_bd_act[:B], self._s_cd_act[:B],
+            self._s_md_act[:B], self._s_lp[:B], self._s_h[:B],
+        )
+
+    @property
+    def captured(self) -> bool:
+        return self._graph is not None
 
 
 class BuilderMLP(nn.Module):
@@ -896,7 +1020,6 @@ def _parse_trajectories(
     rw_t = torch.empty(N, dtype=torch.float32)
     step_game_t = torch.empty(N, dtype=torch.int32)
     ep_boundaries = []
-    ep_game_idx = []
 
     # Disable cyclic GC — the loop creates no reference cycles, and the
     # collector's O(live_objects) scan is expensive with many live tensors.
@@ -922,6 +1045,7 @@ def _parse_trajectories(
                         harv_r = step[10] if n > 10 else 0.0
                         dmg = step[11] if n > 11 else 0.0
                         lp_t[idx] = step[12] if n > 12 else 0.0
+                        own_dmg = step[21] if n > 21 else 0.0
                     else:
                         cd_t[idx] = step[3]
                         md_t[idx] = step[4]
@@ -930,6 +1054,7 @@ def _parse_trajectories(
                         harv_r = step[9] if n > 9 else 0.0
                         dmg = step[10] if n > 10 else 0.0
                         lp_t[idx] = step[11] if n > 11 else 0.0
+                        own_dmg = 0.0
                 else:
                     obs_t[idx] = torch.tensor(step["obs"], dtype=torch.float32)
                     h_t[idx] = torch.tensor(step["h_prev"], dtype=torch.float32)
@@ -941,17 +1066,18 @@ def _parse_trajectories(
                     conv_r = step.get("conv_r", 0)
                     harv_r = step.get("harv_r", 0)
                     dmg = step.get("dmg", 0)
+                    own_dmg = step.get("own_dmg", 0)
                     lp_t[idx] = step.get("old_lp", 0)
                 rw_t[idx] = (
                     harv_r
                     + conv_r
                     + n_working * REWARD_WORKING_HARVESTER
                     + dmg * REWARD_ENEMY_CORE_DAMAGE
+                    + own_dmg * REWARD_OWN_CORE_DAMAGE
                 )
                 step_game_t[idx] = game_idx
                 idx += 1
             ep_boundaries.append((start, idx))
-            ep_game_idx.append(game_idx)
     finally:
         if gc_was_enabled:
             gc.enable()
@@ -967,19 +1093,6 @@ def _parse_trajectories(
         rnd = int(round(obs_t[i, _OBS_GLOBAL_START].item() * 2000.0))
         rnd = max(0, min(rnd, 1999))
         rw_t[i] = round_reward[(int(step_game_t[i].item()), rnd)]
-
-    # Add a small terminal outcome reward to the final step of every unit
-    # trajectory so dead units can still learn from game outcome.
-    if game_winners:
-        for ep_i, (start, end) in enumerate(ep_boundaries):
-            if end <= start:
-                continue
-            game_idx = ep_game_idx[ep_i]
-            winner = game_winners[game_idx] if game_idx < len(game_winners) else None
-            if winner == "a":
-                rw_t[end - 1] += TERMINAL_WIN_REWARD
-            elif winner == "b":
-                rw_t[end - 1] += TERMINAL_LOSS_REWARD
 
     result = {
         "obs": obs_t.to(DEVICE),
@@ -1323,7 +1436,7 @@ def _compute_all_values(
     unit_xy = data["step_unit_xy"]        # (N, 2) long
     unit_ctx = data["step_unit_ctx"]      # (N, UNIT_CONTEXT_DIM)
     actor_latent = data["step_actor_latent"]  # (N, ACTOR_LATENT_DIM)
-    R = len(data["global_states"])
+    R = data["gpu_obs"].shape[0] if "gpu_obs" in data else len(data["global_states"])
     N = data["n_steps"]
 
     values = torch.zeros(N, device=DEVICE)
@@ -1387,6 +1500,12 @@ def train_on_trajectories(
     if not data.get("has_centralized", False):
         return {"pi_loss": 0, "vf_loss": 0, "entropy": 0, "n_updates": 0, "n_steps": N,
                 "error": "no global states available for centralized critic"}
+
+    # Pre-materialize all round tensors on GPU once (eliminates per-chunk CPU→GPU copies)
+    t_phase = time.perf_counter() if profile is not None else 0.0
+    _materialize_critic_inputs(data)
+    if profile is not None:
+        profile["materialize_s"] = time.perf_counter() - t_phase
 
     # Freeze actor-side unit summaries once so the critic sees a stable
     # per-step latent throughout PPO updates.

@@ -1,12 +1,12 @@
 """Proxy bot for batched GPU inference training.
 
-Uses regular import (not importlib) to load tensor/main.py to avoid
-engine module tracking issues that cause 'NoneType' has no attr 'A' panics.
+Sends observations over pipes to the PyTorch inference server,
+receives actions back. Uses shared.py for obs encoding, masks,
+rewards, and constants — no tensor_lib dependency.
 """
 
 import atexit
 from array import array
-import math
 import os
 import pickle
 import random
@@ -15,41 +15,20 @@ import sys
 
 _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor")
 sys.path.insert(0, _TENSOR_DIR)
-# Use importlib with explicit file path to avoid circular import when the
-# engine loads this file as module "main" (same name as tensor/main.py).
-import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location(
-    "tensor_bot_main", os.path.join(_TENSOR_DIR, "main.py"),
-    submodule_search_locations=[],
+
+from shared import (
+    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES, POS_EMBED_DIM,
+    INPUT_SIZE, HIDDEN_SIZES, H_DIM,
+    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, DIR_DXY, BUILD_COSTS,
+    _CONV_DIR_MASK,
+    SinusoidalPositionEmbedding, GameState,
+    discover_ore, scan_enemy_core_dmg, scan_own_core_dmg,
+    encode_state_into,
+    execute_build, execute_move,
+    sample_from_logits, argmax,
 )
-_TENSOR_MAIN = _ilu.module_from_spec(_spec)
-sys.modules["tensor_bot_main"] = _TENSOR_MAIN  # register to prevent re-import
-_spec.loader.exec_module(_TENSOR_MAIN)
 
 from cambc import Controller, Direction, EntityType, Environment, Position
-
-from tensor_lib import SinusoidalPositionEmbedding
-
-GRID_SIZE = _TENSOR_MAIN.GRID_SIZE
-GRID_HALF = _TENSOR_MAIN.GRID_HALF
-TILE_FEATURES = _TENSOR_MAIN.TILE_FEATURES
-GLOBAL_FEATURES = _TENSOR_MAIN.GLOBAL_FEATURES
-POS_EMBED_DIM = _TENSOR_MAIN.POS_EMBED_DIM
-INPUT_SIZE = _TENSOR_MAIN.INPUT_SIZE
-HIDDEN_SIZES = _TENSOR_MAIN.HIDDEN_SIZES
-H_DIM = _TENSOR_MAIN.H_DIM
-DIRECTIONS = _TENSOR_MAIN.DIRECTIONS
-BUILD_ACTIONS = _TENSOR_MAIN.BUILD_ACTIONS
-DIR_MAP_9 = _TENSOR_MAIN.DIR_MAP_9
-ENV_IDX = _TENSOR_MAIN.ENV_IDX
-BLD_IDX = _TENSOR_MAIN.BLD_IDX
-N_BLD_TYPES = _TENSOR_MAIN.N_BLD_TYPES
-DIR_DXY = _TENSOR_MAIN.DIR_DXY
-BUILD_COSTS = _TENSOR_MAIN.BUILD_COSTS
-_CONV_DIR_MASK = _TENSOR_MAIN._CONV_DIR_MASK
-_argmax = _TENSOR_MAIN._argmax
-_sample_from_logits = _TENSOR_MAIN._sample_from_logits
-_TensorPlayer = _TENSOR_MAIN.Player
 
 _TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
 
@@ -77,11 +56,6 @@ def _flush_live_logs():
 
 
 atexit.register(_flush_live_logs)
-
-
-def _new_proxy_player():
-    """Create a bare tensor Player without model construction or weight I/O."""
-    return object.__new__(_TensorPlayer)
 
 
 def _get_pipes():
@@ -147,10 +121,6 @@ class Player:
         self._prev_resources = None
         self._n_builders_cached = 1
         self._spawn_round: int = -1
-        self._dbg_harv_attempts: int = 0
-        self._dbg_harv_failures: int = 0
-        self._dbg_harv_prox_gate: int = 0
-        self._dbg_harv_prox_paid: int = 0
         self._train_log = [] if _TRAIN_LOG else None
         self._unit_id = id(self) % (2**31)
         if self._train_log is not None:
@@ -169,8 +139,6 @@ class Player:
     def _run_core(self, ct):
         if self.core_center is None:
             self.core_center = ct.get_position()
-        # NOTE: _discover_ore/_scan_* not called here to avoid cross-module
-        # Controller calls before ct.spawn_builder (engine module tracking bug).
         ti, ax = ct.get_global_resources()
         reserve_floor = 150 * (self.num_spawned + 1)
         if ti < reserve_floor:
@@ -194,6 +162,11 @@ class Player:
             self.my_team = ct.get_team()
         if self.core_center is None:
             self._find_core(ct)
+
+        discover_ore(ct)
+        scan_enemy_core_dmg(ct)
+        scan_own_core_dmg(ct)
+
         obs = self._encode_state_buf(ct)
 
         obs_wfd, act_rfd = _get_pipes()
@@ -221,14 +194,10 @@ class Player:
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = DIR_MAP_9[conv_dir_idx]
-        self._dbg_harv_attempts = 0
-        self._dbg_harv_failures = 0
-        self._dbg_harv_prox_gate = 0
-        self._dbg_harv_prox_paid = 0
-        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
+        harv_reward, conv_reward, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team)
 
         move_dir = DIR_MAP_9[move_dir_idx]
-        self._execute_move(ct, move_dir)
+        execute_move(ct, move_dir)
 
         ti_after, ax_after = ct.get_global_resources()
         self._prev_resources = (ti_after, ax_after)
@@ -238,9 +207,10 @@ class Player:
                 obs.tolist(), list(h_in),
                 build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx,
                 value, 0, conv_reward, ti_after,
-                harv_reward, _TensorPlayer._enemy_core_dmg, old_log_prob,
-                self._dbg_harv_attempts, self._dbg_harv_failures,
-                self._dbg_harv_prox_gate, self._dbg_harv_prox_paid,
+                harv_reward, GameState.enemy_core_dmg, old_log_prob,
+                dbg[0], dbg[1], dbg[2], dbg[3],
+                dbg[4], dbg[5], dbg[6], dbg[7],
+                GameState.own_core_dmg,
             ))
             if ct.get_current_round() >= 1999:
                 self._flush_log()
@@ -258,178 +228,21 @@ class Player:
             except Exception:
                 continue
 
-    def _get_proxy(self):
-        if not hasattr(self, '_proxy'):
-            self._proxy = _new_proxy_player()
-        _p = self._proxy
-        _p.core_center = self.core_center
-        _p.enemy_core = self.enemy_core
-        _p.my_team = self.my_team
-        _p.pos_encoder = self.pos_encoder
-        _p._n_builders_cached = self._n_builders_cached
-        _p._prev_resources = self._prev_resources
-        _p._spawn_round = self._spawn_round
-        return _p
-
-    def _sync_from_proxy(self, _p):
-        self._n_builders_cached = _p._n_builders_cached
-        self.enemy_core = _p.enemy_core
-
-    def _encode_state(self, ct):
-        _TensorPlayer._discover_ore(ct)
-        _TensorPlayer._scan_enemy_core_dmg(ct)
-        _p = self._get_proxy()
-        result = _TensorPlayer._encode_state(_p, ct)
-        self._sync_from_proxy(_p)
-        return result
-
     def _encode_state_buf(self, ct):
-        _TensorPlayer._discover_ore(ct)
-        _TensorPlayer._scan_enemy_core_dmg(ct)
-        _p = self._get_proxy()
+        discover_ore(ct)
+        scan_enemy_core_dmg(ct)
+        scan_own_core_dmg(ct)
         del self._obs_buf[:]
-        _TensorPlayer._encode_state_into(_p, ct, self._obs_buf)
-        self._sync_from_proxy(_p)
+        n_builders_out = [0]
+        result = encode_state_into(
+            ct, self._obs_buf, self.core_center, self.enemy_core,
+            self.my_team, self.pos_encoder, self._prev_resources,
+            self._spawn_round, n_builders_out,
+        )
+        if result is not None:
+            self.core_center, self.enemy_core = result
+        self._n_builders_cached = n_builders_out[0]
         return self._obs_buf
-
-    def _execute_build(self, ct, action, direction, conv_direction):
-        """Execute build directly (avoids cross-module Controller calls that can panic)."""
-        if action == "none":
-            return 0.0, 0.0
-
-        _p = self._get_proxy()
-        pos = ct.get_position()
-        build_pos = pos.add(direction)
-        w, h = ct.get_map_width(), ct.get_map_height()
-        if build_pos.x < 0 or build_pos.x >= w or build_pos.y < 0 or build_pos.y >= h:
-            return 0.0, 0.0
-
-        bid = ct.get_tile_building_id(build_pos)
-        btype = None
-        if bid is not None:
-            try:
-                btype = ct.get_entity_type(bid)
-                if ct.get_team(bid) == self.my_team:
-                    if action == "conveyor" and btype == EntityType.CONVEYOR and ct.get_direction(bid) == conv_direction:
-                        return 0.0, 0.0
-                    if action == "armoured_conveyor" and btype == EntityType.ARMOURED_CONVEYOR and ct.get_direction(bid) == conv_direction:
-                        return 0.0, 0.0
-                if ct.get_team(bid) == self.my_team and btype != EntityType.CORE:
-                    idx = BUILD_ACTIONS.index(action)
-                    base_ti, base_ax = BUILD_COSTS[idx]
-                    scale = ct.get_scale_percent() / 100.0
-                    ti, ax = ct.get_global_resources()
-                    if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
-                        ct.destroy(build_pos)
-                        bid, btype = None, None
-                    else:
-                        return 0.0, 0.0
-            except Exception:
-                pass
-
-        if action == "conveyor":
-            if ct.can_build_conveyor(build_pos, conv_direction):
-                ct.build_conveyor(build_pos, conv_direction)
-                _TensorPlayer._conv_count += 1
-        if action == "harvester":
-            self._dbg_harv_attempts = 1
-            if ct.can_build_harvester(build_pos):
-                ct.build_harvester(build_pos)
-                ore_key = (build_pos.x, build_pos.y)
-                if ore_key in _TensorPlayer._harv_placed_ores:
-                    self._sync_from_proxy(_p)
-                    return 0.0, 0.0
-                _TensorPlayer._harv_placed_ores.add(ore_key)
-                self._sync_from_proxy(_p)
-                return _p._PLACE_HARV, 0.0
-            self._dbg_harv_failures = 1
-            reward = 0.0
-            if _TensorPlayer._should_reward_harvester_proximity(_p, ct, build_pos, bid, btype):
-                self._dbg_harv_prox_gate = 1
-                reward = _TensorPlayer._proximity_reward(_p, ct, build_pos)
-                if reward > 0.0:
-                    self._dbg_harv_prox_paid = 1
-            self._sync_from_proxy(_p)
-            return reward, 0.0
-        if action == "road":
-            if ct.can_build_road(build_pos):
-                ct.build_road(build_pos)
-        elif action == "gunner":
-            if ct.can_build_gunner(build_pos, direction):
-                ct.build_gunner(build_pos, direction)
-        elif action == "sentinel":
-            if ct.can_build_sentinel(build_pos, direction):
-                ct.build_sentinel(build_pos, direction)
-        elif action == "breach":
-            if ct.can_build_breach(build_pos, direction):
-                ct.build_breach(build_pos, direction)
-        elif action == "splitter":
-            if ct.can_build_splitter(build_pos, direction):
-                ct.build_splitter(build_pos, direction)
-        elif action == "armoured_conveyor":
-            if ct.can_build_armoured_conveyor(build_pos, conv_direction):
-                ct.build_armoured_conveyor(build_pos, conv_direction)
-                _TensorPlayer._conv_count += 1
-        elif action == "barrier":
-            if ct.can_build_barrier(build_pos):
-                ct.build_barrier(build_pos)
-        elif action == "foundry":
-            if ct.can_build_foundry(build_pos):
-                ct.build_foundry(build_pos)
-        elif action == "launcher":
-            if ct.can_build_launcher(build_pos):
-                ct.build_launcher(build_pos)
-        self._sync_from_proxy(_p)
-        return 0.0, 0.0
-
-    def _execute_move(self, ct, direction):
-        if direction == Direction.CENTRE:
-            return
-        pos = ct.get_position()
-        w, h = ct.get_map_width(), ct.get_map_height()
-        move_pos = pos.add(direction)
-        if 0 <= move_pos.x < w and 0 <= move_pos.y < h:
-            if ct.can_build_road(move_pos):
-                ct.build_road(move_pos)
-        if ct.can_move(direction):
-            ct.move(direction)
-            return
-        for alt in (direction.rotate_left(), direction.rotate_right()):
-            alt_pos = pos.add(alt)
-            if 0 <= alt_pos.x < w and 0 <= alt_pos.y < h:
-                if ct.can_build_road(alt_pos):
-                    ct.build_road(alt_pos)
-            if ct.can_move(alt):
-                ct.move(alt)
-                return
-
-    def _ore_penalty(self, ct):
-        pos = ct.get_position()
-        total_ore = 0
-        penalty_sum = 0.0
-        n_uncapped = 0
-        n_idle = 0
-        for tile_pos in ct.get_nearby_tiles():
-            try:
-                env = ct.get_tile_env(tile_pos)
-                if env not in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
-                    continue
-                total_ore += 1
-                bid = ct.get_tile_building_id(tile_pos)
-                if bid is not None and ct.get_entity_type(bid) == EntityType.HARVESTER \
-                   and ct.get_team(bid) == self.my_team:
-                    if ct.get_stored_resource(bid) is not None:
-                        penalty_sum += 0.45
-                        n_idle += 1
-                else:
-                    d = max(abs(tile_pos.x - pos.x), abs(tile_pos.y - pos.y))
-                    penalty_sum += 0.5 + 0.5 * d / (d + 1.0)
-                    n_uncapped += 1
-            except Exception:
-                continue
-        if total_ore == 0:
-            return 0.0, 0.0, 0.0
-        return penalty_sum / total_ore, n_uncapped / total_ore, n_idle / total_ore
 
     def _flush_log(self):
         if not self._train_log or not _TRAIN_LOG:
