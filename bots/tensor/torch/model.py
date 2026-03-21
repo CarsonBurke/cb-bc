@@ -705,7 +705,8 @@ class BuilderMLP(nn.Module):
         self.head_build_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
         self.head_conv_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
         self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
-        self.head_h_next = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)
+        self.head_h_gate = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wz: update gate
+        self.head_h_cand = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wh: candidate
 
     def train(self, mode=True):
         # Invalidate fused head cache when entering train mode
@@ -744,31 +745,31 @@ class BuilderMLP(nn.Module):
             combined_w = torch.cat([
                 self.head_build_type.weight, self.head_build_dir.weight,
                 self.head_conv_dir.weight,
-                self.head_move_dir.weight, self.head_h_next.weight,
+                self.head_move_dir.weight, self.head_h_gate.weight, self.head_h_cand.weight,
             ], dim=0)
             combined_b = torch.cat([
                 self.head_build_type.bias, self.head_build_dir.bias,
                 self.head_conv_dir.bias,
-                self.head_move_dir.bias, self.head_h_next.bias,
+                self.head_move_dir.bias, self.head_h_gate.bias, self.head_h_cand.bias,
             ])
         else:
             if not hasattr(self, '_cached_head_w'):
                 self._cached_head_w = torch.cat([
                     self.head_build_type.weight, self.head_build_dir.weight,
                     self.head_conv_dir.weight,
-                    self.head_move_dir.weight, self.head_h_next.weight,
+                    self.head_move_dir.weight, self.head_h_gate.weight, self.head_h_cand.weight,
                 ], dim=0)
                 self._cached_head_b = torch.cat([
                     self.head_build_type.bias, self.head_build_dir.bias,
                     self.head_conv_dir.bias,
-                    self.head_move_dir.bias, self.head_h_next.bias,
+                    self.head_move_dir.bias, self.head_h_gate.bias, self.head_h_cand.bias,
                 ])
             combined_w = self._cached_head_w
             combined_b = self._cached_head_b
 
         combined = F.linear(h, combined_w, combined_b)
-        bt_l, bd_l, cd_l, md_l, h_raw = combined.split([N_BUILD, N_DIR, N_DIR, N_DIR, H_DIM], dim=-1)
-        return bt_l, bd_l, cd_l, md_l, torch.tanh(h_raw)
+        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = combined.split([N_BUILD, N_DIR, N_DIR, N_DIR, H_DIM, H_DIM], dim=-1)
+        return bt_l, bd_l, cd_l, md_l, h_gate, h_cand
 
     def _forward_from_trunk_in(self, trunk_in: torch.Tensor):
         enc = self.encoder(trunk_in)
@@ -777,14 +778,20 @@ class BuilderMLP(nn.Module):
 
     def forward(self, x, h_prev):
         trunk_in = self._build_trunk_input(x, h_prev)
-        return self._forward_from_trunk_in(trunk_in)
+        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = self._forward_from_trunk_in(trunk_in)
+        z = torch.sigmoid(h_gate)
+        h_next = (1.0 - z) * h_prev + z * h_cand
+        return bt_l, bd_l, cd_l, md_l, h_next
 
     def infer_packed(self, packed: torch.Tensor):
         """Inference-only path for already-packed [obs, h_prev] batches."""
         obs = packed[:, :OBS_SIZE]
         h_prev = packed[:, OBS_SIZE:]
         trunk_in = self._build_trunk_input(obs, h_prev)
-        return self._forward_from_trunk_in(trunk_in)
+        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = self._forward_from_trunk_in(trunk_in)
+        z = torch.sigmoid(h_gate)
+        h_next = (1.0 - z) * h_prev + z * h_cand
+        return bt_l, bd_l, cd_l, md_l, h_next
 
     def _policy_state_modules(self) -> list[nn.Module]:
         """Policy modules only in tensor_lib serialization order (critic excluded)."""
@@ -793,7 +800,7 @@ class BuilderMLP(nn.Module):
         actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
         return tile_modules + enc_modules + actor_modules + [
             self.head_build_type, self.head_build_dir, self.head_conv_dir, self.head_move_dir,
-            self.head_h_next,
+            self.head_h_gate, self.head_h_cand,
         ]
 
     def export_weights(self) -> list[list[float]]:
