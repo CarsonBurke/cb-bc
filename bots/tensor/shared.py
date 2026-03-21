@@ -427,40 +427,8 @@ def encode_state(ct: Controller, core_center, enemy_core, my_team,
 # Masks
 # ---------------------------------------------------------------------------
 
-def compute_harvester_build_dir_mask(obs: list[float], bd_mask: list[bool]) -> list[bool]:
-    has_visible_ore = False
-    for tile in range(GRID_SIZE * GRID_SIZE):
-        ts = tile * TILE_FEATURES
-        if obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0:
-            has_visible_ore = True
-            break
-
-    harv_bd_mask = [False] * 9
-    for d_idx in range(9):
-        if not bd_mask[d_idx]:
-            continue
-        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
-        is_ore = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
-        empty = obs[ts + 4] == 1.0
-        harv_bd_mask[d_idx] = (is_ore and empty) or ((not is_ore) and has_visible_ore)
-    return harv_bd_mask
-
-
-def compute_conditional_build_dir_mask(
-    obs: list[float],
-    build_type_idx: int,
-    bd_mask: list[bool],
-    harv_bd_mask: list[bool] | None = None,
-) -> list[bool]:
-    if build_type_idx != _HARVESTER_BUILD_TYPE:
-        return bd_mask
-    if harv_bd_mask is None:
-        harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
-    return harv_bd_mask
-
-
-def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], list[bool]]:
-    """Returns (bt_mask, bd_mask, harv_bd_mask)."""
+def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
+    """Returns (bt_mask, bd_mask)."""
     g = _GLOBAL_OBS_START
     ti = obs[g + 3] * 500.0
     ax = obs[g + 4] * 500.0
@@ -486,14 +454,10 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], li
             bd_mask[d_idx] = True
             any_dir = True
 
-    harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
-    if not any(harv_bd_mask):
-        bt_mask[_HARVESTER_BUILD_TYPE] = False
-
     if not any_affordable or not any_dir:
-        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9, [True] * 9
+        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9
 
-    return bt_mask, bd_mask, harv_bd_mask
+    return bt_mask, bd_mask
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +633,8 @@ def execute_build(ct: Controller, action: str, direction: Direction,
                     return 0.0, 0.0, _ZERO_DBG
                 if action == "armoured_conveyor" and btype == EntityType.ARMOURED_CONVEYOR and ct.get_direction(bid) == conv_direction:
                     return 0.0, 0.0, _ZERO_DBG
+                if action == "splitter" and btype == EntityType.SPLITTER and ct.get_direction(bid) == conv_direction:
+                    return 0.0, 0.0, _ZERO_DBG
             if ct.get_team(bid) == my_team and btype != EntityType.CORE:
                 idx = BUILD_ACTIONS.index(action)
                 base_ti, base_ax = BUILD_COSTS[idx]
@@ -689,15 +655,8 @@ def execute_build(ct: Controller, action: str, direction: Direction,
         if ct.can_build_conveyor(build_pos, conv_direction):
             ct.build_conveyor(build_pos, conv_direction)
             GameState.conv_count += 1
-            if should_reward_conv_proximity(ct, build_pos, conv_direction, my_team, bid, btype):
-                dbg[6] = 1
-                reward = conv_proximity_reward(ct, build_pos, conv_direction)
-                if reward > 0.0:
-                    dbg[7] = 1
-                return 0.0, reward, dbg
         else:
             dbg[5] = 1
-        return 0.0, 0.0, dbg
     elif action == "harvester":
         dbg[0] = 1
         if ct.can_build_harvester(build_pos):
@@ -706,13 +665,12 @@ def execute_build(ct: Controller, action: str, direction: Direction,
             if ore_key in GameState.harv_placed_ores:
                 return 0.0, 0.0, dbg
             GameState.harv_placed_ores.add(ore_key)
+            dbg[3] = 1
             return PLACE_HARV, 0.0, dbg
         dbg[1] = 1
         if should_reward_harvester_proximity(ct, build_pos, my_team, bid, btype):
             dbg[2] = 1
             reward = proximity_reward(ct, build_pos, my_team)
-            if reward > 0.0:
-                dbg[3] = 1
             return reward, 0.0, dbg
         return 0.0, 0.0, dbg
     elif action == "road":
@@ -728,22 +686,15 @@ def execute_build(ct: Controller, action: str, direction: Direction,
         if ct.can_build_breach(build_pos, direction):
             ct.build_breach(build_pos, direction)
     elif action == "splitter":
-        if ct.can_build_splitter(build_pos, direction):
-            ct.build_splitter(build_pos, direction)
+        if ct.can_build_splitter(build_pos, conv_direction):
+            ct.build_splitter(build_pos, conv_direction)
     elif action == "armoured_conveyor":
         dbg[4] = 1
         if ct.can_build_armoured_conveyor(build_pos, conv_direction):
             ct.build_armoured_conveyor(build_pos, conv_direction)
             GameState.conv_count += 1
-            if should_reward_conv_proximity(ct, build_pos, conv_direction, my_team, bid, btype):
-                dbg[6] = 1
-                reward = conv_proximity_reward(ct, build_pos, conv_direction)
-                if reward > 0.0:
-                    dbg[7] = 1
-                return 0.0, reward, dbg
         else:
             dbg[5] = 1
-        return 0.0, 0.0, dbg
     elif action == "barrier":
         if ct.can_build_barrier(build_pos):
             ct.build_barrier(build_pos)
@@ -753,10 +704,6 @@ def execute_build(ct: Controller, action: str, direction: Direction,
     elif action == "launcher":
         if ct.can_build_launcher(build_pos):
             ct.build_launcher(build_pos)
-    # Punish placing non-harvester on ore (wasted tile)
-    ore_key = (build_pos.x, build_pos.y)
-    if ore_key in GameState.all_ore_keys:
-        return -PLACE_HARV, 0.0, dbg
     return 0.0, 0.0, dbg
 
 

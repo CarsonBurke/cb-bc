@@ -297,10 +297,12 @@ class Player:
         self.h_prev = [math.tanh(x) for x in h_raw]
 
         # Compute action masks (which builds are affordable, which tiles are free)
-        bt_mask, bd_mask = _compute_masks_from_obs(obs)
+        bt_mask, bd_mask, harv_bd_mask = _compute_masks_from_obs(obs)
 
         build_type_idx = _argmax(outputs["build_type"], bt_mask)
-        build_dir_idx = _argmax(outputs["build_dir"], bd_mask)
+        # Use harvester-specific direction mask when building harvester
+        effective_bd_mask = harv_bd_mask if build_type_idx == 1 else bd_mask
+        build_dir_idx = _argmax(outputs["build_dir"], effective_bd_mask)
         conv_dir_idx = _argmax(outputs["conv_dir"], CONV_DIR_MASK)
         move_dir_idx = _argmax(outputs["move_dir"], None)
 
@@ -421,7 +423,7 @@ class Player:
                 d = max(abs(tile_pos.x - pos.x), abs(tile_pos.y - pos.y))
                 if d > 10:
                     continue
-                reward = self._PLACE_HARV / (1.0 + d)
+                reward = self._PLACE_HARV * 0.2 / (1.0 + d)
                 delta = reward - prev
                 if delta > best_delta:
                     best_delta, best_key, best_reward = delta, key, reward
@@ -598,6 +600,16 @@ class Player:
         if bid is not None:
             try:
                 if ct.get_team(bid) == self.my_team and ct.get_entity_type(bid) != EntityType.CORE:
+                    btype_existing = ct.get_entity_type(bid)
+                    # Skip rebuilding identical conveyor-family buildings
+                    conv_dir = conv_direction if conv_direction is not None else direction
+                    sp_dir = conv_direction if conv_direction is not None else direction
+                    if action == "conveyor" and btype_existing == EntityType.CONVEYOR and ct.get_direction(bid) == conv_dir:
+                        return 0.0, 0.0
+                    if action == "armoured_conveyor" and btype_existing == EntityType.ARMOURED_CONVEYOR and ct.get_direction(bid) == conv_dir:
+                        return 0.0, 0.0
+                    if action == "splitter" and btype_existing == EntityType.SPLITTER and ct.get_direction(bid) == sp_dir:
+                        return 0.0, 0.0
                     idx = BUILD_ACTIONS.index(action)
                     base_ti, base_ax = BUILD_COSTS[idx]
                     scale = ct.get_scale_percent() / 100.0
@@ -636,8 +648,9 @@ class Player:
             if ct.can_build_breach(build_pos, direction):
                 ct.build_breach(build_pos, direction)
         elif action == "splitter":
-            if ct.can_build_splitter(build_pos, direction):
-                ct.build_splitter(build_pos, direction)
+            sp_dir = conv_direction if conv_direction is not None else direction
+            if ct.can_build_splitter(build_pos, sp_dir):
+                ct.build_splitter(build_pos, sp_dir)
         elif action == "armoured_conveyor":
             ac_dir = conv_direction if conv_direction is not None else direction
             if ct.can_build_armoured_conveyor(build_pos, ac_dir):
@@ -681,13 +694,13 @@ class Player:
             if ct.can_move(alt):
                 ct.move(alt)
                 return
-def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
+def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], list[bool]]:
     """Compute build_type and build_dir action masks.
 
     Build directions allow both empty tiles and tiles with friendly non-core
     buildings (the execution layer auto-destroys before building).
 
-    Returns (bt_mask, bd_mask) as lists of booleans (True = allowed).
+    Returns (bt_mask, bd_mask, harv_bd_mask) as lists of booleans (True = allowed).
     """
     g = _GLOBAL_OBS_START
     ti = obs[g + 3] * 500.0
@@ -719,9 +732,28 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
 
     # If nothing affordable or nowhere to build, force "none" (dir irrelevant)
     if not any_affordable or not any_dir:
-        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9
+        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9, [True] * 9
 
-    return bt_mask, bd_mask
+    # Harvester build-direction mask: only allow dirs on ore (if ore visible)
+    # or dirs NOT on ore (if ore visible elsewhere). Suppress harvester if no valid dir.
+    has_visible_ore = False
+    for tile in range(GRID_SIZE * GRID_SIZE):
+        ts = tile * TILE_FEATURES
+        if obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0:
+            has_visible_ore = True
+            break
+    harv_bd_mask = [False] * 9
+    for d_idx in range(9):
+        if not bd_mask[d_idx]:
+            continue
+        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
+        is_ore = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
+        empty = obs[ts + 4] == 1.0
+        harv_bd_mask[d_idx] = (is_ore and empty) or ((not is_ore) and has_visible_ore)
+    if not any(harv_bd_mask):
+        bt_mask[1] = False  # suppress harvester
+
+    return bt_mask, bd_mask, harv_bd_mask
 
 
 def _argmax(data: list[float], mask: list[bool] | None = None) -> int:
