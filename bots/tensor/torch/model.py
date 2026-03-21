@@ -286,26 +286,37 @@ class CentralizedCritic(nn.Module):
     Takes full map state (omniscient, from replay) and produces per-unit
     value estimates. Only used during training.
 
-    The CNN encodes the map once per round. Per-unit computation is just
-    an index into the feature map + a small MLP (cheap, O(1) per unit).
+    Architecture:
+      1. Per-tile 1×1 conv encodes sparse 19-channel indicators into dense
+         embeddings (preserves directional info for supply line analysis).
+      2. Stride-2 3×3 conv downsamples 40×40 → 20×20 with spatial mixing.
+      3. Dilated 3×3 convs expand receptive field at half resolution.
+      4. Per-unit indexing + MLP produces value estimates.
     """
+
+    _STRIDE = 2  # spatial downsample factor
 
     def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS, conv_dim: int = 64):
         super().__init__()
         self.conv_dim = conv_dim
 
-        # Dilated conv stack: full spatial resolution, 31-tile receptive field
         self.conv = nn.Sequential(
-            nn.Conv2d(map_channels, 32, 3, padding=1, dilation=1),
-            RMSNorm2d(32),
+            # Per-tile encode: sparse binary channels → dense embedding.
+            # 1×1 kernel = shared MLP per tile, no spatial mixing yet.
+            nn.Conv2d(map_channels, conv_dim, 1),
+            RMSNorm2d(conv_dim),
             nn.SiLU(),
-            nn.Conv2d(32, conv_dim, 3, padding=2, dilation=2),
+            # Stride-2 spatial downsample: 40×40 → 20×20.
+            # Operates on dense tile embeddings so directional info
+            # (encoded as distinct vectors) survives the mixing.
+            nn.Conv2d(conv_dim, conv_dim, 3, stride=self._STRIDE, padding=1),
+            RMSNorm2d(conv_dim),
+            nn.SiLU(),
+            # Dilated spatial layers at half resolution.
+            nn.Conv2d(conv_dim, conv_dim, 3, padding=2, dilation=2),
             RMSNorm2d(conv_dim),
             nn.SiLU(),
             nn.Conv2d(conv_dim, conv_dim, 3, padding=4, dilation=4),
-            RMSNorm2d(conv_dim),
-            nn.SiLU(),
-            nn.Conv2d(conv_dim, conv_dim, 3, padding=8, dilation=8),
             RMSNorm2d(conv_dim),
             nn.SiLU(),
         )
@@ -347,31 +358,41 @@ class CentralizedCritic(nn.Module):
         map_tensor: torch.Tensor,    # (R, C, H, W) — R unique rounds
         valid_mask: torch.Tensor,     # (R, 1, H, W)
     ) -> torch.Tensor:
-        """Run CNN once per unique round and return full spatial feature maps.
+        """Run CNN once per unique round and return spatial feature maps.
 
         Conv stack runs in bf16 natively (weights are bf16).
-        valid_mask is applied so padded map area contributes no signal.
+        Output is at stride-2 resolution (H/2, W/2).
+        valid_mask is downsampled to match and applied so padded area
+        contributes no signal.
         """
-        return self.conv(map_tensor) * valid_mask
+        feat = self.conv(map_tensor)
+        # Downsample mask to match feature map resolution.
+        # Use ceil_mode=True so odd spatial dims produce the same size
+        # as Conv2d(stride=2, padding=1) which uses ceil semantics.
+        mask_ds = F.max_pool2d(valid_mask, self._STRIDE, ceil_mode=True)
+        return feat * mask_ds
 
     def unit_values(
         self,
-        feat: torch.Tensor,          # (R, conv_dim, H, W) — cached from encode_map
+        feat: torch.Tensor,          # (R, conv_dim, H', W') — cached from encode_map
         round_scalars: torch.Tensor,  # (R, GLOBAL_SCALAR_DIM)
         round_idx: torch.Tensor,      # (B,) — maps each unit-step to its round index
-        unit_xy: torch.Tensor,        # (B, 2) — x, y positions (long)
+        unit_xy: torch.Tensor,        # (B, 2) — x, y positions in ORIGINAL map coords
         unit_context: torch.Tensor,   # (B, UNIT_CONTEXT_DIM)
         actor_latent: torch.Tensor,   # (B, ACTOR_LATENT_DIM) — detached rollout latent
     ) -> torch.Tensor:
         """Compute per-unit marginal values by indexing cached feature maps.
 
+        unit_xy is in original map coordinates; scaled by stride factor
+        to index into the downsampled feature maps.
+
         Returns:
             v_unit: (B,) — per-unit marginal value
         """
-        B = round_idx.shape[0]
-        H, W = feat.shape[2], feat.shape[3]
-        ux = unit_xy[:, 0].clamp(0, W - 1).long()
-        uy = unit_xy[:, 1].clamp(0, H - 1).long()
+        fH, fW = feat.shape[2], feat.shape[3]
+        # Map original tile coords → downsampled feature map coords
+        ux = (unit_xy[:, 0] // self._STRIDE).clamp(0, fW - 1).long()
+        uy = (unit_xy[:, 1] // self._STRIDE).clamp(0, fH - 1).long()
         ri = round_idx.long()
 
         # Index into cached feature maps: (B, conv_dim)
