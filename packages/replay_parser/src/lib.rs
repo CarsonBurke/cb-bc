@@ -635,10 +635,11 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                         state[14 * plane_size + base] = dy;
                     }
                     if kind.is_storing() && ent.stored > 0 {
-                        state[17 * plane_size + base] = 1.0;
+                        // 1.0 = titanium, -1.0 = axionite
+                        state[17 * plane_size + base] = if ent.stored == 1 { 1.0 } else { -1.0 };
                     }
                     if kind == EntityKind::Harvester && ent.cooldown > 0 {
-                        state[18 * plane_size + base] = 1.0;
+                        state[18 * plane_size + base] = ent.cooldown as f32 / 3.0;
                     }
                     if kind == EntityKind::Core {
                         core_hp[ent.team as usize] = ent.hp;
