@@ -488,7 +488,7 @@ fn decode_update(data: &[u8]) -> Option<UpdateEvent> {
 // ── State extraction ──────────────────────────────────────────────────────
 
 const N_CHANNELS: usize = 19;
-const N_SCALARS: usize = 12;
+const N_SCALARS: usize = 17;
 
 const DIR_DELTA: [(f32, f32); 9] = [
     (0.0, 0.0),   // CENTRE
@@ -567,6 +567,11 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
 
     let mut player_res: [PlayerRes; 2] = [PlayerRes::default(), PlayerRes::default()];
     let mut prev_ti_collected: [i32; 2] = [0, 0];
+    // Track previous-turn values for delta scalars
+    let mut prev_own_ti: f32 = 0.0;
+    let mut prev_own_ax: f32 = 0.0;
+    let mut prev_own_core_hp: f32 = 500.0;
+    let mut prev_own_working: f32 = 0.0;
     let team_idx = team as usize;
     let enemy_idx = enemy_team as usize;
 
@@ -658,6 +663,19 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
         sc[9] = own_res.resources_collected as f32 / 500.0;
         sc[10] = enemy_res.resources_collected as f32 / 500.0;
         sc[11] = entities.len() as f32 / 100.0;
+
+        // Delta and working harvester scalars
+        let cur_own_ti = own_res.titanium as f32;
+        let cur_own_ax = own_res.axionite as f32;
+        let cur_own_core_hp = core_hp[team_idx] as f32;
+        sc[12] = prev_own_working / 20.0;
+        sc[13] = (cur_own_ti - prev_own_ti) / 500.0;
+        sc[14] = (cur_own_ax - prev_own_ax) / 500.0;
+        sc[15] = (cur_own_core_hp - prev_own_core_hp) / 500.0;
+        sc[16] = 0.0; // filled after working harvesters are counted
+        prev_own_ti = cur_own_ti;
+        prev_own_ax = cur_own_ax;
+        prev_own_core_hp = cur_own_core_hp;
 
         // ── Decrement harvester cooldowns ──
         for ent in entities.values_mut() {
@@ -763,6 +781,12 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                 }
             }
         }
+        // Write working harvester delta scalar now that wh is computed
+        let cur_own_working = wh[team_idx] as f32;
+        let sc = &mut scalars[turn_idx * N_SCALARS..(turn_idx + 1) * N_SCALARS];
+        sc[12] = cur_own_working / 20.0;
+        sc[16] = (cur_own_working - prev_own_working) / 20.0;
+        prev_own_working = cur_own_working;
 
         // ── Titanium delivered delta per team ──
         let td = &mut titanium_delivered[turn_idx * 2..turn_idx * 2 + 2];
