@@ -511,8 +511,12 @@ struct ReplayData {
     scalars: Vec<f32>,
     /// Flat i32 buffer: n_turns * 2 values [a0, b0, a1, b1, ...].
     working_harvesters: Vec<i32>,
+    /// Flat i32 buffer: n_turns * 2 — per-turn same-team non-core transfer count [a0, b0, a1, b1, ...].
+    resource_transfers: Vec<i32>,
     /// Flat i32 buffer: n_turns * 2 — per-turn titanium delivered delta [a0, b0, a1, b1, ...].
     titanium_delivered: Vec<i32>,
+    /// Flat i32 buffer: n_turns * 2 — per-turn axionite delivered delta [a0, b0, a1, b1, ...].
+    axionite_delivered: Vec<i32>,
     map_w: usize,
     map_h: usize,
     n_turns: usize,
@@ -567,6 +571,7 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
 
     let mut player_res: [PlayerRes; 2] = [PlayerRes::default(), PlayerRes::default()];
     let mut prev_ti_collected: [i32; 2] = [0, 0];
+    let mut prev_ax_collected: [i32; 2] = [0, 0];
     // Track previous-turn values for delta scalars
     let mut prev_own_ti: f32 = 0.0;
     let mut prev_own_ax: f32 = 0.0;
@@ -582,7 +587,9 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
     let mut states = vec![0.0f32; n_turns * state_stride];
     let mut scalars = vec![0.0f32; n_turns * N_SCALARS];
     let mut working_harvesters = vec![0i32; n_turns * 2];
+    let mut resource_transfers = vec![0i32; n_turns * 2];
     let mut titanium_delivered = vec![0i32; n_turns * 2];
+    let mut axionite_delivered = vec![0i32; n_turns * 2];
 
     for (turn_idx, turn_data) in turns.iter().enumerate() {
         // ── Snapshot pre-turn state into contiguous buffer ──
@@ -743,6 +750,14 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                     ent.cooldown = 3;
                                 }
                             }
+                            let src_meta = pos_to_eid
+                                .get(&(from.x, from.y))
+                                .and_then(|src_id| entities.get(src_id))
+                                .map(|src| (src.kind, src.team, src.stored));
+                            let dst_meta = pos_to_eid
+                                .get(&(to.x, to.y))
+                                .and_then(|dst_id| entities.get(dst_id))
+                                .map(|dst| (dst.kind, dst.team));
                             let mut moved_res = 1u8;
                             if let Some(&src_id) = pos_to_eid.get(&(from.x, from.y)) {
                                 if let Some(src) = entities.get_mut(&src_id) {
@@ -757,6 +772,16 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                     if dst.kind.is_storing() {
                                         dst.stored = moved_res;
                                     }
+                                }
+                            }
+                            if let (Some((src_kind, src_team, _src_stored)), Some((dst_kind, dst_team))) =
+                                (src_meta, dst_meta)
+                            {
+                                if src_kind.is_storing()
+                                    && src_team == dst_team
+                                    && dst_kind != EntityKind::Core
+                                {
+                                    resource_transfers[turn_idx * 2 + src_team as usize] += 1;
                                 }
                             }
                         }
@@ -791,10 +816,14 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
 
         // ── Titanium delivered delta per team ──
         let td = &mut titanium_delivered[turn_idx * 2..turn_idx * 2 + 2];
+        let ad = &mut axionite_delivered[turn_idx * 2..turn_idx * 2 + 2];
         for t in 0..2 {
-            let cur = player_res[t].titanium_collected;
-            td[t] = cur - prev_ti_collected[t];
-            prev_ti_collected[t] = cur;
+            let cur_ti = player_res[t].titanium_collected;
+            let cur_ax = player_res[t].axionite_collected;
+            td[t] = cur_ti - prev_ti_collected[t];
+            ad[t] = cur_ax - prev_ax_collected[t];
+            prev_ti_collected[t] = cur_ti;
+            prev_ax_collected[t] = cur_ax;
         }
     }
 
@@ -802,7 +831,9 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
         states,
         scalars,
         working_harvesters,
+        resource_transfers,
         titanium_delivered,
+        axionite_delivered,
         map_w,
         map_h,
         n_turns,
@@ -818,7 +849,9 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
 ///   states: bytes — contiguous f32[n_turns, N_CHANNELS, map_h, map_w]
 ///   scalars: bytes — contiguous f32[n_turns, N_SCALARS]
 ///   working_harvesters: bytes — contiguous i32[n_turns, 2] (team_a, team_b)
+///   resource_transfers: bytes — contiguous i32[n_turns, 2] (same-team non-core transfers)
 ///   titanium_delivered: bytes — contiguous i32[n_turns, 2] (per-turn delta)
+///   axionite_delivered: bytes — contiguous i32[n_turns, 2] (per-turn delta)
 ///   map_w, map_h, n_turns, n_channels, n_scalars: int
 ///   state_stride: int — floats per turn in states buffer
 ///   winner: Optional[int]
@@ -854,6 +887,14 @@ fn parse_replay_full<'py>(
     };
     result.set_item("working_harvesters", PyBytes::new(py, wh_bytes))?;
 
+    let rt_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            rd.resource_transfers.as_ptr() as *const u8,
+            rd.resource_transfers.len() * 4,
+        )
+    };
+    result.set_item("resource_transfers", PyBytes::new(py, rt_bytes))?;
+
     let td_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             rd.titanium_delivered.as_ptr() as *const u8,
@@ -861,6 +902,14 @@ fn parse_replay_full<'py>(
         )
     };
     result.set_item("titanium_delivered", PyBytes::new(py, td_bytes))?;
+
+    let ad_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            rd.axionite_delivered.as_ptr() as *const u8,
+            rd.axionite_delivered.len() * 4,
+        )
+    };
+    result.set_item("axionite_delivered", PyBytes::new(py, ad_bytes))?;
 
     result.set_item("map_w", rd.map_w)?;
     result.set_item("map_h", rd.map_h)?;

@@ -5,10 +5,12 @@ buffers suitable for zero-copy torch.frombuffer().
 
 Primary API:
     replay = parse_replay_full(path, team=0)
-    # replay["states"]  — bytes, f32[n_turns, 18, map_h, map_w]
-    # replay["scalars"] — bytes, f32[n_turns, 12]
+    # replay["states"]  — bytes, f32[n_turns, 19, map_h, map_w]
+    # replay["scalars"] — bytes, f32[n_turns, 17]
     # replay["working_harvesters"] — bytes, i32[n_turns, 2]
+    # replay["resource_transfers"] — bytes, i32[n_turns, 2]
     # replay["titanium_delivered"] — bytes, i32[n_turns, 2]
+    # replay["axionite_delivered"] — bytes, i32[n_turns, 2]
     # replay["map_w"], ["map_h"], ["n_turns"], ["state_stride"], ["winner"]
 """
 
@@ -34,6 +36,7 @@ __all__ = [
     "augment_trajectories_with_working_counts",
     "augment_trajectories_with_replay",
     "augment_trajectories_with_ti_delivery",
+    "augment_trajectories_with_ax_delivery",
 ]
 
 
@@ -109,9 +112,19 @@ class ReplayData:
         return self._raw["working_harvesters"]
 
     @property
+    def resource_transfers_bytes(self) -> bytes:
+        """Contiguous i32[n_turns, 2] — same-team non-core transfers per turn."""
+        return self._raw.get("resource_transfers", b"")
+
+    @property
     def titanium_delivered_bytes(self) -> bytes:
         """Contiguous i32[n_turns, 2] — per-turn ti delivered delta."""
         return self._raw.get("titanium_delivered", b"")
+
+    @property
+    def axionite_delivered_bytes(self) -> bytes:
+        """Contiguous i32[n_turns, 2] — per-turn ax delivered delta."""
+        return self._raw.get("axionite_delivered", b"")
 
     # ── Per-turn slice access (zero-copy with torch) ──
 
@@ -149,6 +162,32 @@ class ReplayData:
     def titanium_delivered_dict(self) -> dict[int, dict[int, int]]:
         """Return {turn: {0: team_a, 1: team_b}} per-turn ti delivered delta."""
         buf = self._raw.get("titanium_delivered", b"")
+        if not buf:
+            return {}
+        n = self._raw["n_turns"]
+        result = {}
+        for t in range(n):
+            off = t * 8
+            a, b = struct.unpack_from("<ii", buf, off)
+            result[t] = {0: a, 1: b}
+        return result
+
+    def resource_transfers_dict(self) -> dict[int, dict[int, int]]:
+        """Return {turn: {0: team_a, 1: team_b}} per-turn non-core transfer count."""
+        buf = self._raw.get("resource_transfers", b"")
+        if not buf:
+            return {}
+        n = self._raw["n_turns"]
+        result = {}
+        for t in range(n):
+            off = t * 8
+            a, b = struct.unpack_from("<ii", buf, off)
+            result[t] = {0: a, 1: b}
+        return result
+
+    def axionite_delivered_dict(self) -> dict[int, dict[int, int]]:
+        """Return {turn: {0: team_a, 1: team_b}} per-turn ax delivered delta."""
+        buf = self._raw.get("axionite_delivered", b"")
         if not buf:
             return {}
         n = self._raw["n_turns"]
@@ -226,6 +265,12 @@ def _replay_aug_index(step: list | tuple, legacy_index: int, new_index: int) -> 
     return new_index if len(step) > 12 else legacy_index
 
 
+def _ensure_step_index(step: list, target_index: int) -> None:
+    """Extend a mutable trajectory step so a given index can be assigned."""
+    if len(step) <= target_index:
+        step.extend([0] * (target_index + 1 - len(step)))
+
+
 def augment_trajectories_with_working_counts(
     trajectories: list[list],
     working: dict[int, dict[int, int]],
@@ -269,7 +314,7 @@ def augment_trajectories_with_ti_delivery(
     trajectories: list[list],
     ti_delivered: dict[int, dict[int, int]],
     team: int = 0,
-    step_index: int = 6,
+    step_index: int = 22,
 ) -> list[list]:
     """Write per-round titanium delivered delta into trajectory steps."""
     if not ti_delivered:
@@ -277,20 +322,43 @@ def augment_trajectories_with_ti_delivery(
 
     for traj in trajectories:
         for i, step in enumerate(traj):
-            if not isinstance(step, (list, tuple)) or len(step) <= step_index:
+            if not isinstance(step, (list, tuple)):
                 continue
             if isinstance(step, tuple):
                 step = list(step)
                 traj[i] = step
+            _ensure_step_index(step, step_index)
             obs = step[0]
             rnd = int(round(obs[_ROUND_OBS_IDX] * 2000.0))
             rnd = max(0, min(rnd, 1999))
             counts = ti_delivered.get(rnd, {})
-            target_index = (
-                _replay_aug_index(step, legacy_index=step_index, new_index=7)
-                if step_index == 6
-                else step_index
-            )
-            step[target_index] = counts.get(team, 0)
+            step[step_index] = counts.get(team, 0)
+
+    return trajectories
+
+
+def augment_trajectories_with_ax_delivery(
+    trajectories: list[list],
+    ax_delivered: dict[int, dict[int, int]],
+    team: int = 0,
+    step_index: int = 23,
+) -> list[list]:
+    """Write per-round axionite delivered delta into trajectory steps."""
+    if not ax_delivered:
+        return trajectories
+
+    for traj in trajectories:
+        for i, step in enumerate(traj):
+            if not isinstance(step, (list, tuple)):
+                continue
+            if isinstance(step, tuple):
+                step = list(step)
+                traj[i] = step
+            _ensure_step_index(step, step_index)
+            obs = step[0]
+            rnd = int(round(obs[_ROUND_OBS_IDX] * 2000.0))
+            rnd = max(0, min(rnd, 1999))
+            counts = ax_delivered.get(rnd, {})
+            step[step_index] = counts.get(team, 0)
 
     return trajectories
