@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # ---- Architecture constants (must match main.py) ----
 
-TILE_FEATURES = 17
+TILE_FEATURES = 19
 GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
@@ -29,7 +29,7 @@ TEACHER_HIDDEN = [128, 128, 128, 64]
 H_DIM = 16
 INPUT_SIZE = OBS_SIZE + H_DIM
 TILE_EMBED_DIM = 8
-TILE_INPUT_DIM = TILE_FEATURES + 2  # 19: raw features + (dx/2, dy/2)
+TILE_INPUT_DIM = TILE_FEATURES + 2  # 21: raw features + (dx/2, dy/2)
 TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
 TRUNK_INPUT_SIZE = TILE_GRID_N * TILE_EMBED_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 239
 ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
@@ -40,7 +40,7 @@ ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
 CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
-REWARD_WORKING_HARVESTER = 2.5
+REWARD_FLOW_THROUGHPUT = 2.5
 REWARD_ENEMY_CORE_DAMAGE = 20.0
 REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
 
@@ -86,7 +86,7 @@ def _mask_indices(device: torch.device):
             torch.tensor(_MASK_COSTS_AX, dtype=torch.float32, device=device),
             torch.tensor([t * TILE_FEATURES for t in _MASK_BD_TILES], dtype=torch.long, device=device),      # is_wall
             torch.tensor([t * TILE_FEATURES + 4 for t in _MASK_BD_TILES], dtype=torch.long, device=device),  # bld_none (no building)
-            torch.tensor([t * TILE_FEATURES + 15 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # has_unit
+            torch.tensor([t * TILE_FEATURES + 17 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # has_unit
             torch.tensor([t * TILE_FEATURES + 12 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # bld_friendly
             torch.tensor([t * TILE_FEATURES + 11 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # bld_core
         )

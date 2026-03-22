@@ -5,12 +5,12 @@
 import math
 import random
 
-from cambc import Controller, Direction, EntityType, Environment, Position
+from cambc import Controller, Direction, EntityType, Environment, Position, ResourceType
 
 # -- Layout constants --
 GRID_SIZE = 5
 GRID_HALF = GRID_SIZE // 2
-TILE_FEATURES = 17
+TILE_FEATURES = 19
 GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
@@ -109,7 +109,7 @@ _BUILD_DIR_TILE_INDICES = tuple(
 _GLOBAL_OBS_START = GRID_SIZE * GRID_SIZE * TILE_FEATURES
 
 _ZERO_TILE = (0.0,) * TILE_FEATURES
-_NO_BUILD_TILE = (1.0,) + (0.0,) * (N_BLD_TYPES - 1) + (0.0, 0.0, 0.0)
+_NO_BUILD_TILE = (1.0,) + (0.0,) * (N_BLD_TYPES - 1) + (0.0, 0.0, 0.0, 0.0, 0.0)
 _BLD_ONE_HOTS = tuple(
     tuple(1.0 if i == idx else 0.0 for i in range(N_BLD_TYPES))
     for idx in range(N_BLD_TYPES)
@@ -337,6 +337,12 @@ def encode_state_into(ct: Controller, features, core_center, enemy_core,
                     append(float(bdy))
                 except Exception:
                     extend((0.0, 0.0))
+                append(0.0)  # bld_cooldown: populated by replay parser during training
+                try:
+                    sr = ct.get_stored_resource(bid)
+                    append(0.0 if sr is None else 1.0 if sr == ResourceType.TITANIUM else -1.0)
+                except Exception:
+                    append(0.0)
             else:
                 extend(_NO_BUILD_TILE)
 
@@ -450,7 +456,7 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
     for d_idx in range(9):
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
         not_wall = obs[ts] == 0.0
-        no_unit = obs[ts + 15] == 0.0
+        no_unit = obs[ts + 17] == 0.0
         empty = obs[ts + 4] == 1.0
         replaceable = obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0
         if not_wall and no_unit and (empty or replaceable):
