@@ -35,6 +35,8 @@ TRUNK_INPUT_SIZE = TILE_GRID_N * TILE_EMBED_DIM + GLOBAL_FEATURES + POS_EMBED_DI
 ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
+N_CONV_DIR = 4  # cardinal only: N, W, E, S (indices 1, 3, 5, 7 in DIR_MAP_9)
+CONV_DIR_TO_9 = [1, 3, 5, 7]  # maps conv_dir index -> DIR_MAP_9 index
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
@@ -65,7 +67,7 @@ _MASK_COSTS_AX = [0, 0, 0, 0, 0, 0, 10, 0, 5, 0, 0, 0]
 _MASK_BD_TILES = [6, 7, 8, 11, 12, 13, 16, 17, 18]
 _MASK_BD_DX = [-1.0, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0]
 _MASK_BD_DY = [-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
-_CONV_DIR_MASK = [True, True, True, True, False, True, True, True, True]
+_CONV_DIR_MASK = [True, True, True, True]  # all 4 cardinal dirs always valid
 
 # Observation feature indices for resources/scale
 _OBS_GLOBAL_START = 5 * 5 * TILE_FEATURES  # 425
@@ -263,7 +265,7 @@ class RMSNorm(nn.Module):
 GLOBAL_MAP_MAX_W = 50
 GLOBAL_MAP_MAX_H = 50
 GLOBAL_MAP_CHANNELS = 19
-GLOBAL_SCALAR_DIM = 12
+GLOBAL_SCALAR_DIM = 17  # 12 base + own_working_harv, Δti, Δax, Δcore_hp, Δworking_harv
 UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
 CENTRALIZED_CNN_CHUNK = 248
 
@@ -300,14 +302,13 @@ class CentralizedCritic(nn.Module):
     Architecture:
       1. Per-tile 1×1 conv encodes sparse 19-channel indicators into dense
          embeddings (preserves directional info for supply line analysis).
-      2. Stride-2 3×3 conv downsamples 40×40 → 20×20 with spatial mixing.
-      3. Dilated 3×3 convs expand receptive field at half resolution.
-      4. Per-unit indexing + MLP produces value estimates.
+      2. Full-resolution 3×3 convs with dilations for spatial context.
+         No striding — preserves per-tile directional precision needed
+         for supply line connectivity analysis.
+      3. Per-unit indexing + MLP produces value estimates.
     """
 
-    _STRIDE = 2  # spatial downsample factor
-
-    def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS, conv_dim: int = 64):
+    def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS, conv_dim: int = 48):
         super().__init__()
         self.conv_dim = conv_dim
 
@@ -317,13 +318,11 @@ class CentralizedCritic(nn.Module):
             nn.Conv2d(map_channels, conv_dim, 1),
             RMSNorm2d(conv_dim),
             nn.SiLU(),
-            # Stride-2 spatial downsample: 40×40 → 20×20.
-            # Operates on dense tile embeddings so directional info
-            # (encoded as distinct vectors) survives the mixing.
-            nn.Conv2d(conv_dim, conv_dim, 3, stride=self._STRIDE, padding=1),
+            # Full-resolution spatial layers — no stride so per-tile
+            # conveyor directions are preserved for supply line analysis.
+            nn.Conv2d(conv_dim, conv_dim, 3, padding=1),
             RMSNorm2d(conv_dim),
             nn.SiLU(),
-            # Dilated spatial layers at half resolution.
             nn.Conv2d(conv_dim, conv_dim, 3, padding=2, dilation=2),
             RMSNorm2d(conv_dim),
             nn.SiLU(),
@@ -372,16 +371,15 @@ class CentralizedCritic(nn.Module):
         """Run CNN once per unique round and return spatial feature maps.
 
         Conv stack runs in bf16 natively (weights are bf16).
-        Output is at stride-2 resolution (H/2, W/2).
-        valid_mask is downsampled to match and applied so padded area
-        contributes no signal.
+        valid_mask applied so padded area contributes no signal.
         """
-        feat = self.conv(map_tensor)
-        # Downsample mask to match feature map resolution.
-        # Use ceil_mode=True so odd spatial dims produce the same size
-        # as Conv2d(stride=2, padding=1) which uses ceil semantics.
-        mask_ds = F.max_pool2d(valid_mask, self._STRIDE, ceil_mode=True)
-        return feat * mask_ds
+        x = map_tensor
+        if _USE_BF16 and x.dtype != torch.bfloat16:
+            x = x.bfloat16()
+        feat = self.conv(x)
+        if feat.dtype != valid_mask.dtype:
+            valid_mask = valid_mask.to(feat.dtype)
+        return feat * valid_mask
 
     def unit_values(
         self,
@@ -394,16 +392,12 @@ class CentralizedCritic(nn.Module):
     ) -> torch.Tensor:
         """Compute per-unit marginal values by indexing cached feature maps.
 
-        unit_xy is in original map coordinates; scaled by stride factor
-        to index into the downsampled feature maps.
-
         Returns:
             v_unit: (B,) — per-unit marginal value
         """
         fH, fW = feat.shape[2], feat.shape[3]
-        # Map original tile coords → downsampled feature map coords
-        ux = (unit_xy[:, 0] // self._STRIDE).clamp(0, fW - 1).long()
-        uy = (unit_xy[:, 1] // self._STRIDE).clamp(0, fH - 1).long()
+        ux = unit_xy[:, 0].clamp(0, fW - 1).long()
+        uy = unit_xy[:, 1].clamp(0, fH - 1).long()
         ri = round_idx.long()
 
         # Index into cached feature maps: (B, conv_dim)
@@ -571,7 +565,7 @@ class GraphedInference:
         self._static_input = torch.zeros(M, OBS_SIZE + H_DIM, device=DEVICE, dtype=mdtype)
         static_g_bt = torch.empty(M, N_BUILD, device=DEVICE, dtype=mdtype)
         static_g_bd = torch.empty(M, N_DIR, device=DEVICE, dtype=mdtype)
-        static_g_cd = torch.empty(M, N_DIR, device=DEVICE, dtype=mdtype)
+        static_g_cd = torch.empty(M, N_CONV_DIR, device=DEVICE, dtype=mdtype)
         static_g_md = torch.empty(M, N_DIR, device=DEVICE, dtype=mdtype)
 
         # Warmup
@@ -703,7 +697,7 @@ class BuilderMLP(nn.Module):
         # Policy heads: small std for near-uniform initial policy
         self.head_build_type = _ortho_init(nn.Linear(prev, N_BUILD), std=0.01)
         self.head_build_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
-        self.head_conv_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
+        self.head_conv_dir = _ortho_init(nn.Linear(prev, N_CONV_DIR), std=0.01)
         self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
         self.head_h_gate = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wz: update gate
         self.head_h_cand = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wh: candidate
@@ -768,7 +762,7 @@ class BuilderMLP(nn.Module):
             combined_b = self._cached_head_b
 
         combined = F.linear(h, combined_w, combined_b)
-        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = combined.split([N_BUILD, N_DIR, N_DIR, N_DIR, H_DIM, H_DIM], dim=-1)
+        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = combined.split([N_BUILD, N_DIR, N_CONV_DIR, N_DIR, H_DIM, H_DIM], dim=-1)
         return bt_l, bd_l, cd_l, md_l, h_gate, h_cand
 
     def _forward_from_trunk_in(self, trunk_in: torch.Tensor):

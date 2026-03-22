@@ -46,7 +46,8 @@ DIR_MAP_9 = [
     Direction.SOUTH,
     Direction.SOUTHEAST,
 ]
-_CONV_DIR_MASK = [d != Direction.CENTRE for d in DIR_MAP_9]
+CONV_DIR_4 = [Direction.NORTH, Direction.WEST, Direction.EAST, Direction.SOUTH]
+CONV_DIR_TO_9 = [1, 3, 5, 7]  # maps conv_dir index -> DIR_MAP_9 index
 _HARVESTER_BUILD_TYPE = 1
 
 ENV_IDX = {

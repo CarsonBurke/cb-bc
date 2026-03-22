@@ -246,7 +246,7 @@ def _dummy_policy(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
     build_type[~can_harv & can_conv] = 2
     build_type[~can_harv & ~can_conv & can_road] = 3
 
-    conv_dir = build_dir.clone()
+    conv_dir = torch.zeros_like(build_type)  # 0 = N (first cardinal)
     move_dir = torch.full_like(build_type, 4)
     return build_type, build_dir, conv_dir, move_dir
 

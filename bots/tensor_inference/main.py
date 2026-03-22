@@ -64,7 +64,7 @@ DIR_MAP_9 = [
     Direction.SOUTH,
     Direction.SOUTHEAST,
 ]
-CONV_DIR_MASK = [d != Direction.CENTRE for d in DIR_MAP_9]
+CONV_DIR_4 = [Direction.NORTH, Direction.WEST, Direction.EAST, Direction.SOUTH]
 
 # Environment type -> one-hot index
 ENV_IDX = {
@@ -160,7 +160,7 @@ def _build_model() -> MLP:
         output_heads={
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
-            "conv_dir": 9,
+            "conv_dir": 4,
             "move_dir": 9,
             "h_gate": H_DIM,
             "h_cand": H_DIM,
@@ -315,7 +315,7 @@ class Player:
         # Use harvester-specific direction mask when building harvester
         effective_bd_mask = harv_bd_mask if build_type_idx == 1 else bd_mask
         build_dir_idx = _argmax(outputs["build_dir"], effective_bd_mask)
-        conv_dir_idx = _argmax(outputs["conv_dir"], CONV_DIR_MASK)
+        conv_dir_idx = _argmax(outputs["conv_dir"], None)
         move_dir_idx = _argmax(outputs["move_dir"], None)
 
         # Snapshot resources before actions to isolate delivery from spending
@@ -324,7 +324,7 @@ class Player:
         # Execute actions
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        conv_dir = DIR_MAP_9[conv_dir_idx]
+        conv_dir = CONV_DIR_4[conv_dir_idx]
         harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
         place_reward = harv_reward + conv_reward
 

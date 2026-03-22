@@ -71,7 +71,7 @@ DIR_MAP_9 = [
     Direction.SOUTH,
     Direction.SOUTHEAST,
 ]
-_CONV_DIR_MASK = [d != Direction.CENTRE for d in DIR_MAP_9]
+CONV_DIR_4 = [Direction.NORTH, Direction.WEST, Direction.EAST, Direction.SOUTH]
 _HARVESTER_BUILD_TYPE = 1
 
 # Environment type -> one-hot index
@@ -182,7 +182,7 @@ def _build_model() -> MLP:
         output_heads={
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
-            "conv_dir": 9,
+            "conv_dir": 4,
             "move_dir": 9,
             "h_gate": H_DIM,
             "h_cand": H_DIM,
@@ -356,7 +356,7 @@ class Player:
         if self._train_log is not None:
             build_type_idx, bt_lp = _sample_from_logits(outputs["build_type"], bt_mask)
             build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"], bd_mask)
-            conv_dir_idx, cd_lp = _sample_from_logits(outputs["conv_dir"], _CONV_DIR_MASK)
+            conv_dir_idx, cd_lp = _sample_from_logits(outputs["conv_dir"], None)
             move_dir_idx, md_lp = _sample_from_logits(outputs["move_dir"], None)
             # Mask build_dir log_prob when build_type is "none" (idx 0)
             # — the direction is causally irrelevant, so exclude from policy gradient
@@ -370,7 +370,7 @@ class Player:
         else:
             build_type_idx = _argmax(outputs["build_type"], bt_mask)
             build_dir_idx = _argmax(outputs["build_dir"], bd_mask)
-            conv_dir_idx = _argmax(outputs["conv_dir"], _CONV_DIR_MASK)
+            conv_dir_idx = _argmax(outputs["conv_dir"], None)
             move_dir_idx = _argmax(outputs["move_dir"], None)
 
         # Snapshot resources before actions to isolate delivery from spending
@@ -379,7 +379,7 @@ class Player:
         # Execute actions
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        conv_dir = DIR_MAP_9[conv_dir_idx]
+        conv_dir = CONV_DIR_4[conv_dir_idx]
         self._dbg_harv_attempts = 0
         self._dbg_harv_failures = 0
         self._dbg_harv_prox_gate = 0
