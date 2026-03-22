@@ -300,9 +300,9 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
   const ds = downsample(episodes)
   const dim = emaOn
   const series = [
-    { key: 'r_harv', label: 'Harvester', color: '#a6e3a1' },
-    { key: 'r_flow', altKey: 'r_conv', label: 'Flow', color: '#89b4fa' },
-    { key: 'r_work', altKey: 'r_deliv', label: 'Working', color: '#f9e2af' },
+    { key: 'r_ti', altKey: 'r_harv', label: 'Ti Delivery', color: '#a6e3a1' },
+    { key: 'r_ax', label: 'Ax Delivery', color: '#74c7ec' },
+    { key: 'r_work', altKey: 'r_flow', label: 'Flow', color: '#f9e2af' },
     { key: 'r_dmg', label: 'Damage', color: '#f38ba8' },
     { key: 'r_own_dmg', label: 'Own Core Dmg', color: '#cba6f7' },
   ]
@@ -537,7 +537,7 @@ function EpisodeLogTable() {
           {[...episodes].reverse().map(e => (
             <Tr key={e.episode}>
               <Td>{e.episode}</Td>
-              <Td title={`Harv: ${fmt(e.r_harv, 2)}  Work: ${fmt(e.r_work ?? e.r_deliv, 2)}  Flow: ${fmt(e.r_flow ?? e.r_conv, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  OwnDmg: ${fmt(e.r_own_dmg, 2)}  |  H a/f/g/p: ${fmt(e.harv_attempts, 2)}/${fmt(e.harv_failures, 2)}/${fmt(e.harv_prox_gate, 2)}/${fmt(e.harv_prox_paid, 2)}  C a/f/g/p: ${fmt(e.conv_attempts, 2)}/${fmt(e.conv_failures, 2)}/${fmt(e.conv_prox_gate, 2)}/${fmt(e.conv_prox_paid, 2)}`}>{fmt(e.reward, 3)}</Td>
+              <Td title={`TiDeliv: ${fmt(e.r_ti ?? e.r_harv, 2)}  AxDeliv: ${fmt(e.r_ax, 2)}  Flow: ${fmt(e.r_work ?? e.r_flow ?? e.r_deliv ?? e.r_conv, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  OwnDmg: ${fmt(e.r_own_dmg, 2)}  |  H a/f/g/p: ${fmt(e.harv_attempts, 2)}/${fmt(e.harv_failures, 2)}/${fmt(e.harv_prox_gate, 2)}/${fmt(e.harv_prox_paid, 2)}  C a/f/g/p: ${fmt(e.conv_attempts, 2)}/${fmt(e.conv_failures, 2)}/${fmt(e.conv_prox_gate, 2)}/${fmt(e.conv_prox_paid, 2)}`}>{fmt(e.reward, 3)}</Td>
               <Td>{fmt(e.resources, 1)}</Td>
               <Td>{fmt(e.pi_loss, 4)}</Td>
               <Td>{fmt(e.entropy, 3)}</Td>
