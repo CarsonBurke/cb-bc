@@ -63,7 +63,7 @@ from model import (
     HARVESTER_BUILD_TYPE,
     H_DIM,
     OBS_SIZE,
-    REWARD_WORKING_HARVESTER,
+    REWARD_FLOW_THROUGHPUT,
     REWARD_ENEMY_CORE_DAMAGE,
     REWARD_OWN_CORE_DAMAGE,
     TILE_FEATURES,
@@ -82,6 +82,7 @@ from model import (
     GraphedInference,
 )
 from replay_parser import augment_trajectories_with_working_counts
+from flow_reward import compute_per_round_throughput, augment_trajectories_with_throughput
 
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
@@ -707,7 +708,16 @@ def collect_games_batched(
             per_opp_winners.setdefault(oid, []).append(None)
             continue
         game_trajs = _read_trajectory_file(log_path)
-        game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
+        # Augment with per-round resource throughput (replaces n_working slot)
+        if gstates and gstates.get("states_buf"):
+            try:
+                throughput = compute_per_round_throughput(gstates)
+                game_trajs = augment_trajectories_with_throughput(game_trajs, throughput)
+            except Exception as e:
+                print(f"  Throughput augmentation error: {e}")
+                game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
+        else:
+            game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -967,7 +977,7 @@ def main():
                     conv_paid = s.get("conv_paid", 0)
                 r_harv += harv_r
                 r_conv += conv_r
-                r_work += n_working * REWARD_WORKING_HARVESTER
+                r_work += n_working * REWARD_FLOW_THROUGHPUT
                 r_dmg += dmg * REWARD_ENEMY_CORE_DAMAGE
                 r_own_dmg += own_dmg * REWARD_OWN_CORE_DAMAGE
                 harv_attempts += harv_attempt

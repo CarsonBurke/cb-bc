@@ -1151,7 +1151,7 @@ def _parse_trajectories(
                 rw_t[idx] = (
                     harv_r
                     + conv_r
-                    + n_working * REWARD_WORKING_HARVESTER
+                    + n_working * REWARD_FLOW_THROUGHPUT
                     + dmg * REWARD_ENEMY_CORE_DAMAGE
                     + own_dmg * REWARD_OWN_CORE_DAMAGE
                 )
@@ -1364,7 +1364,7 @@ def _compute_gae(
     rewards: torch.Tensor,
     values: torch.Tensor,
     ep_boundaries: list[tuple[int, int]],
-    gamma: float = 0.99,
+    gamma: float = 0.995,
     gae_lambda: float = 0.95,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Vectorized GAE on GPU with proper truncation handling.

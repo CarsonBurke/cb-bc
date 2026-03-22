@@ -356,3 +356,158 @@ def augment_trajectories_with_flow_scores(
         step[conv_r_idx] = score / tile_build_count[bpos]
 
     return trajectories
+
+
+# ── Per-round resource throughput ─────────────────────────────────────────
+
+
+def compute_per_round_throughput(
+    global_states: dict,
+) -> dict[int, float]:
+    """Compute per-round count of friendly conveyor tiles actively transporting toward core.
+
+    Only counts conveyors whose output tile is strictly closer to core than
+    the conveyor itself (per Dijkstra flow field). This excludes loops and
+    dead-end conveyors that hold resources without delivering them.
+
+    Returns {round: throughput_count}.
+    """
+    import torch
+
+    map_w = global_states["map_w"]
+    map_h = global_states["map_h"]
+    n_turns = global_states.get("n_turns", 0)
+
+    if map_w == 0 or map_h == 0 or n_turns == 0:
+        return {}
+
+    st = torch.frombuffer(global_states["states_buf"], dtype=torch.float32).clone().reshape(
+        n_turns, _N_CHANNELS, map_h, map_w,
+    )
+
+    # --- Build flow field from first turn (static map geometry) ---
+    t0 = st[0]
+    wall_coords = (t0[_CH_WALL] > 0.5).nonzero(as_tuple=False)
+    wall_set = frozenset((int(c[1]), int(c[0])) for c in wall_coords)
+
+    ore_coords = ((t0[_CH_ORE_TI] > 0.5) | (t0[_CH_ORE_AX] > 0.5)).nonzero(as_tuple=False)
+    ore_positions = [(int(c[1]), int(c[0])) for c in ore_coords]
+
+    core_mask = (t0[_CH_CORE] > 0.5) & (t0[_CH_TEAM] > 0.5)
+    core_coords = core_mask.nonzero(as_tuple=False)
+    if core_coords.shape[0] == 0:
+        return {}
+    core_xy = (int(round(float(core_coords[:, 1].float().mean()))),
+               int(round(float(core_coords[:, 0].float().mean()))))
+
+    dist_field = _build_flow_field(wall_set, ore_positions, core_xy, map_w, map_h)
+
+    # --- Build mask of tiles with positive flow gradient (output closer to core) ---
+    # Check each tile: if it's a friendly conveyor, does its direction point toward core?
+    # Use last turn to get final conveyor layout, but the mask applies to all turns.
+    # Recompute per-turn since conveyors can be built/destroyed.
+    INF = float("inf")
+
+    # For each turn, compute the set of valid (flow-aligned) conveyor tiles
+    is_conv = (st[:, _CH_CONVEYOR] > 0.5) | (st[:, _CH_SPLITTER] > 0.5) | (st[:, _CH_ARMOURED] > 0.5)
+    is_friendly = st[:, _CH_TEAM] > 0.5
+    is_stored = st[:, _CH_STORED] > 0.5
+    dir_dx = st[:, _CH_DIR_DX]  # [T, H, W]
+    dir_dy = st[:, _CH_DIR_DY]  # [T, H, W]
+
+    # Build dist tensor for vectorized gradient check
+    dist_tensor = torch.full((map_h, map_w), INF, dtype=torch.float32)
+    for (x, y), d in dist_field.items():
+        if 0 <= y < map_h and 0 <= x < map_w:
+            dist_tensor[y, x] = d
+
+    # For each conveyor, output tile = (x + round(dx), y + round(dy))
+    # Check dist[output] < dist[here]
+    # Vectorize: shift dist_tensor by each cardinal direction, check gradient
+    # Precompute flow-aligned mask once from the dist field.
+    # For each tile, check all 4 cardinal directions: if any neighbor is closer
+    # to core, a conveyor pointing there would be valid. But we need to check
+    # the actual conveyor direction per-turn. Instead, build shifted dist tensors.
+    #
+    # output_y = y + round(dy), output_x = x + round(dx)
+    # We need dist[output] < dist[here] per conveyor per turn.
+    # Vectorize: compute output coords, gather dist, compare.
+
+    active_base = is_conv & is_friendly & is_stored  # [T, H, W]
+    if not active_base.any():
+        return {}
+
+    # Round directions to integer offsets
+    ox_map = dir_dx.round().long()  # [T, H, W]
+    oy_map = dir_dy.round().long()  # [T, H, W]
+
+    # Create coordinate grids
+    yy = torch.arange(map_h).unsqueeze(1).expand(map_h, map_w)  # [H, W]
+    xx = torch.arange(map_w).unsqueeze(0).expand(map_h, map_w)  # [H, W]
+
+    # Output coordinates (clamp to valid range)
+    out_y = (yy.unsqueeze(0) + oy_map).clamp(0, map_h - 1)  # [T, H, W]
+    out_x = (xx.unsqueeze(0) + ox_map).clamp(0, map_w - 1)  # [T, H, W]
+
+    # Gather distances: dist_here and dist_output
+    dist_here = dist_tensor.unsqueeze(0).expand(n_turns, -1, -1)  # [T, H, W]
+    # Flatten for gather
+    out_flat = out_y * map_w + out_x  # [T, H, W]
+    dist_flat = dist_tensor.reshape(-1)  # [H*W]
+    dist_output = dist_flat[out_flat]  # [T, H, W]
+
+    # Flow-aligned: output strictly closer to core, and tile is reachable
+    flow_aligned = (dist_output < dist_here) & (dist_here < INF)
+
+    # Weight each tile by 1/dist_to_core — closer tiles worth more.
+    # A resource on a tile 2 steps from core contributes 0.5, one 10 steps away
+    # contributes 0.1. This makes short and long chains yield similar total
+    # reward for the same delivery rate, while still giving partial credit
+    # for incomplete chains (dense learning signal).
+    valid = active_base & flow_aligned  # [T, H, W]
+    if not valid.any():
+        return {}
+
+    inv_dist = torch.where(
+        dist_tensor < INF,
+        1.0 / dist_tensor.clamp(min=0.5),
+        torch.zeros_like(dist_tensor),
+    )  # [H, W]
+    weighted = valid.float() * inv_dist.unsqueeze(0)  # [T, H, W]
+    scores = weighted.sum(dim=(1, 2))  # [T]
+
+    result = {}
+    for t in range(n_turns):
+        s = float(scores[t].item())
+        if s > 0:
+            result[t] = s
+    return result
+
+
+def augment_trajectories_with_throughput(
+    trajectories: list[list],
+    throughput: dict[int, float],
+) -> list[list]:
+    """Write per-round resource throughput into the n_working slot of trajectory steps.
+
+    Replaces the working-harvester count with actual flow throughput — how many
+    friendly conveyor tiles are actively transporting resources each round.
+    """
+    if not throughput:
+        return trajectories
+
+    for traj in trajectories:
+        for i, step in enumerate(traj):
+            if not isinstance(step, (list, tuple)) or len(step) < 7:
+                continue
+            if isinstance(step, tuple):
+                step = list(step)
+                traj[i] = step
+            obs = step[0]
+            rnd = int(round(obs[_OBS_GLOBAL_START] * 2000.0))
+            rnd = max(0, min(rnd, 1999))
+            n = len(step)
+            slot = 7 if n > 12 else 6  # n_working slot
+            step[slot] = throughput.get(rnd, 0)
+
+    return trajectories
