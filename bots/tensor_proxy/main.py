@@ -19,7 +19,7 @@ sys.path.insert(0, _TENSOR_DIR)
 from shared import (
     GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES, POS_EMBED_DIM,
     INPUT_SIZE, HIDDEN_SIZES, H_DIM,
-    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, DIR_DXY, BUILD_COSTS,
+    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4, DIR_DXY, BUILD_COSTS,
     _CONV_DIR_MASK,
     SinusoidalPositionEmbedding, GameState,
     discover_ore, scan_enemy_core_dmg, scan_own_core_dmg,
@@ -193,7 +193,7 @@ class Player:
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        conv_dir = DIR_MAP_9[conv_dir_idx]
+        conv_dir = CONV_DIR_4[conv_dir_idx]
         harv_reward, conv_reward, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team)
 
         move_dir = DIR_MAP_9[move_dir_idx]

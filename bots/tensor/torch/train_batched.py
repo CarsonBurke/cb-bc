@@ -82,7 +82,6 @@ from model import (
     GraphedInference,
 )
 from replay_parser import augment_trajectories_with_working_counts
-from flow_reward import augment_trajectories_with_flow_scores, compute_flow_scores
 
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
@@ -709,15 +708,6 @@ def collect_games_batched(
             continue
         game_trajs = _read_trajectory_file(log_path)
         game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
-        if gstates and gstates.get("states_buf"):
-            try:
-                flow_scores = compute_flow_scores(gstates)
-                if flow_scores:
-                    game_trajs = augment_trajectories_with_flow_scores(
-                        game_trajs, flow_scores, gstates["map_w"], gstates["map_h"],
-                    )
-            except Exception as e:
-                print(f"  Flow scoring error: {e}")
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -933,7 +923,7 @@ def main():
 
         # Stats
         def _traj_reward(traj):
-            r_harv, r_flow, r_work, r_dmg, r_own_dmg = 0.0, 0.0, 0.0, 0.0, 0.0
+            r_harv, r_conv, r_work, r_dmg, r_own_dmg = 0.0, 0.0, 0.0, 0.0, 0.0
             harv_attempts = harv_failures = harv_prox_gate = harv_prox_paid = 0
             conv_attempts = conv_failures = conv_prox_gate = conv_prox_paid = 0
             for s in traj:
@@ -976,7 +966,7 @@ def main():
                     conv_gate = s.get("conv_gate", 0)
                     conv_paid = s.get("conv_paid", 0)
                 r_harv += harv_r
-                r_flow += conv_r
+                r_conv += conv_r
                 r_work += n_working * REWARD_WORKING_HARVESTER
                 r_dmg += dmg * REWARD_ENEMY_CORE_DAMAGE
                 r_own_dmg += own_dmg * REWARD_OWN_CORE_DAMAGE
@@ -988,9 +978,9 @@ def main():
                 conv_failures += conv_fail
                 conv_prox_gate += conv_gate
                 conv_prox_paid += conv_paid
-            total = r_harv + r_flow + r_work + r_dmg + r_own_dmg
+            total = r_harv + r_conv + r_work + r_dmg + r_own_dmg
             return (
-                total, r_harv, r_flow, r_work, r_dmg, r_own_dmg,
+                total, r_harv, r_conv, r_work, r_dmg, r_own_dmg,
                 harv_attempts, harv_failures, harv_prox_gate, harv_prox_paid,
                 conv_attempts, conv_failures, conv_prox_gate, conv_prox_paid,
             )
@@ -1006,7 +996,7 @@ def main():
         for traj_i, traj in enumerate(all_trajs):
             rewards.append(_traj_reward(traj))
         mean_r_harv = sum(r[1] for r in rewards) / n_trajs
-        mean_r_flow = sum(r[2] for r in rewards) / n_trajs
+        mean_r_conv = sum(r[2] for r in rewards) / n_trajs
         mean_r_work = sum(r[3] for r in rewards) / n_trajs
         mean_r_dmg = sum(r[4] for r in rewards) / n_trajs
         mean_r_own_dmg = sum(r[5] for r in rewards) / n_trajs
@@ -1018,13 +1008,13 @@ def main():
         mean_conv_failures = sum(r[11] for r in rewards) / n_trajs
         mean_conv_prox_gate = sum(r[12] for r in rewards) / n_trajs
         mean_conv_prox_paid = sum(r[13] for r in rewards) / n_trajs
-        mean_reward = (mean_r_harv + mean_r_flow + mean_r_work + mean_r_dmg + mean_r_own_dmg)
+        mean_reward = (mean_r_harv + mean_r_conv + mean_r_work + mean_r_dmg + mean_r_own_dmg)
         mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
         elapsed = elapsed_offset + (time.time() - run_started_at)
 
         ep_entry = {
             "episode": ep + 1, "reward": round(mean_reward, 4),
-            "r_harv": round(mean_r_harv, 4), "r_flow": round(mean_r_flow, 4),
+            "r_harv": round(mean_r_harv, 4), "r_conv": round(mean_r_conv, 4),
             "r_work": round(mean_r_work, 4), "r_dmg": round(mean_r_dmg, 4),
             "r_own_dmg": round(mean_r_own_dmg, 4),
             "harv_attempts": round(mean_harv_attempts, 3),
@@ -1100,7 +1090,7 @@ def main():
             print(
                 f"  Ep {ep + 1:3d}/{args.episodes}: "
                 f"W/L={total_wins}/{total_losses}/{total_games}  "
-                f"reward/unit={mean_reward:+.2f}  flow={mean_r_flow:.3f}  work={mean_r_work:+.2f}  ti={mean_ti:.0f}  "
+                f"reward/unit={mean_reward:+.2f}  conv={mean_r_conv:.3f}  work={mean_r_work:+.2f}  ti={mean_ti:.0f}  "
                 f"harv a/f/g/p={mean_harv_attempts:.2f}/{mean_harv_failures:.2f}/{mean_harv_prox_gate:.2f}/{mean_harv_prox_paid:.2f}  "
                 f"pi={stats['pi_loss']:+.4f}  "
                 f"kl={stats.get('approx_kl', 0):.4f}  "

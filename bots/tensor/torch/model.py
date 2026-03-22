@@ -36,7 +36,6 @@ ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
 N_CONV_DIR = 4  # cardinal only: N, W, E, S (indices 1, 3, 5, 7 in DIR_MAP_9)
-CONV_DIR_TO_9 = [1, 3, 5, 7]  # maps conv_dir index -> DIR_MAP_9 index
 ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1

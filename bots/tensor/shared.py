@@ -47,7 +47,7 @@ DIR_MAP_9 = [
     Direction.SOUTHEAST,
 ]
 CONV_DIR_4 = [Direction.NORTH, Direction.WEST, Direction.EAST, Direction.SOUTH]
-CONV_DIR_TO_9 = [1, 3, 5, 7]  # maps conv_dir index -> DIR_MAP_9 index
+_CONV_DIR_MASK = [True, True, True, True]  # all 4 cardinal dirs always valid
 _HARVESTER_BUILD_TYPE = 1
 
 ENV_IDX = {
@@ -158,6 +158,7 @@ class GameState:
     all_ore_keys: set[tuple[int, int]] = set()
     harv_proximity: dict[tuple[int, int], float] = {}
     harv_placed_ores: set[tuple[int, int]] = set()
+    conv_proximity: dict[tuple[int, int], float] = {}  # ore_key → conv proximity reward given
 
     working_harv_positions: set[tuple[int, int]] = set()
     working_harv_round: int = -1
@@ -176,6 +177,7 @@ class GameState:
         cls.all_ore_keys = set()
         cls.harv_proximity = {}
         cls.harv_placed_ores = set()
+        cls.conv_proximity = {}
 
         cls.working_harv_positions = set()
         cls.working_harv_round = -1
@@ -466,6 +468,7 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
 # ---------------------------------------------------------------------------
 
 PLACE_HARV = 5.0
+PLACE_CONV = 2.5
 
 
 def proximity_reward(ct: Controller, build_pos: Position, my_team) -> float:
@@ -514,6 +517,64 @@ def should_reward_harvester_proximity(
     except Exception:
         return False
 
+
+
+def conveyor_reward(ct: Controller, pos: Position, facing: Direction) -> float:
+    """Reward for successful conveyor placement based on manhattan proximity to ore.
+    Target distance is 1 (cardinally adjacent). Zero-sum with proximity advances.
+    Zero reward if conveyor faces toward the ore (would push into miner)."""
+    best_dist, best_key = None, None
+    best_given = 0.0
+    fdx, fdy = DIR_DXY.get(facing, (0, 0))
+    for ore_pos in (GameState.all_ore or []):
+        key = (ore_pos.x, ore_pos.y)
+        prev = GameState.conv_proximity.get(key)
+        if prev is not None and prev < 0:
+            continue  # already finalized by a prior placement
+        dx, dy = ore_pos.x - pos.x, ore_pos.y - pos.y
+        d = abs(dx) + abs(dy)
+        # Cardinal adjacent: check facing doesn't point at ore
+        if d == 1 and fdx == dx and fdy == dy:
+            continue  # facing into the ore — useless
+        if best_dist is None or d < best_dist:
+            best_dist, best_key = d, key
+            best_given = prev or 0.0
+    if best_key is None:
+        return 0.0
+    effective_dist = max(0, best_dist - 1)  # target is cardinal adjacent (d=1)
+    reward = PLACE_CONV / (1.0 + effective_dist)
+    GameState.conv_proximity[best_key] = -1.0  # mark finalized
+    return reward - best_given
+
+
+def proximity_reward_conv(ct: Controller) -> float:
+    """Proximity reward for failed conveyor placement.
+    Returns delta improvement: new_advance - old_advance. Improvable on closer approach.
+    Zero-sum with placement: total advance is deducted on successful build."""
+    pos = ct.get_position()
+    best_delta, best_key, best_reward = 0.0, None, 0.0
+    for tile_pos in ct.get_nearby_tiles():
+        try:
+            env = ct.get_tile_env(tile_pos)
+            if env not in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
+                continue
+            key = (tile_pos.x, tile_pos.y)
+            prev = GameState.conv_proximity.get(key)
+            if prev is not None and prev < 0:
+                continue  # finalized by successful placement
+            prev = prev or 0.0
+            d = abs(tile_pos.x - pos.x) + abs(tile_pos.y - pos.y)
+            effective_dist = max(0, d - 1)
+            reward = min(PLACE_CONV / (1.0 + effective_dist), PLACE_CONV * 0.1)
+            delta = reward - prev
+            if delta > best_delta:
+                best_delta, best_key, best_reward = delta, key, reward
+        except Exception:
+            continue
+    if best_key is None or best_delta <= 0:
+        return 0.0
+    GameState.conv_proximity[best_key] = best_reward
+    return best_delta
 
 
 # ---------------------------------------------------------------------------
@@ -599,8 +660,18 @@ def execute_build(ct: Controller, action: str, direction: Direction,
         if ct.can_build_conveyor(build_pos, conv_direction):
             ct.build_conveyor(build_pos, conv_direction)
             GameState.conv_count += 1
+            cr = conveyor_reward(ct, build_pos, conv_direction)
+            dbg[6] = 1
+            if cr > 0:
+                dbg[7] = 1
+            return 0.0, cr, dbg
         else:
             dbg[5] = 1
+        cr = proximity_reward_conv(ct)
+        dbg[6] = 1
+        if cr > 0:
+            dbg[7] = 1
+        return 0.0, cr, dbg
     elif action == "harvester":
         dbg[0] = 1
         if ct.can_build_harvester(build_pos):
@@ -637,8 +708,18 @@ def execute_build(ct: Controller, action: str, direction: Direction,
         if ct.can_build_armoured_conveyor(build_pos, conv_direction):
             ct.build_armoured_conveyor(build_pos, conv_direction)
             GameState.conv_count += 1
+            cr = conveyor_reward(ct, build_pos, conv_direction)
+            dbg[6] = 1
+            if cr > 0:
+                dbg[7] = 1
+            return 0.0, cr, dbg
         else:
             dbg[5] = 1
+        cr = proximity_reward_conv(ct)
+        dbg[6] = 1
+        if cr > 0:
+            dbg[7] = 1
+        return 0.0, cr, dbg
     elif action == "barrier":
         if ct.can_build_barrier(build_pos):
             ct.build_barrier(build_pos)
