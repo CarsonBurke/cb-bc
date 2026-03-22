@@ -354,11 +354,14 @@ class Player:
 
         # Compute action masks (which builds are affordable, which tiles are free)
         bt_mask, bd_mask = _compute_masks_from_obs(obs)
+        harv_bd_mask = _compute_harvester_build_dir_mask(obs, bd_mask)
+        bt_mask[_HARVESTER_BUILD_TYPE] = bt_mask[_HARVESTER_BUILD_TYPE] and any(harv_bd_mask)
 
         # Decode each head via argmax (sample in training mode)
         if self._train_log is not None:
             build_type_idx, bt_lp = _sample_from_logits(outputs["build_type"], bt_mask)
-            build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"], bd_mask)
+            build_dir_mask = harv_bd_mask if build_type_idx == _HARVESTER_BUILD_TYPE else bd_mask
+            build_dir_idx, bd_lp = _sample_from_logits(outputs["build_dir"], build_dir_mask)
             conv_dir_idx, cd_lp = _sample_from_logits(outputs["conv_dir"], None)
             move_dir_idx, md_lp = _sample_from_logits(outputs["move_dir"], None)
             # Mask build_dir log_prob when build_type is "none" (idx 0)
@@ -372,7 +375,8 @@ class Player:
             )
         else:
             build_type_idx = _argmax(outputs["build_type"], bt_mask)
-            build_dir_idx = _argmax(outputs["build_dir"], bd_mask)
+            build_dir_mask = harv_bd_mask if build_type_idx == _HARVESTER_BUILD_TYPE else bd_mask
+            build_dir_idx = _argmax(outputs["build_dir"], build_dir_mask)
             conv_dir_idx = _argmax(outputs["conv_dir"], None)
             move_dir_idx = _argmax(outputs["move_dir"], None)
 
@@ -391,8 +395,9 @@ class Player:
         self._dbg_conv_failures = 0
         self._dbg_conv_prox_gate = 0
         self._dbg_conv_prox_paid = 0
-        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
-        place_reward = harv_reward + conv_reward
+        _harv_aux, _conv_aux = self._execute_build(ct, build_action, build_dir, conv_dir)
+        harv_reward = 0.0
+        conv_reward = 0.0
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
@@ -409,6 +414,7 @@ class Player:
             # Tuple: obs, h, bt, bd, cd, md, value, n_working, conv_r, ti, harv_r, dmg, old_lp,
             #        harv_attempt, harv_fail, harv_gate, harv_paid,
             #        conv_attempt, conv_fail, conv_gate, conv_paid, own_dmg
+            # Replay augmentation appends ti_delivered, ax_delivered at indices 22, 23.
             self._train_log.append((
                 obs,
                 list(h_in),
@@ -1019,6 +1025,19 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
         return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9
 
     return bt_mask, bd_mask
+
+
+def _compute_harvester_build_dir_mask(obs: list[float], bd_mask: list[bool]) -> list[bool]:
+    """Harvester placement is only legal on empty ore tiles."""
+    harv_mask = [False] * 9
+    for d_idx, allowed in enumerate(bd_mask):
+        if not allowed:
+            continue
+        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
+        empty = obs[ts + 4] == 1.0
+        ore_here = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
+        harv_mask[d_idx] = empty and ore_here
+    return harv_mask
 
 
 def _argmax(data: list[float], mask: list[bool] | None = None) -> int:

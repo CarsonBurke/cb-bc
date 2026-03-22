@@ -40,7 +40,23 @@ ACTOR_RMSNORM_LAYERS = (True, True, True, True)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
 CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
+INITIAL_BUILD_TYPE_BIAS = [
+    0.0,   # none
+    0.8,   # harvester
+    1.0,   # conveyor
+    0.0,   # road
+    -0.4,  # gunner
+    -0.4,  # sentinel
+    -0.6,  # breach
+    0.7,   # splitter
+    0.0,   # armoured_conveyor
+    -0.3,  # barrier
+    -0.7,  # foundry
+    -0.5,  # launcher
+]
 REWARD_FLOW_THROUGHPUT = 2.5
+REWARD_TITANIUM_DELIVERY = 0.25
+REWARD_AXIONITE_DELIVERY = 0.5
 REWARD_ENEMY_CORE_DAMAGE = 20.0
 REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
 
@@ -69,7 +85,7 @@ _MASK_BD_DY = [-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
 _CONV_DIR_MASK = [True, True, True, True]  # all 4 cardinal dirs always valid
 
 # Observation feature indices for resources/scale
-_OBS_GLOBAL_START = 5 * 5 * TILE_FEATURES  # 425
+_OBS_GLOBAL_START = 5 * 5 * TILE_FEATURES  # 475
 _OBS_TI = _OBS_GLOBAL_START + 3
 _OBS_AX = _OBS_GLOBAL_START + 4
 _OBS_SCALE = _OBS_GLOBAL_START + 5
@@ -148,23 +164,13 @@ def _harv_mask_indices(device: torch.device):
 def compute_harvester_build_dir_mask(obs: torch.Tensor, bd_mask: torch.Tensor) -> torch.Tensor:
     """Harvester-specific direction mask.
 
-    Allow:
-    - empty ore tiles for real harvester placement
-    - otherwise-valid non-ore tiles when at least one ore tile is visible in the
-      local observation, so failed harvester attempts can enter proximity shaping
+    Harvester placement is only legal on empty ore tiles.
     """
     _, _, _, nobld_idx, _, _, _ = _mask_indices(obs.device)
     ore_ti_idx, ore_ax_idx = _harv_mask_indices(obs.device)
     ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
     empty = obs[:, nobld_idx] == 1.0
-
-    obs_tiles = obs[:, :25 * TILE_FEATURES].reshape(obs.shape[0], 25, TILE_FEATURES)
-    has_visible_ore = (obs_tiles[:, :, 1] == 1.0) | (obs_tiles[:, :, 2] == 1.0)
-    has_visible_ore = has_visible_ore.any(dim=1, keepdim=True)
-
-    place_mask = bd_mask & ore_here & empty
-    prox_mask = bd_mask & (~ore_here) & has_visible_ore
-    return place_mask | prox_mask
+    return bd_mask & ore_here & empty
 
 
 def compute_build_dir_mask_for_type(
@@ -597,8 +603,7 @@ class GraphedInference:
                 ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
                 empty_dir = obs[:, nobld_idx] == 1.0
                 obs_tiles = obs[:, :25 * TILE_FEATURES].reshape(M, 25, TILE_FEATURES)
-                has_ore = ((obs_tiles[:, :, 1] == 1.0) | (obs_tiles[:, :, 2] == 1.0)).any(dim=1, keepdim=True)
-                harv_bd_m = (bd_m & ore_here & empty_dir) | (bd_m & ~ore_here & has_ore)
+                harv_bd_m = bd_m & ore_here & empty_dir
                 bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
 
                 bt_l.masked_fill_(~bt_m, -1e9)
@@ -700,6 +705,12 @@ class BuilderMLP(nn.Module):
         self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
         self.head_h_gate = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wz: update gate
         self.head_h_cand = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wh: candidate
+
+        # Give new policies a structured exploration prior toward economy actions.
+        with torch.no_grad():
+            self.head_build_type.bias.copy_(
+                torch.tensor(INITIAL_BUILD_TYPE_BIAS, dtype=torch.float32),
+            )
 
     def train(self, mode=True):
         # Invalidate fused head cache when entering train mode
@@ -1121,18 +1132,18 @@ def _parse_trajectories(
                         cd_t[idx] = step[4]
                         md_t[idx] = step[5]
                         n_working = step[7] if n > 7 else 0
-                        conv_r = step[8] if n > 8 else 0.0
-                        harv_r = step[10] if n > 10 else 0.0
                         dmg = step[11] if n > 11 else 0.0
+                        ti_delivered = step[22] if n > 22 else 0
+                        ax_delivered = step[23] if n > 23 else 0
                         lp_t[idx] = step[12] if n > 12 else 0.0
                         own_dmg = step[21] if n > 21 else 0.0
                     else:
                         cd_t[idx] = step[3]
                         md_t[idx] = step[4]
                         n_working = step[6] if n > 6 else 0
-                        conv_r = step[7] if n > 7 else 0.0
-                        harv_r = step[9] if n > 9 else 0.0
                         dmg = step[10] if n > 10 else 0.0
+                        ti_delivered = 0
+                        ax_delivered = 0
                         lp_t[idx] = step[11] if n > 11 else 0.0
                         own_dmg = 0.0
                 else:
@@ -1143,15 +1154,15 @@ def _parse_trajectories(
                     cd_t[idx] = step.get("cd", step["bd"])
                     md_t[idx] = step["md"]
                     n_working = step.get("n_working", step.get("ti_delivered", 0))
-                    conv_r = step.get("conv_r", 0)
-                    harv_r = step.get("harv_r", 0)
                     dmg = step.get("dmg", 0)
+                    ti_delivered = step.get("ti_delivered", 0)
+                    ax_delivered = step.get("ax_delivered", 0)
                     own_dmg = step.get("own_dmg", 0)
                     lp_t[idx] = step.get("old_lp", 0)
                 rw_t[idx] = (
-                    harv_r
-                    + conv_r
-                    + n_working * REWARD_FLOW_THROUGHPUT
+                    n_working * REWARD_FLOW_THROUGHPUT
+                    + ti_delivered * REWARD_TITANIUM_DELIVERY
+                    + ax_delivered * REWARD_AXIONITE_DELIVERY
                     + dmg * REWARD_ENEMY_CORE_DAMAGE
                     + own_dmg * REWARD_OWN_CORE_DAMAGE
                 )

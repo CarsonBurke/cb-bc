@@ -194,7 +194,9 @@ class Player:
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = CONV_DIR_4[conv_dir_idx]
-        harv_reward, conv_reward, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team)
+        _harv_aux, _conv_aux, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team)
+        harv_reward = 0.0
+        conv_reward = 0.0
 
         move_dir = DIR_MAP_9[move_dir_idx]
         execute_move(ct, move_dir)
@@ -203,6 +205,7 @@ class Player:
         self._prev_resources = (ti_after, ax_after)
 
         if self._train_log is not None:
+            # Replay augmentation appends ti_delivered, ax_delivered at indices 22, 23.
             self._train_log.append((
                 obs.tolist(), list(h_in),
                 build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx,

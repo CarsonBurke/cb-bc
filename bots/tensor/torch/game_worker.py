@@ -12,6 +12,9 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+REPLAY_PARSER_PYTHON = PROJECT_ROOT / "packages" / "replay_parser" / "python"
+if str(REPLAY_PARSER_PYTHON) not in sys.path:
+    sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 
 from replay_parser import ReplayData
 
@@ -26,10 +29,12 @@ def _run_game_proxy(args):
         rd = ReplayData.from_file(replay_path, team=0)
         working = rd.working_harvesters_dict()
         ti_delivered = rd.titanium_delivered_dict()
+        ax_delivered = rd.axionite_delivered_dict()
         winner = rd.winner_str
         global_states = {
             "states_buf": rd.states_bytes,
             "scalars_buf": rd.scalars_bytes,
+            "transfer_events_buf": rd.resource_transfers_bytes,
             "state_stride": rd.state_stride,
             "map_w": rd.map_w,
             "map_h": rd.map_h,
@@ -39,10 +44,17 @@ def _run_game_proxy(args):
         }
     except BaseException as e:
         print(f"  Game error: {e}")
-        return None, None, None, None, None
+        return None, None, None, None, None, None
     finally:
         os.environ.pop("TENSOR_TRAIN_LOG", None)
-    return (log_path if os.path.exists(log_path) else None), working, winner, global_states, ti_delivered
+    return (
+        (log_path if os.path.exists(log_path) else None),
+        working,
+        winner,
+        global_states,
+        ti_delivered,
+        ax_delivered,
+    )
 
 
 def main(argv=None):

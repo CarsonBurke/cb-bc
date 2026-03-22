@@ -752,14 +752,7 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], l
     if not any_affordable or not any_dir:
         return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9, [True] * 9
 
-    # Harvester build-direction mask: only allow dirs on ore (if ore visible)
-    # or dirs NOT on ore (if ore visible elsewhere). Suppress harvester if no valid dir.
-    has_visible_ore = False
-    for tile in range(GRID_SIZE * GRID_SIZE):
-        ts = tile * TILE_FEATURES
-        if obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0:
-            has_visible_ore = True
-            break
+    # Harvester placement is only legal on empty ore tiles.
     harv_bd_mask = [False] * 9
     for d_idx in range(9):
         if not bd_mask[d_idx]:
@@ -767,7 +760,7 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], l
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
         is_ore = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
         empty = obs[ts + 4] == 1.0
-        harv_bd_mask[d_idx] = (is_ore and empty) or ((not is_ore) and has_visible_ore)
+        harv_bd_mask[d_idx] = is_ore and empty
     if not any(harv_bd_mask):
         bt_mask[1] = False  # suppress harvester
 

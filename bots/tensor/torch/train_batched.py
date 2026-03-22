@@ -30,6 +30,9 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+REPLAY_PARSER_PYTHON = PROJECT_ROOT / "packages" / "replay_parser" / "python"
+if str(REPLAY_PARSER_PYTHON) not in sys.path:
+    sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 
 
 def _maybe_run_worker_mode() -> None:
@@ -64,6 +67,8 @@ from model import (
     H_DIM,
     OBS_SIZE,
     REWARD_FLOW_THROUGHPUT,
+    REWARD_TITANIUM_DELIVERY,
+    REWARD_AXIONITE_DELIVERY,
     REWARD_ENEMY_CORE_DAMAGE,
     REWARD_OWN_CORE_DAMAGE,
     TILE_FEATURES,
@@ -81,7 +86,11 @@ from model import (
     train_on_trajectories,
     GraphedInference,
 )
-from replay_parser import augment_trajectories_with_working_counts
+from replay_parser import (
+    augment_trajectories_with_ax_delivery,
+    augment_trajectories_with_ti_delivery,
+    augment_trajectories_with_working_counts,
+)
 from flow_reward import compute_per_round_throughput, augment_trajectories_with_throughput
 
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
@@ -250,22 +259,26 @@ def _dummy_policy(obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
     move_dir = torch.full_like(build_type, 4)
     return build_type, build_dir, conv_dir, move_dir
 
-def _load_worker_result(result_path: str) -> tuple[str | None, dict | None, str | None, dict | None, dict | None]:
+def _load_worker_result(
+    result_path: str,
+) -> tuple[str | None, dict | None, str | None, dict | None, dict | None, dict | None]:
     try:
         with open(result_path, "rb") as f:
             result = pickle.load(f)
     except (OSError, pickle.PickleError, EOFError):
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None)
     if isinstance(result, tuple):
-        if len(result) == 5:
+        if len(result) == 6:
             return result
+        if len(result) == 5:
+            return result[0], result[1], result[2], result[3], result[4], None
         if len(result) == 4:
-            return result[0], result[1], result[2], result[3], None
+            return result[0], result[1], result[2], result[3], None, None
         if len(result) == 3:
-            return result[0], result[1], result[2], None, None
+            return result[0], result[1], result[2], None, None, None
         if len(result) == 2:
-            return result[0], result[1], None, None, None
-    return (None, None, None, None, None)
+            return result[0], result[1], None, None, None, None
+    return (None, None, None, None, None, None)
 
 
 def _recommended_worker_count(n_games: int) -> int:
@@ -692,23 +705,31 @@ def collect_games_batched(
     per_opp_winners = {}
     for i, result in enumerate(results):
         oid = opp_ids[i]
-        if isinstance(result, tuple) and len(result) == 5:
-            log_path, working, w, gstates, _ti_delivered = result
+        if isinstance(result, tuple) and len(result) == 6:
+            log_path, working, w, gstates, ti_delivered, ax_delivered = result
+        elif isinstance(result, tuple) and len(result) == 5:
+            log_path, working, w, gstates, ti_delivered = result
+            ax_delivered = None
         elif isinstance(result, tuple) and len(result) == 4:
             log_path, working, w, gstates = result
+            ti_delivered, ax_delivered = None, None
         elif isinstance(result, tuple) and len(result) == 3:
             log_path, working, w = result
             gstates = None
+            ti_delivered, ax_delivered = None, None
         elif isinstance(result, tuple) and len(result) == 2:
             log_path, working = result
             w, gstates = None, None
+            ti_delivered, ax_delivered = None, None
         else:
             log_path, working, w, gstates = None, None, None, None
+            ti_delivered, ax_delivered = None, None
         if log_path is None:
             per_opp_winners.setdefault(oid, []).append(None)
             continue
         game_trajs = _read_trajectory_file(log_path)
-        # Augment with per-round resource throughput (replaces n_working slot)
+        # Augment with replay-derived internal resource transfer events
+        # (replaces the old occupancy-based throughput proxy in n_working slot).
         if gstates and gstates.get("states_buf"):
             try:
                 throughput = compute_per_round_throughput(gstates)
@@ -718,6 +739,8 @@ def collect_games_batched(
                 game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
         else:
             game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
+        game_trajs = augment_trajectories_with_ti_delivery(game_trajs, ti_delivered or {}, team=0)
+        game_trajs = augment_trajectories_with_ax_delivery(game_trajs, ax_delivered or {}, team=0)
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -933,7 +956,7 @@ def main():
 
         # Stats
         def _traj_reward(traj):
-            r_harv, r_conv, r_work, r_dmg, r_own_dmg = 0.0, 0.0, 0.0, 0.0, 0.0
+            r_ti, r_ax, r_work, r_dmg, r_own_dmg = 0.0, 0.0, 0.0, 0.0, 0.0
             harv_attempts = harv_failures = harv_prox_gate = harv_prox_paid = 0
             conv_attempts = conv_failures = conv_prox_gate = conv_prox_paid = 0
             for s in traj:
@@ -941,9 +964,9 @@ def main():
                     n = len(s)
                     if n > 12:
                         n_working = s[7] if n > 7 else 0
-                        conv_r = s[8] if n > 8 else 0.0
-                        harv_r = s[10] if n > 10 else 0.0
                         dmg = s[11] if n > 11 else 0.0
+                        ti_delivered = s[22] if n > 22 else 0
+                        ax_delivered = s[23] if n > 23 else 0
                         harv_attempt = s[13] if n > 13 else 0
                         harv_fail = s[14] if n > 14 else 0
                         harv_gate = s[15] if n > 15 else 0
@@ -955,18 +978,18 @@ def main():
                         own_dmg = s[21] if n > 21 else 0.0
                     else:
                         n_working = s[6] if n > 6 else 0
-                        conv_r = s[7] if n > 7 else 0.0
-                        harv_r = s[9] if n > 9 else 0.0
                         dmg = s[10] if n > 10 else 0.0
+                        ti_delivered = 0
+                        ax_delivered = 0
                         harv_attempt = harv_fail = harv_gate = harv_paid = 0
                         conv_attempt = conv_fail = conv_gate = conv_paid = 0
                         own_dmg = 0.0
                 else:
                     n_working = s.get("n_working", s.get("ti_delivered", 0))
-                    conv_r = s.get("conv_r", 0)
-                    harv_r = s.get("harv_r", 0)
                     dmg = s.get("dmg", 0)
                     own_dmg = s.get("own_dmg", 0)
+                    ti_delivered = s.get("ti_delivered", 0)
+                    ax_delivered = s.get("ax_delivered", 0)
                     harv_attempt = s.get("harv_attempt", 0)
                     harv_fail = s.get("harv_fail", 0)
                     harv_gate = s.get("harv_gate", 0)
@@ -975,8 +998,8 @@ def main():
                     conv_fail = s.get("conv_fail", 0)
                     conv_gate = s.get("conv_gate", 0)
                     conv_paid = s.get("conv_paid", 0)
-                r_harv += harv_r
-                r_conv += conv_r
+                r_ti += ti_delivered * REWARD_TITANIUM_DELIVERY
+                r_ax += ax_delivered * REWARD_AXIONITE_DELIVERY
                 r_work += n_working * REWARD_FLOW_THROUGHPUT
                 r_dmg += dmg * REWARD_ENEMY_CORE_DAMAGE
                 r_own_dmg += own_dmg * REWARD_OWN_CORE_DAMAGE
@@ -988,9 +1011,9 @@ def main():
                 conv_failures += conv_fail
                 conv_prox_gate += conv_gate
                 conv_prox_paid += conv_paid
-            total = r_harv + r_conv + r_work + r_dmg + r_own_dmg
+            total = r_ti + r_ax + r_work + r_dmg + r_own_dmg
             return (
-                total, r_harv, r_conv, r_work, r_dmg, r_own_dmg,
+                total, r_ti, r_ax, r_work, r_dmg, r_own_dmg,
                 harv_attempts, harv_failures, harv_prox_gate, harv_prox_paid,
                 conv_attempts, conv_failures, conv_prox_gate, conv_prox_paid,
             )
@@ -1005,8 +1028,8 @@ def main():
         rewards = []
         for traj_i, traj in enumerate(all_trajs):
             rewards.append(_traj_reward(traj))
-        mean_r_harv = sum(r[1] for r in rewards) / n_trajs
-        mean_r_conv = sum(r[2] for r in rewards) / n_trajs
+        mean_r_ti = sum(r[1] for r in rewards) / n_trajs
+        mean_r_ax = sum(r[2] for r in rewards) / n_trajs
         mean_r_work = sum(r[3] for r in rewards) / n_trajs
         mean_r_dmg = sum(r[4] for r in rewards) / n_trajs
         mean_r_own_dmg = sum(r[5] for r in rewards) / n_trajs
@@ -1018,13 +1041,14 @@ def main():
         mean_conv_failures = sum(r[11] for r in rewards) / n_trajs
         mean_conv_prox_gate = sum(r[12] for r in rewards) / n_trajs
         mean_conv_prox_paid = sum(r[13] for r in rewards) / n_trajs
-        mean_reward = (mean_r_harv + mean_r_conv + mean_r_work + mean_r_dmg + mean_r_own_dmg)
+        mean_reward = (mean_r_ti + mean_r_ax + mean_r_work + mean_r_dmg + mean_r_own_dmg)
         mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
         elapsed = elapsed_offset + (time.time() - run_started_at)
 
         ep_entry = {
             "episode": ep + 1, "reward": round(mean_reward, 4),
-            "r_harv": round(mean_r_harv, 4), "r_conv": round(mean_r_conv, 4),
+            "r_harv": 0.0, "r_conv": 0.0,
+            "r_ti": round(mean_r_ti, 4), "r_ax": round(mean_r_ax, 4),
             "r_work": round(mean_r_work, 4), "r_dmg": round(mean_r_dmg, 4),
             "r_own_dmg": round(mean_r_own_dmg, 4),
             "harv_attempts": round(mean_harv_attempts, 3),
@@ -1100,7 +1124,8 @@ def main():
             print(
                 f"  Ep {ep + 1:3d}/{args.episodes}: "
                 f"W/L={total_wins}/{total_losses}/{total_games}  "
-                f"reward/unit={mean_reward:+.2f}  conv={mean_r_conv:.3f}  work={mean_r_work:+.2f}  ti={mean_ti:.0f}  "
+                f"reward/unit={mean_reward:+.2f}  ti_deliv={mean_r_ti:+.2f}  ax_deliv={mean_r_ax:+.2f}  "
+                f"work={mean_r_work:+.2f}  ti={mean_ti:.0f}  "
                 f"harv a/f/g/p={mean_harv_attempts:.2f}/{mean_harv_failures:.2f}/{mean_harv_prox_gate:.2f}/{mean_harv_prox_paid:.2f}  "
                 f"pi={stats['pi_loss']:+.4f}  "
                 f"kl={stats.get('approx_kl', 0):.4f}  "

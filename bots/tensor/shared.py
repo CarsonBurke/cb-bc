@@ -469,6 +469,19 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
     return bt_mask, bd_mask
 
 
+def compute_harvester_build_dir_mask(obs: list[float], bd_mask: list[bool]) -> list[bool]:
+    """Harvester placement is only legal on empty ore tiles."""
+    harv_mask = [False] * 9
+    for d_idx, allowed in enumerate(bd_mask):
+        if not allowed:
+            continue
+        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
+        empty = obs[ts + 4] == 1.0
+        ore_here = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
+        harv_mask[d_idx] = empty and ore_here
+    return harv_mask
+
+
 # ---------------------------------------------------------------------------
 # Reward functions
 # ---------------------------------------------------------------------------
