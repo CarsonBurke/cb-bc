@@ -478,25 +478,25 @@ PLACE_CONV = 2.5
 
 
 def proximity_reward(ct: Controller, build_pos: Position, my_team) -> float:
-    best_delta, best_key, best_reward = 0.0, None, 0.0
+    best_dist, best_key = None, None
     ore_tiles = GameState.all_ore or ()
     for tile_pos in ore_tiles:
         try:
-            key = (tile_pos.x, tile_pos.y)
-            prev = GameState.harv_proximity.get(key, 0.0)
             d = max(abs(tile_pos.x - build_pos.x), abs(tile_pos.y - build_pos.y))
-            if d > 10:
-                continue
-            reward = PLACE_HARV * 0.2 / (1.0 + d)
-            delta = reward - prev
-            if delta > best_delta:
-                best_delta, best_key, best_reward = delta, key, reward
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_key = (tile_pos.x, tile_pos.y)
         except Exception:
             continue
-    if best_key is None or best_delta <= 0:
+    if best_key is None or best_dist > 10:
         return 0.0
-    GameState.harv_proximity[best_key] = best_reward
-    return best_delta
+    prev = GameState.harv_proximity.get(best_key, 0.0)
+    reward = PLACE_HARV * 0.2 / (1.0 + best_dist)
+    delta = reward - prev
+    if delta <= 0:
+        return 0.0
+    GameState.harv_proximity[best_key] = reward
+    return delta
 
 
 def should_reward_harvester_proximity(
@@ -528,25 +528,26 @@ def should_reward_harvester_proximity(
 def conveyor_reward(ct: Controller, pos: Position, facing: Direction) -> float:
     """Reward for successful conveyor placement based on manhattan proximity to ore.
     Target distance is 1 (cardinally adjacent). Zero-sum with proximity advances.
-    Zero reward if conveyor faces toward the ore (would push into miner)."""
+    Always matches closest ore regardless of fulfillment — no reward if already claimed."""
     best_dist, best_key = None, None
-    best_given = 0.0
     fdx, fdy = DIR_DXY.get(facing, (0, 0))
     for ore_pos in (GameState.all_ore or []):
-        key = (ore_pos.x, ore_pos.y)
-        prev = GameState.conv_proximity.get(key)
-        if prev is not None and prev < 0:
-            continue  # already finalized by a prior placement
         dx, dy = ore_pos.x - pos.x, ore_pos.y - pos.y
         d = abs(dx) + abs(dy)
-        # Cardinal adjacent: check facing doesn't point at ore
-        if d == 1 and fdx == dx and fdy == dy:
-            continue  # facing into the ore — useless
         if best_dist is None or d < best_dist:
-            best_dist, best_key = d, key
-            best_given = prev or 0.0
+            best_dist = d
+            best_key = (ore_pos.x, ore_pos.y)
     if best_key is None:
         return 0.0
+    # Already finalized — no reward
+    prev = GameState.conv_proximity.get(best_key)
+    if prev is not None and prev < 0:
+        return 0.0
+    # Cardinal adjacent: check facing doesn't point at ore
+    dx, dy = best_key[0] - pos.x, best_key[1] - pos.y
+    if best_dist == 1 and fdx == dx and fdy == dy:
+        return 0.0  # facing into the ore — useless
+    best_given = prev or 0.0
     effective_dist = max(0, best_dist - 1)  # target is cardinal adjacent (d=1)
     reward = PLACE_CONV / (1.0 + effective_dist)
     GameState.conv_proximity[best_key] = -1.0  # mark finalized
@@ -556,31 +557,33 @@ def conveyor_reward(ct: Controller, pos: Position, facing: Direction) -> float:
 def proximity_reward_conv(ct: Controller) -> float:
     """Proximity reward for failed conveyor placement.
     Returns delta improvement: new_advance - old_advance. Improvable on closer approach.
-    Zero-sum with placement: total advance is deducted on successful build."""
+    Always matches closest ore — no reward if already finalized."""
     pos = ct.get_position()
-    best_delta, best_key, best_reward = 0.0, None, 0.0
+    best_dist, best_key = None, None
     for tile_pos in ct.get_nearby_tiles():
         try:
             env = ct.get_tile_env(tile_pos)
             if env not in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
                 continue
-            key = (tile_pos.x, tile_pos.y)
-            prev = GameState.conv_proximity.get(key)
-            if prev is not None and prev < 0:
-                continue  # finalized by successful placement
-            prev = prev or 0.0
             d = abs(tile_pos.x - pos.x) + abs(tile_pos.y - pos.y)
-            effective_dist = max(0, d - 1)
-            reward = min(PLACE_CONV / (1.0 + effective_dist), PLACE_CONV * 0.1)
-            delta = reward - prev
-            if delta > best_delta:
-                best_delta, best_key, best_reward = delta, key, reward
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_key = (tile_pos.x, tile_pos.y)
         except Exception:
             continue
-    if best_key is None or best_delta <= 0:
+    if best_key is None:
         return 0.0
-    GameState.conv_proximity[best_key] = best_reward
-    return best_delta
+    prev = GameState.conv_proximity.get(best_key)
+    if prev is not None and prev < 0:
+        return 0.0  # finalized by successful placement
+    prev = prev or 0.0
+    effective_dist = max(0, best_dist - 1)
+    reward = min(PLACE_CONV / (1.0 + effective_dist), PLACE_CONV * 0.1)
+    delta = reward - prev
+    if delta <= 0:
+        return 0.0
+    GameState.conv_proximity[best_key] = reward
+    return delta
 
 
 # ---------------------------------------------------------------------------
