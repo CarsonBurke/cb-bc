@@ -69,8 +69,9 @@ def _get_shared_model(path: str):
             else:
                 with open(path) as f:
                     model.load(json.load(f))
-        except Exception:
-            pass
+        except Exception as e:
+            import sys
+            print(f"WARNING: tensor_opp failed to load weights from {path}: {e}", file=sys.stderr)
 
     if cache_key is not None:
         _MODEL_CACHE[cache_key] = model

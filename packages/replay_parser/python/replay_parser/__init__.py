@@ -256,7 +256,7 @@ def extract_global_states(
 
 # ── Trajectory augmentation (pure Python) ─────────────────────────────────
 
-_GLOBAL_START = 25 * 17  # GRID_SIZE^2 * TILE_FEATURES = 425
+_GLOBAL_START = 25 * 19  # GRID_SIZE^2 * TILE_FEATURES = 475
 _ROUND_OBS_IDX = _GLOBAL_START
 
 
