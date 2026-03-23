@@ -28,8 +28,6 @@ def _run_game_proxy(args):
         run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
         rd = ReplayData.from_file(replay_path, team=0)
         working = rd.working_harvesters_dict()
-        ti_delivered = rd.titanium_delivered_dict()
-        ax_delivered = rd.axionite_delivered_dict()
         winner = rd.winner_str
         global_states = {
             "states_buf": rd.states_bytes,
@@ -44,7 +42,7 @@ def _run_game_proxy(args):
         }
     except BaseException as e:
         print(f"  Game error: {e}")
-        return None, None, None, None, None, None
+        return None, None, None, None
     finally:
         os.environ.pop("TENSOR_TRAIN_LOG", None)
     return (
@@ -52,8 +50,6 @@ def _run_game_proxy(args):
         working,
         winner,
         global_states,
-        ti_delivered,
-        ax_delivered,
     )
 
 

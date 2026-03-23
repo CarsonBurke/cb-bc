@@ -363,8 +363,9 @@ def augment_trajectories_with_flow_scores(
 
 def compute_per_round_throughput(
     global_states: dict,
+    team: int = 0,
 ) -> dict[int, float]:
-    """Compute per-round exact same-team non-core resource transfers.
+    """Compute per-round flow-aligned resource transfers for the given team.
 
     This consumes the replay parser's `DistributeResources` events directly,
     so it counts real transfer events instead of inferring throughput from the
@@ -379,9 +380,10 @@ def compute_per_round_throughput(
 
     result = {}
     for t in range(n_turns):
-        a, _b = struct.unpack_from("<ii", buf, t * 8)
-        if a > 0:
-            result[t] = float(a)
+        vals = struct.unpack_from("<ff", buf, t * 8)
+        v = vals[team]
+        if v > 0.0:
+            result[t] = v
     return result
 
 

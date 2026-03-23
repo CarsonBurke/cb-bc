@@ -33,6 +33,7 @@ TILE_INPUT_DIM = TILE_FEATURES + 2  # 21: raw features + (dx/2, dy/2)
 TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
 COMPRESS_DIM = 64  # tile compress output dim (spatial pooling)
 TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 103
+OBS_PREFIX_SIZE = TRUNK_INPUT_SIZE - H_DIM
 ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
@@ -55,9 +56,7 @@ INITIAL_BUILD_TYPE_BIAS = [
     -0.7,  # foundry
     -0.5,  # launcher
 ]
-REWARD_FLOW_THROUGHPUT = 2.5
-REWARD_TITANIUM_DELIVERY = 0.25
-REWARD_AXIONITE_DELIVERY = 0.5
+REWARD_FLOW_THROUGHPUT = 5.0
 REWARD_ENEMY_CORE_DAMAGE = 20.0
 REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
 
@@ -174,6 +173,16 @@ def compute_harvester_build_dir_mask(obs: torch.Tensor, bd_mask: torch.Tensor) -
     return bd_mask & ore_here & empty
 
 
+_conv_dir_mask_cache: dict = {}
+
+
+def _conveyor_dir_mask_base(device: torch.device) -> torch.Tensor:
+    """Get or create the base conveyor direction mask for the given device."""
+    if device not in _conv_dir_mask_cache:
+        _conv_dir_mask_cache[device] = torch.tensor(_CONV_DIR_MASK, dtype=torch.bool, device=device)
+    return _conv_dir_mask_cache[device]
+
+
 def compute_build_dir_mask_for_type(
     obs: torch.Tensor,
     bt_act: torch.Tensor,
@@ -189,8 +198,7 @@ def compute_build_dir_mask_for_type(
 
 
 def conveyor_dir_mask(device: torch.device, batch_size: int) -> torch.Tensor:
-    mask = torch.tensor(_CONV_DIR_MASK, dtype=torch.bool, device=device)
-    return mask.unsqueeze(0).expand(batch_size, -1)
+    return _conveyor_dir_mask_base(device).unsqueeze(0).expand(batch_size, -1)
 
 
 _cond_bt_cache: dict = {}
@@ -273,7 +281,7 @@ GLOBAL_MAP_MAX_H = 50
 GLOBAL_MAP_CHANNELS = 19
 GLOBAL_SCALAR_DIM = 17  # 12 base + own_working_harv, Δti, Δax, Δcore_hp, Δworking_harv
 UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
-CENTRALIZED_CNN_CHUNK = 248
+CENTRALIZED_CNN_CHUNK = 2048
 
 
 class RMSNorm2d(nn.Module):
@@ -402,9 +410,18 @@ class CentralizedCritic(nn.Module):
             v_unit: (B,) — per-unit marginal value
         """
         fH, fW = feat.shape[2], feat.shape[3]
-        ux = unit_xy[:, 0].clamp(0, fW - 1).long()
-        uy = unit_xy[:, 1].clamp(0, fH - 1).long()
-        ri = round_idx.long()
+        if unit_xy.dtype == torch.long:
+            ux = unit_xy[:, 0]
+            uy = unit_xy[:, 1]
+        else:
+            ux = unit_xy[:, 0].round().to(torch.long)
+            uy = unit_xy[:, 1].round().to(torch.long)
+        if round_idx.dtype == torch.long:
+            ri = round_idx
+        else:
+            ri = round_idx.to(torch.long)
+        ux = ux.clamp(0, fW - 1)
+        uy = uy.clamp(0, fH - 1)
 
         # Index into cached feature maps: (B, conv_dim)
         # feat may be bf16 from conv stack; cast to fp32 for the value MLP
@@ -492,6 +509,22 @@ def _load_critic_round_batch(
         centralized_data["gpu_mask"][ids],
         centralized_data["gpu_scalars"][ids],
     )
+
+
+def _chunk_offsets_from_ids(
+    chunk_ids: torch.Tensor,
+    n_chunks: int,
+) -> list[int]:
+    """Return CPU-side prefix offsets for contiguous sorted chunk ids."""
+    if n_chunks <= 0:
+        return [0]
+    if chunk_ids.numel() == 0:
+        return [0] * (n_chunks + 1)
+    counts = torch.bincount(chunk_ids, minlength=n_chunks)
+    offsets = torch.empty(n_chunks + 1, dtype=torch.long, device=counts.device)
+    offsets[0] = 0
+    offsets[1:] = counts.cumsum(0)
+    return offsets.cpu().tolist()
 
 
 def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
@@ -750,15 +783,38 @@ class BuilderMLP(nn.Module):
 
     def _build_trunk_input(self, obs: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         """Build trunk input: compressed tiles + globals + pos_embed + h_prev."""
+        obs_prefix = self._build_obs_prefix(obs)
+        return torch.cat([obs_prefix, h_prev], dim=-1)  # (B, 103)
+
+    def _build_obs_prefix(self, obs: torch.Tensor) -> torch.Tensor:
+        """Build the observation-only trunk prefix."""
         tile_summary = self._encode_tiles(obs)  # (B, 64)
         globals_pos = obs[:, TILE_GRID_N * TILE_FEATURES:]  # (B, 23) globals+pos_embed
-        return torch.cat([tile_summary, globals_pos, h_prev], dim=-1)  # (B, 103)
+        return torch.cat([tile_summary, globals_pos], dim=-1)  # (B, 87)
+
+    def _obs_encoder_pre(self, obs: torch.Tensor) -> torch.Tensor:
+        """Precompute the obs-only contribution to the first encoder linear."""
+        obs_prefix = self._build_obs_prefix(obs)
+        enc_linear = self.encoder[0]
+        return F.linear(obs_prefix, enc_linear.weight[:, :OBS_PREFIX_SIZE], enc_linear.bias)
+
+    def _latent_from_obs_pre(self, obs_pre: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        """Run the recurrent actor from a precomputed obs-side encoder term."""
+        enc_linear = self.encoder[0]
+        h_pre = F.linear(h_prev, enc_linear.weight[:, OBS_PREFIX_SIZE:], None)
+        enc = self.encoder[1](obs_pre + h_pre)
+        enc = self.encoder[2](enc)
+        return self.actor_trunk(enc)
+
+    def _forward_from_obs_pre(self, obs_pre: torch.Tensor, h_prev: torch.Tensor):
+        """Forward pass from precomputed obs-side encoder activations."""
+        h = self._latent_from_obs_pre(obs_pre, h_prev)
+        return self._forward_from_hidden(h)
 
     def actor_latent(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         """Return the pre-head actor latent used for policy logits."""
-        trunk_in = self._build_trunk_input(x, h_prev)
-        enc = self.encoder(trunk_in)
-        return self.actor_trunk(enc)
+        obs_pre = self._obs_encoder_pre(x)
+        return self._latent_from_obs_pre(obs_pre, h_prev)
 
     def _forward_from_hidden(self, h: torch.Tensor):
         """Project actor latent to policy heads."""
@@ -800,8 +856,8 @@ class BuilderMLP(nn.Module):
         return self._forward_from_hidden(h)
 
     def forward(self, x, h_prev):
-        trunk_in = self._build_trunk_input(x, h_prev)
-        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = self._forward_from_trunk_in(trunk_in)
+        obs_pre = self._obs_encoder_pre(x)
+        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
         z = torch.sigmoid(h_gate)
         h_next = (1.0 - z) * h_prev + z * h_cand
         return bt_l, bd_l, cd_l, md_l, h_next
@@ -810,8 +866,8 @@ class BuilderMLP(nn.Module):
         """Inference-only path for already-packed [obs, h_prev] batches."""
         obs = packed[:, :OBS_SIZE]
         h_prev = packed[:, OBS_SIZE:]
-        trunk_in = self._build_trunk_input(obs, h_prev)
-        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = self._forward_from_trunk_in(trunk_in)
+        obs_pre = self._obs_encoder_pre(obs)
+        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
         z = torch.sigmoid(h_gate)
         h_next = (1.0 - z) * h_prev + z * h_cand
         return bt_l, bd_l, cd_l, md_l, h_next
@@ -924,6 +980,229 @@ class BuilderMLP(nn.Module):
 
 # ---- PPO ----
 
+BPTT_K = 32  # truncated BPTT unroll length
+
+
+def _build_bptt_chunks(
+    ep_boundaries: list[tuple[int, int]],
+    bptt_k: int = BPTT_K,
+) -> list[tuple[int, int]]:
+    """Split episodes into non-overlapping (start, length) chunks for BPTT."""
+    chunks: list[tuple[int, int]] = []
+    for ep_start, ep_end in ep_boundaries:
+        ep_len = ep_end - ep_start
+        for t in range(0, ep_len, bptt_k):
+            chunk_len = min(bptt_k, ep_len - t)
+            chunks.append((ep_start + t, chunk_len))
+    return chunks
+
+
+def _chunk_metadata_tensors(
+    chunks: list[tuple[int, int]],
+    device: torch.device,
+    *,
+    sort_desc: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Materialize chunk start/length metadata on-device."""
+    chunk_starts = torch.tensor([start for start, _ in chunks], device=device)
+    chunk_lens = torch.tensor([length for _, length in chunks], device=device)
+    if sort_desc and chunk_lens.numel() > 1:
+        order = chunk_lens.argsort(descending=True)
+        chunk_starts = chunk_starts[order]
+        chunk_lens = chunk_lens[order]
+    return chunk_starts, chunk_lens
+
+
+def _precompute_policy_masks(
+    obs: torch.Tensor,
+    bt_act: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Precompute policy masks and causal coefficients for fixed rollout actions."""
+    bt_mask, bd_mask = compute_action_masks(obs)
+    harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
+    bt_mask = bt_mask.clone()
+    bt_mask[:, HARVESTER_BUILD_TYPE] &= harv_bd_mask.any(dim=1)
+    bd_mask = compute_build_dir_mask_for_type(obs, bt_act, bd_mask, harv_bd_mask)
+    bd_causal = (bt_act != 0).float()
+    cd_causal = (
+        (bt_act == CONVEYOR_BUILD_TYPES[0])
+        | (bt_act == CONVEYOR_BUILD_TYPES[1])
+        | (bt_act == CONVEYOR_BUILD_TYPES[2])
+    ).float()
+    return bt_mask, bd_mask, bd_causal, cd_causal
+
+
+def _split_chunk_ids(
+    chunk_lens: torch.Tensor,
+    bptt_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split chunk ids into full-length and tail-length groups."""
+    all_ids = torch.arange(chunk_lens.shape[0], device=chunk_lens.device)
+    full_ids = all_ids[chunk_lens == bptt_k]
+    tail_ids = all_ids[chunk_lens != bptt_k]
+    if tail_ids.numel() > 1:
+        tail_ids = tail_ids[chunk_lens[tail_ids].argsort(descending=True)]
+    return full_ids, tail_ids
+
+
+def _recurrent_logprob_pass(
+    model: 'BuilderMLP',
+    obs_pre: torch.Tensor,
+    h0: torch.Tensor,
+    bt_act: torch.Tensor,
+    bd_act: torch.Tensor,
+    cd_act: torch.Tensor,
+    md_act: torch.Tensor,
+    bt_mask: torch.Tensor,
+    bd_mask: torch.Tensor,
+    bd_causal: torch.Tensor,
+    cd_causal: torch.Tensor,
+) -> torch.Tensor:
+    """Sequential recurrent pass that returns chosen-action log-probs."""
+    B, K_max, _ = obs_pre.shape
+    dev = obs_pre.device
+    h_t = h0
+    log_probs = torch.empty(B, K_max, device=dev)
+    cd_mask = conveyor_dir_mask(dev, B)
+
+    for t in range(K_max):
+        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
+        z = torch.sigmoid(h_gate)
+        h_t = (1.0 - z) * h_t + z * h_cand
+
+        bt_l = bt_l.masked_fill(~bt_mask[:, t], -1e9)
+        bd_l = bd_l.masked_fill(~bd_mask[:, t], -1e9)
+        cd_l = cd_l.masked_fill(~cd_mask, -1e9)
+
+        bt_lp = F.log_softmax(bt_l, dim=-1).gather(1, bt_act[:, t].unsqueeze(1)).squeeze(1)
+        bd_lp = F.log_softmax(bd_l, dim=-1).gather(1, bd_act[:, t].unsqueeze(1)).squeeze(1)
+        cd_lp = F.log_softmax(cd_l, dim=-1).gather(1, cd_act[:, t].unsqueeze(1)).squeeze(1)
+        md_lp = F.log_softmax(md_l, dim=-1).gather(1, md_act[:, t].unsqueeze(1)).squeeze(1)
+        log_probs[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
+
+    return log_probs
+
+
+def _recurrent_actor_pass(
+    model: 'BuilderMLP',
+    obs_pre: torch.Tensor,
+    h0: torch.Tensor,
+    bt_act: torch.Tensor,
+    bd_act: torch.Tensor,
+    cd_act: torch.Tensor,
+    md_act: torch.Tensor,
+    bt_mask: torch.Tensor,
+    bd_mask: torch.Tensor,
+    bd_causal: torch.Tensor,
+    cd_causal: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sequential recurrent pass that returns log-probs and entropies."""
+    B, K_max, _ = obs_pre.shape
+    dev = obs_pre.device
+    h_t = h0
+    new_lps = torch.empty(B, K_max, device=dev)
+    entropies = torch.empty(B, K_max, device=dev)
+    cd_mask = conveyor_dir_mask(dev, B)
+
+    for t in range(K_max):
+        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
+        z = torch.sigmoid(h_gate)
+        h_t = (1.0 - z) * h_t + z * h_cand
+
+        bt_l = bt_l.masked_fill(~bt_mask[:, t], -1e9)
+        bd_l = bd_l.masked_fill(~bd_mask[:, t], -1e9)
+        cd_l = cd_l.masked_fill(~cd_mask, -1e9)
+
+        bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[:, t])
+        bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[:, t])
+        cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act[:, t])
+        md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[:, t])
+
+        new_lps[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
+        entropies[:, t] = bt_ent + bd_ent * bd_causal[:, t] + cd_ent * cd_causal[:, t] + md_ent
+
+    return new_lps, entropies
+
+
+def _sequential_logprobs(
+    model: 'BuilderMLP',
+    obs: torch.Tensor,
+    h: torch.Tensor,
+    bt_act: torch.Tensor,
+    bd_act: torch.Tensor,
+    cd_act: torch.Tensor,
+    md_act: torch.Tensor,
+    chunks: list[tuple[int, int]],
+    bptt_k: int = BPTT_K,
+    batch_size: int = 2048,
+) -> torch.Tensor:
+    """Recompute log-probs with sequential h propagation (no grad).
+
+    Batches across chunks at each timestep (same pattern as BPTT actor loop)
+    for good GPU utilization. Chunks are sorted by length to minimize padding.
+    """
+    N = obs.shape[0]
+    dev = obs.device
+    log_probs = torch.empty(N, device=dev)
+
+    B_chunk = max(1, batch_size // bptt_k)
+    all_starts, all_lens = _chunk_metadata_tensors(chunks, dev, sort_desc=True)
+    full_chunk_ids, tail_chunk_ids = _split_chunk_ids(all_lens, bptt_k)
+    obs_pre_all = model._obs_encoder_pre(obs)
+    bt_mask_all, bd_mask_all, bd_causal_all, cd_causal_all = _precompute_policy_masks(obs, bt_act)
+
+    def _run_chunk_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
+        for cb_start in range(0, chunk_ids.shape[0], B_chunk):
+            batch_ids = chunk_ids[cb_start:cb_start + B_chunk]
+            B = batch_ids.shape[0]
+            chunk_starts = all_starts[batch_ids]
+            chunk_lens = all_lens[batch_ids]
+            K_max = bptt_k if full_length else int(chunk_lens[0].item())
+
+            t_range = torch.arange(K_max, device=dev).unsqueeze(0)
+            idx_grid = (chunk_starts.unsqueeze(1) + t_range).clamp(max=N - 1)
+            flat_idx = idx_grid.reshape(-1)
+
+            all_obs_pre = obs_pre_all[flat_idx].reshape(B, K_max, -1)
+            all_bt = bt_act[flat_idx].reshape(B, K_max)
+            all_bd = bd_act[flat_idx].reshape(B, K_max)
+            all_cd = cd_act[flat_idx].reshape(B, K_max)
+            all_md = md_act[flat_idx].reshape(B, K_max)
+            all_bt_mask = bt_mask_all[flat_idx].reshape(B, K_max, -1)
+            all_bd_mask = bd_mask_all[flat_idx].reshape(B, K_max, -1)
+            all_bd_causal = bd_causal_all[flat_idx].reshape(B, K_max)
+            all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
+
+            step_lps = _recurrent_logprob_pass(
+                model,
+                all_obs_pre,
+                h[chunk_starts],
+                all_bt,
+                all_bd,
+                all_cd,
+                all_md,
+                all_bt_mask,
+                all_bd_mask,
+                all_bd_causal,
+                all_cd_causal,
+            )
+
+            if full_length:
+                log_probs[flat_idx] = step_lps.reshape(-1)
+                continue
+
+            valid_mask = t_range < chunk_lens.unsqueeze(1)
+            valid_flat_idx = idx_grid[valid_mask]
+            log_probs[valid_flat_idx] = step_lps[valid_mask]
+
+    if full_chunk_ids.numel() > 0:
+        _run_chunk_group(full_chunk_ids, full_length=True)
+    if tail_chunk_ids.numel() > 0:
+        _run_chunk_group(tail_chunk_ids, full_length=False)
+
+    return log_probs
+
+
 def ppo_update(
     model: BuilderMLP,
     optimizer: torch.optim.Optimizer,
@@ -938,8 +1217,10 @@ def ppo_update(
     returns: torch.Tensor,
     centralized_data: dict,
     old_values: torch.Tensor | None = None,
+    ep_boundaries: list[tuple[int, int]] | None = None,
     ppo_epochs: int = 4,
     minibatch_size: int = 2048,
+    bptt_k: int = BPTT_K,
     clip_eps: float = 0.2,
     clip_eps_higher: float | None = 0.28,
     vf_coeff: float = 0.5,
@@ -948,8 +1229,13 @@ def ppo_update(
     target_kl: float | None = None,
     clip_vloss: bool = True,
     profile: dict[str, float] | None = None,
+    bptt_chunks: list[tuple[int, int]] | None = None,
 ) -> dict[str, float]:
-    """PPO update on flattened rollout data. Returns stats dict."""
+    """PPO update with truncated BPTT for recurrent hidden state.
+
+    Processes contiguous K-step windows from episodes. Within each window,
+    h is recomputed sequentially so gradients flow through K timesteps.
+    """
     N = obs.shape[0]
     sum_pi, sum_vf, sum_ent = 0.0, 0.0, 0.0
     sum_kl, sum_clip_frac = 0.0, 0.0
@@ -958,7 +1244,7 @@ def ppo_update(
     critic, critic_opt = get_centralized_critic()
     critic.train()
 
-    # Explained variance: pre-update values vs returns (CleanRL-style, no extra fwd pass)
+    # Explained variance
     if old_values is not None:
         with torch.no_grad():
             var_y = returns.var().item()
@@ -966,78 +1252,156 @@ def ppo_update(
     else:
         ev = 0.0
 
+    # Build BPTT chunks from episode boundaries
+    if bptt_chunks is None:
+        if ep_boundaries is None:
+            ep_boundaries = [(0, N)]
+        bptt_chunks = _build_bptt_chunks(ep_boundaries, bptt_k)
+    n_chunks = len(bptt_chunks)
+    B_chunk = max(1, minibatch_size // bptt_k)
+    dev = obs.device
+
+    # Pre-build chunk metadata as GPU tensors (avoids per-batch CPU-GPU sync)
+    all_chunk_starts, all_chunk_lens = _chunk_metadata_tensors(bptt_chunks, dev)
+
+    # Normalize advantages globally (not per-minibatch) to avoid noisy
+    # normalization on small/correlated chunk batches from length sorting
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    with torch.no_grad():
+        bt_mask_all, bd_mask_all, bd_causal_all, cd_causal_all = _precompute_policy_masks(obs, bt_act)
+    full_chunk_ids, tail_chunk_ids = _split_chunk_ids(all_chunk_lens, bptt_k)
+
+    # ---- Phase 1: Actor updates with BPTT ----
+    actor_stopped_early = False
+    actor_epochs_ran = 0
     for epoch in range(ppo_epochs):
+        actor_epochs_ran += 1
         approx_kl_acc, n_mb = 0.0, 0
 
-        perm = torch.randperm(N, device=DEVICE)
+        full_perm = full_chunk_ids
+        if full_perm.numel() > 1:
+            full_perm = full_perm[torch.randperm(full_perm.numel(), device=dev)]
+
+        tail_perm = tail_chunk_ids
+        if tail_perm.numel() > 1:
+            tail_perm = tail_perm[torch.randperm(tail_perm.numel(), device=dev)]
+            tail_perm = tail_perm[all_chunk_lens[tail_perm].argsort(descending=True, stable=True)]
+
+        def _run_actor_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
+            nonlocal approx_kl_acc, n_mb, sum_kl, sum_clip_frac, sum_pi, sum_ent, n_updates
+            for cb_start in range(0, chunk_ids.shape[0], B_chunk):
+                batch_ids = chunk_ids[cb_start:cb_start + B_chunk]
+                B = batch_ids.shape[0]
+                chunk_starts = all_chunk_starts[batch_ids]
+                chunk_lens = all_chunk_lens[batch_ids]
+                K_max = bptt_k if full_length else int(chunk_lens[0].item())
+                t_range = torch.arange(K_max, device=dev).unsqueeze(0)
+                idx_grid = (chunk_starts.unsqueeze(1) + t_range).clamp(max=N - 1)
+                flat_idx = idx_grid.reshape(-1)
+
+                all_obs_pre = model._obs_encoder_pre(obs[flat_idx]).reshape(B, K_max, -1)
+                all_bt = bt_act[flat_idx].reshape(B, K_max)
+                all_bd = bd_act[flat_idx].reshape(B, K_max)
+                all_cd = cd_act[flat_idx].reshape(B, K_max)
+                all_md = md_act[flat_idx].reshape(B, K_max)
+                all_old_lp = old_log_probs[flat_idx].reshape(B, K_max)
+                all_adv = advantages[flat_idx].reshape(B, K_max)
+                all_bt_mask = bt_mask_all[flat_idx].reshape(B, K_max, -1)
+                all_bd_mask = bd_mask_all[flat_idx].reshape(B, K_max, -1)
+                all_bd_causal = bd_causal_all[flat_idx].reshape(B, K_max)
+                all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
+
+                t_phase = time.perf_counter() if profile is not None else 0.0
+                new_lps, entropies = _recurrent_actor_pass(
+                    model,
+                    all_obs_pre,
+                    h[chunk_starts].detach(),
+                    all_bt,
+                    all_bd,
+                    all_cd,
+                    all_md,
+                    all_bt_mask,
+                    all_bd_mask,
+                    all_bd_causal,
+                    all_cd_causal,
+                )
+                if profile is not None:
+                    profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
+
+                t_phase = time.perf_counter() if profile is not None else 0.0
+                logratio = new_lps - all_old_lp
+                ratio = logratio.exp()
+
+                if full_length:
+                    valid_denom = max(B * K_max, 1)
+                    mb_adv = all_adv
+                    with torch.no_grad():
+                        approx_kl = (((ratio - 1) - logratio).sum() / valid_denom)
+                        approx_kl_acc += approx_kl.item()
+                        _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
+                        clip_frac = (((ratio < (1 - clip_eps)) | (ratio > (1 + _hi))).float().sum() / valid_denom)
+                        sum_kl += approx_kl.item()
+                        sum_clip_frac += clip_frac.item()
+                        n_mb += 1
+                    pg1 = -mb_adv * ratio
+                    _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
+                    pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_eps, 1 + _hi)
+                    pi_loss = torch.max(pg1, pg2).mean()
+                    ent_loss = entropies.mean()
+                else:
+                    valid_mask = t_range < chunk_lens.unsqueeze(1)
+                    valid_denom = valid_mask.sum()
+                    mb_adv = all_adv.clone()
+                    mb_adv[~valid_mask] = 0.0
+                    with torch.no_grad():
+                        approx_kl = (((ratio - 1) - logratio) * valid_mask).sum() / valid_denom
+                        approx_kl_acc += approx_kl.item()
+                        _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
+                        clip_frac = (((ratio < (1 - clip_eps)) | (ratio > (1 + _hi))).float() * valid_mask).sum() / valid_denom
+                        sum_kl += approx_kl.item()
+                        sum_clip_frac += clip_frac.item()
+                        n_mb += 1
+                    pg1 = -mb_adv * ratio
+                    _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
+                    pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_eps, 1 + _hi)
+                    pi_loss = (torch.max(pg1, pg2) * valid_mask).sum() / valid_denom
+                    ent_loss = (entropies * valid_mask).sum() / valid_denom
+
+                if profile is not None:
+                    profile["ppo_policy_loss_s"] = profile.get("ppo_policy_loss_s", 0.0) + (time.perf_counter() - t_phase)
+
+                optimizer.zero_grad(set_to_none=True)
+                actor_loss = pi_loss - entropy_coeff * ent_loss
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+
+                sum_pi += pi_loss.item()
+                sum_ent += ent_loss.item()
+                n_updates += 1
+
+        if full_perm.numel() > 0:
+            _run_actor_group(full_perm, full_length=True)
+        if tail_perm.numel() > 0:
+            _run_actor_group(tail_perm, full_length=False)
+
+        if target_kl is not None and n_mb > 0 and approx_kl_acc / n_mb > target_kl:
+            actor_stopped_early = True
+            break
+
+    # ---- Phase 2: Critic updates with random minibatches (full GPU utilization) ----
+    n_critic_updates = 0
+    critic_epochs = actor_epochs_ran if actor_stopped_early else ppo_epochs
+    for epoch in range(critic_epochs):
+        perm = torch.randperm(N, device=obs.device)
         for start in range(0, N, minibatch_size):
             idx = perm[start:start + minibatch_size]
 
-            t_phase = time.perf_counter() if profile is not None else 0.0
-            bt_l, bd_l, cd_l, md_l, _ = model(obs[idx], h[idx])
-            if profile is not None:
-                profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
-
-            t_phase = time.perf_counter() if profile is not None else 0.0
-            # Apply action masks to logits (affordability + spatial validity)
-            bt_m, bd_m = compute_action_masks(obs[idx])
-            harv_bd_m = compute_harvester_build_dir_mask(obs[idx], bd_m)
-            bt_m = bt_m.clone()
-            bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
-            bd_m = compute_build_dir_mask_for_type(obs[idx], bt_act[idx], bd_m, harv_bd_m)
-            cd_m = conveyor_dir_mask(obs[idx].device, idx.shape[0])
-            bt_l = bt_l.masked_fill(~bt_m, -1e9)
-            bd_l = bd_l.masked_fill(~bd_m, -1e9)
-            cd_l = cd_l.masked_fill(~cd_m, -1e9)
-
-            # Mask build_dir when build_type is "none" (idx 0) — causally irrelevant
-            bd_causal = (bt_act[idx] != 0).float()
-            cd_causal = ((bt_act[idx] == CONVEYOR_BUILD_TYPES[0]) | (bt_act[idx] == CONVEYOR_BUILD_TYPES[1]) | (bt_act[idx] == CONVEYOR_BUILD_TYPES[2])).float()
-            bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[idx])
-            bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[idx])
-            cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act[idx])
-            md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[idx])
-            new_lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
-            entropy = bt_ent + bd_ent * bd_causal + cd_ent * cd_causal + md_ent
-
-            logratio = new_lp - old_log_probs[idx]
-            ratio = logratio.exp()
-
-            with torch.no_grad():
-                approx_kl = ((ratio - 1) - logratio).mean()
-                approx_kl_acc += approx_kl.item()
-                _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
-                clip_frac = ((ratio < (1 - clip_eps)) | (ratio > (1 + _hi))).float().mean()
-                sum_kl += approx_kl.item()
-                sum_clip_frac += clip_frac.item()
-                n_mb += 1
-            if profile is not None:
-                profile["ppo_dist_s"] = profile.get("ppo_dist_s", 0.0) + (time.perf_counter() - t_phase)
-
-            t_phase = time.perf_counter() if profile is not None else 0.0
-            mb_adv = advantages[idx]
-            mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
-
-            pg1 = -mb_adv * ratio
-            _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
-            pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_eps, 1 + _hi)
-            pi_loss = torch.max(pg1, pg2).mean()
-            if profile is not None:
-                profile["ppo_policy_loss_s"] = profile.get("ppo_policy_loss_s", 0.0) + (time.perf_counter() - t_phase)
-
-            t_phase = time.perf_counter() if profile is not None else 0.0
-            optimizer.zero_grad(set_to_none=True)
+            t_value = time.perf_counter() if profile is not None else 0.0
             critic_opt.zero_grad(set_to_none=True)
-
-            actor_loss = pi_loss - entropy_coeff * entropy.mean()
-            actor_loss.backward()
 
             vf_loss_sum = 0.0
             vf_denom = max(idx.shape[0], 1)
-            # Value loss with optional clipping (CleanRL-style), but backpropagated
-            # chunk-by-chunk so the centralized critic never retains a full
-            # minibatch worth of spatial feature maps.
-            t_value = time.perf_counter() if profile is not None else 0.0
             ri = centralized_data["step_round_idx"][idx]
             u_xy = centralized_data["step_unit_xy"][idx]
             u_ctx = centralized_data["step_unit_ctx"][idx]
@@ -1047,17 +1411,25 @@ def ppo_update(
             unique_rounds, inverse = ri.unique(return_inverse=True)
             _CNN_CHUNK = CENTRALIZED_CNN_CHUNK
             _UNIT_CHUNK = 4096
-            for c_start in range(0, unique_rounds.shape[0], _CNN_CHUNK):
+            round_order = inverse.argsort(stable=True)
+            sorted_inverse = inverse[round_order]
+            n_round_chunks = (unique_rounds.shape[0] + _CNN_CHUNK - 1) // _CNN_CHUNK
+            chunk_offsets = _chunk_offsets_from_ids(
+                torch.div(sorted_inverse, _CNN_CHUNK, rounding_mode='floor'),
+                n_round_chunks,
+            )
+            for chunk_idx in range(n_round_chunks):
+                lo = chunk_offsets[chunk_idx]
+                hi = chunk_offsets[chunk_idx + 1]
+                if lo == hi:
+                    continue
+                c_start = chunk_idx * _CNN_CHUNK
                 c_end = min(c_start + _CNN_CHUNK, unique_rounds.shape[0])
                 c_rounds = unique_rounds[c_start:c_end]
                 g_obs, g_mask, g_scalars = _load_critic_round_batch(centralized_data, c_rounds)
                 feat = critic.encode_map(g_obs, g_mask)
-                step_mask = (inverse >= c_start) & (inverse < c_end)
-                step_indices = step_mask.nonzero(as_tuple=True)[0]
-                if step_indices.numel() == 0:
-                    continue
-
-                local_round_idx = inverse[step_indices] - c_start
+                step_indices = round_order[lo:hi]
+                local_round_idx = sorted_inverse[lo:hi] - c_start
                 for u_start in range(0, step_indices.shape[0], _UNIT_CHUNK):
                     u_end = min(u_start + _UNIT_CHUNK, step_indices.shape[0])
                     si = step_indices[u_start:u_end]
@@ -1078,28 +1450,18 @@ def ppo_update(
                     vf_loss_sum += 0.5 * v_loss_elems.detach().sum().item()
                     (vf_coeff * 0.5 * v_loss_elems.sum() / vf_denom).backward()
 
-            vf_loss = vf_loss_sum / vf_denom
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
+            critic_opt.step()
+
+            sum_vf += vf_loss_sum / vf_denom
+            n_critic_updates += 1
+
             if profile is not None:
                 profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_value)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
-            optimizer.step()
-            critic_opt.step()
-            if profile is not None:
-                profile["ppo_backward_step_s"] = profile.get("ppo_backward_step_s", 0.0) + (time.perf_counter() - t_phase)
-
-            sum_pi += pi_loss.item()
-            sum_vf += vf_loss
-            sum_ent += entropy.mean().item()
-            n_updates += 1
-
-        if target_kl is not None and n_mb > 0 and approx_kl_acc / n_mb > target_kl:
-            break
-
     return {
         "pi_loss": sum_pi / max(n_updates, 1),
-        "vf_loss": sum_vf / max(n_updates, 1),
+        "vf_loss": sum_vf / max(n_critic_updates, 1),
         "entropy": sum_ent / max(n_updates, 1),
         "approx_kl": sum_kl / max(n_updates, 1),
         "clip_frac": sum_clip_frac / max(n_updates, 1),
@@ -1149,69 +1511,110 @@ def _parse_trajectories(
         for traj_i, traj in enumerate(trajectories):
             start = idx
             game_idx = traj_game_map[traj_i] if traj_game_map and traj_i < len(traj_game_map) else 0
-            for step in traj:
-                if isinstance(step, (list, tuple)):
-                    n = len(step)
-                    obs_t[idx] = torch.tensor(step[0], dtype=torch.float32)
-                    h_t[idx] = torch.tensor(step[1], dtype=torch.float32)
-                    bt_t[idx] = step[2]
-                    bd_t[idx] = step[3]
-                    if n > 12:
-                        cd_t[idx] = step[4]
-                        md_t[idx] = step[5]
-                        n_working = step[7] if n > 7 else 0
-                        dmg = step[11] if n > 11 else 0.0
-                        ti_delivered = step[22] if n > 22 else 0
-                        ax_delivered = step[23] if n > 23 else 0
-                        lp_t[idx] = step[12] if n > 12 else 0.0
-                        own_dmg = step[21] if n > 21 else 0.0
-                    else:
-                        cd_t[idx] = step[3]
-                        md_t[idx] = step[4]
-                        n_working = step[6] if n > 6 else 0
-                        dmg = step[10] if n > 10 else 0.0
-                        ti_delivered = 0
-                        ax_delivered = 0
-                        lp_t[idx] = step[11] if n > 11 else 0.0
-                        own_dmg = 0.0
+            traj_len = len(traj)
+            end = idx + traj_len
+            if traj_len == 0:
+                ep_boundaries.append((start, end))
+                continue
+
+            step0 = traj[0]
+            if isinstance(step0, (list, tuple)) and all(isinstance(step, (list, tuple)) for step in traj):
+                obs_t[start:end] = torch.as_tensor([step[0] for step in traj], dtype=torch.float32)
+                h_t[start:end] = torch.as_tensor([step[1] for step in traj], dtype=torch.float32)
+                lengths = [len(step) for step in traj]
+                bt_t[start:end] = torch.as_tensor([step[2] for step in traj], dtype=torch.long)
+                bd_t[start:end] = torch.as_tensor([step[3] for step in traj], dtype=torch.long)
+
+                if all(n > 12 for n in lengths):
+                    cd_t[start:end] = torch.as_tensor([step[4] for step in traj], dtype=torch.long)
+                    md_t[start:end] = torch.as_tensor([step[5] for step in traj], dtype=torch.long)
+                    n_working_t = torch.as_tensor([step[7] if len(step) > 7 else 0 for step in traj], dtype=torch.float32)
+                    dmg_t = torch.as_tensor([step[11] if len(step) > 11 else 0.0 for step in traj], dtype=torch.float32)
+                    lp_t[start:end] = torch.as_tensor([step[12] if len(step) > 12 else 0.0 for step in traj], dtype=torch.float32)
+                    own_dmg_t = torch.as_tensor([step[21] if len(step) > 21 else 0.0 for step in traj], dtype=torch.float32)
                 else:
-                    obs_t[idx] = torch.tensor(step["obs"], dtype=torch.float32)
-                    h_t[idx] = torch.tensor(step["h_prev"], dtype=torch.float32)
-                    bt_t[idx] = step["bt"]
-                    bd_t[idx] = step["bd"]
-                    cd_t[idx] = step.get("cd", step["bd"])
-                    md_t[idx] = step["md"]
-                    n_working = step.get("n_working", step.get("ti_delivered", 0))
-                    dmg = step.get("dmg", 0)
-                    ti_delivered = step.get("ti_delivered", 0)
-                    ax_delivered = step.get("ax_delivered", 0)
-                    own_dmg = step.get("own_dmg", 0)
-                    lp_t[idx] = step.get("old_lp", 0)
-                rw_t[idx] = (
-                    n_working * REWARD_FLOW_THROUGHPUT
-                    + ti_delivered * REWARD_TITANIUM_DELIVERY
-                    + ax_delivered * REWARD_AXIONITE_DELIVERY
-                    + dmg * REWARD_ENEMY_CORE_DAMAGE
-                    + own_dmg * REWARD_OWN_CORE_DAMAGE
+                    cd_t[start:end] = torch.as_tensor([step[3] for step in traj], dtype=torch.long)
+                    md_t[start:end] = torch.as_tensor([step[4] for step in traj], dtype=torch.long)
+                    n_working_t = torch.as_tensor([step[6] if len(step) > 6 else 0 for step in traj], dtype=torch.float32)
+                    dmg_t = torch.as_tensor([step[10] if len(step) > 10 else 0.0 for step in traj], dtype=torch.float32)
+                    lp_t[start:end] = torch.as_tensor([step[11] if len(step) > 11 else 0.0 for step in traj], dtype=torch.float32)
+                    own_dmg_t = torch.zeros(traj_len, dtype=torch.float32)
+            elif isinstance(step0, dict) and all(isinstance(step, dict) for step in traj):
+                obs_t[start:end] = torch.as_tensor([step["obs"] for step in traj], dtype=torch.float32)
+                h_t[start:end] = torch.as_tensor([step["h_prev"] for step in traj], dtype=torch.float32)
+                bt_t[start:end] = torch.as_tensor([step["bt"] for step in traj], dtype=torch.long)
+                bd_t[start:end] = torch.as_tensor([step["bd"] for step in traj], dtype=torch.long)
+                cd_t[start:end] = torch.as_tensor([step.get("cd", step["bd"]) for step in traj], dtype=torch.long)
+                md_t[start:end] = torch.as_tensor([step["md"] for step in traj], dtype=torch.long)
+                n_working_t = torch.as_tensor(
+                    [step.get("n_working", 0) for step in traj],
+                    dtype=torch.float32,
                 )
-                step_game_t[idx] = game_idx
-                idx += 1
-            ep_boundaries.append((start, idx))
+                dmg_t = torch.as_tensor([step.get("dmg", 0.0) for step in traj], dtype=torch.float32)
+                own_dmg_t = torch.as_tensor([step.get("own_dmg", 0.0) for step in traj], dtype=torch.float32)
+                lp_t[start:end] = torch.as_tensor([step.get("old_lp", 0.0) for step in traj], dtype=torch.float32)
+            else:
+                for offset, step in enumerate(traj):
+                    i = start + offset
+                    if isinstance(step, (list, tuple)):
+                        n = len(step)
+                        obs_t[i] = torch.as_tensor(step[0], dtype=torch.float32)
+                        h_t[i] = torch.as_tensor(step[1], dtype=torch.float32)
+                        bt_t[i] = step[2]
+                        bd_t[i] = step[3]
+                        if n > 12:
+                            cd_t[i] = step[4]
+                            md_t[i] = step[5]
+                            n_working = step[7] if n > 7 else 0
+                            dmg = step[11] if n > 11 else 0.0
+                            lp_t[i] = step[12] if n > 12 else 0.0
+                            own_dmg = step[21] if n > 21 else 0.0
+                        else:
+                            cd_t[i] = step[3]
+                            md_t[i] = step[4]
+                            n_working = step[6] if n > 6 else 0
+                            dmg = step[10] if n > 10 else 0.0
+                            lp_t[i] = step[11] if n > 11 else 0.0
+                            own_dmg = 0.0
+                    else:
+                        obs_t[i] = torch.as_tensor(step["obs"], dtype=torch.float32)
+                        h_t[i] = torch.as_tensor(step["h_prev"], dtype=torch.float32)
+                        bt_t[i] = step["bt"]
+                        bd_t[i] = step["bd"]
+                        cd_t[i] = step.get("cd", step["bd"])
+                        md_t[i] = step["md"]
+                        n_working = step.get("n_working", 0)
+                        dmg = step.get("dmg", 0)
+                        own_dmg = step.get("own_dmg", 0)
+                        lp_t[i] = step.get("old_lp", 0)
+                    rw_t[i] = (
+                        n_working * REWARD_FLOW_THROUGHPUT
+                        + dmg * REWARD_ENEMY_CORE_DAMAGE
+                        + own_dmg * REWARD_OWN_CORE_DAMAGE
+                    )
+                step_game_t[start:end] = game_idx
+                idx = end
+                ep_boundaries.append((start, end))
+                continue
+
+            rw_t[start:end] = (
+                n_working_t * REWARD_FLOW_THROUGHPUT
+                + dmg_t * REWARD_ENEMY_CORE_DAMAGE
+                + own_dmg_t * REWARD_OWN_CORE_DAMAGE
+            )
+            step_game_t[start:end] = game_idx
+            idx = end
+            ep_boundaries.append((start, end))
     finally:
         if gc_was_enabled:
             gc.enable()
 
-    # Share each round's total reward across all unit-steps from that game/round.
-    round_reward: dict[tuple[int, int], float] = {}
-    for i in range(N):
-        rnd = int(round(obs_t[i, _OBS_GLOBAL_START].item() * 2000.0))
-        rnd = max(0, min(rnd, 1999))
-        key = (int(step_game_t[i].item()), rnd)
-        round_reward[key] = round_reward.get(key, 0.0) + float(rw_t[i].item())
-    for i in range(N):
-        rnd = int(round(obs_t[i, _OBS_GLOBAL_START].item() * 2000.0))
-        rnd = max(0, min(rnd, 1999))
-        rw_t[i] = round_reward[(int(step_game_t[i].item()), rnd)]
+    round_idx_t = _round_index_from_obs(obs_t)
+    reward_keys = step_game_t.to(torch.long) * 2000 + round_idx_t
+    _, reward_inverse = reward_keys.unique(sorted=False, return_inverse=True)
+    round_reward = torch.zeros(int(reward_inverse.max().item()) + 1, dtype=rw_t.dtype)
+    round_reward.index_add_(0, reward_inverse, rw_t)
+    rw_t = round_reward[reward_inverse]
 
     result = {
         "obs": obs_t.to(DEVICE),
@@ -1229,7 +1632,7 @@ def _parse_trajectories(
     # Build centralized critic data if global states available
     if global_states_list and any(gs is not None for gs in global_states_list):
         result.update(_build_centralized_critic_data(
-            obs_t, trajectories, global_states_list, ep_boundaries, N,
+            obs_t, round_idx_t, global_states_list, ep_boundaries, N,
             traj_game_map=traj_game_map,
         ))
 
@@ -1248,7 +1651,7 @@ _OBS_SPAWN_ROUND = _OBS_GLOBAL_START + 14  # spawn_round / 2000.0
 
 def _build_centralized_critic_data(
     obs_t: torch.Tensor,
-    trajectories: list[list],
+    round_idx_t: torch.Tensor,
     global_states_list: list[dict | None],
     ep_boundaries: list[tuple[int, int]],
     N: int,
@@ -1276,14 +1679,13 @@ def _build_centralized_critic_data(
     unique_states: list[object] = [zero_state]  # bytearray or buffer slice
     unique_valid_masks = [(1, 1)]
     unique_scalars: list[list[float]] = [zero_scalars]
-    unique_keys = {}  # (game_idx, round) → flat index (starting from 1)
-
     # Per-step: index into unique states, unit xy, unit context
     step_round_idx = torch.zeros(N, dtype=torch.long)
     step_unit_xy = torch.zeros(N, 2, dtype=torch.long)
     step_unit_ctx = torch.zeros(N, UNIT_CONTEXT_DIM, dtype=torch.float32)
 
     n_games = len(global_states_list)
+    game_round_lookup: dict[int, tuple[int, int, torch.Tensor]] = {}
 
     for ep_i, (start, end) in enumerate(ep_boundaries):
         if end <= start:
@@ -1294,91 +1696,76 @@ def _build_centralized_critic_data(
         if gs is None:
             continue
 
-        gs_map_w = gs.get("map_w", max_w)
-        gs_map_h = gs.get("map_h", max_h)
+        cached = game_round_lookup.get(game_idx)
+        if cached is None:
+            gs_map_w = gs.get("map_w", max_w)
+            gs_map_h = gs.get("map_h", max_h)
+            states_buf = gs.get("states_buf")
 
-        # Detect format: contiguous buffer or legacy per-turn dicts
-        states_buf = gs.get("states_buf")
-        if states_buf is not None:
-            # Contiguous buffer format — index by byte offset
-            state_stride_bytes = gs.get("state_stride", n_ch * gs_map_h * gs_map_w) * 4
-            scalars_buf = gs.get("scalars_buf", b"")
-            scalar_stride_bytes = gs.get("n_scalars", n_sc) * 4
-            gs_n_turns = gs.get("n_turns", 0)
+            if states_buf is not None:
+                import struct
 
-            def _get_state(rnd):
-                if 0 <= rnd < gs_n_turns:
+                state_stride_bytes = gs.get("state_stride", n_ch * gs_map_h * gs_map_w) * 4
+                scalars_buf = gs.get("scalars_buf", b"")
+                scalar_stride_bytes = gs.get("n_scalars", n_sc) * 4
+                gs_n_turns = gs.get("n_turns", 0)
+                available_rounds_t = torch.arange(gs_n_turns, dtype=torch.long)
+                available_unique_idx = torch.empty(gs_n_turns, dtype=torch.long)
+
+                for rnd in range(gs_n_turns):
                     off = rnd * state_stride_bytes
-                    return bytearray(states_buf[off:off + state_stride_bytes])
-                return zero_state
+                    scalar_off = rnd * scalar_stride_bytes
+                    unique_states.append(bytearray(states_buf[off:off + state_stride_bytes]))
+                    unique_valid_masks.append((gs_map_w, gs_map_h))
+                    if scalar_stride_bytes > 0:
+                        n = scalar_stride_bytes // 4
+                        unique_scalars.append(list(struct.unpack_from(f"<{n}f", scalars_buf, scalar_off)))
+                    else:
+                        unique_scalars.append(zero_scalars)
+                    available_unique_idx[rnd] = len(unique_states) - 1
+            else:
+                gs_states = gs.get("states", {})
+                gs_scalars_d = gs.get("scalars", {})
+                available_rounds = sorted(gs_states.keys()) if gs_states else []
+                available_rounds_t = torch.tensor(available_rounds, dtype=torch.long)
+                available_unique_idx = torch.empty(len(available_rounds), dtype=torch.long)
 
-            def _get_scalars(rnd):
-                if 0 <= rnd < gs_n_turns:
-                    import struct
-                    off = rnd * scalar_stride_bytes
-                    n = scalar_stride_bytes // 4
-                    return list(struct.unpack_from(f"<{n}f", scalars_buf, off))
-                return zero_scalars
+                for pos, rnd in enumerate(available_rounds):
+                    state = gs_states[rnd]
+                    if not isinstance(state, (bytes, bytearray)):
+                        state = bytearray(state.tobytes() if hasattr(state, "tobytes") else bytes(state))
+                    scalars = gs_scalars_d.get(rnd)
+                    unique_states.append(state)
+                    unique_valid_masks.append((gs_map_w, gs_map_h))
+                    unique_scalars.append(list(scalars) if scalars is not None else zero_scalars)
+                    available_unique_idx[pos] = len(unique_states) - 1
 
-            available_rounds = list(range(gs_n_turns)) if gs_n_turns > 0 else []
-        else:
-            # Legacy per-turn dict format
-            gs_states = gs.get("states", {})
-            gs_scalars_d = gs.get("scalars", {})
-            available_rounds = sorted(gs_states.keys()) if gs_states else []
+            if available_rounds_t.numel() > 0:
+                nearest_pos = _nearest_round_positions(available_rounds_t)
+                round_lookup = available_unique_idx[nearest_pos]
+            else:
+                round_lookup = torch.zeros(2000, dtype=torch.long)
 
-            def _get_state(rnd):
-                s = gs_states.get(rnd)
-                if s is not None:
-                    if isinstance(s, (bytes, bytearray)):
-                        return s
-                    # array.array — convert to bytearray for torch.frombuffer
-                    return bytearray(s.tobytes() if hasattr(s, "tobytes") else bytes(s))
-                return zero_state
+            cached = (gs_map_w, gs_map_h, round_lookup)
+            game_round_lookup[game_idx] = cached
 
-            def _get_scalars(rnd):
-                s = gs_scalars_d.get(rnd)
-                if s is not None:
-                    return list(s)
-                return zero_scalars
+        gs_map_w, gs_map_h, round_lookup = cached
+        step_round_idx[start:end] = round_lookup[round_idx_t[start:end]]
 
-        for i in range(start, end):
-            rnd = int(round(obs_t[i, _OBS_GLOBAL_START].item() * 2000.0))
-            rnd = max(0, min(rnd, 1999))
+        x_norm = obs_t[start:end, _OBS_X_NORM]
+        y_norm = obs_t[start:end, _OBS_Y_NORM]
+        step_unit_xy[start:end, 0] = torch.clamp((x_norm * gs_map_w).round().to(torch.long), 0, max_w - 1)
+        step_unit_xy[start:end, 1] = torch.clamp((y_norm * gs_map_h).round().to(torch.long), 0, max_h - 1)
 
-            key = (game_idx, rnd)
-            if key not in unique_keys:
-                state = _get_state(rnd)
-                scalars = _get_scalars(rnd)
-                if state is zero_state and available_rounds:
-                    # Round not in replay — find nearest
-                    nearest = min(available_rounds, key=lambda r: abs(r - rnd))
-                    state = _get_state(nearest)
-                    scalars = _get_scalars(nearest)
-                unique_keys[key] = len(unique_states)
-                unique_states.append(state)
-                unique_valid_masks.append((gs_map_w, gs_map_h))
-                unique_scalars.append(scalars)
-
-            step_round_idx[i] = unique_keys[key]
-
-            # Extract unit position from obs (denormalize)
-            x_norm = obs_t[i, _OBS_X_NORM].item()
-            y_norm = obs_t[i, _OBS_Y_NORM].item()
-            ux = int(round(x_norm * gs_map_w))
-            uy = int(round(y_norm * gs_map_h))
-            step_unit_xy[i, 0] = max(0, min(ux, max_w - 1))
-            step_unit_xy[i, 1] = max(0, min(uy, max_h - 1))
-
-            step_unit_ctx[i, 0] = obs_t[i, _OBS_X_NORM]
-            step_unit_ctx[i, 1] = obs_t[i, _OBS_Y_NORM]
-            step_unit_ctx[i, 2] = obs_t[i, _OBS_CORE_DX]
-            step_unit_ctx[i, 3] = obs_t[i, _OBS_CORE_DY]
-            step_unit_ctx[i, 4] = obs_t[i, _OBS_ECORE_DX]
-            step_unit_ctx[i, 5] = obs_t[i, _OBS_ECORE_DY]
-            rnd_norm = obs_t[i, _OBS_GLOBAL_START].item()
-            spawn_norm = obs_t[i, _OBS_SPAWN_ROUND].item()
-            step_unit_ctx[i, 6] = rnd_norm - spawn_norm
+        step_unit_ctx[start:end, 0] = x_norm
+        step_unit_ctx[start:end, 1] = y_norm
+        step_unit_ctx[start:end, 2] = obs_t[start:end, _OBS_CORE_DX]
+        step_unit_ctx[start:end, 3] = obs_t[start:end, _OBS_CORE_DY]
+        step_unit_ctx[start:end, 4] = obs_t[start:end, _OBS_ECORE_DX]
+        step_unit_ctx[start:end, 5] = obs_t[start:end, _OBS_ECORE_DY]
+        step_unit_ctx[start:end, 6] = (
+            obs_t[start:end, _OBS_GLOBAL_START] - obs_t[start:end, _OBS_SPAWN_ROUND]
+        )
 
     global_sizes = torch.tensor(unique_valid_masks, dtype=torch.int16)
     global_scalars = torch.tensor(unique_scalars, dtype=torch.float32)
@@ -1465,6 +1852,33 @@ def _compute_gae(
 
     returns = advantages + values
     return advantages, returns
+
+
+def _round_index_from_obs(obs_t: torch.Tensor) -> torch.Tensor:
+    """Decode normalized round feature into integer round indices on CPU/GPU."""
+    return torch.clamp((obs_t[:, _OBS_GLOBAL_START] * 2000.0).round().to(torch.long), 0, 1999)
+
+
+def _nearest_round_positions(
+    available_rounds: torch.Tensor,
+    max_rounds: int = 2000,
+) -> torch.Tensor:
+    """Map each target round in [0, max_rounds) to the nearest available-round position."""
+    if available_rounds.numel() == 0:
+        return torch.zeros(max_rounds, dtype=torch.long)
+
+    targets = torch.arange(max_rounds, dtype=torch.long)
+    insert_pos = torch.bucketize(targets, available_rounds)
+    left_pos = (insert_pos - 1).clamp(min=0)
+    right_pos = insert_pos.clamp(max=available_rounds.numel() - 1)
+
+    left_rounds = available_rounds[left_pos]
+    right_rounds = available_rounds[right_pos]
+
+    choose_left = (insert_pos == available_rounds.numel()) | (
+        (insert_pos > 0) & ((targets - left_rounds) <= (right_rounds - targets))
+    )
+    return torch.where(choose_left, left_pos, right_pos)
 
 
 # ---- Reward normalizer (running variance of discounted returns) ----
@@ -1648,19 +2062,26 @@ def _compute_all_values(
 
     # Process rounds in chunks; for each chunk, compute CNN features,
     # then scatter V_team + V_unit to the steps that reference those rounds.
-    for r_start in range(0, R, cnn_chunk_size):
+    step_chunk_ids = torch.div(round_idx, cnn_chunk_size, rounding_mode='floor')
+    step_order = step_chunk_ids.argsort(stable=True)
+    sorted_chunk_ids = step_chunk_ids[step_order]
+    n_round_chunks = (R + cnn_chunk_size - 1) // cnn_chunk_size
+    chunk_offsets = _chunk_offsets_from_ids(sorted_chunk_ids, n_round_chunks)
+
+    for chunk_idx in range(n_round_chunks):
+        lo = chunk_offsets[chunk_idx]
+        hi = chunk_offsets[chunk_idx + 1]
+        if lo == hi:
+            continue
+        r_start = chunk_idx * cnn_chunk_size
         r_end = min(r_start + cnn_chunk_size, R)
-        round_ids = torch.arange(r_start, r_end, dtype=torch.long)
-        g_obs, g_mask, g_scalars = _load_critic_round_batch(data, round_ids)
+        g_obs = data["gpu_obs"][r_start:r_end]
+        g_mask = data["gpu_mask"][r_start:r_end]
+        g_scalars = data["gpu_scalars"][r_start:r_end]
         feat = critic.encode_map(g_obs, g_mask)
 
-        # Find all steps that reference rounds in this chunk
-        step_mask = (round_idx >= r_start) & (round_idx < r_end)
-        step_indices = step_mask.nonzero(as_tuple=True)[0]
-        if step_indices.shape[0] == 0:
-            continue
-
         # Compute per-unit values for these steps
+        step_indices = step_order[lo:hi]
         local_ri = round_idx[step_indices] - r_start  # remap to chunk-local index
         for u_start in range(0, step_indices.shape[0], unit_chunk_size):
             u_end = min(u_start + unit_chunk_size, step_indices.shape[0])
@@ -1747,34 +2168,19 @@ def train_on_trajectories(
     ppo_profile = profile if profile is not None else None
     model.train()
 
-    # Recompute old_log_probs via eager forward pass — CUDA-graphed rollout
-    # log_probs can diverge from eager due to graph replay numerics (different
-    # cuBLAS algo selection, memory reuse across replays, etc.).
+    # Recompute old_log_probs with sequential h propagation through BPTT chunks.
+    # This ensures old_log_probs match what the BPTT training loop produces,
+    # preventing ratio drift from stored-vs-recomputed h mismatch.
     t_phase = time.perf_counter() if profile is not None else 0.0
+    bptt_k = int(ppo_kwargs.get("bptt_k", BPTT_K))
+    bptt_chunks = _build_bptt_chunks(data["ep_boundaries"], bptt_k)
     with torch.no_grad():
-        _recomp_lp = torch.empty(N, device=DEVICE)
-        _RECOMP_CHUNK = 4096
-        for _rc_start in range(0, N, _RECOMP_CHUNK):
-            _rc_end = min(_rc_start + _RECOMP_CHUNK, N)
-            _rc_idx = slice(_rc_start, _rc_end)
-            _rc_bt_l, _rc_bd_l, _rc_cd_l, _rc_md_l, _ = model(obs[_rc_idx], h[_rc_idx])
-            _rc_bt_m, _rc_bd_m = compute_action_masks(obs[_rc_idx])
-            _rc_harv = compute_harvester_build_dir_mask(obs[_rc_idx], _rc_bd_m)
-            _rc_bt_m = _rc_bt_m.clone()
-            _rc_bt_m[:, HARVESTER_BUILD_TYPE] &= _rc_harv.any(dim=1)
-            _rc_bd_m = compute_build_dir_mask_for_type(obs[_rc_idx], data["bt"][_rc_idx], _rc_bd_m, _rc_harv)
-            _rc_cd_m = conveyor_dir_mask(DEVICE, _rc_end - _rc_start)
-            _rc_bt_l = _rc_bt_l.masked_fill(~_rc_bt_m, -1e9)
-            _rc_bd_l = _rc_bd_l.masked_fill(~_rc_bd_m, -1e9)
-            _rc_cd_l = _rc_cd_l.masked_fill(~_rc_cd_m, -1e9)
-            _rc_bt_lp, _ = action_log_prob_and_entropy(_rc_bt_l, data["bt"][_rc_idx])
-            _rc_bd_lp, _ = action_log_prob_and_entropy(_rc_bd_l, data["bd"][_rc_idx])
-            _rc_cd_lp, _ = action_log_prob_and_entropy(_rc_cd_l, data["cd"][_rc_idx])
-            _rc_md_lp, _ = action_log_prob_and_entropy(_rc_md_l, data["md"][_rc_idx])
-            _rc_bd_c = (data["bt"][_rc_idx] != 0).float()
-            _rc_cd_c = ((data["bt"][_rc_idx] == CONVEYOR_BUILD_TYPES[0]) | (data["bt"][_rc_idx] == CONVEYOR_BUILD_TYPES[1]) | (data["bt"][_rc_idx] == CONVEYOR_BUILD_TYPES[2])).float()
-            _recomp_lp[_rc_idx] = _rc_bt_lp + _rc_bd_lp * _rc_bd_c + _rc_cd_lp * _rc_cd_c + _rc_md_lp
-        data["old_log_probs"] = _recomp_lp
+        data["old_log_probs"] = _sequential_logprobs(
+            model, obs, h,
+            data["bt"], data["bd"], data["cd"], data["md"],
+            bptt_chunks,
+            bptt_k=bptt_k,
+        )
     if profile is not None:
         profile["recompute_lp_s"] = time.perf_counter() - t_phase
 
@@ -1784,6 +2190,8 @@ def train_on_trajectories(
         data["old_log_probs"], advantages, returns,
         old_values=values,
         centralized_data=data,
+        ep_boundaries=data["ep_boundaries"],
+        bptt_chunks=bptt_chunks,
         profile=ppo_profile,
         **ppo_kwargs,
     )
