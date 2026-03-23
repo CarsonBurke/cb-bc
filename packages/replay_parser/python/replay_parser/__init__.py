@@ -113,7 +113,7 @@ class ReplayData:
 
     @property
     def resource_transfers_bytes(self) -> bytes:
-        """Contiguous i32[n_turns, 2] — same-team non-core transfers per turn."""
+        """Contiguous f32[n_turns, 2] — flow-aligned weighted transfers per turn."""
         return self._raw.get("resource_transfers", b"")
 
     @property
@@ -172,8 +172,8 @@ class ReplayData:
             result[t] = {0: a, 1: b}
         return result
 
-    def resource_transfers_dict(self) -> dict[int, dict[int, int]]:
-        """Return {turn: {0: team_a, 1: team_b}} per-turn non-core transfer count."""
+    def resource_transfers_dict(self) -> dict[int, dict[int, float]]:
+        """Return {turn: {0: team_a, 1: team_b}} per-turn flow-aligned weighted transfers."""
         buf = self._raw.get("resource_transfers", b"")
         if not buf:
             return {}
@@ -181,7 +181,7 @@ class ReplayData:
         result = {}
         for t in range(n):
             off = t * 8
-            a, b = struct.unpack_from("<ii", buf, off)
+            a, b = struct.unpack_from("<ff", buf, off)
             result[t] = {0: a, 1: b}
         return result
 

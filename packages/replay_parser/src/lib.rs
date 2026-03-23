@@ -512,7 +512,7 @@ struct ReplayData {
     /// Flat i32 buffer: n_turns * 2 values [a0, b0, a1, b1, ...].
     working_harvesters: Vec<i32>,
     /// Flat i32 buffer: n_turns * 2 — per-turn same-team non-core transfer count [a0, b0, a1, b1, ...].
-    resource_transfers: Vec<i32>,
+    resource_transfers: Vec<f32>,
     /// Flat i32 buffer: n_turns * 2 — per-turn titanium delivered delta [a0, b0, a1, b1, ...].
     titanium_delivered: Vec<i32>,
     /// Flat i32 buffer: n_turns * 2 — per-turn axionite delivered delta [a0, b0, a1, b1, ...].
@@ -548,6 +548,22 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
 
     let enemy_team = if team == 0 { 1u8 } else { 0u8 };
     let mut core_hp: [i32; 2] = [500, 500];
+
+    // Precompute core center per team for flow-aligned transfer filtering
+    let mut core_center: [(i32, i32); 2] = [(0, 0), (0, 0)];
+    let mut core_count: [i32; 2] = [0, 0];
+    for (_id, t, pos) in &map.cores {
+        let ti = *t as usize;
+        core_center[ti].0 += pos.x;
+        core_center[ti].1 += pos.y;
+        core_count[ti] += 1;
+    }
+    for ti in 0..2 {
+        if core_count[ti] > 0 {
+            core_center[ti].0 /= core_count[ti];
+            core_center[ti].1 /= core_count[ti];
+        }
+    }
 
     for (id, t, pos) in &map.cores {
         entities.insert(
@@ -587,7 +603,7 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
     let mut states = vec![0.0f32; n_turns * state_stride];
     let mut scalars = vec![0.0f32; n_turns * N_SCALARS];
     let mut working_harvesters = vec![0i32; n_turns * 2];
-    let mut resource_transfers = vec![0i32; n_turns * 2];
+    let mut resource_transfers = vec![0.0f32; n_turns * 2];
     let mut titanium_delivered = vec![0i32; n_turns * 2];
     let mut axionite_delivered = vec![0i32; n_turns * 2];
 
@@ -779,9 +795,21 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                             {
                                 if src_kind.is_storing()
                                     && src_team == dst_team
-                                    && dst_kind != EntityKind::Core
                                 {
-                                    resource_transfers[turn_idx * 2 + src_team as usize] += 1;
+                                    // Flow-aligned: only count if dst is strictly closer to core.
+                                    // Core delivery always counts (weight 1.0).
+                                    // Linear decay so near-core transfers get more credit.
+                                    let cc = core_center[src_team as usize];
+                                    let src_dist = (from.x - cc.0).abs() + (from.y - cc.1).abs();
+                                    let dst_dist = (to.x - cc.0).abs() + (to.y - cc.1).abs();
+                                    if dst_dist < src_dist {
+                                        let weight = if dst_kind == EntityKind::Core {
+                                            1.0
+                                        } else {
+                                            (1.0 - src_dist as f32 / 30.0).max(0.1)
+                                        };
+                                        resource_transfers[turn_idx * 2 + src_team as usize] += weight;
+                                    }
                                 }
                             }
                         }
@@ -849,7 +877,7 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
 ///   states: bytes — contiguous f32[n_turns, N_CHANNELS, map_h, map_w]
 ///   scalars: bytes — contiguous f32[n_turns, N_SCALARS]
 ///   working_harvesters: bytes — contiguous i32[n_turns, 2] (team_a, team_b)
-///   resource_transfers: bytes — contiguous i32[n_turns, 2] (same-team non-core transfers)
+///   resource_transfers: bytes — contiguous f32[n_turns, 2] (flow-aligned weighted transfers)
 ///   titanium_delivered: bytes — contiguous i32[n_turns, 2] (per-turn delta)
 ///   axionite_delivered: bytes — contiguous i32[n_turns, 2] (per-turn delta)
 ///   map_w, map_h, n_turns, n_channels, n_scalars: int
