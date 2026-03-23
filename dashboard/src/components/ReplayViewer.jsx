@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react'
 import { useSetAtom } from 'jotai'
 import { viewerAtom, viewerMinimizedAtom } from '../store'
 import Card from './Card'
 import { Table, Th, Td, Thead, Tr } from './Table'
 import { relativeTime } from '../data'
+import { viewerUrl } from '../api'
+import { useReplayListQuery } from '../hooks/useDashboardQueries'
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`
@@ -20,31 +21,19 @@ function parseReplayName(name) {
 }
 
 export default function ReplayViewer() {
-  const [replays, setReplays] = useState([])
-  const [loading, setLoading] = useState(true)
+  const replayQuery = useReplayListQuery()
+  const replays = replayQuery.data || []
+  const loading = replayQuery.isPending || replayQuery.isFetching
   const setViewer = useSetAtom(viewerAtom)
   const setMinimized = useSetAtom(viewerMinimizedAtom)
 
-  useEffect(() => {
-    fetch('/api/replays')
-      .then(r => r.json())
-      .then(setReplays)
-      .catch(() => setReplays([]))
-      .finally(() => setLoading(false))
-  }, [])
-
   function refresh() {
-    setLoading(true)
-    fetch('/api/replays')
-      .then(r => r.json())
-      .then(setReplays)
-      .catch(() => setReplays([]))
-      .finally(() => setLoading(false))
+    replayQuery.refetch()
   }
 
   function openReplay(name) {
     setViewer({
-      url: `/viewer/?replayUrl=/api/replay/${encodeURIComponent(name)}`,
+      url: viewerUrl(`/api/replay/${encodeURIComponent(name)}`),
       title: parseReplayName(name),
     })
     setMinimized(false)

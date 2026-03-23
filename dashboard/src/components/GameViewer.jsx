@@ -18,6 +18,19 @@ export default function GameViewer() {
     return () => window.removeEventListener('keydown', onKey)
   }, [viewer, minimized, close])
 
+  useEffect(() => {
+    if (!viewer || minimized) return
+
+    function onMessage(event) {
+      if (event.data?.type === 'dashboard-viewer-escape') {
+        close()
+      }
+    }
+
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [viewer, minimized, close])
+
   // Attach Escape listener to iframe contentWindow (same-origin)
   function handleIframeLoad() {
     try {

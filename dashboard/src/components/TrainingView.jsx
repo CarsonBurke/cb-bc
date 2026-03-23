@@ -1,145 +1,73 @@
-import { useState, useEffect, useRef, memo } from 'react'
+import { createContext, memo, useContext } from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import {
-  viewerAtom, viewerMinimizedAtom, trainSessionAtom,
-  trainEpisodesAtom, trainConfigAtom, trainLoadingAtom,
-  trainLeagueModelsAtom, trainGameLogAtom,
-} from '../store'
+import { viewerAtom, viewerMinimizedAtom, trainSessionAtom } from '../store'
 import { Line, Bar } from 'react-chartjs-2'
-import { Chart as ChartJS, BarElement } from 'chart.js'
+import { viewerUrl } from '../api'
+import {
+  useGameLogQuery,
+  useLeagueQuery,
+  useTrainLogQuery,
+  useTrainReplaysQuery,
+} from '../hooks/useDashboardQueries'
+import '../chartjs'
 
-ChartJS.register(BarElement)
 import { Table, Th, Td, Thead, Tr } from './Table'
 import { CHART_THEME, relativeTime } from '../data'
 import TileLayout from './TileLayout'
-import { useCardSettings } from './Card'
+import { useCardSettings } from './CardSettingsContext'
 
-const POLL_MS = 2000
+const TrainEpisodesCtx = createContext([])
+const TrainConfigCtx = createContext({})
+const TrainLoadingCtx = createContext(true)
+const TrainLeagueCtx = createContext([])
+const TrainGameLogCtx = createContext({})
+const EMPTY_ARRAY = []
+const EMPTY_OBJECT = {}
 
-// ---- Data hooks ----
-
-function useTrainLog(session) {
-  const setEpisodes = useSetAtom(trainEpisodesAtom)
-  const setConfig = useSetAtom(trainConfigAtom)
-  const setLoading = useSetAtom(trainLoadingAtom)
-  const timer = useRef(null)
-  const accum = useRef({ episodes: [], config: {}, total: 0 })
-
-  useEffect(() => {
-    setLoading(true)
-    accum.current = { episodes: [], config: {}, total: 0 }
-    function fetch_log() {
-      const after = accum.current.total
-      const params = new URLSearchParams()
-      if (session) params.set('session', session)
-      if (after > 0) params.set('after', String(after))
-      const qs = params.toString() ? `?${params}` : ''
-      fetch(`/api/train-log${qs}`)
-        .then(r => r.json())
-        .then(d => {
-          const newEps = d.episodes || []
-          const serverTotal = d.total ?? (after + newEps.length)
-          if (newEps.length === 0 && serverTotal === accum.current.total) return
-          if (after > 0) {
-            accum.current.episodes = accum.current.episodes.concat(newEps)
-          } else {
-            accum.current.episodes = newEps
-            accum.current.config = d.config || {}
-            setConfig(accum.current.config)
-          }
-          accum.current.total = serverTotal
-          setEpisodes(accum.current.episodes)
-        })
-        .catch(() => {})
-        .finally(() => setLoading(false))
-    }
-    fetch_log()
-    timer.current = setInterval(fetch_log, POLL_MS)
-    return () => clearInterval(timer.current)
-  }, [session, setEpisodes, setConfig, setLoading])
+function useTrainEpisodes() {
+  return useContext(TrainEpisodesCtx)
 }
 
-function useLeague(session) {
-  const setModels = useSetAtom(trainLeagueModelsAtom)
-  const timer = useRef(null)
-  const lastHash = useRef('')
-
-  useEffect(() => {
-    lastHash.current = ''
-    function fetch_league() {
-      const qs = session ? `?session=${encodeURIComponent(session)}` : ''
-      fetch(`/api/league${qs}`)
-        .then(r => r.text())
-        .then(text => {
-          if (text !== lastHash.current) {
-            lastHash.current = text
-            try { setModels(JSON.parse(text).models || []) } catch {}
-          }
-        })
-        .catch(() => {})
-    }
-    fetch_league()
-    timer.current = setInterval(fetch_league, POLL_MS)
-    return () => clearInterval(timer.current)
-  }, [session, setModels])
+function useTrainConfig() {
+  return useContext(TrainConfigCtx)
 }
 
-function useTrainReplays(session) {
-  const [replays, setReplays] = useState([])
-  const timer = useRef(null)
-  const lastLen = useRef(0)
-
-  useEffect(() => {
-    lastLen.current = 0
-    function refresh() {
-      const qs = session ? `?session=${encodeURIComponent(session)}` : ''
-      fetch(`/api/train-replays${qs}`)
-        .then(r => r.json())
-        .then(d => {
-          if (d.length !== lastLen.current) {
-            lastLen.current = d.length
-            setReplays(d)
-          }
-        })
-        .catch(() => {})
-    }
-    refresh()
-    timer.current = setInterval(refresh, POLL_MS)
-    return () => clearInterval(timer.current)
-  }, [session])
-
-  return replays
+function useTrainLoading() {
+  return useContext(TrainLoadingCtx)
 }
 
-function useGameLog(session) {
-  const setGames = useSetAtom(trainGameLogAtom)
-  const timer = useRef(null)
-  const accum = useRef({ map: {}, total: 0 })
+function useTrainLeagueModels() {
+  return useContext(TrainLeagueCtx)
+}
 
-  useEffect(() => {
-    accum.current = { map: {}, total: 0 }
-    function fetch_games() {
-      const after = accum.current.total
-      const params = new URLSearchParams()
-      if (session) params.set('session', session)
-      if (after > 0) params.set('after', String(after))
-      const qs = params.toString() ? `?${params}` : ''
-      fetch(`/api/game-log${qs}`)
-        .then(r => r.json())
-        .then(d => {
-          const newGames = d.games || d
-          const serverTotal = d.total ?? (after + newGames.length)
-          if (newGames.length === 0 && serverTotal === accum.current.total) return
-          for (const g of newGames) if (g.replay) accum.current.map[g.replay] = g
-          accum.current.total = serverTotal
-          setGames({ ...accum.current.map })
-        })
-        .catch(() => {})
-    }
-    fetch_games()
-    timer.current = setInterval(fetch_games, POLL_MS)
-    return () => clearInterval(timer.current)
-  }, [session, setGames])
+function useTrainGameLog() {
+  return useContext(TrainGameLogCtx)
+}
+
+function TrainingDataProvider({ session, children }) {
+  const trainLogQuery = useTrainLogQuery(session)
+  const leagueQuery = useLeagueQuery(session)
+  const gameLogQuery = useGameLogQuery(session)
+
+  const episodes = trainLogQuery.data?.episodes ?? EMPTY_ARRAY
+  const config = trainLogQuery.data?.config ?? EMPTY_OBJECT
+  const loading = trainLogQuery.isPending && !episodes.length
+  const leagueModels = leagueQuery.data ?? EMPTY_ARRAY
+  const gameLog = gameLogQuery.data?.map ?? EMPTY_OBJECT
+
+  return (
+    <TrainEpisodesCtx.Provider value={episodes}>
+      <TrainConfigCtx.Provider value={config}>
+        <TrainLoadingCtx.Provider value={loading}>
+          <TrainLeagueCtx.Provider value={leagueModels}>
+            <TrainGameLogCtx.Provider value={gameLog}>
+              {children}
+            </TrainGameLogCtx.Provider>
+          </TrainLeagueCtx.Provider>
+        </TrainLoadingCtx.Provider>
+      </TrainConfigCtx.Provider>
+    </TrainEpisodesCtx.Provider>
+  )
 }
 
 // ---- Chart helpers ----
@@ -237,9 +165,9 @@ function chartBase(yViewport = null) {
 // ---- Card content components ----
 
 function StatusPanel() {
-  const episodes = useAtomValue(trainEpisodesAtom)
-  const config = useAtomValue(trainConfigAtom)
-  const loading = useAtomValue(trainLoadingAtom)
+  const episodes = useTrainEpisodes()
+  const config = useTrainConfig()
+  const loading = useTrainLoading()
   const latest = episodes[episodes.length - 1]
   const progress = config.total_episodes
     ? `${episodes.length} / ${config.total_episodes}`
@@ -271,7 +199,7 @@ function StatusPanel() {
 }
 
 const RewardChart = memo(function RewardChart() {
-  const episodes = useAtomValue(trainEpisodesAtom)
+  const episodes = useTrainEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -294,14 +222,12 @@ const RewardChart = memo(function RewardChart() {
 })
 
 const RewardBreakdownChart = memo(function RewardBreakdownChart() {
-  const episodes = useAtomValue(trainEpisodesAtom)
+  const episodes = useTrainEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
   const dim = emaOn
   const series = [
-    { key: 'r_ti', altKey: 'r_harv', label: 'Ti Delivery', color: '#a6e3a1' },
-    { key: 'r_ax', label: 'Ax Delivery', color: '#74c7ec' },
     { key: 'r_work', altKey: 'r_flow', label: 'Flow', color: '#f9e2af' },
     { key: 'r_dmg', label: 'Damage', color: '#f38ba8' },
     { key: 'r_own_dmg', label: 'Own Core Dmg', color: '#cba6f7' },
@@ -335,7 +261,7 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
 })
 
 const HarvesterDebugChart = memo(function HarvesterDebugChart() {
-  const episodes = useAtomValue(trainEpisodesAtom)
+  const episodes = useTrainEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -375,7 +301,7 @@ const HarvesterDebugChart = memo(function HarvesterDebugChart() {
 })
 
 const ConveyorDebugChart = memo(function ConveyorDebugChart() {
-  const episodes = useAtomValue(trainEpisodesAtom)
+  const episodes = useTrainEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -417,7 +343,7 @@ const ConveyorDebugChart = memo(function ConveyorDebugChart() {
 function makeSimpleChart(label, dataKey, color, opts = {}) {
   return memo(function SimpleChart() {
     "use no memo"
-    const episodes = useAtomValue(trainEpisodesAtom)
+    const episodes = useTrainEpisodes()
     const { ema: emaOn, bands: bandsOn } = useCardSettings()
     if (episodes.length <= 1) return <NoData />
     const ds = downsample(episodes)
@@ -451,7 +377,7 @@ const KLChart = makeSimpleChart('KL', 'approx_kl', '#fab387')
 const ClipChart = makeSimpleChart('Clip Frac', 'clip_frac', '#f9e2af')
 
 const LossChart = memo(function LossChart() {
-  const episodes = useAtomValue(trainEpisodesAtom)
+  const episodes = useTrainEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const dim = emaOn
@@ -489,7 +415,7 @@ const LossChart = memo(function LossChart() {
 })
 
 const LeagueEloCard = memo(function LeagueEloCard() {
-  const leagueModels = useAtomValue(trainLeagueModelsAtom)
+  const leagueModels = useTrainLeagueModels()
   if (!leagueModels.length) return <NoData />
   const sorted = [...leagueModels].sort((a, b) => a.gen - b.gen)
   const labels = sorted.map(m => m.id)
@@ -517,7 +443,7 @@ const LeagueEloCard = memo(function LeagueEloCard() {
 })
 
 function EpisodeLogTable() {
-  const episodes = useAtomValue(trainEpisodesAtom)
+  const episodes = useTrainEpisodes()
   if (!episodes.length) return <NoData />
   return (
     <div className="max-h-96 overflow-y-auto">
@@ -537,7 +463,7 @@ function EpisodeLogTable() {
           {[...episodes].reverse().map(e => (
             <Tr key={e.episode}>
               <Td>{e.episode}</Td>
-              <Td title={`TiDeliv: ${fmt(e.r_ti ?? e.r_harv, 2)}  AxDeliv: ${fmt(e.r_ax, 2)}  Flow: ${fmt(e.r_work ?? e.r_flow ?? e.r_deliv ?? e.r_conv, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  OwnDmg: ${fmt(e.r_own_dmg, 2)}  |  H a/f/g/p: ${fmt(e.harv_attempts, 2)}/${fmt(e.harv_failures, 2)}/${fmt(e.harv_prox_gate, 2)}/${fmt(e.harv_prox_paid, 2)}  C a/f/g/p: ${fmt(e.conv_attempts, 2)}/${fmt(e.conv_failures, 2)}/${fmt(e.conv_prox_gate, 2)}/${fmt(e.conv_prox_paid, 2)}`}>{fmt(e.reward, 3)}</Td>
+              <Td title={`Flow: ${fmt(e.r_work ?? e.r_flow, 2)}  Dmg: ${fmt(e.r_dmg, 2)}  OwnDmg: ${fmt(e.r_own_dmg, 2)}  |  H a/f/g/p: ${fmt(e.harv_attempts, 2)}/${fmt(e.harv_failures, 2)}/${fmt(e.harv_prox_gate, 2)}/${fmt(e.harv_prox_paid, 2)}  C a/f/g/p: ${fmt(e.conv_attempts, 2)}/${fmt(e.conv_failures, 2)}/${fmt(e.conv_prox_gate, 2)}/${fmt(e.conv_prox_paid, 2)}`}>{fmt(e.reward, 3)}</Td>
               <Td>{fmt(e.resources, 1)}</Td>
               <Td>{fmt(e.pi_loss, 4)}</Td>
               <Td>{fmt(e.entropy, 3)}</Td>
@@ -555,8 +481,8 @@ function EpisodeLogTable() {
 
 function TrainingReplaysContent() {
   const session = useAtomValue(trainSessionAtom)
-  const gameLog = useAtomValue(trainGameLogAtom)
-  const replays = useTrainReplays(session)
+  const gameLog = useTrainGameLog()
+  const replays = useTrainReplaysQuery(session).data || []
   const setViewer = useSetAtom(viewerAtom)
   const setMinimized = useSetAtom(viewerMinimizedAtom)
 
@@ -564,7 +490,7 @@ function TrainingReplaysContent() {
     const sessionQs = session ? `?session=${encodeURIComponent(session)}` : ''
     const replayPath = `/api/train-replay/${encodeURIComponent(name)}${sessionQs}`
     setViewer({
-      url: `/viewer/?replayUrl=${encodeURIComponent(replayPath)}`,
+      url: viewerUrl(replayPath),
       title: parseReplayName(name),
     })
     setMinimized(false)
@@ -662,15 +588,14 @@ const DEFAULT_LAYOUT = {
 
 export default function TrainingView() {
   const session = useAtomValue(trainSessionAtom)
-  useTrainLog(session)
-  useLeague(session)
-  useGameLog(session)
 
   return (
-    <TileLayout
-      cards={TRAINING_CARDS}
-      storageKey="training-tiles"
-      defaultLayout={DEFAULT_LAYOUT}
-    />
+    <TrainingDataProvider session={session}>
+      <TileLayout
+        cards={TRAINING_CARDS}
+        storageKey="training-tiles"
+        defaultLayout={DEFAULT_LAYOUT}
+      />
+    </TrainingDataProvider>
   )
 }

@@ -356,8 +356,6 @@ function CardSlot({ cardId, leafId, card, isDragTarget, dragPos, onDragOverCard,
     },
   }
 
-  const content = card.render()
-
   return (
     <div
       ref={ref}
@@ -385,9 +383,8 @@ function CardSlot({ cardId, leafId, card, isDragTarget, dragPos, onDragOverCard,
         defaultOpen={card.defaultOpen ?? true}
         dragHandleProps={dragHandleProps}
         hasEma={card.hasEma}
-      >
-        {content}
-      </Card>
+        renderContent={card.render}
+      />
 
       {/* Drop indicator — after */}
       <div className={`absolute bottom-0 left-3 right-3 h-0.5 rounded-full bg-blue z-10 transition-opacity duration-100 ${

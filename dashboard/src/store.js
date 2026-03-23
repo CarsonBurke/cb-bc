@@ -86,13 +86,6 @@ export const syncFromHash = (set) => {
 export const viewerAtom = atom(null)
 export const viewerMinimizedAtom = atom(false)
 
-// Training data atoms — granular so consumers only re-render on their slice
-export const trainEpisodesAtom = atom([])
-export const trainConfigAtom = atom({})
-export const trainLoadingAtom = atom(true)
-export const trainLeagueModelsAtom = atom([])
-export const trainGameLogAtom = atom({})
-
 // Persisted card collapse state: { [cardId]: boolean }
 const STORAGE_KEY = 'dashboard-card-state'
 
@@ -114,7 +107,7 @@ export const cardOpenAtom = (id, defaultOpen) => atom(
   (get, set, next) => {
     const state = { ...get(cardStateAtom), [id]: next }
     set(cardStateAtom, state)
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)) } catch {}
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)) } catch { return undefined }
   },
 )
 
@@ -136,7 +129,7 @@ export const cardSizeAtom = (id) => atom(
   (get, set, next) => {
     const state = { ...get(cardSizeStateAtom), [id]: next }
     set(cardSizeStateAtom, state)
-    try { localStorage.setItem(SIZE_KEY, JSON.stringify(state)) } catch {}
+    try { localStorage.setItem(SIZE_KEY, JSON.stringify(state)) } catch { return undefined }
   },
 )
 
@@ -158,7 +151,7 @@ export const cardEmaAtom = (id) => atom(
   (get, set, next) => {
     const state = { ...get(cardEmaStateAtom), [id]: next }
     set(cardEmaStateAtom, state)
-    try { localStorage.setItem(EMA_KEY, JSON.stringify(state)) } catch {}
+    try { localStorage.setItem(EMA_KEY, JSON.stringify(state)) } catch { return undefined }
   },
 )
 
@@ -180,6 +173,6 @@ export const cardBandsAtom = (id) => atom(
   (get, set, next) => {
     const state = { ...get(cardBandsStateAtom), [id]: next }
     set(cardBandsStateAtom, state)
-    try { localStorage.setItem(BANDS_KEY, JSON.stringify(state)) } catch {}
+    try { localStorage.setItem(BANDS_KEY, JSON.stringify(state)) } catch { return undefined }
   },
 )

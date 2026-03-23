@@ -1,20 +1,18 @@
+import { useMemo } from 'react'
 import { Bar } from 'react-chartjs-2'
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  BarElement,
-  Tooltip,
-} from 'chart.js'
-import { botColor, getAllBots, CHART_THEME } from '../data'
+import { botColor, CHART_THEME } from '../data'
+import '../chartjs'
 
-ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip)
-
-export default function EloBarChart({ bots }) {
-  const allBotsList = getAllBots()
-  const sorted = Object.entries(bots).sort((a, b) => b[1].elo - a[1].elo)
-  const names = sorted.map(([n]) => n)
-  const elos = sorted.map(([, d]) => d.elo)
+export default function EloBarChart({ bots, allBots }) {
+  const { names, elos, borderColors, backgroundColors } = useMemo(() => {
+    const indexByBot = new Map(allBots.map((name, index) => [name, index]))
+    const sorted = Object.entries(bots).sort((a, b) => b[1].elo - a[1].elo)
+    const names = sorted.map(([name]) => name)
+    const elos = sorted.map(([, data]) => data.elo)
+    const borderColors = names.map((name) => botColor(indexByBot.get(name) || 0))
+    const backgroundColors = borderColors.map((color) => `${color}80`)
+    return { names, elos, borderColors, backgroundColors }
+  }, [allBots, bots])
 
   return (
     <div className="min-h-[260px]">
@@ -23,14 +21,8 @@ export default function EloBarChart({ bots }) {
           labels: names,
           datasets: [{
             data: elos,
-            backgroundColor: names.map(n => {
-              const ci = allBotsList.indexOf(n)
-              return botColor(ci >= 0 ? ci : 0) + '80'
-            }),
-            borderColor: names.map(n => {
-              const ci = allBotsList.indexOf(n)
-              return botColor(ci >= 0 ? ci : 0)
-            }),
+            backgroundColor: backgroundColors,
+            borderColor: borderColors,
             borderWidth: 1.5,
             borderRadius: 3,
           }],

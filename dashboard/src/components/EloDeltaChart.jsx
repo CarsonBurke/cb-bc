@@ -1,40 +1,32 @@
+import { useMemo } from 'react'
 import { Line } from 'react-chartjs-2'
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Tooltip,
-  Legend,
-} from 'chart.js'
-import { botColor, getAllBots, CHART_THEME } from '../data'
+import { botColor, CHART_THEME } from '../data'
+import '../chartjs'
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend)
+export default function EloDeltaChart({ timeline, allBots }) {
+  const { labels, datasets } = useMemo(() => {
+    const labels = timeline.slice(1).map((round) => `Round ${round.round_id}`)
+    const datasets = allBots.map((bot, index) => ({
+      label: bot,
+      data: timeline.slice(1).map((round, offset) => {
+        const previous = timeline[offset]
+        const currentElo = round.bots[bot]
+        const previousElo = previous.bots[bot]
+        if (currentElo == null || previousElo == null) return null
+        return currentElo - previousElo
+      }),
+      borderColor: botColor(index),
+      backgroundColor: `${botColor(index)}22`,
+      tension: 0.3,
+      spanGaps: true,
+      pointRadius: 5,
+      pointHoverRadius: 7,
+      borderWidth: 2.5,
+    }))
+    return { labels, datasets }
+  }, [allBots, timeline])
 
-export default function EloDeltaChart({ rounds }) {
-  const allBots = getAllBots()
-  if (rounds.length < 2) return <p className="text-overlay0 text-sm">Need at least 2 rounds for deltas.</p>
-
-  const labels = rounds.slice(1).map(r => `Round ${r.round_id}`)
-
-  const datasets = allBots.map((bot, i) => ({
-    label: bot,
-    data: rounds.slice(1).map((r, idx) => {
-      const prev = rounds[idx]
-      const cur = r.bots[bot]?.elo
-      const pre = prev.bots[bot]?.elo
-      if (cur == null || pre == null) return null
-      return cur - pre
-    }),
-    borderColor: botColor(i),
-    backgroundColor: botColor(i) + '22',
-    tension: 0.3,
-    spanGaps: true,
-    pointRadius: 5,
-    pointHoverRadius: 7,
-    borderWidth: 2.5,
-  }))
+  if (timeline.length < 2) return <p className="text-overlay0 text-sm">Need at least 2 rounds for deltas.</p>
 
   return (
     <div className="min-h-[240px]">

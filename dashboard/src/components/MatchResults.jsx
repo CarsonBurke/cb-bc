@@ -3,6 +3,7 @@ import { useSetAtom } from 'jotai'
 import { viewerAtom, viewerMinimizedAtom } from '../store'
 import MatchStats from './MatchStats'
 import { Table, Th, Td, Thead, Tr } from './Table'
+import { viewerUrl } from '../api'
 
 function WatchButton({ matchId, onWatch }) {
   return (
@@ -76,7 +77,7 @@ export default function MatchResults({ matches }) {
 
   function handleWatch(matchId) {
     setViewer({
-      url: `/viewer/?replayUrl=/api/replay/match_${matchId}.replay26`,
+      url: viewerUrl(`/api/replay/match_${matchId}.replay26`),
       title: `Match ${matchId}`,
     })
     setMinimized(false)

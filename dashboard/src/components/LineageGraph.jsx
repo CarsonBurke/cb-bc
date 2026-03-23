@@ -1,46 +1,69 @@
-import { useState } from 'react'
-import { DATA, botColor, getAllBots, getLatestRound } from '../data'
+import { useMemo, useState } from 'react'
+import { botColor } from '../data'
 
-export default function LineageGraph() {
-  const lineage = DATA.lineage || {}
-  const nodes = Object.keys(lineage)
+export default function LineageGraph({ lineage, allBots, latestBots }) {
+  const nodes = useMemo(() => Object.keys(lineage || {}), [lineage])
   const [hovered, setHovered] = useState(null)
 
-  if (!nodes.length) return <p className="text-overlay0 text-sm">No lineage data.</p>
-
-  const children = {}
-  const roots = []
-  nodes.forEach(n => {
-    const p = lineage[n]?.parent
-    if (!p || !lineage[p]) roots.push(n)
-    else { children[p] = children[p] || []; children[p].push(n) }
-  })
-
-  const positions = {}
-  let xCounter = 0
-  const xSpacing = 140
-  const ySpacing = 90
-
-  function layout(node, depth) {
-    const kids = (children[node] || []).sort()
-    if (!kids.length) {
-      positions[node] = { x: xCounter * xSpacing, y: depth * ySpacing }
-      xCounter++
-    } else {
-      kids.forEach(k => layout(k, depth + 1))
-      const fx = positions[kids[0]].x
-      const lx = positions[kids[kids.length - 1]].x
-      positions[node] = { x: (fx + lx) / 2, y: depth * ySpacing }
+  const { positions, minX, width, height } = useMemo(() => {
+    if (!nodes.length) {
+      return { positions: {}, minX: 0, width: 320, height: 200 }
     }
-  }
-  roots.sort().forEach(r => layout(r, 0))
 
-  const allBots = getAllBots()
-  const latest = getLatestRound()
+    const children = {}
+    const roots = []
+    nodes.forEach((node) => {
+      const parent = lineage[node]?.parent
+      if (!parent || !lineage[parent]) roots.push(node)
+      else {
+        children[parent] = children[parent] || []
+        children[parent].push(node)
+      }
+    })
 
-  const elos = latest ? Object.values(latest.bots).map(b => b.elo) : []
-  const minElo = Math.min(...elos, 1000)
-  const maxElo = Math.max(...elos, 1000)
+    const positions = {}
+    let xCounter = 0
+    const xSpacing = 140
+    const ySpacing = 90
+
+    function layout(node, depth) {
+      const kids = (children[node] || []).sort()
+      if (!kids.length) {
+        positions[node] = { x: xCounter * xSpacing, y: depth * ySpacing }
+        xCounter += 1
+      } else {
+        kids.forEach((child) => layout(child, depth + 1))
+        positions[node] = {
+          x: (positions[kids[0]].x + positions[kids[kids.length - 1]].x) / 2,
+          y: depth * ySpacing,
+        }
+      }
+    }
+
+    roots.sort().forEach((root) => layout(root, 0))
+
+    const allX = Object.values(positions).map((point) => point.x)
+    const allY = Object.values(positions).map((point) => point.y)
+    const margin = 70
+    const minX = Math.min(...allX) - margin
+    const width = Math.max(...allX) - minX + margin + 160
+    const height = Math.max(...allY) + margin * 2
+
+    return { positions, minX, width, height }
+  }, [lineage, nodes])
+
+  const latestElos = useMemo(
+    () => Object.values(latestBots || {}).filter((elo) => elo != null),
+    [latestBots],
+  )
+  const minElo = Math.min(...latestElos, 1000)
+  const maxElo = Math.max(...latestElos, 1000)
+  const botIndex = useMemo(
+    () => new Map(allBots.map((name, index) => [name, index])),
+    [allBots],
+  )
+
+  if (!nodes.length) return <p className="text-overlay0 text-sm">No lineage data.</p>
 
   function eloColor(elo) {
     if (elo == null || maxElo === minElo) return '#f9e2af'
@@ -61,17 +84,10 @@ export default function LineageGraph() {
     }
   }
 
-  const allX = Object.values(positions).map(p => p.x)
-  const allY = Object.values(positions).map(p => p.y)
-  const margin = 70
-  const minX = Math.min(...allX) - margin
-  const width = Math.max(...allX) - minX + margin + 160
-  const height = Math.max(...allY) + margin * 2
-
   return (
     <div className="overflow-auto">
       <svg
-        viewBox={`${minX} ${-margin} ${width} ${height}`}
+        viewBox={`${minX} -70 ${width} ${height}`}
         style={{ height: Math.max(height, 200), width: '100%' }}
         className="overflow-visible"
       >
@@ -95,8 +111,8 @@ export default function LineageGraph() {
           if (!positions[n]) return null
           const { x, y } = positions[n]
           const cl = lineage[n]?.changelog || ''
-          const elo = latest?.bots[n]?.elo
-          const ci = allBots.indexOf(n)
+          const elo = latestBots?.[n]
+          const ci = botIndex.get(n)
           const color = ci >= 0 ? botColor(ci) : '#a6e3a1'
           const isHovered = hovered === n
 

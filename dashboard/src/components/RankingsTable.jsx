@@ -1,9 +1,7 @@
-import { DATA } from '../data'
 import { Table, Th, Td, Thead, Tr } from './Table'
 
-export default function RankingsTable({ bots, prevBots }) {
+export default function RankingsTable({ bots, prevBots, lineage }) {
   const sorted = Object.entries(bots).sort((a, b) => b[1].elo - a[1].elo)
-  const lineage = DATA.lineage || {}
 
   return (
     <Table>
