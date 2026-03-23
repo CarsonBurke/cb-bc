@@ -17,10 +17,11 @@ _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "te
 sys.path.insert(0, _TENSOR_DIR)
 
 from shared import (
-    INPUT_SIZE, HIDDEN_SIZES, H_DIM, RMSNORM_LAYERS, POS_EMBED_DIM,
-    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9,
+    INPUT_SIZE, HIDDEN_SIZES, H_DIM, RMSNORM_LAYERS, POS_EMBED_DIM, COMPRESS_DIM,
+    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4,
     SinusoidalPositionEmbedding,
     encode_state_into, argmax,
+    TILE_FEATURES, GRID_SIZE,
 )
 
 # Import MLP from tensor_inference's tensor_lib
@@ -46,17 +47,25 @@ def _get_shared_model(path: str):
     if cache_key is not None and cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
+    _tile_input_dim = TILE_FEATURES + 2  # 21
+    _tile_embed_dim = 8
     model = MLP(
-        input_size=INPUT_SIZE + H_DIM,
+        input_size=COMPRESS_DIM + POS_EMBED_DIM + 15 + H_DIM,  # 103
         hidden_sizes=HIDDEN_SIZES,
         output_heads={
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
+            "conv_dir": 4,
             "move_dir": 9,
-            "h_next": H_DIM,
+            "h_gate": H_DIM,
+            "h_cand": H_DIM,
         },
         activation="silu",
         rmsnorm_layers=RMSNORM_LAYERS,
+        tile_encoder_sizes=(_tile_input_dim, _tile_embed_dim),
+        tile_grid_n=GRID_SIZE * GRID_SIZE,
+        tile_conv=True,
+        tile_compress_size=COMPRESS_DIM,
     )
     model.eval()
 
@@ -141,16 +150,29 @@ class Player:
         features = obs + self.h_prev
         outputs = self.model.infer(features)
 
-        h_raw = outputs["h_next"]
-        self.h_prev = [math.tanh(x) for x in h_raw]
+        # minGRU: gated recurrent update
+        h_gate_raw = outputs["h_gate"]
+        h_cand = outputs["h_cand"]
+        h_in = self.h_prev
+        h_new = [0.0] * len(h_in)
+        for i in range(len(h_in)):
+            g = h_gate_raw[i]
+            if g >= 0:
+                z = 1.0 / (1.0 + math.exp(-g))
+            else:
+                e = math.exp(g)
+                z = e / (1.0 + e)
+            h_new[i] = (1.0 - z) * h_in[i] + z * h_cand[i]
+        self.h_prev = h_new
 
         build_type_idx = argmax(outputs["build_type"])
         build_dir_idx = argmax(outputs["build_dir"])
+        conv_dir_idx = argmax(outputs["conv_dir"])
         move_dir_idx = argmax(outputs["move_dir"])
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        self._execute_build(ct, build_action, build_dir)
+        self._execute_build(ct, build_action, build_dir, conv_dir_idx)
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
@@ -184,15 +206,11 @@ class Player:
         self._n_builders_cached = n_builders_out[0]
         return features
 
-    def _execute_build(self, ct, action, direction):
+    def _execute_build(self, ct, action, direction, conv_dir_idx=0):
         pos = ct.get_position()
         build_pos = pos.add(direction)
+        conv_dir = CONV_DIR_4[conv_dir_idx]
         if action == "conveyor":
-            conv_dir = direction
-            if self.core_center:
-                conv_dir = build_pos.direction_to(self.core_center)
-                if conv_dir == Direction.CENTRE:
-                    conv_dir = direction
             if ct.can_build_conveyor(build_pos, conv_dir):
                 ct.build_conveyor(build_pos, conv_dir)
         elif action == "harvester":
@@ -211,11 +229,11 @@ class Player:
             if ct.can_build_breach(build_pos, direction):
                 ct.build_breach(build_pos, direction)
         elif action == "splitter":
-            if ct.can_build_splitter(build_pos, direction):
-                ct.build_splitter(build_pos, direction)
+            if ct.can_build_splitter(build_pos, conv_dir):
+                ct.build_splitter(build_pos, conv_dir)
         elif action == "armoured_conveyor":
-            if ct.can_build_armoured_conveyor(build_pos, direction):
-                ct.build_armoured_conveyor(build_pos, direction)
+            if ct.can_build_armoured_conveyor(build_pos, conv_dir):
+                ct.build_armoured_conveyor(build_pos, conv_dir)
         elif action == "barrier":
             if ct.can_build_barrier(build_pos):
                 ct.build_barrier(build_pos)
