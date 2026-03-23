@@ -220,7 +220,11 @@ class MLP:
     Each head produces independent logits for a different decision.
     """
 
-    __slots__ = ("trunk", "heads", "_infer_cache", "tile_encoder", "tile_grid_n", "tile_raw_features", "tile_embed_dim", "_tile_dxdy")
+    __slots__ = (
+        "trunk", "heads", "_infer_cache",
+        "tile_encoder", "tile_grid_n", "tile_raw_features", "tile_embed_dim", "_tile_dxdy",
+        "tile_conv_w", "tile_conv_b", "tile_compress", "tile_compress_size",
+    )
 
     def __init__(
         self,
@@ -233,6 +237,8 @@ class MLP:
         dropout: float = 0.0,
         tile_encoder_sizes: tuple[int, int] | None = None,
         tile_grid_n: int = 25,
+        tile_conv: bool = False,
+        tile_compress_size: int | None = None,
     ):
         act_cls = {"relu": ReLU, "tanh": Tanh, "sigmoid": Sigmoid, "silu": SiLU}[activation]
         if rmsnorm_layers is None:
@@ -267,7 +273,7 @@ class MLP:
             te_in, te_out = tile_encoder_sizes
             self.tile_encoder = Sequential(Linear(te_in, te_out), SiLU())
             self.tile_grid_n = tile_grid_n
-            self.tile_raw_features = te_in - 2  # 17 raw features per tile
+            self.tile_raw_features = te_in - 2
             self.tile_embed_dim = te_out
             self._tile_dxdy = [(float((i % 5) - 2) / 2.0, float((i // 5) - 2) / 2.0) for i in range(tile_grid_n)]
         else:
@@ -276,6 +282,27 @@ class MLP:
             self.tile_raw_features = 0
             self.tile_embed_dim = 0
             self._tile_dxdy = None
+
+        # Depthwise 3x3 conv for spatial mixing between adjacent tiles
+        if tile_conv and tile_encoder_sizes is not None:
+            te_out = tile_encoder_sizes[1]
+            # Conv weights: flat (channels * 9) tensor, zero-init (residual starts as identity)
+            self.tile_conv_w = Tensor([0.0] * (te_out * 9), (te_out * 9,))
+            self.tile_conv_b = Tensor([0.0] * te_out, (te_out,))
+            # Compress: Linear(n_tiles * embed_dim, compress_size) + RMSNorm + SiLU
+            assert tile_compress_size is not None
+            self.tile_compress_size = tile_compress_size
+            compress_in = tile_grid_n * te_out
+            self.tile_compress = Sequential(
+                Linear(compress_in, tile_compress_size),
+                RMSNorm(tile_compress_size),
+                SiLU(),
+            )
+        else:
+            self.tile_conv_w = None
+            self.tile_conv_b = None
+            self.tile_compress = None
+            self.tile_compress_size = None
 
         self._infer_cache: list | None = None
 
@@ -287,6 +314,11 @@ class MLP:
         params: list[Tensor] = []
         if self.tile_encoder is not None:
             params.extend(self.tile_encoder.parameters())
+        if self.tile_conv_w is not None:
+            params.append(self.tile_conv_w)
+            params.append(self.tile_conv_b)
+        if self.tile_compress is not None:
+            params.extend(self.tile_compress.parameters())
         params.extend(self.trunk.parameters())
         for head in self.heads.values():
             params.extend(head.parameters())
@@ -388,7 +420,43 @@ class MLP:
             te_bias = list(te_linear.bias.data) if te_linear.bias is not None else None
             tile_cache = (te_w_rows, te_bias, te_out_dim)
 
-        return [ops, (head_names, head_slices, fused_w_rows, fused_bias, offset), tile_cache]
+        # Build conv cache: neighbor indices + kernel weights for depthwise 3x3
+        conv_cache = None
+        if self.tile_conv_w is not None:
+            n_tiles = self.tile_grid_n
+            grid_w = int(n_tiles ** 0.5)  # 5 for 25 tiles
+            te_out = self.tile_embed_dim
+            # Precompute neighbor indices for each tile (3x3 kernel, zero-pad)
+            neighbors: list[tuple[int, ...]] = []
+            for t in range(n_tiles):
+                row, col = t // grid_w, t % grid_w
+                nbrs = []
+                for kr in range(-1, 2):
+                    for kc in range(-1, 2):
+                        nr, nc = row + kr, col + kc
+                        nbrs.append(nr * grid_w + nc if 0 <= nr < grid_w and 0 <= nc < grid_w else -1)
+                neighbors.append(tuple(nbrs))
+            # Reshape flat (channels*9) weights into per-channel 9-element lists
+            flat_w = self.tile_conv_w.data
+            conv_w = [flat_w[c * 9:(c + 1) * 9] for c in range(te_out)]
+            conv_b = list(self.tile_conv_b.data)
+            conv_cache = (conv_w, conv_b, neighbors)
+
+        # Build compress cache: Linear + RMSNorm + SiLU fused op
+        compress_cache = None
+        if self.tile_compress is not None:
+            comp_layers = self.tile_compress.layers
+            comp_linear = comp_layers[0]  # Linear
+            comp_w = comp_linear.weight.data
+            comp_N = comp_linear.out_features
+            comp_w_rows = [comp_w[j::comp_N] for j in range(comp_N)]
+            comp_b = list(comp_linear.bias.data) if comp_linear.bias is not None else None
+            comp_rms = comp_layers[1]  # RMSNorm
+            comp_gamma = list(comp_rms.gamma.data)
+            comp_eps = comp_rms.eps
+            compress_cache = (comp_w_rows, comp_b, comp_N, comp_gamma, comp_eps)
+
+        return [ops, (head_names, head_slices, fused_w_rows, fused_bias, offset), tile_cache, conv_cache, compress_cache]
 
     def infer(self, features: list[float]) -> dict[str, list[float]]:
         """Fast inference for a single input — bypasses Tensor overhead.
@@ -403,7 +471,7 @@ class MLP:
 
         _exp = math.exp
         _dot = _DOT
-        ops, fused_heads, tile_cache = self._infer_cache
+        ops, fused_heads, tile_cache, conv_cache, compress_cache = self._infer_cache
 
         if tile_cache is not None:
             te_w_rows, te_bias, te_out = tile_cache
@@ -426,7 +494,53 @@ class MLP:
                         encoded[idx] = x * e / (1.0 + e)
                     idx += 1
 
-            h = encoded + features[tile_end:]
+            # Depthwise 3x3 conv + residual + SiLU
+            if conv_cache is not None:
+                conv_w, conv_b, neighbors = conv_cache
+                total = n_tiles * te_out
+                conv_out = [0.0] * total
+                for t in range(n_tiles):
+                    nbr = neighbors[t]
+                    t_base = t * te_out
+                    for c in range(te_out):
+                        cw = conv_w[c]
+                        s = conv_b[c]
+                        for k in range(9):
+                            nt = nbr[k]
+                            if nt >= 0:
+                                s += encoded[nt * te_out + c] * cw[k]
+                        conv_out[t_base + c] = s
+                # Fused residual + SiLU
+                for i in range(total):
+                    x = encoded[i] + conv_out[i]
+                    if x >= 0:
+                        encoded[i] = x / (1.0 + _exp(-x))
+                    else:
+                        e = _exp(x)
+                        encoded[i] = x * e / (1.0 + e)
+
+            # Compress 200→64 + RMSNorm + SiLU, then concat globals
+            if compress_cache is not None:
+                comp_w_rows, comp_b, comp_N, comp_gamma, comp_eps = compress_cache
+                compressed = [0.0] * comp_N
+                mean_sq = 0.0
+                for j in range(comp_N):
+                    x = _dot(encoded, comp_w_rows[j]) if _dot else sum(map(_mul, encoded, comp_w_rows[j]))
+                    if comp_b is not None:
+                        x += comp_b[j]
+                    compressed[j] = x
+                    mean_sq += x * x
+                inv_rms = 1.0 / (mean_sq / comp_N + comp_eps) ** 0.5
+                for j in range(comp_N):
+                    x = compressed[j] * inv_rms * comp_gamma[j]
+                    if x >= 0:
+                        compressed[j] = x / (1.0 + _exp(-x))
+                    else:
+                        e = _exp(x)
+                        compressed[j] = x * e / (1.0 + e)
+                h = compressed + features[tile_end:]
+            else:
+                h = encoded + features[tile_end:]
         else:
             h = features
 

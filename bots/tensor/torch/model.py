@@ -24,19 +24,20 @@ TILE_FEATURES = 19
 GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN = [64, 64, 48, 48]
+HIDDEN = [64, 48]
 TEACHER_HIDDEN = [128, 128, 128, 64]
-H_DIM = 16
+H_DIM = 24
 INPUT_SIZE = OBS_SIZE + H_DIM
 TILE_EMBED_DIM = 8
 TILE_INPUT_DIM = TILE_FEATURES + 2  # 21: raw features + (dx/2, dy/2)
 TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
-TRUNK_INPUT_SIZE = TILE_GRID_N * TILE_EMBED_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 239
+COMPRESS_DIM = 64  # tile compress output dim (spatial pooling)
+TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 103
 ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
 N_CONV_DIR = 4  # cardinal only: N, W, E, S (indices 1, 3, 5, 7 in DIR_MAP_9)
-ACTOR_RMSNORM_LAYERS = (True, True, True, True)
+ACTOR_RMSNORM_LAYERS = (True, True)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
 CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
@@ -672,9 +673,20 @@ class BuilderMLP(nn.Module):
         hidden = hidden or HIDDEN
         self._hidden = hidden
 
-        # Shared tile encoder: per-tile MLP applied to each of the 25 tiles
-        self.tile_encoder = nn.Sequential(
-            _ortho_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM)),
+        # Per-tile linear encoder
+        self.tile_linear = _ortho_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM))
+        # Depthwise 3x3 conv for spatial mixing between adjacent tiles
+        self.tile_conv = nn.Conv2d(
+            TILE_EMBED_DIM, TILE_EMBED_DIM, 3, padding=1,
+            groups=TILE_EMBED_DIM, bias=True,
+        )
+        nn.init.zeros_(self.tile_conv.weight)  # residual starts as identity
+        nn.init.zeros_(self.tile_conv.bias)
+        self.tile_act = nn.SiLU()
+        # Compress 25×8=200 spatially-mixed tile features → 64-dim summary
+        self.tile_compress = nn.Sequential(
+            _ortho_init(nn.Linear(TILE_GRID_N * TILE_EMBED_DIM, COMPRESS_DIM)),
+            RMSNorm(COMPRESS_DIM),
             nn.SiLU(),
         )
         self.register_buffer('_tile_dxdy', _TILE_DXDY.clone())
@@ -720,20 +732,27 @@ class BuilderMLP(nn.Module):
         return super().train(mode)
 
     def _encode_tiles(self, obs: torch.Tensor) -> torch.Tensor:
-        """Extract tiles from flat obs, prepend dx/dy, run shared encoder."""
+        """Extract tiles, encode per-tile, spatial conv, compress to summary."""
         B = obs.shape[0]
-        tile_flat = obs[:, :TILE_GRID_N * TILE_FEATURES]  # (B, 425)
-        tiles = tile_flat.reshape(B, TILE_GRID_N, TILE_FEATURES)  # (B, 25, 17)
-        dxdy = self._tile_dxdy.unsqueeze(0).expand(B, -1, -1)  # (B, 25, 2)
-        tile_in = torch.cat([dxdy, tiles], dim=-1)  # (B, 25, 19)
-        tile_emb = self.tile_encoder(tile_in)  # (B, 25, 8)
-        return tile_emb.reshape(B, TILE_GRID_N * TILE_EMBED_DIM)  # (B, 200)
+        tile_flat = obs[:, :TILE_GRID_N * TILE_FEATURES]
+        tiles = tile_flat.reshape(B, TILE_GRID_N, TILE_FEATURES)
+        dxdy = self._tile_dxdy.unsqueeze(0).expand(B, -1, -1)
+        tile_in = torch.cat([dxdy, tiles], dim=-1)          # (B, 25, 21)
+        h = F.silu(self.tile_linear(tile_in))               # (B, 25, 8)
+        # Depthwise 3x3 conv + residual + SiLU
+        h_grid = h.reshape(B, 5, 5, TILE_EMBED_DIM).permute(0, 3, 1, 2)
+        conv_out = self.tile_conv(h_grid)                   # (B, 8, 5, 5)
+        conv_out = conv_out.permute(0, 2, 3, 1).reshape(B, TILE_GRID_N, TILE_EMBED_DIM)
+        h = self.tile_act(h + conv_out)                     # (B, 25, 8)
+        # Compress to fixed-size tile summary
+        h_flat = h.reshape(B, TILE_GRID_N * TILE_EMBED_DIM) # (B, 200)
+        return self.tile_compress(h_flat)                    # (B, 64)
 
     def _build_trunk_input(self, obs: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        """Build trunk input: encoded tiles + globals + pos_embed + h_prev."""
-        tile_enc = self._encode_tiles(obs)  # (B, 200)
+        """Build trunk input: compressed tiles + globals + pos_embed + h_prev."""
+        tile_summary = self._encode_tiles(obs)  # (B, 64)
         globals_pos = obs[:, TILE_GRID_N * TILE_FEATURES:]  # (B, 23) globals+pos_embed
-        return torch.cat([tile_enc, globals_pos, h_prev], dim=-1)  # (B, 239)
+        return torch.cat([tile_summary, globals_pos, h_prev], dim=-1)  # (B, 103)
 
     def actor_latent(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         """Return the pre-head actor latent used for policy logits."""
@@ -799,48 +818,49 @@ class BuilderMLP(nn.Module):
 
     def _policy_state_modules(self) -> list[nn.Module]:
         """Policy modules only in tensor_lib serialization order (critic excluded)."""
-        tile_modules = [m for m in self.tile_encoder if isinstance(m, (nn.Linear, RMSNorm))]
+        tile_modules = [self.tile_linear, self.tile_conv]
+        compress_modules = [m for m in self.tile_compress if isinstance(m, (nn.Linear, RMSNorm))]
         enc_modules = [m for m in self.encoder if isinstance(m, (nn.Linear, RMSNorm))]
         actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
-        return tile_modules + enc_modules + actor_modules + [
+        return tile_modules + compress_modules + enc_modules + actor_modules + [
             self.head_build_type, self.head_build_dir, self.head_conv_dir, self.head_move_dir,
             self.head_h_gate, self.head_h_cand,
         ]
 
     def export_weights(self) -> list[list[float]]:
-        """Export weights as JSON list. Transposes to match tensor_lib (in, out) format."""
+        """Export weights as JSON list. Transposes Linear to match tensor_lib (in, out) format."""
         state: list[list[float]] = []
         for layer in self._policy_state_modules():
             if isinstance(layer, nn.Linear):
                 state.append(layer.weight.T.contiguous().view(-1).tolist())
                 state.append(layer.bias.view(-1).tolist())
+            elif isinstance(layer, nn.Conv2d):
+                # (C_out, C_in/groups, kH, kW) → flatten as-is
+                state.append(layer.weight.view(-1).tolist())
+                if layer.bias is not None:
+                    state.append(layer.bias.view(-1).tolist())
             else:
                 state.append(layer.weight.view(-1).tolist())
         return state
 
     def import_weights(self, state: list[list[float]]) -> None:
-        """Load weights from tensor_lib JSON format, including legacy no-RMSNorm states."""
+        """Load weights from tensor_lib JSON format."""
         modules = self._policy_state_modules()
-        full_entries = sum(2 if isinstance(layer, nn.Linear) else 1 for layer in modules)
-        legacy_entries = sum(2 for layer in modules if isinstance(layer, nn.Linear))
-        legacy_no_conv_entries = full_entries - 2
-        legacy_no_conv_no_rms_entries = legacy_entries - 2
+        full_entries = sum(
+            (2 if isinstance(m, (nn.Linear, nn.Conv2d)) else 1)
+            for m in modules
+        )
+        # Also support loading without conv_dir head (2 fewer entries)
+        full_no_conv_dir = full_entries - 2
+
         if len(state) == full_entries:
-            load_rmsnorm = True
             load_conv_dir = True
-        elif len(state) == legacy_no_conv_entries:
-            load_rmsnorm = True
-            load_conv_dir = False
-        elif len(state) == legacy_entries:
-            load_rmsnorm = False
-            load_conv_dir = True
-        elif len(state) == legacy_no_conv_no_rms_entries:
-            load_rmsnorm = False
+        elif len(state) == full_no_conv_dir:
             load_conv_dir = False
         else:
             raise AssertionError(
                 f"State has {len(state)} entries, expected {full_entries} "
-                f"({legacy_entries} legacy without RMSNorm)"
+                f"(or {full_no_conv_dir} without conv_dir head)"
             )
 
         idx = 0
@@ -855,7 +875,15 @@ class BuilderMLP(nn.Module):
                 idx += 1
                 layer.bias.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
                 idx += 1
-            elif load_rmsnorm:
+            elif isinstance(layer, nn.Conv2d):
+                w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
+                layer.weight.data = w_flat.view(layer.weight.shape)
+                idx += 1
+                if layer.bias is not None:
+                    layer.bias.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
+                    idx += 1
+            else:
+                # RMSNorm
                 layer.weight.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
                 idx += 1
 

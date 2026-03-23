@@ -35,9 +35,10 @@ TILE_FEATURES = 19
 GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN_SIZES = [64, 64, 48, 48]
-H_DIM = 16  # Recurrent hidden state size
-RMSNORM_LAYERS = [True, True, True, True]
+HIDDEN_SIZES = [64, 48]
+H_DIM = 24  # Recurrent hidden state size
+COMPRESS_DIM = 64
+RMSNORM_LAYERS = [True, True]
 TILE_EMBED_DIM = 8
 TILE_INPUT_DIM = TILE_FEATURES + 2  # 21: raw features + (dx/2, dy/2)
 
@@ -177,7 +178,7 @@ def _weight_cache_key(path: str) -> tuple[str, int, int] | None:
 
 def _build_model() -> MLP:
     model = MLP(
-        input_size=GRID_SIZE * GRID_SIZE * TILE_EMBED_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM,
+        input_size=COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM,
         hidden_sizes=HIDDEN_SIZES,
         output_heads={
             "build_type": len(BUILD_ACTIONS),
@@ -191,6 +192,8 @@ def _build_model() -> MLP:
         rmsnorm_layers=RMSNORM_LAYERS,
         tile_encoder_sizes=(TILE_INPUT_DIM, TILE_EMBED_DIM),
         tile_grid_n=GRID_SIZE * GRID_SIZE,
+        tile_conv=True,
+        tile_compress_size=COMPRESS_DIM,
     )
     model.eval()
     return model
