@@ -56,7 +56,7 @@ INITIAL_BUILD_TYPE_BIAS = [
     -0.7,  # foundry
     -0.5,  # launcher
 ]
-REWARD_FLOW_THROUGHPUT = 5.0
+REWARD_FLOW_THROUGHPUT = 50.0
 REWARD_ENEMY_CORE_DAMAGE = 20.0
 REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
 
@@ -478,10 +478,13 @@ def _materialize_critic_inputs(centralized_data: dict) -> None:
         mh = int(sizes[i, 1].item())
         if mw > 0 and mh > 0:
             buf = global_states[i]
-            state_view = torch.frombuffer(
-                buf, dtype=torch.float32,
-            ).reshape(GLOBAL_MAP_CHANNELS, mh, mw)
-            obs_cpu[i, :, :mh, :mw].copy_(state_view)
+            if isinstance(buf, torch.Tensor):
+                obs_cpu[i, :, :mh, :mw].copy_(buf)
+            else:
+                state_view = torch.frombuffer(
+                    buf, dtype=torch.float32,
+                ).reshape(GLOBAL_MAP_CHANNELS, mh, mw)
+                obs_cpu[i, :, :mh, :mw].copy_(state_view)
             mask_cpu[i, 0, :mh, :mw] = 1.0
 
     centralized_data["gpu_obs"] = obs_cpu.to(device=DEVICE, dtype=gpu_dtype)
@@ -1712,17 +1715,27 @@ def _build_centralized_critic_data(
                 available_rounds_t = torch.arange(gs_n_turns, dtype=torch.long)
                 available_unique_idx = torch.empty(gs_n_turns, dtype=torch.long)
 
+                # Single frombuffer + reshape for all rounds (no per-round bytearray copy)
+                all_states_t = torch.frombuffer(
+                    bytearray(states_buf), dtype=torch.float32,
+                ).reshape(gs_n_turns, n_ch, gs_map_h, gs_map_w)
+
+                # Bulk-parse scalars if present
+                if scalar_stride_bytes > 0:
+                    n_scalar_floats = scalar_stride_bytes // 4
+                    all_scalars_t = torch.frombuffer(
+                        bytearray(scalars_buf), dtype=torch.float32,
+                    ).reshape(gs_n_turns, n_scalar_floats)
+
+                base_idx = len(unique_states)
                 for rnd in range(gs_n_turns):
-                    off = rnd * state_stride_bytes
-                    scalar_off = rnd * scalar_stride_bytes
-                    unique_states.append(bytearray(states_buf[off:off + state_stride_bytes]))
+                    unique_states.append(all_states_t[rnd])  # tensor view, no copy
                     unique_valid_masks.append((gs_map_w, gs_map_h))
                     if scalar_stride_bytes > 0:
-                        n = scalar_stride_bytes // 4
-                        unique_scalars.append(list(struct.unpack_from(f"<{n}f", scalars_buf, scalar_off)))
+                        unique_scalars.append(all_scalars_t[rnd].tolist())
                     else:
                         unique_scalars.append(zero_scalars)
-                    available_unique_idx[rnd] = len(unique_states) - 1
+                    available_unique_idx[rnd] = base_idx + rnd
             else:
                 gs_states = gs.get("states", {})
                 gs_scalars_d = gs.get("scalars", {})
@@ -1806,34 +1819,35 @@ def _compute_gae(
     max_len = max(end - start for start, end in ep_boundaries)
     gl = gamma * gae_lambda
 
-    # Pad episodes into (E, T) tensors
+    # Vectorized pad: build index tensors once, scatter into (E, T) tensors
+    ep_starts = torch.tensor([s for s, _ in ep_boundaries], dtype=torch.long, device=dev)
+    ep_lens = torch.tensor([e - s for s, e in ep_boundaries], dtype=torch.long, device=dev)
+    t_range = torch.arange(max_len, device=dev).unsqueeze(0)  # (1, T)
+    valid = t_range < ep_lens.unsqueeze(1)  # (E, T)
+    flat_idx = (ep_starts.unsqueeze(1) + t_range).clamp(max=N - 1)  # (E, T)
+    valid_idx = flat_idx[valid]
+
     r_pad = torch.zeros(n_eps, max_len, device=dev)
     v_pad = torch.zeros(n_eps, max_len, device=dev)
-    # nonterminal: 1.0 for all valid steps; 0.0 at last step of terminal episodes
-    # and for all padding positions (prevents GAE leaking across episode boundaries)
-    nonterminal = torch.zeros(n_eps, max_len, device=dev)
+    r_pad[valid] = rewards[valid_idx]
+    v_pad[valid] = values[valid_idx]
 
-    for i, (start, end) in enumerate(ep_boundaries):
-        ep_len = end - start
-        r_pad[i, :ep_len] = rewards[start:end]
-        v_pad[i, :ep_len] = values[start:end]
-        truncated = ep_len >= _TRUNCATION_THRESHOLD
-        # Interior steps are nonterminal; last step only if truncated
-        if ep_len > 1:
-            nonterminal[i, :ep_len - 1] = 1.0
-        if truncated:
-            nonterminal[i, ep_len - 1] = 1.0
+    # Nonterminal mask: 1.0 for interior steps + last step of truncated episodes
+    truncated = ep_lens >= _TRUNCATION_THRESHOLD
+    interior = t_range < (ep_lens - 1).clamp(min=0).unsqueeze(1)
+    last_step = t_range == (ep_lens - 1).clamp(min=0).unsqueeze(1)
+    nonterminal = (interior | (last_step & truncated.unsqueeze(1) & (ep_lens > 0).unsqueeze(1))).float()
 
-    # Build next_values: shift values left, last position gets bootstrap
+    # Build next_values: shift left, bootstrap truncated with V(s_T)
     next_v = torch.zeros_like(v_pad)
     if max_len > 1:
         next_v[:, :-1] = v_pad[:, 1:]
-    for i, (start, end) in enumerate(ep_boundaries):
-        ep_len = end - start
-        # Truncated: bootstrap with V(s_T) as approx for V(s_{T+1})
-        if ep_len >= _TRUNCATION_THRESHOLD:
-            next_v[i, ep_len - 1] = v_pad[i, ep_len - 1]
-        # Terminal: next_v stays 0 (already zero-initialized)
+    trunc_mask = truncated & (ep_lens > 0)
+    if trunc_mask.any():
+        ep_idx = torch.arange(n_eps, device=dev)
+        trunc_i = ep_idx[trunc_mask]
+        trunc_last = (ep_lens[trunc_mask] - 1).clamp(min=0)
+        next_v[trunc_i, trunc_last] = v_pad[trunc_i, trunc_last]
 
     # TD residuals: delta = r + gamma * next_v * nonterminal - v
     delta = r_pad + gamma * next_v * nonterminal - v_pad
@@ -1845,10 +1859,9 @@ def _compute_gae(
         gae = delta[:, t] + gl * nonterminal[:, t] * gae
         adv_pad[:, t] = gae
 
-    # Unpad back to flat (N,) tensor
+    # Vectorized unpad back to flat (N,) tensor
     advantages = torch.zeros(N, device=dev)
-    for i, (start, end) in enumerate(ep_boundaries):
-        advantages[start:end] = adv_pad[i, :end - start]
+    advantages[valid_idx] = adv_pad[valid]
 
     returns = advantages + values
     return advantages, returns
@@ -1902,36 +1915,56 @@ class RewardNormalizer:
         rewards: torch.Tensor,
         ep_boundaries: list[tuple[int, int]],
     ) -> torch.Tensor:
-        """Normalize rewards in-place using running return variance.
+        """Normalize rewards using running return variance.
 
-        Updates running stats from the discounted returns of each episode,
-        then divides all rewards by sqrt(running_var + eps) and clips.
+        Vectorized: pads episodes into (E, T) tensor, computes discounted
+        returns via reverse scan across all episodes simultaneously, then
+        updates running stats with a single parallel Welford merge.
         """
         gamma = self.gamma
+        n_eps = len(ep_boundaries)
+        if n_eps == 0:
+            std = max(self.var, 0.0) ** 0.5 + self.eps
+            return rewards / std
 
-        # 1. Compute discounted returns per episode and update running stats
-        all_returns: list[float] = []
-        for start, end in ep_boundaries:
-            ep_rewards = rewards[start:end]
-            # Compute discounted return for each timestep
-            disc_return = 0.0
-            for t in range(ep_rewards.shape[0] - 1, -1, -1):
-                disc_return = float(ep_rewards[t].item()) + gamma * disc_return
-                all_returns.append(disc_return)
+        dev = rewards.device
+        max_len = max(end - start for start, end in ep_boundaries)
 
-        # Batch Welford update
-        for ret in all_returns:
-            self.count += 1.0
-            delta = ret - self.mean
-            self.mean += delta / self.count
-            delta2 = ret - self.mean
-            self.var += (delta * delta2 - self.var) / self.count
-        self.var = max(self.var, 0.0)  # guard against float rounding
+        # Pad episodes into (E, T) for vectorized reverse scan
+        r_pad = rewards.new_zeros(n_eps, max_len)
+        lengths = torch.empty(n_eps, dtype=torch.long, device=dev)
+        for i, (start, end) in enumerate(ep_boundaries):
+            ep_len = end - start
+            r_pad[i, :ep_len] = rewards[start:end]
+            lengths[i] = ep_len
 
-        # 2. Normalize rewards by sqrt(var)
-        std = max(self.var, 0.0) ** 0.5 + self.eps
-        rewards = rewards / std
-        return rewards
+        # Reverse scan: disc[:, t] = r[:, t] + gamma * disc[:, t+1]
+        disc = rewards.new_zeros(n_eps, max_len)
+        disc[:, max_len - 1] = r_pad[:, max_len - 1]
+        for t in range(max_len - 2, -1, -1):
+            disc[:, t] = r_pad[:, t] + gamma * disc[:, t + 1]
+
+        # Mask valid positions and collect all discounted returns
+        valid = torch.arange(max_len, device=dev).unsqueeze(0) < lengths.unsqueeze(1)
+        all_rets = disc[valid]
+
+        # Parallel Welford merge: combine batch stats with running stats
+        n = all_rets.numel()
+        if n > 0:
+            batch_mean = all_rets.mean().item()
+            batch_m2 = all_rets.var(correction=0).item() * n
+
+            old_count = self.count
+            old_m2 = self.var * old_count
+            new_count = old_count + n
+            delta = batch_mean - self.mean
+            self.mean = self.mean + delta * n / new_count
+            self.var = (old_m2 + batch_m2 + delta * delta * old_count * n / new_count) / new_count
+            self.count = new_count
+        self.var = max(self.var, 0.0)
+
+        std = self.var ** 0.5 + self.eps
+        return rewards / std
 
     def state_dict(self) -> dict:
         return {"mean": self.mean, "var": self.var, "count": self.count,
