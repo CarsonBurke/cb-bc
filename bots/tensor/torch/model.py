@@ -64,6 +64,8 @@ REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
 NUM_BUCKETS = 255
 BUCKET_LOW = -20.0
 BUCKET_HIGH = 20.0
+BUCKET_STEP = (BUCKET_HIGH - BUCKET_LOW) / (NUM_BUCKETS - 1)
+VALUE_TARGET_KERNEL_SIGMA = BUCKET_STEP * 0.5
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -75,56 +77,88 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
 
 
 def _make_bucket_centers() -> torch.Tensor:
-    """255 uniformly-spaced centers in symlog space [-20, 20]."""
-    return torch.linspace(BUCKET_LOW, BUCKET_HIGH, NUM_BUCKETS, dtype=torch.float32)
+    """DreamerV3-style symexp-spaced bins in original value space.
+
+    Builds 255 bins via symexp(linspace(-20, 0, 128)) mirrored around 0.
+    Dense near zero, sparse at extremes — matches DreamerV3 heads.py:132.
+    """
+    n_half = (NUM_BUCKETS - 1) // 2 + 1  # 128
+    half = torch.linspace(BUCKET_LOW, 0.0, n_half, dtype=torch.float32)
+    half = symexp(half)
+    return torch.cat([half, -half[:-1].flip(0)])
 
 
-def twohot_encode(targets: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
-    """Encode scalar targets as twohot distributions over bucket centers.
+def twohot_encode(targets: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+    """Encode scalar targets as twohot distributions over bins.
+
+    Bins are symexp-spaced in original value space. Targets are raw
+    returns (NOT symlog'd) — same space as bins.
 
     Args:
-        targets: (...,) scalar targets already in symlog space.
-        centers: (NUM_BUCKETS,) bucket centers in symlog space.
+        targets: (...,) scalar targets in original value space.
+        bins: (NUM_BUCKETS,) bin centers in original value space.
 
     Returns:
         (..., NUM_BUCKETS) twohot probability vectors.
     """
-    # Clamp to bucket range
-    targets = targets.clamp(centers[0], centers[-1])
-    # Find the bucket index just below each target
-    below = torch.bucketize(targets, centers) - 1
-    below = below.clamp(0, len(centers) - 2)
+    targets = targets.clamp(bins[0], bins[-1])
+    below = torch.bucketize(targets, bins) - 1
+    below = below.clamp(0, len(bins) - 2)
     above = below + 1
-    # Interpolation weights (inverse distance).
-    # above = below + 1 always, so total > 0 in practice (bin spacing ~0.157).
-    # Clamp guards against theoretical float32 edge cases.
-    dist_to_below = (targets - centers[below]).abs()
-    dist_to_above = (centers[above] - targets).abs()
+    dist_to_below = (targets - bins[below]).abs()
+    dist_to_above = (bins[above] - targets).abs()
     total = (dist_to_below + dist_to_above).clamp(min=1e-8)
     weight_below = dist_to_above / total
     weight_above = dist_to_below / total
-    # Build twohot
-    result = torch.zeros(*targets.shape, len(centers), device=targets.device, dtype=targets.dtype)
+    result = torch.zeros(*targets.shape, len(bins), device=targets.device, dtype=targets.dtype)
     result.scatter_(-1, below.unsqueeze(-1), weight_below.unsqueeze(-1))
     result.scatter_(-1, above.unsqueeze(-1), weight_above.unsqueeze(-1))
     return result
 
 
-def decode_value(logits: torch.Tensor, centers_symexp: torch.Tensor) -> torch.Tensor:
-    """Decode categorical logits to scalar values.
+def decode_value(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+    """Decode categorical logits to scalar values via symmetric summation.
 
-    Takes precomputed symexp(centers) to avoid Jensen's inequality bias.
-    E[symexp(X)] != symexp(E[X]); we need the former.
+    Bins are already in original value space (symexp-spaced), so the
+    weighted average is the predicted value directly — no symexp needed.
+    Symmetric sum ensures uniform logits decode to exactly 0.
 
     Args:
         logits: (..., NUM_BUCKETS) raw logits.
-        centers_symexp: (NUM_BUCKETS,) symexp(bucket_centers) — in original value space.
+        bins: (NUM_BUCKETS,) bin centers in original value space.
 
     Returns:
-        (...,) predicted values in original (unsquashed) space.
+        (...,) predicted values in original value space.
     """
+    n = bins.shape[0]
+    m = (n - 1) // 2  # 127 — center index
     probs = torch.softmax(logits, dim=-1)
-    return (probs * centers_symexp).sum(dim=-1)
+    # Symmetric sum: pair bins equidistant from center to cancel float error.
+    # p_left * bins_left (reversed) + p_right * bins_right cancel perfectly
+    # when probs are uniform over symmetric bins.
+    left = probs[..., :m] * bins[:m]          # (*, 127) — negative side
+    center = probs[..., m:m+1] * bins[m]      # (*, 1) — center bin (=0)
+    right = probs[..., m+1:] * bins[m+1:]     # (*, 127) — positive side
+    wavg = center.sum(dim=-1) + (left.flip(-1) + right).sum(dim=-1)
+    return wavg
+
+
+def value_target_logits(
+    targets: torch.Tensor,
+    bin_symlog: torch.Tensor,
+    sigma: float = VALUE_TARGET_KERNEL_SIGMA,
+) -> torch.Tensor:
+    """Project scalar values to dense logits over bins in symlog space.
+
+    Use the same smooth target family for both unclipped and clipped branches
+    so the PPO max compares like with like while still avoiding sparse-support
+    dead zones.
+    """
+    target_symlog = symlog(targets).unsqueeze(-1)
+    if bin_symlog.device != targets.device or bin_symlog.dtype != targets.dtype:
+        bin_symlog = bin_symlog.to(device=targets.device, dtype=targets.dtype)
+    diff = (target_symlog - bin_symlog) / sigma
+    return -0.5 * diff.square()
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
@@ -424,11 +458,10 @@ class CentralizedCritic(nn.Module):
             nn.Linear(64, NUM_BUCKETS),
         )
 
-        # Bucket centers in symlog space — registered as buffer so they move with device.
-        # Precompute symexp(centers) for Jensen-free decoding.
-        centers = _make_bucket_centers()
-        self.register_buffer("bucket_centers", centers)
-        self.register_buffer("bucket_centers_symexp", symexp(centers))
+        # DreamerV3-style symexp-spaced bins in original value space.
+        bucket_centers = _make_bucket_centers()
+        self.register_buffer("bucket_centers", bucket_centers)
+        self.register_buffer("bucket_symlog", symlog(bucket_centers))
 
         self._init_weights()
 
@@ -508,7 +541,7 @@ class CentralizedCritic(nn.Module):
             dim=-1,
         )
         logits = self.unit_head(unit_in)  # (B, NUM_BUCKETS)
-        return decode_value(logits, self.bucket_centers_symexp)  # (B,)
+        return decode_value(logits, self.bucket_centers)  # (B,)
 
     def unit_value_logits(
         self,
@@ -546,7 +579,7 @@ class CentralizedCritic(nn.Module):
             dim=-1,
         )
         logits = self.unit_head(unit_in)  # (B, NUM_BUCKETS)
-        values = decode_value(logits, self.bucket_centers_symexp)  # (B,)
+        values = decode_value(logits, self.bucket_centers)  # (B,)
         return values, logits
 
     def forward(
@@ -855,8 +888,15 @@ class BuilderMLP(nn.Module):
             TILE_EMBED_DIM, TILE_EMBED_DIM, 3, padding=1,
             groups=TILE_EMBED_DIM, bias=True,
         )
-        nn.init.zeros_(self.tile_conv.weight)  # residual starts as identity
+        # Pointwise 1x1 conv mixes channels after depthwise spatial aggregation.
+        self.tile_pointwise = nn.Conv2d(
+            TILE_EMBED_DIM, TILE_EMBED_DIM, 1, bias=True,
+        )
+        nn.init.orthogonal_(self.tile_conv.weight, gain=0.1)
         nn.init.zeros_(self.tile_conv.bias)
+        nn.init.orthogonal_(self.tile_pointwise.weight, gain=1.0)
+        nn.init.zeros_(self.tile_pointwise.bias)
+        self.tile_rms = RMSNorm(TILE_EMBED_DIM)
         self.tile_act = nn.SiLU()
         # Compress 25×8=200 spatially-mixed tile features → 64-dim summary
         self.tile_compress = nn.Sequential(
@@ -914,11 +954,12 @@ class BuilderMLP(nn.Module):
         dxdy = self._tile_dxdy.unsqueeze(0).expand(B, -1, -1)
         tile_in = torch.cat([dxdy, tiles], dim=-1)          # (B, 25, 21)
         h = F.silu(self.tile_linear(tile_in))               # (B, 25, 8)
-        # Depthwise 3x3 conv + residual + SiLU
+        # Depthwise 3x3 + pointwise 1x1 + residual + SiLU
         h_grid = h.reshape(B, 5, 5, TILE_EMBED_DIM).permute(0, 3, 1, 2)
-        conv_out = self.tile_conv(h_grid)                   # (B, 8, 5, 5)
+        conv_out = self.tile_pointwise(self.tile_conv(h_grid))  # (B, 8, 5, 5)
         conv_out = conv_out.permute(0, 2, 3, 1).reshape(B, TILE_GRID_N, TILE_EMBED_DIM)
-        h = self.tile_act(h + conv_out)                     # (B, 25, 8)
+        h = self.tile_rms(h + conv_out)
+        h = self.tile_act(h)                                # (B, 25, 8)
         # Compress to fixed-size tile summary
         h_flat = h.reshape(B, TILE_GRID_N * TILE_EMBED_DIM) # (B, 200)
         return self.tile_compress(h_flat)                    # (B, 64)
@@ -1016,7 +1057,7 @@ class BuilderMLP(nn.Module):
 
     def _policy_state_modules(self) -> list[nn.Module]:
         """Policy modules only in tensor_lib serialization order (critic excluded)."""
-        tile_modules = [self.tile_linear, self.tile_conv]
+        tile_modules = [self.tile_linear, self.tile_conv, self.tile_pointwise, self.tile_rms]
         compress_modules = [m for m in self.tile_compress if isinstance(m, (nn.Linear, RMSNorm))]
         enc_modules = [m for m in self.encoder if isinstance(m, (nn.Linear, RMSNorm))]
         actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
@@ -1050,9 +1091,43 @@ class BuilderMLP(nn.Module):
         )
         # Also support loading without conv_dir head (2 fewer entries)
         full_no_conv_dir = full_entries - 2
+        # Legacy exports before the pointwise 1x1 conv existed.
+        full_no_pointwise = full_entries - 3
+        full_no_pointwise_no_conv_dir = full_no_conv_dir - 3
+        # Legacy exports before the tile RMSNorm existed.
+        full_no_tile_rms = full_entries - 1
+        full_no_tile_rms_no_conv_dir = full_no_conv_dir - 1
+        pointwise_weight_size = self.tile_pointwise.weight.numel()
+        tile_rms_size = self.tile_rms.weight.numel()
+        load_pointwise = True
+        load_tile_rms = True
 
         if len(state) == full_entries:
             load_conv_dir = True
+        elif len(state) == full_no_conv_dir and len(state[4]) == pointwise_weight_size:
+            load_conv_dir = False
+        elif (
+            len(state) == full_no_tile_rms
+            and len(state[4]) == pointwise_weight_size
+            and len(state[6]) != tile_rms_size
+        ):
+            load_conv_dir = True
+            load_tile_rms = False
+        elif (
+            len(state) == full_no_tile_rms_no_conv_dir
+            and len(state[4]) == pointwise_weight_size
+            and len(state[6]) != tile_rms_size
+        ):
+            load_conv_dir = False
+            load_tile_rms = False
+        elif len(state) == full_no_pointwise:
+            load_conv_dir = True
+            load_pointwise = False
+            load_tile_rms = False
+        elif len(state) == full_no_pointwise_no_conv_dir:
+            load_conv_dir = False
+            load_pointwise = False
+            load_tile_rms = False
         elif len(state) == full_no_conv_dir:
             load_conv_dir = False
         else:
@@ -1065,6 +1140,10 @@ class BuilderMLP(nn.Module):
         dev = next(self.parameters()).device
         for layer in modules:
             if layer is self.head_conv_dir and not load_conv_dir:
+                continue
+            if layer is self.tile_pointwise and not load_pointwise:
+                continue
+            if layer is self.tile_rms and not load_tile_rms:
                 continue
             if isinstance(layer, nn.Linear):
                 w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
@@ -1370,6 +1449,7 @@ def ppo_update(
     max_grad_norm: float = 0.5,
     target_kl: float | None = None,
     clip_vloss: bool = True,
+    value_clip: float = 0.4,
     profile: dict[str, float] | None = None,
     bptt_chunks: list[tuple[int, int]] | None = None,
 ) -> dict[str, float]:
@@ -1390,7 +1470,7 @@ def ppo_update(
     if old_values is not None:
         with torch.no_grad():
             var_y = returns.var().item()
-            ev = float('nan') if var_y == 0 else 1.0 - (returns - old_values).var().item() / var_y
+            ev = 0.0 if var_y == 0 else 1.0 - (returns - old_values).var().item() / var_y
     else:
         ev = 0.0
 
@@ -1576,14 +1656,35 @@ def ppo_update(
                     u_end = min(u_start + _UNIT_CHUNK, step_indices.shape[0])
                     si = step_indices[u_start:u_end]
                     lr = local_round_idx[u_start:u_end]
-                    _newvalue, logits = critic.unit_value_logits(
+                    newvalue, logits = critic.unit_value_logits(
                         feat, g_scalars, lr, u_xy[si], u_ctx[si], u_latent[si],
                     )
-                    # DreamerV3-style twohot cross-entropy loss
-                    target_symlog = symlog(mb_returns[si])
-                    target_twohot = twohot_encode(target_symlog, critic.bucket_centers)
-                    log_probs = F.log_softmax(logits, dim=-1)
-                    v_loss_elems = -(target_twohot * log_probs).sum(dim=-1)
+                    # Dreamer4-style value clipping: decode, clip in scalar
+                    # space, re-project, then compare both branches in the same
+                    # smooth value-target family.
+                    return_target = F.softmax(
+                        value_target_logits(
+                            mb_returns[si], critic.bucket_symlog,
+                        ),
+                        dim=-1,
+                    )
+                    v_loss_unclipped = F.cross_entropy(
+                        logits, return_target, reduction='none',
+                    )
+
+                    if clip_vloss and mb_old_values is not None:
+                        clipped_val = mb_old_values[si] + (newvalue - mb_old_values[si]).clamp(
+                            -value_clip, value_clip,
+                        )
+                        clipped_logits = value_target_logits(
+                            clipped_val, critic.bucket_symlog,
+                        )
+                        v_loss_clipped = F.cross_entropy(
+                            clipped_logits, return_target, reduction='none',
+                        )
+                        v_loss_elems = torch.max(v_loss_unclipped, v_loss_clipped)
+                    else:
+                        v_loss_elems = v_loss_unclipped
 
                     vf_loss_sum += v_loss_elems.detach().sum().item()
                     (vf_coeff * v_loss_elems.sum() / vf_denom).backward()
