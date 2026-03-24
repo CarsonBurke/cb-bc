@@ -128,6 +128,11 @@ _BUILD_DIR_TILE_INDICES = tuple(
     (GRID_HALF + int(DIR_DXY[d][1])) * GRID_SIZE + (GRID_HALF + int(DIR_DXY[d][0]))
     for d in DIR_MAP_9
 )
+_LOCAL_TILE_OFFSETS = tuple(
+    (dx, dy)
+    for dy in range(-GRID_HALF, GRID_HALF + 1)
+    for dx in range(-GRID_HALF, GRID_HALF + 1)
+)
 
 # Offset where global features start in observation vector
 _GLOBAL_OBS_START = GRID_SIZE * GRID_SIZE * TILE_FEATURES
@@ -140,7 +145,10 @@ _BLD_ONE_HOTS = tuple(
 )
 
 # Weights file path (adjacent to main.py)
-WEIGHT_PATH = "weights.json"
+WEIGHT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.json")
+_HARVESTER_BUILD_TYPE = 1
+_ALL_DIRS_MASK = [True] * 9
+_NONE_ONLY_BUILD_MASK = [True] + [False] * (len(BUILD_COSTS) - 1)
 
 _SHARED_MODEL = None
 _SHARED_MODEL_KEY = None
@@ -281,14 +289,16 @@ class Player:
             self.my_team = ct.get_team()
         if self.core_center is None:
             self._find_core(ct)
+        nearby_tiles = ct.get_nearby_tiles()
+        nearby_entities = ct.get_nearby_entities()
         # Accumulate ore discoveries and enemy core damage.
         # Working-harvester reward is replay-derived during training, so we do
         # not spend per-turn CPU estimating it from partial vision here.
-        self._discover_ore(ct)
-        self._scan_enemy_core_dmg(ct)
+        self._discover_ore(ct, nearby_tiles)
+        self._scan_enemy_core_dmg(ct, nearby_entities)
         # Opportunistically scan for enemy core
         if self.enemy_core is None:
-            for eid in ct.get_nearby_entities():
+            for eid in nearby_entities:
                 try:
                     if ct.get_entity_type(eid) == EntityType.CORE and ct.get_team(eid) != self.my_team:
                         self.enemy_core = ct.get_position(eid)
@@ -297,7 +307,7 @@ class Player:
                     continue
 
         # Encode game state + recurrent hidden -> feature vector
-        obs = self._encode_state(ct)
+        obs = self._encode_state(ct, nearby_tiles, nearby_entities)
 
         h_in = self.h_prev
         features = obs + h_in
@@ -307,15 +317,15 @@ class Player:
         h_gate_raw = outputs["h_gate"]
         h_cand = outputs["h_cand"]
         h_in = self.h_prev
+        exp = math.exp
         h_new = [0.0] * len(h_in)
-        for i in range(len(h_in)):
-            g = h_gate_raw[i]
+        for i, g in enumerate(h_gate_raw):
             if g >= 0:
-                z = 1.0 / (1.0 + math.exp(-g))
+                z = 1.0 / (1.0 + exp(-g))
             else:
-                e = math.exp(g)
+                e = exp(g)
                 z = e / (1.0 + e)
-            h_new[i] = (1.0 - z) * h_in[i] + z * h_cand[i]
+            h_new[i] = h_in[i] + z * (h_cand[i] - h_in[i])
         self.h_prev = h_new
 
         # Compute action masks (which builds are affordable, which tiles are free)
@@ -348,12 +358,14 @@ class Player:
         self._prev_resources = (ti_after, ax_after)
 
     @staticmethod
-    def _discover_ore(ct: Controller) -> None:
+    def _discover_ore(ct: Controller, nearby_tiles=None) -> None:
         """Add any newly visible ore tiles to the shared set."""
         if Player._all_ore is None:
             Player._all_ore = []
             Player._all_ore_keys = set()
-        for tile_pos in ct.get_nearby_tiles():
+        if nearby_tiles is None:
+            nearby_tiles = ct.get_nearby_tiles()
+        for tile_pos in nearby_tiles:
             key = (tile_pos.x, tile_pos.y)
             if key in Player._all_ore_keys:
                 continue
@@ -412,14 +424,16 @@ class Player:
                 continue
 
     @staticmethod
-    def _scan_enemy_core_dmg(ct: Controller) -> None:
+    def _scan_enemy_core_dmg(ct: Controller, nearby_entities=None) -> None:
         """Track enemy core HP changes. Any unit seeing the enemy core updates shared state."""
         rnd = ct.get_current_round()
         if Player._enemy_core_dmg_round != rnd:
             Player._enemy_core_dmg = 0.0
             Player._enemy_core_dmg_round = rnd
         team = ct.get_team()
-        for eid in ct.get_nearby_entities():
+        if nearby_entities is None:
+            nearby_entities = ct.get_nearby_entities()
+        for eid in nearby_entities:
             try:
                 if ct.get_entity_type(eid) == EntityType.CORE and ct.get_team(eid) != team:
                     hp = ct.get_hp(eid)
@@ -473,7 +487,7 @@ class Player:
 
     # ---- State encoding ----
 
-    def _encode_state_into(self, ct: Controller, features) -> None:
+    def _encode_state_into(self, ct: Controller, features, nearby_tiles=None, nearby_entities=None) -> None:
         """Append encoded state into a list-like float buffer."""
         pos = ct.get_position()
         my_team = self.my_team
@@ -488,48 +502,53 @@ class Player:
 
         # 5x5 local grid
         w, h = ct.get_map_width(), ct.get_map_height()
-        for dy in range(-GRID_HALF, GRID_HALF + 1):
-            for dx in range(-GRID_HALF, GRID_HALF + 1):
-                tx, ty = pos.x + dx, pos.y + dy
-                if tx < 0 or tx >= w or ty < 0 or ty >= h or not ct.is_in_vision(Position(tx, ty)):
-                    extend(_ZERO_TILE)
-                    continue
-                tp = Position(tx, ty)
+        if nearby_tiles is None:
+            nearby_tiles = ct.get_nearby_tiles()
+        visible_tiles = {(tile_pos.x, tile_pos.y): tile_pos for tile_pos in nearby_tiles}
+        for dx, dy in _LOCAL_TILE_OFFSETS:
+            tx, ty = pos.x + dx, pos.y + dy
+            if tx < 0 or tx >= w or ty < 0 or ty >= h:
+                extend(_ZERO_TILE)
+                continue
+            tp = visible_tiles.get((tx, ty))
+            if tp is None:
+                extend(_ZERO_TILE)
+                continue
 
-                env = get_tile_env(tp)
-                append(1.0 if env == Environment.WALL else 0.0)
-                append(1.0 if env == Environment.ORE_TITANIUM else 0.0)
-                append(1.0 if env == Environment.ORE_AXIONITE else 0.0)
-                append(0.0 if ct.is_tile_passable(tp) else 1.0)
+            env = get_tile_env(tp)
+            append(1.0 if env == Environment.WALL else 0.0)
+            append(1.0 if env == Environment.ORE_TITANIUM else 0.0)
+            append(1.0 if env == Environment.ORE_AXIONITE else 0.0)
+            append(0.0 if ct.is_tile_passable(tp) else 1.0)
 
-                bid = get_tile_building_id(tp)
-                if bid is not None:
-                    btype = get_entity_type(bid)
-                    bidx = BLD_IDX.get(btype, 3)
-                    extend(_BLD_ONE_HOTS[bidx])
-                    append(1.0 if get_team(bid) == my_team else -1.0)
-                    try:
-                        bdir = get_direction(bid)
-                        bdx, bdy = DIR_DXY.get(bdir, (0, 0))
-                        append(float(bdx))
-                        append(float(bdy))
-                    except Exception:
-                        extend((0.0, 0.0))
-                    append(0.0)  # bld_cooldown: populated by replay parser during training
-                    try:
-                        sr = ct.get_stored_resource(bid)
-                        append(0.0 if sr is None else 1.0 if sr == ResourceType.TITANIUM else -1.0)
-                    except Exception:
-                        append(0.0)
-                else:
-                    extend(_NO_BUILD_TILE)
-
-                uid = get_tile_builder_bot_id(tp)
-                if uid is not None:
-                    append(1.0)
-                    append(1.0 if get_team(uid) == my_team else -1.0)
-                else:
+            bid = get_tile_building_id(tp)
+            if bid is not None:
+                btype = get_entity_type(bid)
+                bidx = BLD_IDX.get(btype, 3)
+                extend(_BLD_ONE_HOTS[bidx])
+                append(1.0 if get_team(bid) == my_team else -1.0)
+                try:
+                    bdir = get_direction(bid)
+                    bdx, bdy = DIR_DXY.get(bdir, (0, 0))
+                    append(float(bdx))
+                    append(float(bdy))
+                except Exception:
                     extend((0.0, 0.0))
+                append(0.0)  # bld_cooldown: populated by replay parser during training
+                try:
+                    sr = ct.get_stored_resource(bid)
+                    append(0.0 if sr is None else 1.0 if sr == ResourceType.TITANIUM else -1.0)
+                except Exception:
+                    append(0.0)
+            else:
+                extend(_NO_BUILD_TILE)
+
+            uid = get_tile_builder_bot_id(tp)
+            if uid is not None:
+                append(1.0)
+                append(1.0 if get_team(uid) == my_team else -1.0)
+            else:
+                extend((0.0, 0.0))
 
         rnd = ct.get_current_round() / 2000.0
         x_norm = pos.x / max(w, 1)
@@ -539,7 +558,9 @@ class Player:
 
         n_builders = 0
         own_hp, enemy_hp = Player._own_core_hp, Player._enemy_core_hp
-        for eid in ct.get_nearby_entities():
+        if nearby_entities is None:
+            nearby_entities = ct.get_nearby_entities()
+        for eid in nearby_entities:
             try:
                 etype = get_entity_type(eid)
                 team = get_team(eid)
@@ -593,10 +614,10 @@ class Player:
 
         extend(self.pos_encoder.encode(pos.x, pos.y))
 
-    def _encode_state(self, ct: Controller) -> list[float]:
+    def _encode_state(self, ct: Controller, nearby_tiles=None, nearby_entities=None) -> list[float]:
         """Encode 5x5 grid (16 feat/tile) + global (14) + pos embed (8)."""
         features: list[float] = []
-        self._encode_state_into(ct, features)
+        self._encode_state_into(ct, features, nearby_tiles, nearby_entities)
         return features
 
     # ---- Action execution ----
@@ -760,7 +781,7 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], l
 
     # If nothing affordable or nowhere to build, force "none" (dir irrelevant)
     if not any_affordable or not any_dir:
-        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9, [True] * 9
+        return _NONE_ONLY_BUILD_MASK, _ALL_DIRS_MASK, _ALL_DIRS_MASK
 
     # Harvester placement is only legal on empty ore tiles.
     harv_bd_mask = [False] * 9
@@ -772,14 +793,23 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], l
         empty = obs[ts + 4] == 1.0
         harv_bd_mask[d_idx] = is_ore and empty
     if not any(harv_bd_mask):
-        bt_mask[1] = False  # suppress harvester
+        bt_mask[_HARVESTER_BUILD_TYPE] = False  # suppress harvester
 
     return bt_mask, bd_mask, harv_bd_mask
 
 
 def _argmax(data: list[float], mask: list[bool] | None = None) -> int:
-    """C-friendly argmax using max() with key, with optional mask."""
-    if mask is not None:
-        masked = [d if m else float('-inf') for d, m in zip(data, mask)]
-        return max(range(len(masked)), key=masked.__getitem__)
-    return max(range(len(data)), key=data.__getitem__)
+    """Argmax without allocating a masked copy."""
+    best_idx = 0
+    best_val = float("-inf")
+    if mask is None:
+        for i, value in enumerate(data):
+            if value > best_val:
+                best_idx = i
+                best_val = value
+        return best_idx
+    for i, value in enumerate(data):
+        if mask[i] and value > best_val:
+            best_idx = i
+            best_val = value
+    return best_idx
