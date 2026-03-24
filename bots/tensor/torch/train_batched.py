@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ast  # noqa: F401 — engine imports can still expect ast in sys.modules
+from collections import OrderedDict
 import gc
 import json
 import os
@@ -106,12 +107,103 @@ _LP_STRUCT = struct.Struct('=f')
 _H_BYTES = H_DIM * 4
 DEFAULT_COALESCE_MS = 0.25 if DEVICE.type == "cuda" else 0.0
 import ctypes as _ctypes
-WORKER_LAUNCH_STAGGER_S = 0.02
+WORKER_LAUNCH_STAGGER_S = 0.005
 DUMMY_OPP_PATH = "__dummy__"
 DUMMY_OPP_ID = "dummy"
 _ZERO_H_BYTES = bytes(_H_BYTES)
 _DUMMY_DIR_TILES = (6, 7, 8, 11, 12, 13, 16, 17, 18)
 _dummy_idx_cache = {}
+_OPP_GRAPH_TEMP = 0.5
+_OPP_GRAPH_BATCH_BUCKETS = (8, 16, 32, 64, 128, 256)
+_OPP_MODEL_CACHE_MAX = 32
+_OPP_GRAPH_CACHE_MAX = 64
+_opp_model_cache: OrderedDict[tuple[object, ...], BuilderMLP] = OrderedDict()
+_opp_graph_cache: OrderedDict[tuple[object, ...], GraphedInference] = OrderedDict()
+_opp_graph_failures: set[tuple[object, ...]] = set()
+
+
+def _cache_put(cache: OrderedDict, key, value, max_items: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_items:
+        cache.popitem(last=False)
+
+
+def _hidden_key(hidden: list[int] | None) -> tuple[int, ...]:
+    return tuple(hidden) if hidden is not None else ()
+
+
+def _weight_sig(weight_path: str) -> tuple[int, int]:
+    st = os.stat(weight_path)
+    return st.st_mtime_ns, st.st_size
+
+
+def _graph_batch_bucket(batch_size: int) -> int | None:
+    for bucket in _OPP_GRAPH_BATCH_BUCKETS:
+        if batch_size <= bucket:
+            return bucket
+    return None
+
+
+def _opponent_model_cache_key(weight_path: str, hidden: list[int] | None) -> tuple[object, ...]:
+    return (weight_path, _hidden_key(hidden), *_weight_sig(weight_path), DEVICE.type)
+
+
+def _get_cached_opponent_model(weight_path: str, hidden: list[int] | None) -> BuilderMLP:
+    key = _opponent_model_cache_key(weight_path, hidden)
+    cached = _opp_model_cache.get(key)
+    if cached is not None:
+        _opp_model_cache.move_to_end(key)
+        cached.eval()
+        return cached
+
+    model = BuilderMLP(hidden=hidden).to(DEVICE)
+    model.load_weights(weight_path)
+    model.eval()
+    _cache_put(_opp_model_cache, key, model, _OPP_MODEL_CACHE_MAX)
+    return model
+
+
+def _get_cached_opponent_graph(
+    model_key: tuple[object, ...],
+    model: BuilderMLP,
+    batch_size: int,
+    temperature: float,
+) -> GraphedInference | None:
+    if DEVICE.type != "cuda":
+        return None
+    bucket = _graph_batch_bucket(batch_size)
+    if bucket is None:
+        return None
+
+    dtype_key = str(next(model.parameters()).dtype)
+    key = (
+        *model_key,
+        bucket,
+        temperature,
+        False,
+        dtype_key,
+    )
+    if key in _opp_graph_failures:
+        return None
+    cached = _opp_graph_cache.get(key)
+    if cached is not None:
+        _opp_graph_cache.move_to_end(key)
+        return cached
+
+    try:
+        graph = GraphedInference(
+            model,
+            max_batch=bucket,
+            temperature=temperature,
+            return_log_prob=False,
+        )
+        graph.capture()
+    except Exception:
+        _opp_graph_failures.add(key)
+        return None
+    _cache_put(_opp_graph_cache, key, graph, _OPP_GRAPH_CACHE_MAX)
+    return graph
 
 
 def _session_state_path(sess: dict) -> Path:
@@ -349,6 +441,7 @@ def collect_games_batched(
     # Load opponent models on GPU (deduplicate by weight path)
     t_phase = time.perf_counter() if profile is not None else 0.0
     opp_models = {}  # weight_path -> BuilderMLP
+    opp_model_keys = {}  # weight_path -> cache key
     game_to_opp = {}  # game_idx -> weight_path
     for i in range(n_games):
         wp = opp_weight_paths[i]
@@ -356,10 +449,8 @@ def collect_games_batched(
         if wp == DUMMY_OPP_PATH:
             continue
         if wp not in opp_models:
-            opp_m = BuilderMLP(hidden=opp_hidden).to(DEVICE)
-            opp_m.load_weights(wp)
-            opp_m.eval()
-            opp_models[wp] = opp_m
+            opp_model_keys[wp] = _opponent_model_cache_key(wp, opp_hidden)
+            opp_models[wp] = _get_cached_opponent_model(wp, opp_hidden)
     if profile is not None:
         profile["opp_model_load_s"] = time.perf_counter() - t_phase
 
@@ -556,7 +647,6 @@ def collect_games_batched(
             total_inferences += n_a
 
         # Batch B inference grouped by opponent model (low-temp sampling for diversity)
-        OPP_TEMP = 0.5
         if pending_b:
             by_opp = {}
             for game_idx, fb, wp in pending_b:
@@ -594,43 +684,44 @@ def collect_games_batched(
                     continue
 
                 opp_m = opp_models[wp]
+                opp_g = _get_cached_opponent_graph(opp_model_keys[wp], opp_m, n_b, _OPP_GRAPH_TEMP)
                 with torch.no_grad():
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     all_t = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_b, _OBS_FLOATS).to(DEVICE)
-                    obs_t = all_t[:, :OBS_SIZE]
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
                         profile["h2d_b_s"] = profile.get("h2d_b_s", 0.0) + dt
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    bt_l, bd_l, cd_l, md_l, h_next = opp_m.infer_packed(all_t)
-                    if profile is not None:
-                        dt = time.perf_counter() - t_phase
-                        profile["forward_b_s"] = profile.get("forward_b_s", 0.0) + dt
-                        profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
+                    if opp_g is not None and n_b <= opp_g.max_batch:
+                        # CUDA-graphed path: forward + mask + sample in one graph replay
+                        bt_act, bd_act, cd_act, md_act, _, h_next = opp_g(all_t)
+                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, md_act]).cpu()
+                        h_cpu = h_next.cpu().contiguous()
+                    else:
+                        # Fallback: ungraphed inference
+                        obs_t = all_t[:, :OBS_SIZE]
+                        bt_l, bd_l, cd_l, md_l, h_next = opp_m.infer_packed(all_t)
+                        if profile is not None:
+                            dt = time.perf_counter() - t_phase
+                            profile["forward_b_s"] = profile.get("forward_b_s", 0.0) + dt
+                            profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
-                    t_phase = time.perf_counter() if profile is not None else 0.0
-                    bt_m, bd_m = compute_action_masks(obs_t)
-                    cd_m = conveyor_dir_mask(obs_t.device, obs_t.shape[0])
-                    bt_l.masked_fill_(~bt_m, -1e9)
-                    cd_l.masked_fill_(~cd_m, -1e9)
-                    bt_act, _ = sample_logits_gumbel(bt_l, OPP_TEMP, return_log_prob=False)
-                    bd_l.masked_fill_(~bd_m, -1e9)
-                    bd_act, _ = sample_logits_gumbel(bd_l, OPP_TEMP, return_log_prob=False)
-                    cd_act, _ = sample_logits_gumbel(cd_l, OPP_TEMP, return_log_prob=False)
-                    md_act, _ = sample_logits_gumbel(md_l, OPP_TEMP, return_log_prob=False)
+                        t_phase = time.perf_counter() if profile is not None else 0.0
+                        bt_m, bd_m = compute_action_masks(obs_t)
+                        cd_m = conveyor_dir_mask(obs_t.device, obs_t.shape[0])
+                        bt_l.masked_fill_(~bt_m, -1e9)
+                        cd_l.masked_fill_(~cd_m, -1e9)
+                        bt_act, _ = sample_logits_gumbel(bt_l, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        bd_l.masked_fill_(~bd_m, -1e9)
+                        bd_act, _ = sample_logits_gumbel(bd_l, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        cd_act, _ = sample_logits_gumbel(cd_l, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        md_act, _ = sample_logits_gumbel(md_l, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, md_act]).cpu()
+                        h_cpu = h_next.cpu().contiguous()
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
-                        profile["sample_b_s"] = profile.get("sample_b_s", 0.0) + dt
-                        profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
-
-                    t_phase = time.perf_counter() if profile is not None else 0.0
-                    acts_cpu = torch.stack([bt_act, bd_act, cd_act, md_act]).cpu()
-                    h_cpu = h_next.cpu().contiguous()
-                    if profile is not None:
-                        dt = time.perf_counter() - t_phase
-                        profile["d2h_b_s"] = profile.get("d2h_b_s", 0.0) + dt
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
