@@ -166,6 +166,11 @@ function readTrainSessions() {
   return dirs
 }
 
+// Python may emit NaN/Infinity which are not valid JSON — replace with null.
+function safeJsonParse(line) {
+  return JSON.parse(line.replace(/\bNaN\b/g, 'null').replace(/\b-?Infinity\b/g, 'null'))
+}
+
 function readIncrementalJsonl(cacheMap, filePath, parseFirstLineAsConfig = false) {
   const stats = statSync(filePath)
   const cached = cacheMap.get(filePath)
@@ -185,7 +190,7 @@ function readIncrementalJsonl(cacheMap, filePath, parseFirstLineAsConfig = false
 
         const tail = newBytes.toString('utf8').trimEnd()
         if (tail) {
-          const nextRows = tail.split('\n').map((line) => JSON.parse(line))
+          const nextRows = tail.split('\n').map((line) => safeJsonParse(line))
           cached.rows.push(...nextRows)
         }
         cached.offset = stats.size
@@ -199,18 +204,18 @@ function readIncrementalJsonl(cacheMap, filePath, parseFirstLineAsConfig = false
     if (!updatedIncrementally) {
       const lines = readFileSync(filePath, 'utf8').trimEnd().split('\n').filter(Boolean)
       if (parseFirstLineAsConfig) {
-        const first = lines[0] ? JSON.parse(lines[0]) : {}
+        const first = lines[0] ? safeJsonParse(lines[0]) : {}
         cacheMap.set(filePath, {
           size: stats.size,
           offset: stats.size,
-          rows: lines.slice(1).map((line) => JSON.parse(line)),
+          rows: lines.slice(1).map((line) => safeJsonParse(line)),
           config: first.config || {},
         })
       } else {
         cacheMap.set(filePath, {
           size: stats.size,
           offset: stats.size,
-          rows: lines.map((line) => JSON.parse(line)),
+          rows: lines.map((line) => safeJsonParse(line)),
         })
       }
     }
@@ -504,7 +509,7 @@ export function createDashboardServer() {
   })
 }
 
-export function startDashboardServer({ host = '127.0.0.1', port = 3030 } = {}) {
+export function startDashboardServer({ host = '127.0.0.1', port = 5173 } = {}) {
   const server = createDashboardServer()
   return new Promise((resolveServer, reject) => {
     server.once('error', reject)

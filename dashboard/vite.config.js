@@ -1,15 +1,15 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import tailwindcss from '@tailwindcss/vite'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 export default defineConfig({
-  plugins: [
-    react({ babel: { plugins: [['babel-plugin-react-compiler']] } }),
-    tailwindcss(),
-  ],
-  server: {
-    proxy: {
-      '/api': 'http://127.0.0.1:3030',
-      '/viewer': 'http://127.0.0.1:3030',
-    },
-  },
-})
+	plugins: [
+		react({ babel: { plugins: [["babel-plugin-react-compiler"]] } }),
+		tailwindcss(),
+	],
+	server: {
+		proxy: {
+			"/api": "http://127.0.0.1:5173",
+			"/viewer": "http://127.0.0.1:5173",
+		},
+	},
+});

@@ -1,7 +1,7 @@
 import { startDashboardServer } from './app.js'
 
 const host = process.env.DASHBOARD_HOST || '127.0.0.1'
-const port = Number.parseInt(process.env.DASHBOARD_PORT || '3030', 10)
+const port = Number.parseInt(process.env.DASHBOARD_PORT || '5173', 10)
 
 startDashboardServer({ host, port })
   .then(() => {

@@ -5,7 +5,7 @@ The dashboard now runs with a real Node backend instead of Vite-only middleware.
 ## Scripts
 
 - `npm run dev`
-  Starts the backend on `http://127.0.0.1:3030` and the Vite frontend on the default Vite port.
+  Starts the backend on `http://127.0.0.1:5173` and the Vite frontend on the default Vite port.
 - `npm run dev:api`
   Starts only the backend server.
 - `npm run dev:web`
