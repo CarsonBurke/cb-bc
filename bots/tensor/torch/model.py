@@ -482,8 +482,9 @@ class CentralizedCritic(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Near-uniform init for final categorical logits (DreamerV3 convention)
-        nn.init.zeros_(self.unit_head[-1].weight)
+        # Small random init so the value head is not pinned to an exact
+        # uniform-logit / zero-value predictor at startup.
+        nn.init.orthogonal_(self.unit_head[-1].weight, gain=0.01)
         nn.init.zeros_(self.unit_head[-1].bias)
 
     def encode_map(
@@ -727,6 +728,16 @@ def _apply_head_logit_scales(
     raw: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     scales = _bounded_logit_scales(raw)
+    return _scale_head_logits(bt_l, bd_l, cd_l, md_l, scales)
+
+
+def _scale_head_logits(
+    bt_l: torch.Tensor,
+    bd_l: torch.Tensor,
+    cd_l: torch.Tensor,
+    md_l: torch.Tensor,
+    scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         bt_l * scales[:, 0:1],
         bd_l * scales[:, 1:2],
@@ -1023,8 +1034,11 @@ class BuilderMLP(nn.Module):
         obs_pre = self._obs_encoder_pre(x)
         return self._latent_from_obs_pre(obs_pre, h_prev)
 
-    def _forward_from_hidden(self, h: torch.Tensor):
-        """Project actor latent to policy heads."""
+    def _project_actor_heads(
+        self,
+        h: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project latent to policy heads and return bounded per-head logit scales."""
         # Fuse 4 head matmuls into one kernel launch
         # Cache fused weights in eval mode (inference hot path)
         if self.training:
@@ -1062,10 +1076,21 @@ class BuilderMLP(nn.Module):
             [N_BUILD, N_DIR, N_CONV_DIR, N_DIR, N_LOGIT_SCALE, H_DIM, H_DIM],
             dim=-1,
         )
-        bt_l, bd_l, cd_l, md_l = _apply_head_logit_scales(
-            bt_l, bd_l, cd_l, md_l, logit_scale,
+        scales = _bounded_logit_scales(logit_scale)
+        bt_l, bd_l, cd_l, md_l = _scale_head_logits(
+            bt_l, bd_l, cd_l, md_l, scales,
         )
+        return bt_l, bd_l, cd_l, md_l, scales, h_gate, h_cand
+
+    def _forward_from_hidden(self, h: torch.Tensor):
+        """Project actor latent to policy heads."""
+        bt_l, bd_l, cd_l, md_l, _scales, h_gate, h_cand = self._project_actor_heads(h)
         return bt_l, bd_l, cd_l, md_l, h_gate, h_cand
+
+    def _forward_from_obs_pre_with_scales(self, obs_pre: torch.Tensor, h_prev: torch.Tensor):
+        """Forward pass that also returns bounded per-head logit scales."""
+        h = self._latent_from_obs_pre(obs_pre, h_prev)
+        return self._project_actor_heads(h)
 
     def _forward_from_trunk_in(self, trunk_in: torch.Tensor):
         enc = self.encoder(trunk_in)
@@ -1370,17 +1395,18 @@ def _recurrent_actor_pass(
     bd_mask: torch.Tensor,
     bd_causal: torch.Tensor,
     cd_causal: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sequential recurrent pass that returns log-probs and entropies."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sequential recurrent pass that returns log-probs, entropies, and logit scales."""
     B, K_max, _ = obs_pre.shape
     dev = obs_pre.device
     h_t = h0
     new_lps = torch.empty(B, K_max, device=dev)
     entropies = torch.empty(B, K_max, device=dev)
+    logit_scales = torch.empty(B, K_max, N_LOGIT_SCALE, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
     for t in range(K_max):
-        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
+        bt_l, bd_l, cd_l, md_l, scales, h_gate, h_cand = model._forward_from_obs_pre_with_scales(obs_pre[:, t], h_t)
         z = torch.sigmoid(h_gate)
         h_t = (1.0 - z) * h_t + z * h_cand
 
@@ -1395,8 +1421,9 @@ def _recurrent_actor_pass(
 
         new_lps[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
         entropies[:, t] = bt_ent + bd_ent * bd_causal[:, t] + cd_ent * cd_causal[:, t] + md_ent
+        logit_scales[:, t] = scales
 
-    return new_lps, entropies
+    return new_lps, entropies, logit_scales
 
 
 def _sequential_logprobs(
@@ -1515,6 +1542,9 @@ def ppo_update(
     N = obs.shape[0]
     sum_pi, sum_vf, sum_ent = 0.0, 0.0, 0.0
     sum_kl, sum_clip_frac = 0.0, 0.0
+    sum_logit_scale = torch.zeros(N_LOGIT_SCALE, device=obs.device)
+    sum_logit_scale_sq = torch.zeros(N_LOGIT_SCALE, device=obs.device)
+    n_logit_scale = 0
     n_updates = 0
 
     critic, critic_opt = get_centralized_critic()
@@ -1565,6 +1595,7 @@ def ppo_update(
 
         def _run_actor_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
             nonlocal approx_kl_acc, n_mb, sum_kl, sum_clip_frac, sum_pi, sum_ent, n_updates
+            nonlocal sum_logit_scale, sum_logit_scale_sq, n_logit_scale
             for cb_start in range(0, chunk_ids.shape[0], B_chunk):
                 batch_ids = chunk_ids[cb_start:cb_start + B_chunk]
                 B = batch_ids.shape[0]
@@ -1588,7 +1619,7 @@ def ppo_update(
                 all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                new_lps, entropies = _recurrent_actor_pass(
+                new_lps, entropies, logit_scales = _recurrent_actor_pass(
                     model,
                     all_obs_pre,
                     h[chunk_starts].detach(),
@@ -1642,6 +1673,16 @@ def ppo_update(
                     pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_eps, 1 + _hi)
                     pi_loss = (torch.max(pg1, pg2) * valid_mask).sum() / valid_denom
                     ent_loss = (entropies * valid_mask).sum() / valid_denom
+
+                with torch.no_grad():
+                    if full_length:
+                        valid_scales = logit_scales.reshape(-1, N_LOGIT_SCALE)
+                    else:
+                        valid_scales = logit_scales[valid_mask]
+                    if valid_scales.numel() > 0:
+                        sum_logit_scale += valid_scales.sum(dim=0)
+                        sum_logit_scale_sq += (valid_scales * valid_scales).sum(dim=0)
+                        n_logit_scale += int(valid_scales.shape[0])
 
                 if profile is not None:
                     profile["ppo_policy_loss_s"] = profile.get("ppo_policy_loss_s", 0.0) + (time.perf_counter() - t_phase)
@@ -1752,6 +1793,14 @@ def ppo_update(
             if profile is not None:
                 profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_value)
 
+    if n_logit_scale > 0:
+        mean_logit_scale = sum_logit_scale / n_logit_scale
+        var_logit_scale = (sum_logit_scale_sq / n_logit_scale) - mean_logit_scale.square()
+        std_logit_scale = var_logit_scale.clamp_min(0.0).sqrt()
+    else:
+        mean_logit_scale = torch.ones(N_LOGIT_SCALE, device=obs.device)
+        std_logit_scale = torch.zeros(N_LOGIT_SCALE, device=obs.device)
+
     return {
         "pi_loss": sum_pi / max(n_updates, 1),
         "vf_loss": sum_vf / max(n_critic_updates, 1),
@@ -1759,6 +1808,14 @@ def ppo_update(
         "approx_kl": sum_kl / max(n_updates, 1),
         "clip_frac": sum_clip_frac / max(n_updates, 1),
         "explained_var": round(ev, 4),
+        "ls_bt_mean": mean_logit_scale[0].item(),
+        "ls_bd_mean": mean_logit_scale[1].item(),
+        "ls_cd_mean": mean_logit_scale[2].item(),
+        "ls_md_mean": mean_logit_scale[3].item(),
+        "ls_bt_std": std_logit_scale[0].item(),
+        "ls_bd_std": std_logit_scale[1].item(),
+        "ls_cd_std": std_logit_scale[2].item(),
+        "ls_md_std": std_logit_scale[3].item(),
         "n_updates": n_updates,
     }
 
