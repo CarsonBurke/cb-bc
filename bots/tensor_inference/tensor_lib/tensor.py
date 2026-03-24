@@ -10,6 +10,8 @@ import math
 import random
 from operator import mul as _mul
 
+_DOT = math.sumprod
+
 
 class Tensor:
     """N-dimensional tensor for forward-pass computation.
@@ -219,7 +221,7 @@ class Tensor:
             a_row = sd[rs : rs + K]
             ob = i * N
             for j in range(N):
-                out_data[ob + j] = sum(map(_mul, a_row, od[j::N]))
+                out_data[ob + j] = _DOT(a_row, od[j::N])
 
         return Tensor(out_data, (M, N))
 

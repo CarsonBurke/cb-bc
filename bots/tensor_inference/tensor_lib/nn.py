@@ -7,11 +7,10 @@ Training is done in PyTorch — these layers are forward-pass only.
 from __future__ import annotations
 
 import math
-from operator import mul as _mul
 
 from .tensor import Tensor
 
-_DOT = math.sumprod if hasattr(math, "sumprod") else None
+_DOT = math.sumprod
 
 
 class Linear:
@@ -486,7 +485,7 @@ class MLP:
                 base = t * raw_feat
                 tile_in = [dxdy[t][0], dxdy[t][1]] + features[base:base + raw_feat]
                 for j in range(te_out):
-                    x = (_dot(tile_in, te_w_rows[j]) if _dot else sum(map(_mul, tile_in, te_w_rows[j]))) + te_bias[j]
+                    x = _dot(tile_in, te_w_rows[j]) + te_bias[j]
                     if x >= 0:
                         encoded[idx] = x / (1.0 + _exp(-x))
                     else:
@@ -525,7 +524,7 @@ class MLP:
                 compressed = [0.0] * comp_N
                 mean_sq = 0.0
                 for j in range(comp_N):
-                    x = _dot(encoded, comp_w_rows[j]) if _dot else sum(map(_mul, encoded, comp_w_rows[j]))
+                    x = _dot(encoded, comp_w_rows[j])
                     if comp_b is not None:
                         x += comp_b[j]
                     compressed[j] = x
@@ -551,7 +550,7 @@ class MLP:
                 if act == 'SiLU':
                     out = [0.0] * N
                     for j in range(N):
-                        x = _dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))
+                        x = _dot(h, w_rows[j])
                         if b is not None:
                             x += b[j]
                         if x >= 0:
@@ -562,19 +561,19 @@ class MLP:
                     h = out
                 elif act == 'ReLU':
                     if b is not None:
-                        h = [max(0.0, (_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) + b[j]) for j in range(N)]
+                        h = [max(0.0, _dot(h, w_rows[j]) + b[j]) for j in range(N)]
                     else:
-                        h = [max(0.0, _dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) for j in range(N)]
+                        h = [max(0.0, _dot(h, w_rows[j])) for j in range(N)]
                 elif act == 'Tanh':
                     _tanh = math.tanh
                     if b is not None:
-                        h = [_tanh((_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) + b[j]) for j in range(N)]
+                        h = [_tanh(_dot(h, w_rows[j]) + b[j]) for j in range(N)]
                     else:
-                        h = [_tanh(_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) for j in range(N)]
+                        h = [_tanh(_dot(h, w_rows[j])) for j in range(N)]
                 elif act == 'Sigmoid':
                     out = [0.0] * N
                     for j in range(N):
-                        x = _dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))
+                        x = _dot(h, w_rows[j])
                         if b is not None:
                             x += b[j]
                         if x >= 0:
@@ -586,15 +585,15 @@ class MLP:
                 else:
                     # No activation to fuse
                     if b is not None:
-                        h = [(_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))) + b[j] for j in range(N)]
+                        h = [_dot(h, w_rows[j]) + b[j] for j in range(N)]
                     else:
-                        h = [_dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j])) for j in range(N)]
+                        h = [_dot(h, w_rows[j]) for j in range(N)]
             elif tag == 'linear_rmsnorm':
                 _, act, w_rows, b, N, gamma, eps = op
                 out = [0.0] * N
                 mean_sq = 0.0
                 for j in range(N):
-                    x = _dot(h, w_rows[j]) if _dot is not None else sum(map(_mul, h, w_rows[j]))
+                    x = _dot(h, w_rows[j])
                     if b is not None:
                         x += b[j]
                     out[j] = x
@@ -663,9 +662,9 @@ class MLP:
 
         head_names, head_slices, fused_w_rows, fused_bias, total_out = fused_heads
         if fused_bias is not None:
-            fused_out = [(_dot(h, fused_w_rows[j]) if _dot is not None else sum(map(_mul, h, fused_w_rows[j]))) + fused_bias[j] for j in range(total_out)]
+            fused_out = [_dot(h, fused_w_rows[j]) + fused_bias[j] for j in range(total_out)]
         else:
-            fused_out = [_dot(h, fused_w_rows[j]) if _dot is not None else sum(map(_mul, h, fused_w_rows[j])) for j in range(total_out)]
+            fused_out = [_dot(h, fused_w_rows[j]) for j in range(total_out)]
 
         results: dict[str, list[float]] = {}
         for name, (start, end) in zip(head_names, head_slices):
