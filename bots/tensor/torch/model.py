@@ -38,10 +38,12 @@ ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
 N_DIR = 9
 N_CONV_DIR = 4  # cardinal only: N, W, E, S (indices 1, 3, 5, 7 in DIR_MAP_9)
+N_LOGIT_SCALE = 4
 ACTOR_RMSNORM_LAYERS = (True, True)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
 CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
+LOGIT_SCALE_LOG_BOUND = 0.35
 INITIAL_BUILD_TYPE_BIAS = [
     0.0,   # none
     0.8,   # harvester
@@ -712,6 +714,27 @@ def action_log_prob_and_entropy(
     return chosen, entropy
 
 
+def _bounded_logit_scales(raw: torch.Tensor) -> torch.Tensor:
+    """Map raw scale logits to a tight multiplicative logit scale range."""
+    return torch.exp(LOGIT_SCALE_LOG_BOUND * torch.tanh(raw))
+
+
+def _apply_head_logit_scales(
+    bt_l: torch.Tensor,
+    bd_l: torch.Tensor,
+    cd_l: torch.Tensor,
+    md_l: torch.Tensor,
+    raw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    scales = _bounded_logit_scales(raw)
+    return (
+        bt_l * scales[:, 0:1],
+        bd_l * scales[:, 1:2],
+        cd_l * scales[:, 2:3],
+        md_l * scales[:, 3:4],
+    )
+
+
 def _normalize_actor_latent_dim(latent: torch.Tensor) -> torch.Tensor:
     """Pad/slice actor latents so critic input width is stable across models."""
     cur_dim = latent.shape[-1]
@@ -930,6 +953,7 @@ class BuilderMLP(nn.Module):
         self.head_build_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
         self.head_conv_dir = _ortho_init(nn.Linear(prev, N_CONV_DIR), std=0.01)
         self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
+        self.head_logit_scale = _ortho_init(nn.Linear(prev, N_LOGIT_SCALE), std=0.01)
         self.head_h_gate = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wz: update gate
         self.head_h_cand = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wh: candidate
 
@@ -1007,30 +1031,40 @@ class BuilderMLP(nn.Module):
             combined_w = torch.cat([
                 self.head_build_type.weight, self.head_build_dir.weight,
                 self.head_conv_dir.weight,
-                self.head_move_dir.weight, self.head_h_gate.weight, self.head_h_cand.weight,
+                self.head_move_dir.weight, self.head_logit_scale.weight,
+                self.head_h_gate.weight, self.head_h_cand.weight,
             ], dim=0)
             combined_b = torch.cat([
                 self.head_build_type.bias, self.head_build_dir.bias,
                 self.head_conv_dir.bias,
-                self.head_move_dir.bias, self.head_h_gate.bias, self.head_h_cand.bias,
+                self.head_move_dir.bias, self.head_logit_scale.bias,
+                self.head_h_gate.bias, self.head_h_cand.bias,
             ])
         else:
             if not hasattr(self, '_cached_head_w'):
                 self._cached_head_w = torch.cat([
                     self.head_build_type.weight, self.head_build_dir.weight,
                     self.head_conv_dir.weight,
-                    self.head_move_dir.weight, self.head_h_gate.weight, self.head_h_cand.weight,
+                    self.head_move_dir.weight, self.head_logit_scale.weight,
+                    self.head_h_gate.weight, self.head_h_cand.weight,
                 ], dim=0)
                 self._cached_head_b = torch.cat([
                     self.head_build_type.bias, self.head_build_dir.bias,
                     self.head_conv_dir.bias,
-                    self.head_move_dir.bias, self.head_h_gate.bias, self.head_h_cand.bias,
+                    self.head_move_dir.bias, self.head_logit_scale.bias,
+                    self.head_h_gate.bias, self.head_h_cand.bias,
                 ])
             combined_w = self._cached_head_w
             combined_b = self._cached_head_b
 
         combined = F.linear(h, combined_w, combined_b)
-        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = combined.split([N_BUILD, N_DIR, N_CONV_DIR, N_DIR, H_DIM, H_DIM], dim=-1)
+        bt_l, bd_l, cd_l, md_l, logit_scale, h_gate, h_cand = combined.split(
+            [N_BUILD, N_DIR, N_CONV_DIR, N_DIR, N_LOGIT_SCALE, H_DIM, H_DIM],
+            dim=-1,
+        )
+        bt_l, bd_l, cd_l, md_l = _apply_head_logit_scales(
+            bt_l, bd_l, cd_l, md_l, logit_scale,
+        )
         return bt_l, bd_l, cd_l, md_l, h_gate, h_cand
 
     def _forward_from_trunk_in(self, trunk_in: torch.Tensor):
@@ -1063,6 +1097,7 @@ class BuilderMLP(nn.Module):
         actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
         return tile_modules + compress_modules + enc_modules + actor_modules + [
             self.head_build_type, self.head_build_dir, self.head_conv_dir, self.head_move_dir,
+            self.head_logit_scale,
             self.head_h_gate, self.head_h_cand,
         ]
 
@@ -1091,21 +1126,30 @@ class BuilderMLP(nn.Module):
         )
         # Also support loading without conv_dir head (2 fewer entries)
         full_no_conv_dir = full_entries - 2
-        # Legacy exports before the pointwise 1x1 conv existed.
-        full_no_pointwise = full_entries - 3
-        full_no_pointwise_no_conv_dir = full_no_conv_dir - 3
-        # Legacy exports before the tile RMSNorm existed.
-        full_no_tile_rms = full_entries - 1
-        full_no_tile_rms_no_conv_dir = full_no_conv_dir - 1
+        # Legacy exports before the learned logit-scale head existed.
+        full_no_logit_scale = full_entries - 2
+        full_no_conv_dir_no_logit_scale = full_no_conv_dir - 2
+        # Legacy exports before the tile RMSNorm existed (and before logit scale).
+        full_no_tile_rms = full_entries - 3
+        full_no_tile_rms_no_conv_dir = full_no_conv_dir - 3
+        # Legacy exports before the pointwise 1x1 conv existed (also no tile RMS/logit scale).
+        full_no_pointwise = full_entries - 5
+        full_no_pointwise_no_conv_dir = full_no_conv_dir - 5
         pointwise_weight_size = self.tile_pointwise.weight.numel()
         tile_rms_size = self.tile_rms.weight.numel()
+        move_dir_weight_size = self.head_move_dir.weight.numel()
         load_pointwise = True
         load_tile_rms = True
+        load_logit_scale = True
 
         if len(state) == full_entries:
             load_conv_dir = True
-        elif len(state) == full_no_conv_dir and len(state[4]) == pointwise_weight_size:
-            load_conv_dir = False
+        elif len(state) == full_no_conv_dir:
+            if len(state[20]) == move_dir_weight_size:
+                load_conv_dir = False
+            else:
+                load_conv_dir = True
+                load_logit_scale = False
         elif (
             len(state) == full_no_tile_rms
             and len(state[4]) == pointwise_weight_size
@@ -1113,6 +1157,7 @@ class BuilderMLP(nn.Module):
         ):
             load_conv_dir = True
             load_tile_rms = False
+            load_logit_scale = False
         elif (
             len(state) == full_no_tile_rms_no_conv_dir
             and len(state[4]) == pointwise_weight_size
@@ -1120,16 +1165,23 @@ class BuilderMLP(nn.Module):
         ):
             load_conv_dir = False
             load_tile_rms = False
+            load_logit_scale = False
+        elif len(state) == full_no_conv_dir_no_logit_scale:
+            load_conv_dir = False
+            load_logit_scale = False
         elif len(state) == full_no_pointwise:
             load_conv_dir = True
             load_pointwise = False
             load_tile_rms = False
+            load_logit_scale = False
         elif len(state) == full_no_pointwise_no_conv_dir:
             load_conv_dir = False
             load_pointwise = False
             load_tile_rms = False
-        elif len(state) == full_no_conv_dir:
-            load_conv_dir = False
+            load_logit_scale = False
+        elif len(state) == full_no_logit_scale:
+            load_conv_dir = True
+            load_logit_scale = False
         else:
             raise AssertionError(
                 f"State has {len(state)} entries, expected {full_entries} "
@@ -1144,6 +1196,8 @@ class BuilderMLP(nn.Module):
             if layer is self.tile_pointwise and not load_pointwise:
                 continue
             if layer is self.tile_rms and not load_tile_rms:
+                continue
+            if layer is self.head_logit_scale and not load_logit_scale:
                 continue
             if isinstance(layer, nn.Linear):
                 w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
