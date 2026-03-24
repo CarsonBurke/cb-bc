@@ -60,6 +60,72 @@ REWARD_FLOW_THROUGHPUT = 50.0
 REWARD_ENEMY_CORE_DAMAGE = 20.0
 REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
 
+# ---- DreamerV3-style symlog twohot value prediction ----
+NUM_BUCKETS = 255
+BUCKET_LOW = -20.0
+BUCKET_HIGH = 20.0
+
+
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    return x.sign() * torch.log1p(x.abs())
+
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    return x.sign() * torch.expm1(x.abs())
+
+
+def _make_bucket_centers() -> torch.Tensor:
+    """255 uniformly-spaced centers in symlog space [-20, 20]."""
+    return torch.linspace(BUCKET_LOW, BUCKET_HIGH, NUM_BUCKETS, dtype=torch.float32)
+
+
+def twohot_encode(targets: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+    """Encode scalar targets as twohot distributions over bucket centers.
+
+    Args:
+        targets: (...,) scalar targets already in symlog space.
+        centers: (NUM_BUCKETS,) bucket centers in symlog space.
+
+    Returns:
+        (..., NUM_BUCKETS) twohot probability vectors.
+    """
+    # Clamp to bucket range
+    targets = targets.clamp(centers[0], centers[-1])
+    # Find the bucket index just below each target
+    below = torch.bucketize(targets, centers) - 1
+    below = below.clamp(0, len(centers) - 2)
+    above = below + 1
+    # Interpolation weights (inverse distance).
+    # above = below + 1 always, so total > 0 in practice (bin spacing ~0.157).
+    # Clamp guards against theoretical float32 edge cases.
+    dist_to_below = (targets - centers[below]).abs()
+    dist_to_above = (centers[above] - targets).abs()
+    total = (dist_to_below + dist_to_above).clamp(min=1e-8)
+    weight_below = dist_to_above / total
+    weight_above = dist_to_below / total
+    # Build twohot
+    result = torch.zeros(*targets.shape, len(centers), device=targets.device, dtype=targets.dtype)
+    result.scatter_(-1, below.unsqueeze(-1), weight_below.unsqueeze(-1))
+    result.scatter_(-1, above.unsqueeze(-1), weight_above.unsqueeze(-1))
+    return result
+
+
+def decode_value(logits: torch.Tensor, centers_symexp: torch.Tensor) -> torch.Tensor:
+    """Decode categorical logits to scalar values.
+
+    Takes precomputed symexp(centers) to avoid Jensen's inequality bias.
+    E[symexp(X)] != symexp(E[X]); we need the former.
+
+    Args:
+        logits: (..., NUM_BUCKETS) raw logits.
+        centers_symexp: (NUM_BUCKETS,) symexp(bucket_centers) — in original value space.
+
+    Returns:
+        (...,) predicted values in original (unsquashed) space.
+    """
+    probs = torch.softmax(logits, dim=-1)
+    return (probs * centers_symexp).sum(dim=-1)
+
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
 REPLAY_DIR = PROJECT_ROOT / "replays" / "training"
@@ -346,6 +412,7 @@ class CentralizedCritic(nn.Module):
         )
 
         # Single per-unit value head from tile features + replay/global context.
+        # Outputs NUM_BUCKETS logits for DreamerV3-style symlog twohot prediction.
         unit_in = conv_dim + UNIT_CONTEXT_DIM + GLOBAL_SCALAR_DIM + ACTOR_LATENT_DIM
         self.unit_head = nn.Sequential(
             nn.Linear(unit_in, 128),
@@ -354,8 +421,14 @@ class CentralizedCritic(nn.Module):
             nn.Linear(128, 64),
             RMSNorm(64),
             nn.SiLU(),
-            nn.Linear(64, 1),
+            nn.Linear(64, NUM_BUCKETS),
         )
+
+        # Bucket centers in symlog space — registered as buffer so they move with device.
+        # Precompute symexp(centers) for Jensen-free decoding.
+        centers = _make_bucket_centers()
+        self.register_buffer("bucket_centers", centers)
+        self.register_buffer("bucket_centers_symexp", symexp(centers))
 
         self._init_weights()
 
@@ -374,8 +447,9 @@ class CentralizedCritic(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Small std for final value outputs
-        nn.init.orthogonal_(self.unit_head[-1].weight, gain=1.0)
+        # Near-uniform init for final categorical logits (DreamerV3 convention)
+        nn.init.zeros_(self.unit_head[-1].weight)
+        nn.init.zeros_(self.unit_head[-1].bias)
 
     def encode_map(
         self,
@@ -428,12 +502,52 @@ class CentralizedCritic(nn.Module):
         unit_tile_feat = feat[ri, :, uy, ux].float()
         unit_round_scalars = round_scalars[ri]
 
-        # Per-unit value
+        # Per-unit categorical value prediction (DreamerV3-style)
         unit_in = torch.cat(
             [unit_tile_feat, unit_round_scalars, unit_context, actor_latent],
             dim=-1,
         )
-        return self.unit_head(unit_in).squeeze(-1)  # (B,)
+        logits = self.unit_head(unit_in)  # (B, NUM_BUCKETS)
+        return decode_value(logits, self.bucket_centers_symexp)  # (B,)
+
+    def unit_value_logits(
+        self,
+        feat: torch.Tensor,
+        round_scalars: torch.Tensor,
+        round_idx: torch.Tensor,
+        unit_xy: torch.Tensor,
+        unit_context: torch.Tensor,
+        actor_latent: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Like unit_values but also returns raw logits for training loss.
+
+        Returns:
+            (decoded_values (B,), logits (B, NUM_BUCKETS))
+        """
+        fH, fW = feat.shape[2], feat.shape[3]
+        if unit_xy.dtype == torch.long:
+            ux = unit_xy[:, 0]
+            uy = unit_xy[:, 1]
+        else:
+            ux = unit_xy[:, 0].round().to(torch.long)
+            uy = unit_xy[:, 1].round().to(torch.long)
+        if round_idx.dtype == torch.long:
+            ri = round_idx
+        else:
+            ri = round_idx.to(torch.long)
+        ux = ux.clamp(0, fW - 1)
+        uy = uy.clamp(0, fH - 1)
+
+        unit_tile_feat = feat[ri, :, uy, ux].float()
+        unit_round_scalars = round_scalars[ri]
+
+        unit_in = torch.cat(
+            [unit_tile_feat, unit_round_scalars, unit_context, actor_latent],
+            dim=-1,
+        )
+        logits = self.unit_head(unit_in)  # (B, NUM_BUCKETS)
+        values = decode_value(logits, self.bucket_centers_symexp)  # (B,)
+        return values, logits
 
     def forward(
         self,
@@ -1462,21 +1576,17 @@ def ppo_update(
                     u_end = min(u_start + _UNIT_CHUNK, step_indices.shape[0])
                     si = step_indices[u_start:u_end]
                     lr = local_round_idx[u_start:u_end]
-                    newvalue = critic.unit_values(
+                    _newvalue, logits = critic.unit_value_logits(
                         feat, g_scalars, lr, u_xy[si], u_ctx[si], u_latent[si],
                     )
-                    if clip_vloss and mb_old_values is not None:
-                        v_loss_unclipped = (newvalue - mb_returns[si]) ** 2
-                        _vhi = clip_eps_higher if clip_eps_higher is not None else clip_eps
-                        v_clipped = mb_old_values[si] + torch.clamp(
-                            newvalue - mb_old_values[si], -clip_eps, _vhi,
-                        )
-                        v_loss_elems = torch.max(v_loss_unclipped, (v_clipped - mb_returns[si]) ** 2)
-                    else:
-                        v_loss_elems = (newvalue - mb_returns[si]) ** 2
+                    # DreamerV3-style twohot cross-entropy loss
+                    target_symlog = symlog(mb_returns[si])
+                    target_twohot = twohot_encode(target_symlog, critic.bucket_centers)
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    v_loss_elems = -(target_twohot * log_probs).sum(dim=-1)
 
-                    vf_loss_sum += 0.5 * v_loss_elems.detach().sum().item()
-                    (vf_coeff * 0.5 * v_loss_elems.sum() / vf_denom).backward()
+                    vf_loss_sum += v_loss_elems.detach().sum().item()
+                    (vf_coeff * v_loss_elems.sum() / vf_denom).backward()
 
             torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
             critic_opt.step()
@@ -1924,100 +2034,6 @@ def _nearest_round_positions(
 # Welford's online algorithm over full episode returns, divides each reward
 # by sqrt(var + eps), clips to [-clip, clip].
 
-class RewardNormalizer:
-    """Running reward normalizer using discounted return variance."""
-
-    def __init__(self, gamma: float = 0.99, eps: float = 1e-8):
-        self.gamma = gamma
-        self.eps = eps
-        # Welford running stats
-        self.mean: float = 0.0
-        self.var: float = 1.0
-        self.count: float = 1e-4  # avoid div-by-zero on first call
-
-    def normalize(
-        self,
-        rewards: torch.Tensor,
-        ep_boundaries: list[tuple[int, int]],
-    ) -> torch.Tensor:
-        """Normalize rewards using running return variance.
-
-        Vectorized: pads episodes into (E, T) tensor, computes discounted
-        returns via reverse scan across all episodes simultaneously, then
-        updates running stats with a single parallel Welford merge.
-        """
-        gamma = self.gamma
-        n_eps = len(ep_boundaries)
-        if n_eps == 0:
-            std = max(self.var, 0.0) ** 0.5 + self.eps
-            return rewards / std
-
-        dev = rewards.device
-        max_len = max(end - start for start, end in ep_boundaries)
-
-        # Pad episodes into (E, T) for vectorized reverse scan
-        r_pad = rewards.new_zeros(n_eps, max_len)
-        lengths = torch.empty(n_eps, dtype=torch.long, device=dev)
-        for i, (start, end) in enumerate(ep_boundaries):
-            ep_len = end - start
-            r_pad[i, :ep_len] = rewards[start:end]
-            lengths[i] = ep_len
-
-        # Reverse scan: disc[:, t] = r[:, t] + gamma * disc[:, t+1]
-        disc = rewards.new_zeros(n_eps, max_len)
-        disc[:, max_len - 1] = r_pad[:, max_len - 1]
-        for t in range(max_len - 2, -1, -1):
-            disc[:, t] = r_pad[:, t] + gamma * disc[:, t + 1]
-
-        # Mask valid positions and collect all discounted returns
-        valid = torch.arange(max_len, device=dev).unsqueeze(0) < lengths.unsqueeze(1)
-        all_rets = disc[valid]
-
-        # Parallel Welford merge: combine batch stats with running stats
-        n = all_rets.numel()
-        if n > 0:
-            batch_mean = all_rets.mean().item()
-            batch_m2 = all_rets.var(correction=0).item() * n
-
-            old_count = self.count
-            old_m2 = self.var * old_count
-            new_count = old_count + n
-            delta = batch_mean - self.mean
-            self.mean = self.mean + delta * n / new_count
-            self.var = (old_m2 + batch_m2 + delta * delta * old_count * n / new_count) / new_count
-            self.count = new_count
-        self.var = max(self.var, 0.0)
-
-        std = self.var ** 0.5 + self.eps
-        return rewards / std
-
-    def state_dict(self) -> dict:
-        return {"mean": self.mean, "var": self.var, "count": self.count,
-                "gamma": self.gamma, "eps": self.eps}
-
-    def load_state_dict(self, d: dict) -> None:
-        self.mean = d.get("mean", 0.0)
-        self.var = d.get("var", 1.0)
-        self.count = d.get("count", 1e-4)
-        self.gamma = d.get("gamma", self.gamma)
-        self.eps = d.get("eps", self.eps)
-
-
-_reward_normalizer: RewardNormalizer | None = None
-
-
-def get_reward_normalizer(gamma: float = 0.99) -> RewardNormalizer:
-    global _reward_normalizer
-    if _reward_normalizer is None:
-        _reward_normalizer = RewardNormalizer(gamma=gamma)
-    return _reward_normalizer
-
-
-def reset_reward_normalizer() -> None:
-    global _reward_normalizer
-    _reward_normalizer = None
-
-
 _centralized_critic: CentralizedCritic | None = None
 _centralized_optimizer: torch.optim.Optimizer | None = None
 
@@ -2069,16 +2085,10 @@ def load_centralized_critic_checkpoint(
         critic.load_state_dict(critic_state)
         if opt_state is not None:
             critic_opt.load_state_dict(opt_state)
-        # Restore reward normalizer state if present
-        rn_state = payload.get("reward_normalizer")
-        if rn_state is not None:
-            rn = get_reward_normalizer()
-            rn.load_state_dict(rn_state)
         return True
     except Exception as e:
         print(f"Could not load centralized critic from {ckpt_path}: {e}")
         reset_centralized_critic()
-        reset_reward_normalizer()
         return False
 
 
@@ -2092,8 +2102,6 @@ def save_centralized_critic_checkpoint(weight_path: str | Path = WEIGHT_PATH) ->
         "critic": _centralized_critic.state_dict(),
         "optimizer": _centralized_optimizer.state_dict(),
     }
-    if _reward_normalizer is not None:
-        payload["reward_normalizer"] = _reward_normalizer.state_dict()
     torch.save(payload, ckpt_path)
     return ckpt_path
 
@@ -2211,11 +2219,6 @@ def train_on_trajectories(
     if profile is not None:
         profile["value_forward_s"] = time.perf_counter() - t_phase
 
-    # Normalize rewards using running return variance (like gym.NormalizeReward)
-    rn = get_reward_normalizer(gamma=gamma)
-    raw_reward_std = data["rewards"].std().item()
-    data["rewards"] = rn.normalize(data["rewards"], data["ep_boundaries"])
-
     t_phase = time.perf_counter() if profile is not None else 0.0
     advantages, returns = _compute_gae(
         data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,
@@ -2254,9 +2257,7 @@ def train_on_trajectories(
         **ppo_kwargs,
     )
     stats["n_steps"] = data["n_steps"]
-    stats["reward_raw_std"] = raw_reward_std
-    stats["reward_norm_var"] = rn.var
-    stats["reward_norm_count"] = rn.count
+    stats["reward_raw_std"] = data["rewards"].std().item()
     return stats
 
 
