@@ -797,17 +797,14 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                     && src_team == dst_team
                                 {
                                     // Flow-aligned: only count if dst is strictly closer to core.
-                                    // Core delivery always counts (weight 1.0).
-                                    // Linear decay so near-core transfers get more credit.
+                                    // Weight 1/sqrt(dist) — sub-linear decay keeps far hops
+                                    // meaningful while still favoring near-core transfers.
+                                    // 10-hop vs 3-hop ratio ~2.2x (vs 2.9x unweighted).
                                     let cc = core_center[src_team as usize];
                                     let src_dist = (from.x - cc.0).abs() + (from.y - cc.1).abs();
                                     let dst_dist = (to.x - cc.0).abs() + (to.y - cc.1).abs();
                                     if dst_dist < src_dist {
-                                        let weight = if dst_kind == EntityKind::Core {
-                                            1.0
-                                        } else {
-                                            (1.0 - src_dist as f32 / 30.0).max(0.1)
-                                        };
+                                        let weight = 1.0 / (src_dist.max(1) as f32).sqrt();
                                         resource_transfers[turn_idx * 2 + src_team as usize] += weight;
                                     }
                                 }
