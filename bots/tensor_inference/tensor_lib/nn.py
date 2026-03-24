@@ -11,6 +11,8 @@ import math
 from .tensor import Tensor
 
 _DOT = math.sumprod
+_LOGIT_SCALE_LOG_BOUND = 0.35
+_LOGIT_SCALE_HEADS = ("build_type", "build_dir", "conv_dir", "move_dir")
 
 
 class Linear:
@@ -669,6 +671,15 @@ class MLP:
         results: dict[str, list[float]] = {}
         for name, (start, end) in zip(head_names, head_slices):
             results[name] = fused_out[start:end]
+        raw_logit_scale = results.pop("logit_scale", None)
+        if raw_logit_scale is not None:
+            scales = [
+                math.exp(_LOGIT_SCALE_LOG_BOUND * math.tanh(v))
+                for v in raw_logit_scale[:len(_LOGIT_SCALE_HEADS)]
+            ]
+            for name, scale in zip(_LOGIT_SCALE_HEADS, scales):
+                if name in results:
+                    results[name] = [x * scale for x in results[name]]
         return results
 
     def save(self) -> list[list[float]]:
@@ -681,41 +692,75 @@ class MLP:
         Supports legacy MLP states saved before RMSNorm parameters were added
         and before optional newer heads such as `conv_dir` existed.
         """
+        def _head_params(skip: set[str] | None = None) -> list[Tensor]:
+            skip = skip or set()
+            params: list[Tensor] = []
+            for name, head in self.heads.items():
+                if name in skip:
+                    continue
+                params.extend(head.parameters())
+            return params
+
         full_params = self.parameters()
 
         # Params without tile encoder (trunk + heads only)
         no_tile_params: list[Tensor] = list(self.trunk.parameters())
-        for head in self.heads.values():
-            no_tile_params.extend(head.parameters())
+        no_tile_params.extend(_head_params())
+
+        no_tile_no_logit_params: list[Tensor] = list(self.trunk.parameters())
+        no_tile_no_logit_params.extend(_head_params({"logit_scale"}))
 
         # Without tile encoder AND without conv_dir head
         no_tile_no_conv_params: list[Tensor] = list(self.trunk.parameters())
-        for name, head in self.heads.items():
-            if name != "conv_dir":
-                no_tile_no_conv_params.extend(head.parameters())
+        no_tile_no_conv_params.extend(_head_params({"conv_dir"}))
+
+        no_tile_no_conv_no_logit_params: list[Tensor] = list(self.trunk.parameters())
+        no_tile_no_conv_no_logit_params.extend(_head_params({"conv_dir", "logit_scale"}))
 
         no_conv_params: list[Tensor] = []
         if self.tile_encoder is not None:
             no_conv_params.extend(self.tile_encoder.parameters())
         for layer in self.trunk.layers:
             no_conv_params.extend(layer.parameters())
-        for name, head in self.heads.items():
-            if name != "conv_dir":
-                no_conv_params.extend(head.parameters())
+        no_conv_params.extend(_head_params({"conv_dir"}))
+
+        no_logit_params: list[Tensor] = []
+        if self.tile_encoder is not None:
+            no_logit_params.extend(self.tile_encoder.parameters())
+        if self.tile_conv_w is not None:
+            no_logit_params.append(self.tile_conv_w)
+            no_logit_params.append(self.tile_conv_b)
+        if self.tile_compress is not None:
+            no_logit_params.extend(self.tile_compress.parameters())
+        no_logit_params.extend(self.trunk.parameters())
+        no_logit_params.extend(_head_params({"logit_scale"}))
+
+        no_conv_no_logit_params: list[Tensor] = []
+        if self.tile_encoder is not None:
+            no_conv_no_logit_params.extend(self.tile_encoder.parameters())
+        for layer in self.trunk.layers:
+            no_conv_no_logit_params.extend(layer.parameters())
+        no_conv_no_logit_params.extend(_head_params({"conv_dir", "logit_scale"}))
 
         legacy_params: list[Tensor] = []
+        legacy_no_logit_params: list[Tensor] = []
         legacy_no_conv_params: list[Tensor] = []
+        legacy_no_conv_no_logit_params: list[Tensor] = []
         for layer in self.trunk.layers:
             if isinstance(layer, Linear):
                 legacy_params.extend(layer.parameters())
+                legacy_no_logit_params.extend(layer.parameters())
                 legacy_no_conv_params.extend(layer.parameters())
+                legacy_no_conv_no_logit_params.extend(layer.parameters())
             elif isinstance(layer, LayerNorm):
                 legacy_params.extend(layer.parameters())
+                legacy_no_logit_params.extend(layer.parameters())
                 legacy_no_conv_params.extend(layer.parameters())
-        for name, head in self.heads.items():
-            if name != "conv_dir":
-                legacy_no_conv_params.extend(head.parameters())
-            legacy_params.extend(head.parameters())
+                legacy_no_conv_no_logit_params.extend(layer.parameters())
+        legacy_params.extend(_head_params())
+        legacy_no_logit_params.extend(_head_params({"logit_scale"}))
+        legacy_no_conv_params.extend(_head_params({"conv_dir"}))
+        legacy_no_conv_no_logit_params.extend(_head_params({"conv_dir", "logit_scale"}))
 
         # When tile_encoder is present, no_conv_params and no_tile_params
         # can have the same count (tile_enc adds 2 params, conv_dir adds 2).
@@ -730,18 +775,30 @@ class MLP:
 
         if len(state) == len(full_params):
             params = full_params
+        elif len(state) == len(no_logit_params):
+            params = no_logit_params
         elif len(state) == len(no_conv_params) and _has_tile_first:
             params = no_conv_params
+        elif len(state) == len(no_conv_no_logit_params) and _has_tile_first:
+            params = no_conv_no_logit_params
         elif len(state) == len(no_tile_params):
             params = no_tile_params
+        elif len(state) == len(no_tile_no_logit_params):
+            params = no_tile_no_logit_params
         elif len(state) == len(no_tile_no_conv_params):
             params = no_tile_no_conv_params
+        elif len(state) == len(no_tile_no_conv_no_logit_params):
+            params = no_tile_no_conv_no_logit_params
         elif len(state) == len(no_conv_params):
             params = no_conv_params
         elif len(state) == len(legacy_params):
             params = legacy_params
+        elif len(state) == len(legacy_no_logit_params):
+            params = legacy_no_logit_params
         elif len(state) == len(legacy_no_conv_params):
             params = legacy_no_conv_params
+        elif len(state) == len(legacy_no_conv_no_logit_params):
+            params = legacy_no_conv_no_logit_params
         else:
             raise AssertionError(
                 f"State has {len(state)} entries, model has {len(full_params)} params "

@@ -191,6 +191,7 @@ def _build_model() -> MLP:
             "build_dir": 9,
             "conv_dir": 4,
             "move_dir": 9,
+            "logit_scale": 4,
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },
