@@ -14,7 +14,22 @@ from cambc import Controller, Direction, EntityType, Environment, Position, Reso
 
 import sys
 
-sys.path.insert(0, ".")
+def _resolve_bot_dir() -> str:
+    file_path = globals().get("__file__")
+    if file_path:
+        return os.path.dirname(os.path.abspath(file_path))
+    cwd = os.getcwd()
+    if cwd:
+        return cwd
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0:
+        return os.path.dirname(os.path.abspath(argv0))
+    return "."
+
+
+BOT_DIR = _resolve_bot_dir()
+if BOT_DIR not in sys.path:
+    sys.path.insert(0, BOT_DIR)
 from tensor_lib import MLP, SinusoidalPositionEmbedding
 
 # -- Layout constants --
@@ -145,7 +160,7 @@ _BLD_ONE_HOTS = tuple(
 )
 
 # Weights file path (adjacent to main.py)
-WEIGHT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.json")
+WEIGHT_PATH = os.path.join(BOT_DIR, "weights.json")
 _HARVESTER_BUILD_TYPE = 1
 _ALL_DIRS_MASK = [True] * 9
 _NONE_ONLY_BUILD_MASK = [True] + [False] * (len(BUILD_COSTS) - 1)
