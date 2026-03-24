@@ -376,6 +376,66 @@ const ExplVarChart = makeSimpleChart('Explained Var', 'explained_var', '#a6e3a1'
 const KLChart = makeSimpleChart('KL', 'approx_kl', '#fab387')
 const ClipChart = makeSimpleChart('Clip Frac', 'clip_frac', '#f9e2af')
 
+const LogitScaleChart = memo(function LogitScaleChart({ series }) {
+  const episodes = useTrainEpisodes()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  if (episodes.length <= 1) return <NoData />
+  const ds = downsample(episodes)
+  const dim = emaOn
+  const datasets = series.flatMap(({ key, label, color }) => {
+    const raw = ds.map(e => e[key])
+    const result = [{
+      label, data: raw, borderColor: dim ? color + '40' : color,
+      tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
+    }]
+    if (emaOn) result.push({
+      label: `${label} EMA`, data: ema(raw), borderColor: color,
+      borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
+    })
+    return result
+  })
+  const yViewport = bandsOn
+    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key]).filter(v => v != null)))
+    : null
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels: ds.map(e => e.episode), datasets }}
+        options={{
+          ...chartBase(yViewport),
+          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+})
+
+const LogitScaleMeanChart = memo(function LogitScaleMeanChart() {
+  return (
+    <LogitScaleChart
+      series={[
+        { key: 'ls_bt_mean', label: 'Build Type', color: '#f38ba8' },
+        { key: 'ls_bd_mean', label: 'Build Dir', color: '#89b4fa' },
+        { key: 'ls_cd_mean', label: 'Conv Dir', color: '#f9e2af' },
+        { key: 'ls_md_mean', label: 'Move Dir', color: '#a6e3a1' },
+      ]}
+    />
+  )
+})
+
+const LogitScaleStdChart = memo(function LogitScaleStdChart() {
+  return (
+    <LogitScaleChart
+      series={[
+        { key: 'ls_bt_std', label: 'Build Type', color: '#f38ba8' },
+        { key: 'ls_bd_std', label: 'Build Dir', color: '#89b4fa' },
+        { key: 'ls_cd_std', label: 'Conv Dir', color: '#f9e2af' },
+        { key: 'ls_md_std', label: 'Move Dir', color: '#a6e3a1' },
+      ]}
+    />
+  )
+})
+
 const LossChart = memo(function LossChart() {
   const episodes = useTrainEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
@@ -575,6 +635,8 @@ const TRAINING_CARDS = {
   'train-ev':               { title: 'Explained Variance',  hasEma: true, render: () => <ExplVarChart /> },
   'train-kl':               { title: 'Approx KL',           defaultOpen: false, hasEma: true, render: () => <KLChart /> },
   'train-clip':             { title: 'Clip Fraction',       defaultOpen: false, hasEma: true, render: () => <ClipChart /> },
+  'train-logit-scale-mean': { title: 'Logit Scale Mean',    defaultOpen: false, hasEma: true, render: () => <LogitScaleMeanChart /> },
+  'train-logit-scale-std':  { title: 'Logit Scale Std',     defaultOpen: false, hasEma: true, render: () => <LogitScaleStdChart /> },
   'train-log-table':        { title: 'Episode Log',         defaultOpen: false, render: () => <EpisodeLogTable /> },
   'train-replays':          { title: 'Training Replays',    render: () => <TrainingReplaysContent /> },
 }
