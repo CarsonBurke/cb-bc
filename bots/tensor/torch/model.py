@@ -584,9 +584,18 @@ class GraphedInference:
     Pads inputs to MAX_B and slices outputs to the actual batch size.
     """
 
-    def __init__(self, model: nn.Module, max_batch: int = 16):
+    def __init__(
+        self,
+        model: nn.Module,
+        max_batch: int = 16,
+        temperature: float = 1.0,
+        *,
+        return_log_prob: bool = True,
+    ):
         self.max_batch = max_batch
         self._model = model
+        self._temperature = temperature
+        self._return_log_prob = return_log_prob
         self._graph: torch.cuda.CUDAGraph | None = None
         # Static buffers (set during capture)
         self._static_input: torch.Tensor | None = None
@@ -639,12 +648,17 @@ class GraphedInference:
 
                 ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
                 empty_dir = obs[:, nobld_idx] == 1.0
-                obs_tiles = obs[:, :25 * TILE_FEATURES].reshape(M, 25, TILE_FEATURES)
                 harv_bd_m = bd_m & ore_here & empty_dir
                 bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
 
                 bt_l.masked_fill_(~bt_m, -1e9)
                 cd_l.masked_fill_(~cd_mask, -1e9)
+
+                # Apply temperature scaling for Gumbel-max sampling
+                _T = self._temperature
+                if _T != 1.0:
+                    bt_l = bt_l / _T
+                    cd_l = cd_l / _T
 
                 static_g_bt.exponential_()
                 s_bt_act = (bt_l - static_g_bt.log_()).argmax(dim=-1)
@@ -652,6 +666,9 @@ class GraphedInference:
                 harv_rows = s_bt_act == HARVESTER_BUILD_TYPE
                 bd_m_final = torch.where(harv_rows.unsqueeze(1), harv_bd_m, bd_m)
                 bd_l.masked_fill_(~bd_m_final, -1e9)
+                if _T != 1.0:
+                    bd_l = bd_l / _T
+                    md_l = md_l / _T
 
                 static_g_bd.exponential_()
                 static_g_cd.exponential_()
@@ -660,14 +677,20 @@ class GraphedInference:
                 s_cd_act = (cd_l - static_g_cd.log_()).argmax(dim=-1)
                 s_md_act = (md_l - static_g_md.log_()).argmax(dim=-1)
 
-                s_bt_lp = bt_l.gather(1, s_bt_act.unsqueeze(1)).squeeze(1) - bt_l.logsumexp(dim=-1)
-                s_bd_lp = bd_l.gather(1, s_bd_act.unsqueeze(1)).squeeze(1) - bd_l.logsumexp(dim=-1)
-                s_cd_lp = cd_l.gather(1, s_cd_act.unsqueeze(1)).squeeze(1) - cd_l.logsumexp(dim=-1)
-                s_md_lp = md_l.gather(1, s_md_act.unsqueeze(1)).squeeze(1) - md_l.logsumexp(dim=-1)
+                s_lp = None
+                if self._return_log_prob:
+                    s_bt_lp = bt_l.gather(1, s_bt_act.unsqueeze(1)).squeeze(1) - bt_l.logsumexp(dim=-1)
+                    s_bd_lp = bd_l.gather(1, s_bd_act.unsqueeze(1)).squeeze(1) - bd_l.logsumexp(dim=-1)
+                    s_cd_lp = cd_l.gather(1, s_cd_act.unsqueeze(1)).squeeze(1) - cd_l.logsumexp(dim=-1)
+                    s_md_lp = md_l.gather(1, s_md_act.unsqueeze(1)).squeeze(1) - md_l.logsumexp(dim=-1)
 
-                bd_causal = (s_bt_act != 0).float()
-                cd_causal = ((s_bt_act == CONVEYOR_BUILD_TYPES[0]) | (s_bt_act == CONVEYOR_BUILD_TYPES[1]) | (s_bt_act == CONVEYOR_BUILD_TYPES[2])).float()
-                s_lp = s_bt_lp + s_bd_lp * bd_causal + s_cd_lp * cd_causal + s_md_lp
+                    bd_causal = (s_bt_act != 0).float()
+                    cd_causal = (
+                        (s_bt_act == CONVEYOR_BUILD_TYPES[0])
+                        | (s_bt_act == CONVEYOR_BUILD_TYPES[1])
+                        | (s_bt_act == CONVEYOR_BUILD_TYPES[2])
+                    ).float()
+                    s_lp = s_bt_lp + s_bd_lp * bd_causal + s_cd_lp * cd_causal + s_md_lp
 
         self._s_bt_act = s_bt_act
         self._s_bd_act = s_bd_act
@@ -686,7 +709,9 @@ class GraphedInference:
         self._graph.replay()
         return (
             self._s_bt_act[:B], self._s_bd_act[:B], self._s_cd_act[:B],
-            self._s_md_act[:B], self._s_lp[:B], self._s_h[:B],
+            self._s_md_act[:B],
+            self._s_lp[:B] if self._s_lp is not None else None,
+            self._s_h[:B],
         )
 
     @property
