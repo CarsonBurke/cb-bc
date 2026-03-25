@@ -33,8 +33,6 @@ def _run_game_proxy(args):
             "states_buf": rd.states_bytes,
             "scalars_buf": rd.scalars_bytes,
             "transfer_events_buf": rd.resource_transfers_bytes,
-            "conveyor_births_buf": rd.conveyor_births_bytes,
-            "tile_transfers_buf": rd.tile_transfers_bytes,
             "state_stride": rd.state_stride,
             "map_w": rd.map_w,
             "map_h": rd.map_h,

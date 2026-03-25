@@ -4,7 +4,7 @@
 //! Exposes the same interface via PyO3 so it's a drop-in replacement.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -320,7 +320,7 @@ fn decode_entity(data: &[u8], _outer_data: &[u8]) -> Entity {
 struct MapData {
     width: usize,
     height: usize,
-    env_grid: Vec<u8>, // row-major, env enum values
+    env_grid: Vec<u8>,          // row-major, env enum values
     cores: Vec<(i32, u8, Pos)>, // (id, team, position)
 }
 
@@ -390,13 +390,30 @@ fn decode_map(data: &[u8]) -> MapData {
 /// Update types we care about from Turn.updates
 enum UpdateEvent {
     PlaceEntity(Entity),
-    MoveBuilderBot { id: i32, to: Pos },
-    RemoveEntity { id: i32 },
+    MoveBuilderBot {
+        id: i32,
+        to: Pos,
+    },
+    RemoveEntity {
+        id: i32,
+    },
     DistributeResources(Vec<(Pos, Pos)>),
-    UpdateHp { id: i32, delta: i32 },
-    UpdatePlayers { a: Option<PlayerRes>, b: Option<PlayerRes> },
-    SetActionCooldown { id: i32, value: i32 },
-    SetMoveCooldown { id: i32, value: i32 },
+    UpdateHp {
+        id: i32,
+        delta: i32,
+    },
+    UpdatePlayers {
+        a: Option<PlayerRes>,
+        b: Option<PlayerRes>,
+    },
+    SetActionCooldown {
+        id: i32,
+        value: i32,
+    },
+    SetMoveCooldown {
+        id: i32,
+        value: i32,
+    },
 }
 
 fn decode_update(data: &[u8]) -> Option<UpdateEvent> {
@@ -517,10 +534,6 @@ struct ReplayData {
     titanium_delivered: Vec<i32>,
     /// Flat i32 buffer: n_turns * 2 — per-turn axionite delivered delta [a0, b0, a1, b1, ...].
     axionite_delivered: Vec<i32>,
-    /// Flat i32 triples [turn, x, y, ...] — friendly conveyor/splitter/armoured placements.
-    conveyor_births: Vec<i32>,
-    /// Flat i32 triples [turn, x, y, ...] — productive transfer events (hop-filtered) at source pos.
-    tile_transfers: Vec<i32>,
     map_w: usize,
     map_h: usize,
     n_turns: usize,
@@ -610,8 +623,6 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
     let mut resource_transfers = vec![0.0f32; n_turns * 2];
     let mut titanium_delivered = vec![0i32; n_turns * 2];
     let mut axionite_delivered = vec![0i32; n_turns * 2];
-    let mut conveyor_births: Vec<i32> = Vec::new();
-    let mut tile_transfers: Vec<i32> = Vec::new();
 
     for (turn_idx, turn_data) in turns.iter().enumerate() {
         // ── Snapshot pre-turn state into contiguous buffer ──
@@ -631,6 +642,8 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
         // Entity channels
         let mut n_own_builders = 0i32;
         let mut n_enemy_builders = 0i32;
+        let mut n_own_working = 0i32;
+        let mut n_enemy_working = 0i32;
 
         for ent in entities.values() {
             let ex = ent.x as usize;
@@ -669,6 +682,11 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                     }
                     if kind == EntityKind::Harvester && ent.cooldown > 0 {
                         state[18 * plane_size + base] = ent.cooldown as f32 / 3.0;
+                        if ent.team == team {
+                            n_own_working += 1;
+                        } else {
+                            n_enemy_working += 1;
+                        }
                     }
                     if kind == EntityKind::Core {
                         core_hp[ent.team as usize] = ent.hp;
@@ -694,18 +712,24 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
         sc[10] = enemy_res.resources_collected as f32 / 500.0;
         sc[11] = entities.len() as f32 / 100.0;
 
-        // Delta and working harvester scalars
+        // Delta and working harvester scalars for the same pre-turn snapshot.
         let cur_own_ti = own_res.titanium as f32;
         let cur_own_ax = own_res.axionite as f32;
         let cur_own_core_hp = core_hp[team_idx] as f32;
-        sc[12] = prev_own_working / 20.0;
+        let cur_own_working = n_own_working as f32;
+        sc[12] = cur_own_working / 20.0;
         sc[13] = (cur_own_ti - prev_own_ti) / 500.0;
         sc[14] = (cur_own_ax - prev_own_ax) / 500.0;
         sc[15] = (cur_own_core_hp - prev_own_core_hp) / 500.0;
-        sc[16] = 0.0; // filled after working harvesters are counted
+        sc[16] = (cur_own_working - prev_own_working) / 20.0;
         prev_own_ti = cur_own_ti;
         prev_own_ax = cur_own_ax;
         prev_own_core_hp = cur_own_core_hp;
+        prev_own_working = cur_own_working;
+
+        let wh = &mut working_harvesters[turn_idx * 2..turn_idx * 2 + 2];
+        wh[team_idx] = n_own_working;
+        wh[enemy_idx] = n_enemy_working;
 
         // ── Decrement harvester cooldowns ──
         for ent in entities.values_mut() {
@@ -725,12 +749,6 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                         let eid = ent.id;
                         if ent.kind == EntityKind::Harvester {
                             harv_positions.insert((ent.x, ent.y), eid);
-                        }
-                        // Track friendly resource-chain births (anything that transfers resources)
-                        if ent.team == team && ent.kind.is_storing() {
-                            conveyor_births.push(turn_idx as i32);
-                            conveyor_births.push(ent.x);
-                            conveyor_births.push(ent.y);
                         }
                         entities.insert(eid, ent);
                     }
@@ -767,10 +785,8 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                         }
                     }
                     UpdateEvent::DistributeResources(moves) => {
-                        let pos_to_eid: HashMap<(i32, i32), i32> = entities
-                            .iter()
-                            .map(|(eid, e)| ((e.x, e.y), *eid))
-                            .collect();
+                        let pos_to_eid: HashMap<(i32, i32), i32> =
+                            entities.iter().map(|(eid, e)| ((e.x, e.y), *eid)).collect();
 
                         for (from, to) in &moves {
                             if let Some(&eid) = harv_positions.get(&(from.x, from.y)) {
@@ -802,12 +818,12 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                     }
                                 }
                             }
-                            if let (Some((src_kind, src_team, _src_stored)), Some((dst_kind, dst_team))) =
-                                (src_meta, dst_meta)
+                            if let (
+                                Some((src_kind, src_team, _src_stored)),
+                                Some((_dst_kind, dst_team)),
+                            ) = (src_meta, dst_meta)
                             {
-                                if src_kind.is_storing()
-                                    && src_team == dst_team
-                                {
+                                if src_kind.is_storing() && src_team == dst_team {
                                     // Flow-aligned: only count if dst is strictly closer to core.
                                     // Weight 1/sqrt(dist) — sub-linear decay keeps far hops
                                     // meaningful while still favoring near-core transfers.
@@ -817,13 +833,8 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                     let dst_dist = (to.x - cc.0).abs() + (to.y - cc.1).abs();
                                     if dst_dist < src_dist {
                                         let weight = 1.0 / (src_dist.max(1) as f32).sqrt();
-                                        resource_transfers[turn_idx * 2 + src_team as usize] += weight;
-                                        // Per-tile transfer for retroactive credit assignment
-                                        if src_team == team {
-                                            tile_transfers.push(turn_idx as i32);
-                                            tile_transfers.push(from.x);
-                                            tile_transfers.push(from.y);
-                                        }
+                                        resource_transfers[turn_idx * 2 + src_team as usize] +=
+                                            weight;
                                     }
                                 }
                             }
@@ -840,22 +851,6 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                 }
             }
         }
-
-        // ── Count working harvesters per team ──
-        let wh = &mut working_harvesters[turn_idx * 2..turn_idx * 2 + 2];
-        for &eid in harv_positions.values() {
-            if let Some(ent) = entities.get(&eid) {
-                if ent.cooldown > 0 {
-                    wh[ent.team as usize] += 1;
-                }
-            }
-        }
-        // Write working harvester delta scalar now that wh is computed
-        let cur_own_working = wh[team_idx] as f32;
-        let sc = &mut scalars[turn_idx * N_SCALARS..(turn_idx + 1) * N_SCALARS];
-        sc[12] = cur_own_working / 20.0;
-        sc[16] = (cur_own_working - prev_own_working) / 20.0;
-        prev_own_working = cur_own_working;
 
         // ── Titanium delivered delta per team ──
         let td = &mut titanium_delivered[turn_idx * 2..turn_idx * 2 + 2];
@@ -877,8 +872,6 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
         resource_transfers,
         titanium_delivered,
         axionite_delivered,
-        conveyor_births,
-        tile_transfers,
         map_w,
         map_h,
         n_turns,
@@ -902,21 +895,17 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
 ///   winner: Optional[int]
 #[pyfunction]
 #[pyo3(signature = (path, team=0))]
-fn parse_replay_full<'py>(
-    py: Python<'py>,
-    path: &str,
-    team: u8,
-) -> PyResult<PyObject> {
-    let data = fs::read(Path::new(path))
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to read {}: {}", path, e)))?;
+fn parse_replay_full<'py>(py: Python<'py>, path: &str, team: u8) -> PyResult<PyObject> {
+    let data = fs::read(Path::new(path)).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to read {}: {}", path, e))
+    })?;
 
     let rd = process_replay(&data, team);
     let result = PyDict::new(py);
 
     // Single contiguous bytes for each buffer — torch.frombuffer directly
-    let states_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(rd.states.as_ptr() as *const u8, rd.states.len() * 4)
-    };
+    let states_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(rd.states.as_ptr() as *const u8, rd.states.len() * 4) };
     result.set_item("states", PyBytes::new(py, states_bytes))?;
 
     let scalars_bytes: &[u8] = unsafe {
@@ -956,22 +945,6 @@ fn parse_replay_full<'py>(
     };
     result.set_item("axionite_delivered", PyBytes::new(py, ad_bytes))?;
 
-    let cb_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            rd.conveyor_births.as_ptr() as *const u8,
-            rd.conveyor_births.len() * 4,
-        )
-    };
-    result.set_item("conveyor_births", PyBytes::new(py, cb_bytes))?;
-
-    let tt_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            rd.tile_transfers.as_ptr() as *const u8,
-            rd.tile_transfers.len() * 4,
-        )
-    };
-    result.set_item("tile_transfers", PyBytes::new(py, tt_bytes))?;
-
     result.set_item("map_w", rd.map_w)?;
     result.set_item("map_h", rd.map_h)?;
     result.set_item("n_turns", rd.n_turns)?;
@@ -986,8 +959,9 @@ fn parse_replay_full<'py>(
 /// Minimal parse: just extract working harvesters and winner.
 #[pyfunction]
 fn parse_replay_working(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let data = fs::read(Path::new(path))
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to read {}: {}", path, e)))?;
+    let data = fs::read(Path::new(path)).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to read {}: {}", path, e))
+    })?;
 
     let rd = process_replay(&data, 0);
     let result = PyDict::new(py);
@@ -1008,8 +982,9 @@ fn parse_replay_working(py: Python<'_>, path: &str) -> PyResult<PyObject> {
 /// Parse replay and return full Python dict (compatible with Python replay_parser.parse_replay).
 #[pyfunction]
 fn parse_replay(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let data = fs::read(Path::new(path))
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to read {}: {}", path, e)))?;
+    let data = fs::read(Path::new(path)).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to read {}: {}", path, e))
+    })?;
 
     let top = decode_fields(&data, 0, data.len());
 
