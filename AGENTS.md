@@ -46,6 +46,14 @@ All commands run via the project venv: `.venv/bin/cambc`. Map names require the 
 
 Replays are written to `replays/`.
 
+## Testing Discipline
+
+- **Prefer test-driven changes.** When fixing a bug or changing training logic, first add or update a focused regression test that would fail without the fix, then make the code change.
+- **Keep tests in the same change.** If behavior, interfaces, reward shaping, PPO math, masking, or logging formats change, update the relevant tests in the same task. Do not leave known-stale tests behind.
+- **Test the exact failure mode.** Prefer narrow unit/regression tests over broad smoke tests when validating subtle training issues like log-prob recomputation, clipping, reward accounting, or action legality.
+- **Run the smallest relevant test set first.** Start with the targeted test file(s), then run adjacent coverage once the fix is in.
+- **Treat missing coverage as technical debt to pay immediately.** If a risky path has no test and you touch it, add one.
+
 ## Ablations
 
 ### Tooling
