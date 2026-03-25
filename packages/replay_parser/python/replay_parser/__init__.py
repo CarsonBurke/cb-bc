@@ -126,6 +126,16 @@ class ReplayData:
         """Contiguous i32[n_turns, 2] — per-turn ax delivered delta."""
         return self._raw.get("axionite_delivered", b"")
 
+    @property
+    def conveyor_births_bytes(self) -> bytes:
+        """Flat i32 triples [turn, x, y, ...] — friendly conveyor placements."""
+        return self._raw.get("conveyor_births", b"")
+
+    @property
+    def tile_transfers_bytes(self) -> bytes:
+        """Flat i32 triples [turn, x, y, ...] — productive transfer events at source pos."""
+        return self._raw.get("tile_transfers", b"")
+
     # ── Per-turn slice access (zero-copy with torch) ──
 
     def state_bytes_for_turn(self, turn: int) -> memoryview:

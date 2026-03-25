@@ -517,6 +517,10 @@ struct ReplayData {
     titanium_delivered: Vec<i32>,
     /// Flat i32 buffer: n_turns * 2 — per-turn axionite delivered delta [a0, b0, a1, b1, ...].
     axionite_delivered: Vec<i32>,
+    /// Flat i32 triples [turn, x, y, ...] — friendly conveyor/splitter/armoured placements.
+    conveyor_births: Vec<i32>,
+    /// Flat i32 triples [turn, x, y, ...] — productive transfer events (hop-filtered) at source pos.
+    tile_transfers: Vec<i32>,
     map_w: usize,
     map_h: usize,
     n_turns: usize,
@@ -606,6 +610,8 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
     let mut resource_transfers = vec![0.0f32; n_turns * 2];
     let mut titanium_delivered = vec![0i32; n_turns * 2];
     let mut axionite_delivered = vec![0i32; n_turns * 2];
+    let mut conveyor_births: Vec<i32> = Vec::new();
+    let mut tile_transfers: Vec<i32> = Vec::new();
 
     for (turn_idx, turn_data) in turns.iter().enumerate() {
         // ── Snapshot pre-turn state into contiguous buffer ──
@@ -720,6 +726,12 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                         if ent.kind == EntityKind::Harvester {
                             harv_positions.insert((ent.x, ent.y), eid);
                         }
+                        // Track friendly resource-chain births (anything that transfers resources)
+                        if ent.team == team && ent.kind.is_storing() {
+                            conveyor_births.push(turn_idx as i32);
+                            conveyor_births.push(ent.x);
+                            conveyor_births.push(ent.y);
+                        }
                         entities.insert(eid, ent);
                     }
                     UpdateEvent::MoveBuilderBot { id, to } => {
@@ -806,6 +818,12 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                     if dst_dist < src_dist {
                                         let weight = 1.0 / (src_dist.max(1) as f32).sqrt();
                                         resource_transfers[turn_idx * 2 + src_team as usize] += weight;
+                                        // Per-tile transfer for retroactive credit assignment
+                                        if src_team == team {
+                                            tile_transfers.push(turn_idx as i32);
+                                            tile_transfers.push(from.x);
+                                            tile_transfers.push(from.y);
+                                        }
                                     }
                                 }
                             }
@@ -859,6 +877,8 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
         resource_transfers,
         titanium_delivered,
         axionite_delivered,
+        conveyor_births,
+        tile_transfers,
         map_w,
         map_h,
         n_turns,
@@ -935,6 +955,22 @@ fn parse_replay_full<'py>(
         )
     };
     result.set_item("axionite_delivered", PyBytes::new(py, ad_bytes))?;
+
+    let cb_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            rd.conveyor_births.as_ptr() as *const u8,
+            rd.conveyor_births.len() * 4,
+        )
+    };
+    result.set_item("conveyor_births", PyBytes::new(py, cb_bytes))?;
+
+    let tt_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            rd.tile_transfers.as_ptr() as *const u8,
+            rd.tile_transfers.len() * 4,
+        )
+    };
+    result.set_item("tile_transfers", PyBytes::new(py, tt_bytes))?;
 
     result.set_item("map_w", rd.map_w)?;
     result.set_item("map_h", rd.map_h)?;
