@@ -82,9 +82,6 @@ from model import (
     train_on_trajectories,
     GraphedInference,
 )
-from replay_parser import (
-    augment_trajectories_with_working_counts,
-)
 from flow_reward import compute_retroactive_build_rewards, augment_trajectories_with_build_rewards
 
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
