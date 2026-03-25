@@ -58,12 +58,12 @@ INITIAL_BUILD_TYPE_BIAS = [
     -0.7,  # foundry
     -0.5,  # launcher
 ]
-REWARD_BUILD_CREDIT = 20.0  # scale for retroactive conveyor build credit
+REWARD_BUILD_CREDIT = 20.0  # scale for replay-derived dense flow reward
 
 # ---- Dreamer4-style symexp two-hot value prediction ----
 NUM_BUCKETS = 255
-BUCKET_LOW = -20.0
-BUCKET_HIGH = 20.0
+BUCKET_LOW = -9.9035  # symlog(20_000) — bucket extremes at ±20k in value space
+BUCKET_HIGH = 9.9035
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -153,6 +153,56 @@ def value_target_probs(
     if bins.device != targets.device or bins.dtype != targets.dtype:
         bins = bins.to(device=targets.device, dtype=targets.dtype)
     return twohot_encode(targets, bins)
+
+
+def soft_cross_entropy_from_logits(
+    logits: torch.Tensor,
+    target_probs: torch.Tensor,
+) -> torch.Tensor:
+    """Cross-entropy for soft targets against raw logits."""
+    return -(target_probs * F.log_softmax(logits, dim=-1)).sum(dim=-1)
+
+
+def soft_cross_entropy_from_probs(
+    pred_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Cross-entropy for soft targets against normalized probabilities."""
+    return -(target_probs * pred_probs.clamp_min(eps).log()).sum(dim=-1)
+
+
+def distributional_value_loss(
+    logits: torch.Tensor,
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    bins: torch.Tensor,
+    *,
+    old_values: torch.Tensor | None = None,
+    clip_vloss: bool = True,
+    value_clip: float = 0.4,
+) -> torch.Tensor:
+    """PPO-style clipped value loss for a distributional critic.
+
+    The clip decision is made in decoded scalar value space, matching PPO's
+    value-clipping rule. Once the branch is chosen, the loss still scores the
+    model's logits against a two-hot target so distribution shape remains part
+    of the optimization target.
+    """
+    return_target = value_target_probs(returns, bins)
+    unclipped_ce = soft_cross_entropy_from_logits(logits, return_target)
+
+    if not clip_vloss or old_values is None:
+        return unclipped_ce
+
+    clipped_values = old_values + (values - old_values).clamp(-value_clip, value_clip)
+    scalar_loss_unclipped = (values - returns).square()
+    scalar_loss_clipped = (clipped_values - returns).square()
+
+    clipped_target = value_target_probs(clipped_values, bins)
+    clipped_ce = soft_cross_entropy_from_logits(logits, clipped_target)
+    use_clipped = scalar_loss_clipped > scalar_loss_unclipped
+    return torch.where(use_clipped, clipped_ce, unclipped_ce)
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
@@ -401,6 +451,46 @@ class RMSNorm2d(nn.Module):
         return x * torch.rsqrt(x.square().mean(1, keepdim=True) + self.eps) * self.weight.view(1, -1, 1, 1)
 
 
+class CriticBottleneckBlock(nn.Module):
+    """Full-resolution residual bottleneck for symbolic map reasoning.
+
+    The block keeps the post-conv latent compact while briefly widening into a
+    richer hidden state for spatial mixing. On our training GPU this style
+    outperformed a literal MobileNet depthwise port at the critic's small width.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        hidden_dim: int,
+        kernel_size: int,
+        dilation: int,
+    ):
+        super().__init__()
+        pad = dilation * (kernel_size // 2)
+
+        self.expand = nn.Conv2d(dim, hidden_dim, 1)
+        self.expand_norm = RMSNorm2d(hidden_dim)
+        self.spatial = nn.Conv2d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size,
+            padding=pad,
+            dilation=dilation,
+        )
+        self.spatial_norm = RMSNorm2d(hidden_dim)
+        self.project = nn.Conv2d(hidden_dim, dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.expand(x)
+        y = F.silu(self.expand_norm(y))
+        y = self.spatial(y)
+        y = F.silu(self.spatial_norm(y))
+        y = self.project(y)
+        return x + y
+
+
 class CentralizedCritic(nn.Module):
     """Centralized per-unit critic over full replay-derived map state.
 
@@ -426,15 +516,11 @@ class CentralizedCritic(nn.Module):
             nn.Conv2d(map_channels, conv_dim, 1),
             RMSNorm2d(conv_dim),
             nn.SiLU(),
-            # Full-resolution spatial layers — no stride so per-tile
-            # conveyor directions are preserved for supply line analysis.
-            nn.Conv2d(conv_dim, conv_dim, 3, padding=1),
-            RMSNorm2d(conv_dim),
-            nn.SiLU(),
-            nn.Conv2d(conv_dim, conv_dim, 3, padding=2, dilation=2),
-            RMSNorm2d(conv_dim),
-            nn.SiLU(),
-            nn.Conv2d(conv_dim, conv_dim, 3, padding=4, dilation=4),
+            # Stage local symbolic decoding first, then grow map context with
+            # wider kernels and dilations while keeping the readout latent compact.
+            CriticBottleneckBlock(conv_dim, hidden_dim=64, kernel_size=5, dilation=1),
+            CriticBottleneckBlock(conv_dim, hidden_dim=64, kernel_size=3, dilation=2),
+            CriticBottleneckBlock(conv_dim, hidden_dim=64, kernel_size=3, dilation=4),
             RMSNorm2d(conv_dim),
             nn.SiLU(),
         )
@@ -1750,26 +1836,15 @@ def ppo_update(
                     # Dreamer4-style value loss: decode to a scalar, clip in
                     # scalar space, and encode both targets with the same exact
                     # two-hot operator over the value bins.
-                    return_target = value_target_probs(
-                        mb_returns[si], critic.bucket_centers,
+                    v_loss_elems = distributional_value_loss(
+                        logits,
+                        newvalue,
+                        mb_returns[si],
+                        critic.bucket_centers,
+                        old_values=mb_old_values[si] if mb_old_values is not None else None,
+                        clip_vloss=clip_vloss,
+                        value_clip=value_clip,
                     )
-                    v_loss_unclipped = F.cross_entropy(
-                        logits, return_target, reduction='none',
-                    )
-
-                    if clip_vloss and mb_old_values is not None:
-                        clipped_val = mb_old_values[si] + (newvalue - mb_old_values[si]).clamp(
-                            -value_clip, value_clip,
-                        )
-                        clipped_logits = value_target_probs(
-                            clipped_val, critic.bucket_centers,
-                        )
-                        v_loss_clipped = F.cross_entropy(
-                            clipped_logits, return_target, reduction='none',
-                        )
-                        v_loss_elems = torch.max(v_loss_unclipped, v_loss_clipped)
-                    else:
-                        v_loss_elems = v_loss_unclipped
 
                     vf_loss_sum += v_loss_elems.detach().sum().item()
                     (vf_coeff * v_loss_elems.sum() / vf_denom).backward()
@@ -2129,11 +2204,6 @@ def _build_centralized_critic_data(
     }
 
 
-# Max steps a single unit can take in a full game (~2000 rounds).
-# Episodes reaching this are truncated (tiebreaker), not terminated.
-_TRUNCATION_THRESHOLD = 1900
-
-
 def _compute_gae(
     rewards: torch.Tensor,
     values: torch.Tensor,
@@ -2141,12 +2211,11 @@ def _compute_gae(
     gamma: float = 0.995,
     gae_lambda: float = 0.95,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Vectorized GAE on GPU with proper truncation handling.
+    """Vectorized GAE on GPU for terminal per-unit trajectories.
 
-    Pads episodes to (E, max_len), computes TD residuals in one shot,
-    then reverse-scans over T (sequential) but vectorized across all E episodes.
-    Episodes >= _TRUNCATION_THRESHOLD steps bootstrap with V(s_final);
-    shorter episodes (core destroyed / unit killed) bootstrap with 0.
+    Training episodes are complete unit lifetimes: they end on unit death or
+    game termination, not on an arbitrary collector cutoff. That means the
+    final step should be treated as terminal and bootstrap with 0.
     """
     dev = rewards.device
     N = rewards.shape[0]
@@ -2167,22 +2236,14 @@ def _compute_gae(
     r_pad[valid] = rewards[valid_idx]
     v_pad[valid] = values[valid_idx]
 
-    # Nonterminal mask: 1.0 for interior steps + last step of truncated episodes
-    truncated = ep_lens >= _TRUNCATION_THRESHOLD
+    # Nonterminal mask: only interior steps bootstrap from the next value.
     interior = t_range < (ep_lens - 1).clamp(min=0).unsqueeze(1)
-    last_step = t_range == (ep_lens - 1).clamp(min=0).unsqueeze(1)
-    nonterminal = (interior | (last_step & truncated.unsqueeze(1) & (ep_lens > 0).unsqueeze(1))).float()
+    nonterminal = interior.float()
 
-    # Build next_values: shift left, bootstrap truncated with V(s_T)
+    # Build next_values by shifting within each episode; terminal tail stays 0.
     next_v = torch.zeros_like(v_pad)
     if max_len > 1:
         next_v[:, :-1] = v_pad[:, 1:]
-    trunc_mask = truncated & (ep_lens > 0)
-    if trunc_mask.any():
-        ep_idx = torch.arange(n_eps, device=dev)
-        trunc_i = ep_idx[trunc_mask]
-        trunc_last = (ep_lens[trunc_mask] - 1).clamp(min=0)
-        next_v[trunc_i, trunc_last] = v_pad[trunc_i, trunc_last]
 
     # TD residuals: delta = r + gamma * next_v * nonterminal - v
     delta = r_pad + gamma * next_v * nonterminal - v_pad
