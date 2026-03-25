@@ -67,9 +67,7 @@ from model import (
     HARVESTER_BUILD_TYPE,
     H_DIM,
     OBS_SIZE,
-    REWARD_FLOW_THROUGHPUT,
-    REWARD_ENEMY_CORE_DAMAGE,
-    REWARD_OWN_CORE_DAMAGE,
+    REWARD_BUILD_CREDIT,
     TILE_FEATURES,
     TEACHER_HIDDEN,
     _parse_trajectories,
@@ -87,7 +85,7 @@ from model import (
 from replay_parser import (
     augment_trajectories_with_working_counts,
 )
-from flow_reward import compute_per_round_throughput, augment_trajectories_with_throughput
+from flow_reward import compute_retroactive_build_rewards, augment_trajectories_with_build_rewards
 
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
@@ -807,17 +805,16 @@ def collect_games_batched(
             per_opp_winners.setdefault(oid, []).append(None)
             continue
         game_trajs = _read_trajectory_file(log_path)
-        # Augment with replay-derived internal resource transfer events
-        # (replaces the old occupancy-based throughput proxy in n_working slot).
-        if gstates and gstates.get("states_buf"):
+        # Retroactive build credit: attribute each conveyor's lifetime
+        # productive transfers back to the round it was built.
+        # Always call augment to zero out stale n_working values.
+        build_rewards: dict[int, float] = {}
+        if gstates and gstates.get("conveyor_births_buf"):
             try:
-                throughput = compute_per_round_throughput(gstates)
-                game_trajs = augment_trajectories_with_throughput(game_trajs, throughput)
+                build_rewards = compute_retroactive_build_rewards(gstates)
             except Exception as e:
-                print(f"  Throughput augmentation error: {e}")
-                game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
-        else:
-            game_trajs = augment_trajectories_with_working_counts(game_trajs, working, team=0)
+                print(f"  Build reward augmentation error: {e}")
+        game_trajs = augment_trajectories_with_build_rewards(game_trajs, build_rewards)
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -1068,9 +1065,7 @@ def main():
                     conv_fail = s.get("conv_fail", 0)
                     conv_gate = s.get("conv_gate", 0)
                     conv_paid = s.get("conv_paid", 0)
-                r_work += n_working * REWARD_FLOW_THROUGHPUT
-                r_dmg += dmg * REWARD_ENEMY_CORE_DAMAGE
-                r_own_dmg += own_dmg * REWARD_OWN_CORE_DAMAGE
+                r_work += n_working * REWARD_BUILD_CREDIT
                 harv_attempts += harv_attempt
                 harv_failures += harv_fail
                 harv_prox_gate += harv_gate
@@ -1079,9 +1074,9 @@ def main():
                 conv_failures += conv_fail
                 conv_prox_gate += conv_gate
                 conv_prox_paid += conv_paid
-            total = r_work + r_dmg + r_own_dmg
+            total = r_work
             return (
-                total, r_work, r_dmg, r_own_dmg,
+                total, r_work, 0.0, 0.0,
                 harv_attempts, harv_failures, harv_prox_gate, harv_prox_paid,
                 conv_attempts, conv_failures, conv_prox_gate, conv_prox_paid,
             )

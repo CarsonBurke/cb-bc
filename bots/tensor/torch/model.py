@@ -31,8 +31,8 @@ INPUT_SIZE = OBS_SIZE + H_DIM
 TILE_EMBED_DIM = 8
 TILE_INPUT_DIM = TILE_FEATURES + 2  # 21: raw features + (dx/2, dy/2)
 TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
-COMPRESS_DIM = 64  # tile compress output dim (spatial pooling)
-TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 103
+COMPRESS_DIM = 80  # tile compress output dim (spatial pooling)
+TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 119
 OBS_PREFIX_SIZE = TRUNK_INPUT_SIZE - H_DIM
 ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 12
@@ -58,9 +58,7 @@ INITIAL_BUILD_TYPE_BIAS = [
     -0.7,  # foundry
     -0.5,  # launcher
 ]
-REWARD_FLOW_THROUGHPUT = 50.0
-REWARD_ENEMY_CORE_DAMAGE = 20.0
-REWARD_OWN_CORE_DAMAGE = -40.0  # heavy punishment for damage taken to our core
+REWARD_BUILD_CREDIT = 50.0  # scale for retroactive conveyor build credit
 
 # ---- DreamerV3-style symlog twohot value prediction ----
 NUM_BUCKETS = 255
@@ -932,7 +930,7 @@ class BuilderMLP(nn.Module):
         nn.init.zeros_(self.tile_pointwise.bias)
         self.tile_rms = RMSNorm(TILE_EMBED_DIM)
         self.tile_act = nn.SiLU()
-        # Compress 25×8=200 spatially-mixed tile features → 64-dim summary
+        # Compress 25×8=200 spatially-mixed tile features → 80-dim summary
         self.tile_compress = nn.Sequential(
             _ortho_init(nn.Linear(TILE_GRID_N * TILE_EMBED_DIM, COMPRESS_DIM)),
             RMSNorm(COMPRESS_DIM),
@@ -997,7 +995,7 @@ class BuilderMLP(nn.Module):
         h = self.tile_act(h)                                # (B, 25, 8)
         # Compress to fixed-size tile summary
         h_flat = h.reshape(B, TILE_GRID_N * TILE_EMBED_DIM) # (B, 200)
-        return self.tile_compress(h_flat)                    # (B, 64)
+        return self.tile_compress(h_flat)                    # (B, 80)
 
     def _build_trunk_input(self, obs: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         """Build trunk input: compressed tiles + globals + pos_embed + h_prev."""
@@ -1937,21 +1935,13 @@ def _parse_trajectories(
                         dmg = step.get("dmg", 0)
                         own_dmg = step.get("own_dmg", 0)
                         lp_t[i] = step.get("old_lp", 0)
-                    rw_t[i] = (
-                        n_working * REWARD_FLOW_THROUGHPUT
-                        + dmg * REWARD_ENEMY_CORE_DAMAGE
-                        + own_dmg * REWARD_OWN_CORE_DAMAGE
-                    )
+                    rw_t[i] = n_working * REWARD_BUILD_CREDIT
                 step_game_t[start:end] = game_idx
                 idx = end
                 ep_boundaries.append((start, end))
                 continue
 
-            rw_t[start:end] = (
-                n_working_t * REWARD_FLOW_THROUGHPUT
-                + dmg_t * REWARD_ENEMY_CORE_DAMAGE
-                + own_dmg_t * REWARD_OWN_CORE_DAMAGE
-            )
+            rw_t[start:end] = n_working_t * REWARD_BUILD_CREDIT
             step_game_t[start:end] = game_idx
             idx = end
             ep_boundaries.append((start, end))
