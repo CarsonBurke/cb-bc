@@ -47,7 +47,7 @@ POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN_SIZES = [64, 48]
 H_DIM = 24  # Recurrent hidden state size
-COMPRESS_DIM = 64
+COMPRESS_DIM = 80
 RMSNORM_LAYERS = [True, True]
 
 DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
@@ -67,6 +67,18 @@ BUILD_ACTIONS = [
     "foundry",
     "launcher",
 ]
+_ACTION_NONE = 0
+_ACTION_HARVESTER = 1
+_ACTION_CONVEYOR = 2
+_ACTION_ROAD = 3
+_ACTION_GUNNER = 4
+_ACTION_SENTINEL = 5
+_ACTION_BREACH = 6
+_ACTION_SPLITTER = 7
+_ACTION_ARMOURED_CONVEYOR = 8
+_ACTION_BARRIER = 9
+_ACTION_FOUNDRY = 10
+_ACTION_LAUNCHER = 11
 
 # Maps network output index -> Direction (3x3 grid layout)
 DIR_MAP_9 = [
@@ -158,7 +170,6 @@ _BLD_ONE_HOTS = tuple(
     tuple(1.0 if i == idx else 0.0 for i in range(N_BLD_TYPES))
     for idx in range(N_BLD_TYPES)
 )
-
 # Weights file path (adjacent to main.py)
 WEIGHT_PATH = os.path.join(BOT_DIR, "weights.json")
 _HARVESTER_BUILD_TYPE = 1
@@ -180,6 +191,8 @@ def _weight_cache_key(path: str) -> tuple[str, int, int] | None:
 TILE_FEATURES_COUNT = 19
 TILE_INPUT_DIM = TILE_FEATURES_COUNT + 2  # 21: raw features + (dx/2, dy/2)
 TILE_EMBED_DIM = 8
+OBS_SIZE = _GLOBAL_OBS_START + GLOBAL_FEATURES + POS_EMBED_DIM
+_ZERO_OBS = (0.0,) * OBS_SIZE
 
 
 def _build_model() -> MLP:
@@ -256,6 +269,8 @@ class Player:
 
         self._prev_resources: tuple[float, float] | None = None
         self._spawn_round: int = -1
+        self._obs_buf: list[float] = []
+        self._feature_buf: list[float] = []
 
     def run(self, ct: Controller) -> None:
         etype = ct.get_entity_type()
@@ -303,30 +318,19 @@ class Player:
             self._spawn_round = ct.get_current_round()
         if self.my_team is None:
             self.my_team = ct.get_team()
-        if self.core_center is None:
-            self._find_core(ct)
         nearby_tiles = ct.get_nearby_tiles()
         nearby_entities = ct.get_nearby_entities()
-        # Accumulate ore discoveries and enemy core damage.
-        # Working-harvester reward is replay-derived during training, so we do
-        # not spend per-turn CPU estimating it from partial vision here.
-        self._discover_ore(ct, nearby_tiles)
-        self._scan_enemy_core_dmg(ct, nearby_entities)
-        # Opportunistically scan for enemy core
-        if self.enemy_core is None:
-            for eid in nearby_entities:
-                try:
-                    if ct.get_entity_type(eid) == EntityType.CORE and ct.get_team(eid) != self.my_team:
-                        self.enemy_core = ct.get_position(eid)
-                        break
-                except Exception:
-                    continue
+        if self.core_center is None or self.enemy_core is None:
+            self._find_cores_in_entities(ct, nearby_entities)
 
         # Encode game state + recurrent hidden -> feature vector
         obs = self._encode_state(ct, nearby_tiles, nearby_entities)
 
         h_in = self.h_prev
-        features = obs + h_in
+        features = self._feature_buf
+        features.clear()
+        features.extend(obs)
+        features.extend(h_in)
         outputs = self.model.infer(features)
 
         # minGRU: gated recurrent update
@@ -354,24 +358,15 @@ class Player:
         conv_dir_idx = _argmax(outputs["conv_dir"], None)
         move_dir_idx = _argmax(outputs["move_dir"], None)
 
-        # Snapshot resources before actions to isolate delivery from spending
-        ti_before, ax_before = ct.get_global_resources()
-
         # Execute actions
-        build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = CONV_DIR_4[conv_dir_idx]
-        harv_reward, conv_reward = self._execute_build(ct, build_action, build_dir, conv_dir)
-        place_reward = harv_reward + conv_reward
+        self._execute_build(ct, build_type_idx, build_dir, conv_dir)
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
 
-        # Enemy core damage (class-level, accumulated from all units' vision)
-        enemy_dmg = Player._enemy_core_dmg
-
-        ti_after, ax_after = ct.get_global_resources()
-        self._prev_resources = (ti_after, ax_after)
+        self._prev_resources = ct.get_global_resources()
 
     @staticmethod
     def _discover_ore(ct: Controller, nearby_tiles=None) -> None:
@@ -501,77 +496,113 @@ class Player:
                 continue
         return self.core_center or ct.get_position()
 
+    def _find_cores_in_entities(self, ct: Controller, nearby_entities) -> Position:
+        if self.my_team is None:
+            self.my_team = ct.get_team()
+        get_entity_type = ct.get_entity_type
+        get_team = ct.get_team
+        get_position = ct.get_position
+        for eid in nearby_entities:
+            try:
+                if get_entity_type(eid) != EntityType.CORE:
+                    continue
+                if get_team(eid) == self.my_team:
+                    self.core_center = get_position(eid)
+                else:
+                    self.enemy_core = get_position(eid)
+            except Exception:
+                continue
+        return self.core_center or ct.get_position()
+
     # ---- State encoding ----
 
     def _encode_state_into(self, ct: Controller, features, nearby_tiles=None, nearby_entities=None) -> None:
         """Append encoded state into a list-like float buffer."""
+        if len(features) != OBS_SIZE:
+            features.clear()
+            features.extend(_ZERO_OBS)
+        else:
+            features[:] = _ZERO_OBS
         pos = ct.get_position()
+        pos_x = pos.x
+        pos_y = pos.y
         my_team = self.my_team
-        append = features.append
-        extend = features.extend
         get_tile_env = ct.get_tile_env
+        is_tile_passable = ct.is_tile_passable
         get_tile_building_id = ct.get_tile_building_id
         get_tile_builder_bot_id = ct.get_tile_builder_bot_id
         get_entity_type = ct.get_entity_type
         get_team = ct.get_team
         get_direction = ct.get_direction
+        get_stored_resource = ct.get_stored_resource
+        get_position = ct.get_position
+        get_hp = ct.get_hp
 
         # 5x5 local grid
         w, h = ct.get_map_width(), ct.get_map_height()
+        ore_keys = Player._all_ore_keys
+        ore_tiles = Player._all_ore
+        if ore_tiles is None:
+            ore_tiles = []
+            Player._all_ore = ore_tiles
+            Player._all_ore_keys = ore_keys = set()
         if nearby_tiles is None:
             nearby_tiles = ct.get_nearby_tiles()
-        visible_tiles = {(tile_pos.x, tile_pos.y): tile_pos for tile_pos in nearby_tiles}
-        for dx, dy in _LOCAL_TILE_OFFSETS:
-            tx, ty = pos.x + dx, pos.y + dy
-            if tx < 0 or tx >= w or ty < 0 or ty >= h:
-                extend(_ZERO_TILE)
+        for tile_pos in nearby_tiles:
+            tx = tile_pos.x
+            ty = tile_pos.y
+            lx = tx - pos_x + GRID_HALF
+            ly = ty - pos_y + GRID_HALF
+            if lx < 0 or lx >= GRID_SIZE or ly < 0 or ly >= GRID_SIZE:
                 continue
-            tp = visible_tiles.get((tx, ty))
-            if tp is None:
-                extend(_ZERO_TILE)
+            try:
+                env = get_tile_env(tile_pos)
+            except Exception:
                 continue
+            key = (tx, ty)
+            if key not in ore_keys and env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
+                ore_tiles.append(tile_pos)
+                ore_keys.add(key)
+            base = (ly * GRID_SIZE + lx) * TILE_FEATURES
+            features[base] = 1.0 if env == Environment.WALL else 0.0
+            features[base + 1] = 1.0 if env == Environment.ORE_TITANIUM else 0.0
+            features[base + 2] = 1.0 if env == Environment.ORE_AXIONITE else 0.0
+            features[base + 3] = 0.0 if is_tile_passable(tile_pos) else 1.0
+            features[base + 4] = 1.0  # default building type: none
 
-            env = get_tile_env(tp)
-            append(1.0 if env == Environment.WALL else 0.0)
-            append(1.0 if env == Environment.ORE_TITANIUM else 0.0)
-            append(1.0 if env == Environment.ORE_AXIONITE else 0.0)
-            append(0.0 if ct.is_tile_passable(tp) else 1.0)
-
-            bid = get_tile_building_id(tp)
+            bid = get_tile_building_id(tile_pos)
             if bid is not None:
-                btype = get_entity_type(bid)
-                bidx = BLD_IDX.get(btype, 3)
-                extend(_BLD_ONE_HOTS[bidx])
-                append(1.0 if get_team(bid) == my_team else -1.0)
                 try:
                     bdir = get_direction(bid)
-                    bdx, bdy = DIR_DXY.get(bdir, (0, 0))
-                    append(float(bdx))
-                    append(float(bdy))
+                    sr = get_stored_resource(bid)
                 except Exception:
-                    extend((0.0, 0.0))
-                append(0.0)  # bld_cooldown: populated by replay parser during training
-                try:
-                    sr = ct.get_stored_resource(bid)
-                    append(0.0 if sr is None else 1.0 if sr == ResourceType.TITANIUM else -1.0)
-                except Exception:
-                    append(0.0)
-            else:
-                extend(_NO_BUILD_TILE)
+                    bdir = Direction.CENTRE
+                    sr = None
+                btype = get_entity_type(bid)
+                bidx = BLD_IDX.get(btype, 3)
+                one_hot = _BLD_ONE_HOTS[bidx]
+                features[base + 4:base + 12] = one_hot
+                features[base + 12] = 1.0 if get_team(bid) == my_team else -1.0
+                bdx, bdy = DIR_DXY.get(bdir, (0, 0))
+                features[base + 13] = float(bdx)
+                features[base + 14] = float(bdy)
+                features[base + 16] = 0.0 if sr is None else 1.0 if sr == ResourceType.TITANIUM else -1.0
 
-            uid = get_tile_builder_bot_id(tp)
+            uid = get_tile_builder_bot_id(tile_pos)
             if uid is not None:
-                append(1.0)
-                append(1.0 if get_team(uid) == my_team else -1.0)
-            else:
-                extend((0.0, 0.0))
+                features[base + 17] = 1.0
+                features[base + 18] = 1.0 if get_team(uid) == my_team else -1.0
 
-        rnd = ct.get_current_round() / 2000.0
-        x_norm = pos.x / max(w, 1)
-        y_norm = pos.y / max(h, 1)
+        rnd_n = ct.get_current_round()
+        rnd = rnd_n / 2000.0
+        x_norm = pos_x / max(w, 1)
+        y_norm = pos_y / max(h, 1)
         ti, ax = ct.get_global_resources()
         scale = ct.get_scale_percent() / 500.0
 
+        if Player._enemy_core_dmg_round != rnd_n:
+            Player._enemy_core_dmg = 0.0
+            Player._enemy_core_dmg_round = rnd_n
         n_builders = 0
         own_hp, enemy_hp = Player._own_core_hp, Player._enemy_core_hp
         if nearby_entities is None:
@@ -585,29 +616,32 @@ class Player:
                 elif etype == EntityType.CORE:
                     if team == my_team:
                         if self.core_center is None:
-                            self.core_center = ct.get_position(eid)
-                        own_hp = ct.get_hp(eid)
+                            self.core_center = get_position(eid)
+                        own_hp = get_hp(eid)
                         Player._own_core_hp = own_hp
                     else:
                         if self.enemy_core is None:
-                            self.enemy_core = ct.get_position(eid)
-                        hp = ct.get_hp(eid)
+                            self.enemy_core = get_position(eid)
+                        hp = get_hp(eid)
+                        dmg = max(0.0, Player._enemy_core_hp - hp)
+                        if dmg > Player._enemy_core_dmg:
+                            Player._enemy_core_dmg = dmg
                         Player._enemy_core_hp = hp
                         enemy_hp = hp
             except Exception:
                 pass
         core_dx, core_dy = 0.0, 0.0
         if self.core_center is not None:
-            cdx = self.core_center.x - pos.x
-            cdy = self.core_center.y - pos.y
+            cdx = self.core_center.x - pos_x
+            cdy = self.core_center.y - pos_y
             d = max(abs(cdx), abs(cdy), 1)
             core_dx = cdx / d
             core_dy = cdy / d
 
         ecore_dx, ecore_dy = 0.0, 0.0
         if self.enemy_core is not None:
-            edx = self.enemy_core.x - pos.x
-            edy = self.enemy_core.y - pos.y
+            edx = self.enemy_core.x - pos_x
+            edy = self.enemy_core.y - pos_y
             d = max(abs(edx), abs(edy), 1)
             ecore_dx = edx / d
             ecore_dy = edy / d
@@ -620,19 +654,19 @@ class Player:
 
         hp_advantage = (own_hp - enemy_hp) / 500.0
 
-        extend([
+        features[_GLOBAL_OBS_START:_GLOBAL_OBS_START + GLOBAL_FEATURES] = (
             rnd, x_norm, y_norm, ti / 500.0, ax / 500.0, scale,
             core_dx, core_dy, ecore_dx, ecore_dy,
             n_builders / 10.0,
             ti_delta, ax_delta, hp_advantage,
             self._spawn_round / 2000.0 if self._spawn_round >= 0 else 0.0,
-        ])
-
-        extend(self.pos_encoder.encode(pos.x, pos.y))
+        )
+        features[_GLOBAL_OBS_START + GLOBAL_FEATURES:OBS_SIZE] = self.pos_encoder.encode(pos_x, pos_y)
 
     def _encode_state(self, ct: Controller, nearby_tiles=None, nearby_entities=None) -> list[float]:
         """Encode 5x5 grid (16 feat/tile) + global (14) + pos embed (8)."""
-        features: list[float] = []
+        features = self._obs_buf
+        features.clear()
         self._encode_state_into(ct, features, nearby_tiles, nearby_entities)
         return features
 
@@ -641,18 +675,17 @@ class Player:
     _PLACE_HARV = 5.0
 
     def _execute_build(
-        self, ct: Controller, action: str, direction: Direction, conv_direction: Direction | None = None
+        self, ct: Controller, action_idx: int, direction: Direction, conv_direction: Direction | None = None
     ) -> tuple[float, float]:
         """Execute build action. Returns (harv_reward, conv_reward).
 
         If the target tile has a friendly non-core building, auto-destroys it
         first (destroy has no cooldown cost). Skips if we can't afford the build.
         """
-        if action == "none":
+        if action_idx == _ACTION_NONE:
             return 0.0, 0.0
 
-        pos = ct.get_position()
-        build_pos = pos.add(direction)
+        build_pos = ct.get_position().add(direction)
 
         # Bounds check — build_pos can be out of map when near edges
         w, h = ct.get_map_width(), ct.get_map_height()
@@ -664,19 +697,19 @@ class Player:
         bid = ct.get_tile_building_id(build_pos)
         if bid is not None:
             try:
-                if ct.get_team(bid) == self.my_team and ct.get_entity_type(bid) != EntityType.CORE:
+                if ct.get_team(bid) == self.my_team:
                     btype_existing = ct.get_entity_type(bid)
+                    if btype_existing == EntityType.CORE:
+                        return 0.0, 0.0
                     # Skip rebuilding identical conveyor-family buildings
                     conv_dir = conv_direction if conv_direction is not None else direction
-                    sp_dir = conv_direction if conv_direction is not None else direction
-                    if action == "conveyor" and btype_existing == EntityType.CONVEYOR and ct.get_direction(bid) == conv_dir:
+                    if action_idx == _ACTION_CONVEYOR and btype_existing == EntityType.CONVEYOR and ct.get_direction(bid) == conv_dir:
                         return 0.0, 0.0
-                    if action == "armoured_conveyor" and btype_existing == EntityType.ARMOURED_CONVEYOR and ct.get_direction(bid) == conv_dir:
+                    if action_idx == _ACTION_ARMOURED_CONVEYOR and btype_existing == EntityType.ARMOURED_CONVEYOR and ct.get_direction(bid) == conv_dir:
                         return 0.0, 0.0
-                    if action == "splitter" and btype_existing == EntityType.SPLITTER and ct.get_direction(bid) == sp_dir:
+                    if action_idx == _ACTION_SPLITTER and btype_existing == EntityType.SPLITTER and ct.get_direction(bid) == conv_dir:
                         return 0.0, 0.0
-                    idx = BUILD_ACTIONS.index(action)
-                    base_ti, base_ax = BUILD_COSTS[idx]
+                    base_ti, base_ax = BUILD_COSTS[action_idx]
                     scale = ct.get_scale_percent() / 100.0
                     ti, ax = ct.get_global_resources()
                     if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
@@ -686,12 +719,12 @@ class Player:
             except Exception:
                 pass
 
-        if action == "conveyor":
+        if action_idx == _ACTION_CONVEYOR:
             conv_dir = conv_direction if conv_direction is not None else direction
             if ct.can_build_conveyor(build_pos, conv_dir):
                 ct.build_conveyor(build_pos, conv_dir)
                 Player._conv_count += 1
-        elif action == "harvester":
+        elif action_idx == _ACTION_HARVESTER:
             if ct.can_build_harvester(build_pos):
                 ct.build_harvester(build_pos)
                 ore_key = (build_pos.x, build_pos.y)
@@ -700,34 +733,34 @@ class Player:
                 return self._PLACE_HARV - given, 0.0
             # Failed — proximity reward toward nearest ore (one-time per ore)
             return self._proximity_reward(ct), 0.0
-        elif action == "road":
+        elif action_idx == _ACTION_ROAD:
             if ct.can_build_road(build_pos):
                 ct.build_road(build_pos)
-        elif action == "gunner":
+        elif action_idx == _ACTION_GUNNER:
             if ct.can_build_gunner(build_pos, direction):
                 ct.build_gunner(build_pos, direction)
-        elif action == "sentinel":
+        elif action_idx == _ACTION_SENTINEL:
             if ct.can_build_sentinel(build_pos, direction):
                 ct.build_sentinel(build_pos, direction)
-        elif action == "breach":
+        elif action_idx == _ACTION_BREACH:
             if ct.can_build_breach(build_pos, direction):
                 ct.build_breach(build_pos, direction)
-        elif action == "splitter":
+        elif action_idx == _ACTION_SPLITTER:
             sp_dir = conv_direction if conv_direction is not None else direction
             if ct.can_build_splitter(build_pos, sp_dir):
                 ct.build_splitter(build_pos, sp_dir)
-        elif action == "armoured_conveyor":
+        elif action_idx == _ACTION_ARMOURED_CONVEYOR:
             ac_dir = conv_direction if conv_direction is not None else direction
             if ct.can_build_armoured_conveyor(build_pos, ac_dir):
                 ct.build_armoured_conveyor(build_pos, ac_dir)
                 Player._conv_count += 1
-        elif action == "barrier":
+        elif action_idx == _ACTION_BARRIER:
             if ct.can_build_barrier(build_pos):
                 ct.build_barrier(build_pos)
-        elif action == "foundry":
+        elif action_idx == _ACTION_FOUNDRY:
             if ct.can_build_foundry(build_pos):
                 ct.build_foundry(build_pos)
-        elif action == "launcher":
+        elif action_idx == _ACTION_LAUNCHER:
             if ct.can_build_launcher(build_pos):
                 ct.build_launcher(build_pos)
         # Punish placing non-harvester on ore (wasted tile)
