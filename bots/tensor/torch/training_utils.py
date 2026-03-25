@@ -134,37 +134,37 @@ class League:
 
         Prefers opponents close in skill (small |mu_a - mu_b|) and those with
         high uncertainty (large sigma), since games against them are most
-        informative.  Falls back to uniform if the league has <=2 models.
+        informative. Excludes the latest model when any earlier checkpoint
+        exists, but falls back to self-play bootstrap for a one-model league.
         """
         if not self.models:
             return []
-        if len(self.models) <= 2:
-            return random.sample(self.models, min(k, len(self.models)))
 
         # Current model is the latest gen
         latest = max(self.models, key=lambda m: m["gen"])
+        candidates = [m for m in self.models if m["id"] != latest["id"]]
+        if not candidates:
+            return [latest] if k > 0 else []
+        if len(candidates) == 1:
+            return candidates[:min(k, 1)]
         latest_mu = latest["mu"]
 
         weights = []
-        for m in self.models:
-            if m["id"] == latest["id"]:
-                # Don't play against yourself
-                weights.append(0.0)
-            else:
-                # Prefer close skill + high uncertainty opponents
-                skill_diff = abs(m["mu"] - latest_mu)
-                closeness = math.exp(-skill_diff / 10.0)
-                uncertainty = m["sigma"] / TS_ENV.sigma
-                weights.append(closeness + 0.5 * uncertainty + 0.1)  # floor avoids starvation
+        for m in candidates:
+            # Prefer close skill + high uncertainty opponents
+            skill_diff = abs(m["mu"] - latest_mu)
+            closeness = math.exp(-skill_diff / 10.0)
+            uncertainty = m["sigma"] / TS_ENV.sigma
+            weights.append(closeness + 0.5 * uncertainty + 0.1)  # floor avoids starvation
 
         total = sum(weights)
         if total == 0:
-            return random.sample(self.models, min(k, len(self.models)))
+            return random.sample(candidates, min(k, len(candidates)))
 
         # Weighted sampling without replacement
-        pool = list(range(len(self.models)))
+        pool = list(range(len(candidates)))
         selected = []
-        for _ in range(min(k, len(self.models) - 1)):
+        for _ in range(min(k, len(candidates))):
             if not pool:
                 break
             probs = [weights[i] for i in pool]
@@ -179,12 +179,14 @@ class League:
                 if r <= cumulative:
                     chosen_idx = idx
                     break
-            selected.append(self.models[chosen_idx])
+            selected.append(candidates[chosen_idx])
             pool.remove(chosen_idx)
 
         return selected
 
     def update_elo(self, model_a_id: str, model_b_id: str, winner: str | None):
+        if model_a_id == model_b_id:
+            return
         a = next((m for m in self.models if m["id"] == model_a_id), None)
         b = next((m for m in self.models if m["id"] == model_b_id), None)
         if not a or not b:
