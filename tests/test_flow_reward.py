@@ -13,6 +13,12 @@ from flow_reward import (
     augment_trajectories_with_build_rewards,
 )
 
+try:
+    from model import _parse_trajectories, REWARD_BUILD_CREDIT
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -166,6 +172,16 @@ class TestAugmentTrajectories:
         traj = [[step]]
         augment_trajectories_with_build_rewards(traj, {10: 4.0})
         assert step[6] == 4.0
+
+    @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
+    def test_shared_round_reward_is_not_multiplied_by_unit_count(self):
+        step_a = _make_step(round_num=10)
+        step_b = _make_step(round_num=10)
+        trajs = [[step_a], [step_b]]
+        augment_trajectories_with_build_rewards(trajs, {10: 3.0})
+        data = _parse_trajectories(trajs, traj_game_map=[0, 0])
+        assert data is not None
+        assert data["rewards"].tolist() == [3.0 * REWARD_BUILD_CREDIT, 3.0 * REWARD_BUILD_CREDIT]
 
 
 # ── Integration: replay parser → build rewards ──────────────────────────
