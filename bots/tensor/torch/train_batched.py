@@ -82,7 +82,7 @@ from model import (
     train_on_trajectories,
     GraphedInference,
 )
-from flow_reward import compute_retroactive_build_rewards, augment_trajectories_with_build_rewards
+from flow_reward import compute_dense_flow_rewards, augment_trajectories_with_flow_rewards
 
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
@@ -802,16 +802,15 @@ def collect_games_batched(
             per_opp_winners.setdefault(oid, []).append(None)
             continue
         game_trajs = _read_trajectory_file(log_path)
-        # Retroactive build credit: attribute each conveyor's lifetime
-        # productive transfers back to the round it was built.
-        # Always call augment to zero out stale n_working values.
-        build_rewards: dict[int, float] = {}
-        if gstates and gstates.get("conveyor_births_buf"):
+        # Dense flow reward: use replay-derived productive transfer totals for
+        # each round. Always call augment to zero out stale n_working values.
+        flow_rewards: dict[int, float] = {}
+        if gstates and gstates.get("transfer_events_buf"):
             try:
-                build_rewards = compute_retroactive_build_rewards(gstates)
+                flow_rewards = compute_dense_flow_rewards(gstates)
             except Exception as e:
-                print(f"  Build reward augmentation error: {e}")
-        game_trajs = augment_trajectories_with_build_rewards(game_trajs, build_rewards)
+                print(f"  Flow reward augmentation error: {e}")
+        game_trajs = augment_trajectories_with_flow_rewards(game_trajs, flow_rewards)
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -835,6 +834,37 @@ def collect_games_batched(
     shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"    [{n_games} games, {total_inferences} GPU inferences]")
     return trajectories, winners, per_opp_winners, all_global_states, traj_game_map, game_origin
+
+
+def _step_round_index(step) -> int | None:
+    if not isinstance(step, (list, tuple)) or len(step) < 1:
+        return None
+    obs = step[0]
+    if not isinstance(obs, (list, tuple)) or len(obs) <= 475:
+        return None
+    return max(0, min(int(round(obs[475] * 2000.0)), 1999))
+
+
+def _step_build_reward(step) -> float:
+    if isinstance(step, (list, tuple)):
+        n = len(step)
+        if n > 12:
+            return float(step[7] if n > 7 else 0.0) * REWARD_BUILD_CREDIT
+        return float(step[6] if n > 6 else 0.0) * REWARD_BUILD_CREDIT
+    return float(step.get("n_working", 0.0)) * REWARD_BUILD_CREDIT
+
+
+def _shared_flow_reward_total(game_trajs: list[list]) -> float:
+    round_rewards: dict[int, float] = {}
+    for traj in game_trajs:
+        for step in traj:
+            rnd = _step_round_index(step)
+            if rnd is None:
+                continue
+            reward = _step_build_reward(step)
+            if reward > round_rewards.get(rnd, 0.0):
+                round_rewards[rnd] = reward
+    return sum(round_rewards.values())
 
 
 def main():
@@ -1088,7 +1118,16 @@ def main():
         rewards = []
         for traj_i, traj in enumerate(all_trajs):
             rewards.append(_traj_reward(traj))
-        mean_r_work = sum(r[1] for r in rewards) / n_trajs
+        game_trajs: dict[int, list[list]] = {}
+        for traj_i, traj in enumerate(all_trajs):
+            gi = traj_game_map[traj_i] if traj_i < len(traj_game_map) else 0
+            game_trajs.setdefault(gi, []).append(traj)
+        game_shared_work = {
+            gi: _shared_flow_reward_total(trajs)
+            for gi, trajs in game_trajs.items()
+        }
+        n_games_logged = max(len(game_shared_work), 1)
+        mean_r_work = sum(game_shared_work.values()) / n_games_logged
         mean_r_dmg = sum(r[2] for r in rewards) / n_trajs
         mean_r_own_dmg = sum(r[3] for r in rewards) / n_trajs
         mean_harv_attempts = sum(r[4] for r in rewards) / n_trajs
@@ -1165,7 +1204,7 @@ def main():
                 gf.write(json.dumps({
                     "episode": ep + 1, "game": orig_i,
                     "opp": oid, "winner": w,
-                    "reward": round(gr[0] / nu, 3), "units": gr[_N_REWARD_FIELDS],
+                    "reward": round(game_shared_work.get(gi, 0.0), 3), "units": gr[_N_REWARD_FIELDS],
                     "harv_attempts": round(gr[4] / nu, 3),
                     "harv_failures": round(gr[5] / nu, 3),
                     "harv_prox_gate": round(gr[6] / nu, 3),
