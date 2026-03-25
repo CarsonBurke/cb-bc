@@ -58,14 +58,12 @@ INITIAL_BUILD_TYPE_BIAS = [
     -0.7,  # foundry
     -0.5,  # launcher
 ]
-REWARD_BUILD_CREDIT = 50.0  # scale for retroactive conveyor build credit
+REWARD_BUILD_CREDIT = 20.0  # scale for retroactive conveyor build credit
 
-# ---- DreamerV3-style symlog twohot value prediction ----
+# ---- Dreamer4-style symexp two-hot value prediction ----
 NUM_BUCKETS = 255
 BUCKET_LOW = -20.0
 BUCKET_HIGH = 20.0
-BUCKET_STEP = (BUCKET_HIGH - BUCKET_LOW) / (NUM_BUCKETS - 1)
-VALUE_TARGET_KERNEL_SIGMA = BUCKET_STEP * 0.5
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -77,10 +75,10 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
 
 
 def _make_bucket_centers() -> torch.Tensor:
-    """DreamerV3-style symexp-spaced bins in original value space.
+    """Dreamer4-style symexp-spaced bins in original value space.
 
     Builds 255 bins via symexp(linspace(-20, 0, 128)) mirrored around 0.
-    Dense near zero, sparse at extremes — matches DreamerV3 heads.py:132.
+    Dense near zero, sparse at extremes.
     """
     n_half = (NUM_BUCKETS - 1) // 2 + 1  # 128
     half = torch.linspace(BUCKET_LOW, 0.0, n_half, dtype=torch.float32)
@@ -143,22 +141,18 @@ def decode_value(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
     return wavg
 
 
-def value_target_logits(
+def value_target_probs(
     targets: torch.Tensor,
-    bin_symlog: torch.Tensor,
-    sigma: float = VALUE_TARGET_KERNEL_SIGMA,
+    bins: torch.Tensor,
 ) -> torch.Tensor:
-    """Project scalar values to dense logits over bins in symlog space.
+    """Encode scalar values as Dreamer4-style exact two-hot targets.
 
-    Use the same smooth target family for both unclipped and clipped branches
-    so the PPO max compares like with like while still avoiding sparse-support
-    dead zones.
+    Targets and bins live in the same original-value space, so this matches the
+    decode path exactly: expectation over the same symexp-spaced bin centers.
     """
-    target_symlog = symlog(targets).unsqueeze(-1)
-    if bin_symlog.device != targets.device or bin_symlog.dtype != targets.dtype:
-        bin_symlog = bin_symlog.to(device=targets.device, dtype=targets.dtype)
-    diff = (target_symlog - bin_symlog) / sigma
-    return -0.5 * diff.square()
+    if bins.device != targets.device or bins.dtype != targets.dtype:
+        bins = bins.to(device=targets.device, dtype=targets.dtype)
+    return twohot_encode(targets, bins)
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
@@ -446,7 +440,7 @@ class CentralizedCritic(nn.Module):
         )
 
         # Single per-unit value head from tile features + replay/global context.
-        # Outputs NUM_BUCKETS logits for DreamerV3-style symlog twohot prediction.
+        # Outputs NUM_BUCKETS logits for Dreamer4-style symexp two-hot prediction.
         unit_in = conv_dim + UNIT_CONTEXT_DIM + GLOBAL_SCALAR_DIM + ACTOR_LATENT_DIM
         self.unit_head = nn.Sequential(
             nn.Linear(unit_in, 128),
@@ -458,9 +452,10 @@ class CentralizedCritic(nn.Module):
             nn.Linear(64, NUM_BUCKETS),
         )
 
-        # DreamerV3-style symexp-spaced bins in original value space.
+        # Dreamer4-style symexp-spaced bins in original value space.
         bucket_centers = _make_bucket_centers()
         self.register_buffer("bucket_centers", bucket_centers)
+        # Kept for checkpoint compatibility with older critic state dicts.
         self.register_buffer("bucket_symlog", symlog(bucket_centers))
 
         self._init_weights()
@@ -536,7 +531,7 @@ class CentralizedCritic(nn.Module):
         unit_tile_feat = feat[ri, :, uy, ux].float()
         unit_round_scalars = round_scalars[ri]
 
-        # Per-unit categorical value prediction (DreamerV3-style)
+        # Per-unit categorical value prediction over symexp-spaced bins.
         unit_in = torch.cat(
             [unit_tile_feat, unit_round_scalars, unit_context, actor_latent],
             dim=-1,
@@ -1752,14 +1747,11 @@ def ppo_update(
                     newvalue, logits = critic.unit_value_logits(
                         feat, g_scalars, lr, u_xy[si], u_ctx[si], u_latent[si],
                     )
-                    # Dreamer4-style value clipping: decode, clip in scalar
-                    # space, re-project, then compare both branches in the same
-                    # smooth value-target family.
-                    return_target = F.softmax(
-                        value_target_logits(
-                            mb_returns[si], critic.bucket_symlog,
-                        ),
-                        dim=-1,
+                    # Dreamer4-style value loss: decode to a scalar, clip in
+                    # scalar space, and encode both targets with the same exact
+                    # two-hot operator over the value bins.
+                    return_target = value_target_probs(
+                        mb_returns[si], critic.bucket_centers,
                     )
                     v_loss_unclipped = F.cross_entropy(
                         logits, return_target, reduction='none',
@@ -1769,8 +1761,8 @@ def ppo_update(
                         clipped_val = mb_old_values[si] + (newvalue - mb_old_values[si]).clamp(
                             -value_clip, value_clip,
                         )
-                        clipped_logits = value_target_logits(
-                            clipped_val, critic.bucket_symlog,
+                        clipped_logits = value_target_probs(
+                            clipped_val, critic.bucket_centers,
                         )
                         v_loss_clipped = F.cross_entropy(
                             clipped_logits, return_target, reduction='none',
@@ -1952,8 +1944,14 @@ def _parse_trajectories(
     round_idx_t = _round_index_from_obs(obs_t)
     reward_keys = step_game_t.to(torch.long) * 2000 + round_idx_t
     _, reward_inverse = reward_keys.unique(sorted=False, return_inverse=True)
-    round_reward = torch.zeros(int(reward_inverse.max().item()) + 1, dtype=rw_t.dtype)
+    n_round_keys = int(reward_inverse.max().item()) + 1
+    # Replay augmentation writes round-shared reward onto every active unit step.
+    # Average duplicate copies back to one shared round reward before broadcasting.
+    round_reward = torch.zeros(n_round_keys, dtype=rw_t.dtype)
+    round_counts = torch.zeros(n_round_keys, dtype=rw_t.dtype)
     round_reward.index_add_(0, reward_inverse, rw_t)
+    round_counts.index_add_(0, reward_inverse, torch.ones_like(rw_t))
+    round_reward = round_reward / round_counts.clamp_min(1.0)
     rw_t = round_reward[reward_inverse]
 
     result = {
