@@ -224,7 +224,8 @@ class MLP:
     __slots__ = (
         "trunk", "heads", "_infer_cache",
         "tile_encoder", "tile_grid_n", "tile_raw_features", "tile_embed_dim", "_tile_dxdy",
-        "tile_conv_w", "tile_conv_b", "tile_compress", "tile_compress_size",
+        "tile_conv_w", "tile_conv_b", "tile_pointwise", "tile_post_rms",
+        "tile_compress", "tile_compress_size",
     )
 
     def __init__(
@@ -290,6 +291,8 @@ class MLP:
             # Conv weights: flat (channels * 9) tensor, zero-init (residual starts as identity)
             self.tile_conv_w = Tensor([0.0] * (te_out * 9), (te_out * 9,))
             self.tile_conv_b = Tensor([0.0] * te_out, (te_out,))
+            self.tile_pointwise = Linear(te_out, te_out)
+            self.tile_post_rms = RMSNorm(te_out)
             # Compress: Linear(n_tiles * embed_dim, compress_size) + RMSNorm + SiLU
             assert tile_compress_size is not None
             self.tile_compress_size = tile_compress_size
@@ -302,6 +305,8 @@ class MLP:
         else:
             self.tile_conv_w = None
             self.tile_conv_b = None
+            self.tile_pointwise = None
+            self.tile_post_rms = None
             self.tile_compress = None
             self.tile_compress_size = None
 
@@ -318,6 +323,10 @@ class MLP:
         if self.tile_conv_w is not None:
             params.append(self.tile_conv_w)
             params.append(self.tile_conv_b)
+        if self.tile_pointwise is not None:
+            params.extend(self.tile_pointwise.parameters())
+        if self.tile_post_rms is not None:
+            params.extend(self.tile_post_rms.parameters())
         if self.tile_compress is not None:
             params.extend(self.tile_compress.parameters())
         params.extend(self.trunk.parameters())
@@ -417,31 +426,39 @@ class MLP:
             te_linear = te_layers[0]  # Linear layer
             te_w = te_linear.weight.data
             te_out_dim = te_linear.out_features
-            te_w_rows = [te_w[j::te_out_dim] for j in range(te_out_dim)]
+            te_w_rows_full = [te_w[j::te_out_dim] for j in range(te_out_dim)]
+            te_dx_w = [row[0] for row in te_w_rows_full]
+            te_dy_w = [row[1] for row in te_w_rows_full]
+            te_w_rows = [row[2:] for row in te_w_rows_full]
             te_bias = list(te_linear.bias.data) if te_linear.bias is not None else None
-            tile_cache = (te_w_rows, te_bias, te_out_dim)
+            tile_cache = (te_w_rows, te_bias, te_out_dim, te_dx_w, te_dy_w)
 
-        # Build conv cache: neighbor indices + kernel weights for depthwise 3x3
+        # Build conv cache: branchless neighbors + depthwise + pointwise + post RMSNorm
         conv_cache = None
         if self.tile_conv_w is not None:
             n_tiles = self.tile_grid_n
             grid_w = int(n_tiles ** 0.5)  # 5 for 25 tiles
             te_out = self.tile_embed_dim
             # Precompute neighbor indices for each tile (3x3 kernel, zero-pad)
-            neighbors: list[tuple[int, ...]] = []
+            neighbors: list[tuple[tuple[int, int], ...]] = []
             for t in range(n_tiles):
                 row, col = t // grid_w, t % grid_w
                 nbrs = []
                 for kr in range(-1, 2):
                     for kc in range(-1, 2):
                         nr, nc = row + kr, col + kc
-                        nbrs.append(nr * grid_w + nc if 0 <= nr < grid_w and 0 <= nc < grid_w else -1)
+                        if 0 <= nr < grid_w and 0 <= nc < grid_w:
+                            nbrs.append((nr * grid_w + nc, (kr + 1) * 3 + (kc + 1)))
                 neighbors.append(tuple(nbrs))
-            # Reshape flat (channels*9) weights into per-channel 9-element lists
             flat_w = self.tile_conv_w.data
             conv_w = [flat_w[c * 9:(c + 1) * 9] for c in range(te_out)]
             conv_b = list(self.tile_conv_b.data)
-            conv_cache = (conv_w, conv_b, neighbors)
+            pw_w = self.tile_pointwise.weight.data
+            pw_w_rows = [pw_w[j::te_out] for j in range(te_out)]
+            pw_b = list(self.tile_pointwise.bias.data) if self.tile_pointwise.bias is not None else None
+            post_gamma = list(self.tile_post_rms.gamma.data)
+            post_eps = self.tile_post_rms.eps
+            conv_cache = (conv_w, conv_b, pw_w_rows, pw_b, post_gamma, post_eps, neighbors)
 
         # Build compress cache: Linear + RMSNorm + SiLU fused op
         compress_cache = None
@@ -475,7 +492,7 @@ class MLP:
         ops, fused_heads, tile_cache, conv_cache, compress_cache = self._infer_cache
 
         if tile_cache is not None:
-            te_w_rows, te_bias, te_out = tile_cache
+            te_w_rows, te_bias, te_out, te_dx_w, te_dy_w = tile_cache
             n_tiles = self.tile_grid_n
             raw_feat = self.tile_raw_features
             dxdy = self._tile_dxdy
@@ -485,9 +502,10 @@ class MLP:
             idx = 0
             for t in range(n_tiles):
                 base = t * raw_feat
-                tile_in = [dxdy[t][0], dxdy[t][1]] + features[base:base + raw_feat]
+                dx, dy = dxdy[t]
+                tile_raw = features[base:base + raw_feat]
                 for j in range(te_out):
-                    x = _dot(tile_in, te_w_rows[j]) + te_bias[j]
+                    x = _dot(tile_raw, te_w_rows[j]) + dx * te_dx_w[j] + dy * te_dy_w[j] + te_bias[j]
                     if x >= 0:
                         encoded[idx] = x / (1.0 + _exp(-x))
                     else:
@@ -495,9 +513,9 @@ class MLP:
                         encoded[idx] = x * e / (1.0 + e)
                     idx += 1
 
-            # Depthwise 3x3 conv + residual + SiLU
+            # Depthwise 3x3 + pointwise 1x1 + residual + RMSNorm + SiLU
             if conv_cache is not None:
-                conv_w, conv_b, neighbors = conv_cache
+                conv_w, conv_b, pw_w_rows, pw_b, post_gamma, post_eps, neighbors = conv_cache
                 total = n_tiles * te_out
                 conv_out = [0.0] * total
                 for t in range(n_tiles):
@@ -506,21 +524,41 @@ class MLP:
                     for c in range(te_out):
                         cw = conv_w[c]
                         s = conv_b[c]
-                        for k in range(9):
-                            nt = nbr[k]
-                            if nt >= 0:
-                                s += encoded[nt * te_out + c] * cw[k]
+                        for nt, k in nbr:
+                            s += encoded[nt * te_out + c] * cw[k]
                         conv_out[t_base + c] = s
-                # Fused residual + SiLU
+
+                projected = [0.0] * total
+                for t in range(n_tiles):
+                    src_base = t * te_out
+                    src = conv_out[src_base:src_base + te_out]
+                    base = t * te_out
+                    for j in range(te_out):
+                        x = _dot(src, pw_w_rows[j])
+                        if pw_b is not None:
+                            x += pw_b[j]
+                        projected[base + j] = x
+
+                mean_sq = [0.0] * n_tiles
                 for i in range(total):
-                    x = encoded[i] + conv_out[i]
+                    t = i // te_out
+                    x = encoded[i] + projected[i]
+                    encoded[i] = x
+                    mean_sq[t] += x * x
+                inv_rms = [
+                    1.0 / (ms / te_out + post_eps) ** 0.5
+                    for ms in mean_sq
+                ]
+                for i in range(total):
+                    c = i % te_out
+                    x = encoded[i] * inv_rms[i // te_out] * post_gamma[c]
                     if x >= 0:
                         encoded[i] = x / (1.0 + _exp(-x))
                     else:
                         e = _exp(x)
                         encoded[i] = x * e / (1.0 + e)
 
-            # Compress 200→64 + RMSNorm + SiLU, then concat globals
+            # Compress 200→80 + RMSNorm + SiLU, then concat globals
             if compress_cache is not None:
                 comp_w_rows, comp_b, comp_N, comp_gamma, comp_eps = compress_cache
                 compressed = [0.0] * comp_N
@@ -720,6 +758,15 @@ class MLP:
         no_conv_params: list[Tensor] = []
         if self.tile_encoder is not None:
             no_conv_params.extend(self.tile_encoder.parameters())
+        if self.tile_conv_w is not None:
+            no_conv_params.append(self.tile_conv_w)
+            no_conv_params.append(self.tile_conv_b)
+        if self.tile_pointwise is not None:
+            no_conv_params.extend(self.tile_pointwise.parameters())
+        if self.tile_post_rms is not None:
+            no_conv_params.extend(self.tile_post_rms.parameters())
+        if self.tile_compress is not None:
+            no_conv_params.extend(self.tile_compress.parameters())
         for layer in self.trunk.layers:
             no_conv_params.extend(layer.parameters())
         no_conv_params.extend(_head_params({"conv_dir"}))
@@ -730,6 +777,10 @@ class MLP:
         if self.tile_conv_w is not None:
             no_logit_params.append(self.tile_conv_w)
             no_logit_params.append(self.tile_conv_b)
+        if self.tile_pointwise is not None:
+            no_logit_params.extend(self.tile_pointwise.parameters())
+        if self.tile_post_rms is not None:
+            no_logit_params.extend(self.tile_post_rms.parameters())
         if self.tile_compress is not None:
             no_logit_params.extend(self.tile_compress.parameters())
         no_logit_params.extend(self.trunk.parameters())
@@ -738,6 +789,15 @@ class MLP:
         no_conv_no_logit_params: list[Tensor] = []
         if self.tile_encoder is not None:
             no_conv_no_logit_params.extend(self.tile_encoder.parameters())
+        if self.tile_conv_w is not None:
+            no_conv_no_logit_params.append(self.tile_conv_w)
+            no_conv_no_logit_params.append(self.tile_conv_b)
+        if self.tile_pointwise is not None:
+            no_conv_no_logit_params.extend(self.tile_pointwise.parameters())
+        if self.tile_post_rms is not None:
+            no_conv_no_logit_params.extend(self.tile_post_rms.parameters())
+        if self.tile_compress is not None:
+            no_conv_no_logit_params.extend(self.tile_compress.parameters())
         for layer in self.trunk.layers:
             no_conv_no_logit_params.extend(layer.parameters())
         no_conv_no_logit_params.extend(_head_params({"conv_dir", "logit_scale"}))
