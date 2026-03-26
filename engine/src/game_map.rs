@@ -340,7 +340,13 @@ impl Entity {
             Entity::Splitter(s) => s.stored = Some(resource),
             Entity::ArmouredConveyor(c) => c.stored = Some(resource),
             Entity::Bridge(b) => b.stored = Some(resource),
-            Entity::Core(core) => core.received.push(resource),
+            Entity::Core(core) => {
+                // Official engine: core silently discards RawAxionite.
+                // Only Titanium and RefinedAxionite are accepted.
+                if resource != ResourceType::RawAxionite {
+                    core.received.push(resource);
+                }
+            }
             Entity::Gunner(t) => t.receive_ammo(resource),
             Entity::Sentinel(t) => t.receive_ammo(resource),
             Entity::Breach(t) => t.receive_ammo(resource),
@@ -485,12 +491,23 @@ define_category! {
 impl TurretBase {
     pub fn receive_ammo(&mut self, resource: ResourceType) {
         assert!(self.ammo_amount == 0);
-        self.ammo_type = match resource {
-            ResourceType::Titanium => Some(ResourceType::Titanium),
-            ResourceType::RawAxionite => Some(ResourceType::Titanium),
-            ResourceType::RefinedAxionite => Some(ResourceType::RefinedAxionite),
-        };
-        self.ammo_amount = STACK_SIZE;
+        match resource {
+            ResourceType::Titanium => {
+                self.ammo_type = Some(ResourceType::Titanium);
+                self.ammo_amount = STACK_SIZE;
+            }
+            ResourceType::RawAxionite => {
+                // Official engine: raw axionite gives no usable ammo to turrets.
+                // The resource is consumed but ammo_amount stays 0, making the
+                // turret an infinite sink for unrefined axionite.
+                self.ammo_type = Some(ResourceType::Titanium);
+                self.ammo_amount = 0;
+            }
+            ResourceType::RefinedAxionite => {
+                self.ammo_type = Some(ResourceType::RefinedAxionite);
+                self.ammo_amount = STACK_SIZE;
+            }
+        }
     }
 }
 
