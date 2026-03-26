@@ -43,7 +43,10 @@ ACTOR_RMSNORM_LAYERS = (True, True)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
 CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
-LOGIT_SCALE_LOG_BOUND = 0.35
+EPS_MIN = 0.01   # unimix floor (DreamerV3-style safety net)
+EPS_MAX = 0.50   # max exploration ratio per head
+# Init raw eps so sigmoid(raw) ≈ EPS_MIN at start.
+_EPS_INIT_BIAS = -4.6
 INITIAL_BUILD_TYPE_BIAS = [
     0.0,   # none
     0.8,   # harvester
@@ -184,25 +187,22 @@ def distributional_value_loss(
 ) -> torch.Tensor:
     """PPO-style clipped value loss for a distributional critic.
 
-    The clip decision is made in decoded scalar value space, matching PPO's
-    value-clipping rule. Once the branch is chosen, the loss still scores the
-    model's logits against a two-hot target so distribution shape remains part
-    of the optimization target.
+    Mirrors Dreamer4's value clipping rule: score the current logits against the
+    true return two-hot target, also score the clipped decoded scalar value as a
+    synthetic categorical input against that same target, and take the
+    pessimistic branch elementwise.
     """
-    return_target = value_target_probs(returns, bins)
-    unclipped_ce = soft_cross_entropy_from_logits(logits, return_target)
+    return_target = value_target_probs(returns, bins).detach()
+    value_loss_1 = soft_cross_entropy_from_logits(logits, return_target)
 
     if not clip_vloss or old_values is None:
-        return unclipped_ce
+        return value_loss_1
 
     clipped_values = old_values + (values - old_values).clamp(-value_clip, value_clip)
-    scalar_loss_unclipped = (values - returns).square()
-    scalar_loss_clipped = (clipped_values - returns).square()
+    clipped_value_bins = value_target_probs(clipped_values, bins)
+    value_loss_2 = soft_cross_entropy_from_logits(clipped_value_bins, return_target)
 
-    clipped_target = value_target_probs(clipped_values, bins)
-    clipped_ce = soft_cross_entropy_from_logits(logits, clipped_target)
-    use_clipped = scalar_loss_clipped > scalar_loss_unclipped
-    return torch.where(use_clipped, clipped_ce, unclipped_ce)
+    return torch.maximum(value_loss_1, value_loss_2)
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
@@ -561,10 +561,9 @@ class CentralizedCritic(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # Small random init so the value head is not pinned to an exact
-        # uniform-logit / zero-value predictor at startup.
-        nn.init.orthogonal_(self.unit_head[-1].weight, gain=0.01)
-        nn.init.zeros_(self.unit_head[-1].bias)
+        # Dreamer4's create_mlp leaves the value head MLP on nn.Linear defaults.
+        for layer in (self.unit_head[0], self.unit_head[3], self.unit_head[6]):
+            layer.reset_parameters()
 
     def encode_map(
         self,
@@ -766,63 +765,76 @@ def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float =
     return layer
 
 
+def _unimix_logits(
+    logits: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    eps: torch.Tensor | float = EPS_MIN,
+) -> torch.Tensor:
+    """Blend softmax probs with uniform floor (DreamerV3-style).
+
+    eps:  (B,) or scalar — per-sample unimix ratio (learned or fixed).
+    mask: (B, K) boolean — True = valid action. Uniform probability is
+          distributed only over valid actions.
+    """
+    eps_t = torch.as_tensor(eps, dtype=logits.dtype, device=logits.device)
+    # eps may be (B,) — unsqueeze for broadcasting with (B, K)
+    if eps_t.dim() == 1:
+        eps_t = eps_t.unsqueeze(-1)
+
+    if mask is not None:
+        K_valid = mask.float().sum(dim=-1, keepdim=True).clamp(min=1)
+        any_valid = mask.any(dim=-1, keepdim=True)
+        masked_logits = logits.masked_fill(~mask, float("-inf"))
+        # Avoid log_softmax(all -inf) on degenerate rows; they become all -inf below.
+        masked_logits = torch.where(any_valid, masked_logits, torch.zeros_like(masked_logits))
+        log_probs = torch.log_softmax(masked_logits, dim=-1)
+        log_uniform = -K_valid.log()
+        mixed_log = torch.logaddexp(
+            torch.log1p(-eps_t) + log_probs,
+            eps_t.log() + log_uniform,
+        )
+        return mixed_log.masked_fill(~mask, float("-inf"))
+
+    log_probs = torch.log_softmax(logits, dim=-1)
+    log_uniform = logits.new_full(log_probs.shape, -math.log(logits.shape[-1]))
+    return torch.logaddexp(
+        torch.log1p(-eps_t) + log_probs,
+        eps_t.log() + log_uniform,
+    )
+
+
 def sample_logits_gumbel(
     logits: torch.Tensor,
     temperature: float = 1.0,
     *,
+    mask: torch.Tensor | None = None,
+    eps: torch.Tensor | float = EPS_MIN,
     return_log_prob: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Sample exactly from softmax(logits / temperature) via Gumbel-max."""
+    """Sample from unimix(softmax(logits / temperature)) via Gumbel-max."""
     scaled = logits if temperature == 1.0 else logits / temperature
+    scaled = _unimix_logits(scaled, mask, eps)
     gumbel = -torch.empty_like(scaled).exponential_().log()
     actions = (scaled + gumbel).argmax(dim=-1)
     if not return_log_prob:
         return actions, None
-    chosen_logits = scaled.gather(1, actions.unsqueeze(1)).squeeze(1)
-    chosen = chosen_logits - torch.logsumexp(scaled, dim=-1)
+    chosen = scaled.gather(1, actions.unsqueeze(1)).squeeze(1) - torch.logsumexp(scaled, dim=-1)
     return actions, chosen
 
 
 def action_log_prob_and_entropy(
     logits: torch.Tensor,
     actions: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    eps: torch.Tensor | float = EPS_MIN,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return chosen-action log_probs and categorical entropy from logits."""
-    log_probs = F.log_softmax(logits, dim=-1)
+    log_probs = _unimix_logits(logits, mask, eps)
     chosen = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
-    entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+    # nan_to_num handles 0 * -inf from masked actions.
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).nan_to_num().sum(dim=-1)
     return chosen, entropy
-
-
-def _bounded_logit_scales(raw: torch.Tensor) -> torch.Tensor:
-    """Map raw scale logits to a tight multiplicative logit scale range."""
-    return torch.exp(LOGIT_SCALE_LOG_BOUND * torch.tanh(raw))
-
-
-def _apply_head_logit_scales(
-    bt_l: torch.Tensor,
-    bd_l: torch.Tensor,
-    cd_l: torch.Tensor,
-    md_l: torch.Tensor,
-    raw: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    scales = _bounded_logit_scales(raw)
-    return _scale_head_logits(bt_l, bd_l, cd_l, md_l, scales)
-
-
-def _scale_head_logits(
-    bt_l: torch.Tensor,
-    bd_l: torch.Tensor,
-    cd_l: torch.Tensor,
-    md_l: torch.Tensor,
-    scales: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
-        bt_l * scales[:, 0:1],
-        bd_l * scales[:, 1:2],
-        cd_l * scales[:, 2:3],
-        md_l * scales[:, 3:4],
-    )
 
 
 def _normalize_actor_latent_dim(latent: torch.Tensor) -> torch.Tensor:
@@ -887,7 +899,7 @@ class GraphedInference:
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
             with torch.no_grad():
-                bt_l, bd_l, cd_l, md_l, s_h = self._model.infer_packed(self._static_input)
+                bt_l, bd_l, cd_l, md_l, eps, s_h = self._model.infer_packed(self._static_input)
                 obs = self._static_input[:, :OBS_SIZE]
 
                 ti = obs[:, _OBS_TI] * 500.0
@@ -914,11 +926,14 @@ class GraphedInference:
                 bt_l.masked_fill_(~bt_m, -1e9)
                 cd_l.masked_fill_(~cd_mask, -1e9)
 
-                # Apply temperature scaling for Gumbel-max sampling
+                # Apply external temperature scaling for Gumbel-max sampling
                 _T = self._temperature
                 if _T != 1.0:
                     bt_l = bt_l / _T
                     cd_l = cd_l / _T
+
+                bt_l = _unimix_logits(bt_l, bt_m, eps[:, 0])
+                cd_l = _unimix_logits(cd_l, cd_mask, eps[:, 2])
 
                 static_g_bt.exponential_()
                 s_bt_act = (bt_l - static_g_bt.log_()).argmax(dim=-1)
@@ -930,6 +945,9 @@ class GraphedInference:
                     bd_l = bd_l / _T
                     md_l = md_l / _T
 
+                bd_l = _unimix_logits(bd_l, bd_m_final, eps[:, 1])
+                md_l = _unimix_logits(md_l, eps=eps[:, 3])
+
                 static_g_bd.exponential_()
                 static_g_cd.exponential_()
                 static_g_md.exponential_()
@@ -939,10 +957,11 @@ class GraphedInference:
 
                 s_lp = None
                 if self._return_log_prob:
-                    s_bt_lp = bt_l.gather(1, s_bt_act.unsqueeze(1)).squeeze(1) - bt_l.logsumexp(dim=-1)
-                    s_bd_lp = bd_l.gather(1, s_bd_act.unsqueeze(1)).squeeze(1) - bd_l.logsumexp(dim=-1)
-                    s_cd_lp = cd_l.gather(1, s_cd_act.unsqueeze(1)).squeeze(1) - cd_l.logsumexp(dim=-1)
-                    s_md_lp = md_l.gather(1, s_md_act.unsqueeze(1)).squeeze(1) - md_l.logsumexp(dim=-1)
+                    # bt_l etc. are already log-probs from _unimix_logits — just gather.
+                    s_bt_lp = bt_l.gather(1, s_bt_act.unsqueeze(1)).squeeze(1)
+                    s_bd_lp = bd_l.gather(1, s_bd_act.unsqueeze(1)).squeeze(1)
+                    s_cd_lp = cd_l.gather(1, s_cd_act.unsqueeze(1)).squeeze(1)
+                    s_md_lp = md_l.gather(1, s_md_act.unsqueeze(1)).squeeze(1)
 
                     bd_causal = (s_bt_act != 0).float()
                     cd_causal = (
@@ -1047,6 +1066,10 @@ class BuilderMLP(nn.Module):
         self.head_h_gate = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wz: update gate
         self.head_h_cand = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wh: candidate
 
+        # Init eps head bias so sigmoid(raw) ≈ EPS_MIN at start.
+        with torch.no_grad():
+            self.head_logit_scale.bias.fill_(_EPS_INIT_BIAS)
+
         # Give new policies a structured exploration prior toward economy actions.
         with torch.no_grad():
             self.head_build_type.bias.copy_(
@@ -1116,9 +1139,9 @@ class BuilderMLP(nn.Module):
     def _project_actor_heads(
         self,
         h: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project latent to policy heads and return bounded per-head logit scales."""
-        # Fuse 4 head matmuls into one kernel launch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project latent to policy heads and per-head learned eps."""
+        # Fuse head matmuls into one kernel launch
         # Cache fused weights in eval mode (inference hot path)
         if self.training:
             combined_w = torch.cat([
@@ -1151,24 +1174,17 @@ class BuilderMLP(nn.Module):
             combined_b = self._cached_head_b
 
         combined = F.linear(h, combined_w, combined_b)
-        bt_l, bd_l, cd_l, md_l, logit_scale, h_gate, h_cand = combined.split(
+        bt_l, bd_l, cd_l, md_l, eps_raw, h_gate, h_cand = combined.split(
             [N_BUILD, N_DIR, N_CONV_DIR, N_DIR, N_LOGIT_SCALE, H_DIM, H_DIM],
             dim=-1,
         )
-        scales = _bounded_logit_scales(logit_scale)
-        bt_l, bd_l, cd_l, md_l = _scale_head_logits(
-            bt_l, bd_l, cd_l, md_l, scales,
-        )
-        return bt_l, bd_l, cd_l, md_l, scales, h_gate, h_cand
+        # Per-head learned eps: sigmoid → [EPS_MIN, EPS_MAX]
+        # eps_raw is (B, 4) — one per head: bt, bd, cd, md
+        eps = torch.sigmoid(eps_raw) * (EPS_MAX - EPS_MIN) + EPS_MIN
+        return bt_l, bd_l, cd_l, md_l, eps, h_gate, h_cand
 
     def _forward_from_hidden(self, h: torch.Tensor):
         """Project actor latent to policy heads."""
-        bt_l, bd_l, cd_l, md_l, _scales, h_gate, h_cand = self._project_actor_heads(h)
-        return bt_l, bd_l, cd_l, md_l, h_gate, h_cand
-
-    def _forward_from_obs_pre_with_scales(self, obs_pre: torch.Tensor, h_prev: torch.Tensor):
-        """Forward pass that also returns bounded per-head logit scales."""
-        h = self._latent_from_obs_pre(obs_pre, h_prev)
         return self._project_actor_heads(h)
 
     def _forward_from_trunk_in(self, trunk_in: torch.Tensor):
@@ -1178,20 +1194,20 @@ class BuilderMLP(nn.Module):
 
     def forward(self, x, h_prev):
         obs_pre = self._obs_encoder_pre(x)
-        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
+        bt_l, bd_l, cd_l, md_l, eps, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
         z = torch.sigmoid(h_gate)
         h_next = (1.0 - z) * h_prev + z * h_cand
-        return bt_l, bd_l, cd_l, md_l, h_next
+        return bt_l, bd_l, cd_l, md_l, eps, h_next
 
     def infer_packed(self, packed: torch.Tensor):
         """Inference-only path for already-packed [obs, h_prev] batches."""
         obs = packed[:, :OBS_SIZE]
         h_prev = packed[:, OBS_SIZE:]
         obs_pre = self._obs_encoder_pre(obs)
-        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
+        bt_l, bd_l, cd_l, md_l, eps, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
         z = torch.sigmoid(h_gate)
         h_next = (1.0 - z) * h_prev + z * h_cand
-        return bt_l, bd_l, cd_l, md_l, h_next
+        return bt_l, bd_l, cd_l, md_l, eps, h_next
 
     def _policy_state_modules(self) -> list[nn.Module]:
         """Policy modules only in tensor_lib serialization order (critic excluded)."""
@@ -1213,8 +1229,13 @@ class BuilderMLP(nn.Module):
                 state.append(layer.weight.T.contiguous().view(-1).tolist())
                 state.append(layer.bias.view(-1).tolist())
             elif isinstance(layer, nn.Conv2d):
-                # (C_out, C_in/groups, kH, kW) → flatten as-is
-                state.append(layer.weight.view(-1).tolist())
+                w = layer.weight
+                if w.shape[2:] == (1, 1) and layer.groups == 1:
+                    # 1x1 pointwise: (C_out, C_in, 1, 1) → transpose to (C_in, C_out)
+                    state.append(w.squeeze(-1).squeeze(-1).T.contiguous().view(-1).tolist())
+                else:
+                    # Depthwise / spatial kernels: flatten as-is
+                    state.append(w.view(-1).tolist())
                 if layer.bias is not None:
                     state.append(layer.bias.view(-1).tolist())
             else:
@@ -1312,7 +1333,13 @@ class BuilderMLP(nn.Module):
                 idx += 1
             elif isinstance(layer, nn.Conv2d):
                 w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
-                layer.weight.data = w_flat.view(layer.weight.shape)
+                w = layer.weight
+                if w.shape[2:] == (1, 1) and layer.groups == 1:
+                    # Reverse 1x1 transpose: (C_in, C_out) → (C_out, C_in, 1, 1)
+                    c_out, c_in = w.shape[0], w.shape[1]
+                    layer.weight.data = w_flat.view(c_in, c_out).T.contiguous().view(c_out, c_in, 1, 1)
+                else:
+                    layer.weight.data = w_flat.view(w.shape)
                 idx += 1
                 if layer.bias is not None:
                     layer.bias.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
@@ -1445,7 +1472,7 @@ def _recurrent_logprob_pass(
     cd_mask = conveyor_dir_mask(dev, B)
 
     for t in range(K_max):
-        bt_l, bd_l, cd_l, md_l, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
+        bt_l, bd_l, cd_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
         z = torch.sigmoid(h_gate)
         h_t = (1.0 - z) * h_t + z * h_cand
 
@@ -1453,10 +1480,10 @@ def _recurrent_logprob_pass(
         bd_l = bd_l.masked_fill(~bd_mask[:, t], -1e9)
         cd_l = cd_l.masked_fill(~cd_mask, -1e9)
 
-        bt_lp = F.log_softmax(bt_l, dim=-1).gather(1, bt_act[:, t].unsqueeze(1)).squeeze(1)
-        bd_lp = F.log_softmax(bd_l, dim=-1).gather(1, bd_act[:, t].unsqueeze(1)).squeeze(1)
-        cd_lp = F.log_softmax(cd_l, dim=-1).gather(1, cd_act[:, t].unsqueeze(1)).squeeze(1)
-        md_lp = F.log_softmax(md_l, dim=-1).gather(1, md_act[:, t].unsqueeze(1)).squeeze(1)
+        bt_lp = _unimix_logits(bt_l, bt_mask[:, t], eps[:, 0]).gather(1, bt_act[:, t].unsqueeze(1)).squeeze(1)
+        bd_lp = _unimix_logits(bd_l, bd_mask[:, t], eps[:, 1]).gather(1, bd_act[:, t].unsqueeze(1)).squeeze(1)
+        cd_lp = _unimix_logits(cd_l, cd_mask, eps[:, 2]).gather(1, cd_act[:, t].unsqueeze(1)).squeeze(1)
+        md_lp = _unimix_logits(md_l, eps=eps[:, 3]).gather(1, md_act[:, t].unsqueeze(1)).squeeze(1)
         log_probs[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
 
     return log_probs
@@ -1475,17 +1502,17 @@ def _recurrent_actor_pass(
     bd_causal: torch.Tensor,
     cd_causal: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sequential recurrent pass that returns log-probs, entropies, and logit scales."""
+    """Sequential recurrent pass that returns log-probs, entropies, and per-head eps."""
     B, K_max, _ = obs_pre.shape
     dev = obs_pre.device
     h_t = h0
     new_lps = torch.empty(B, K_max, device=dev)
     entropies = torch.empty(B, K_max, device=dev)
-    logit_scales = torch.empty(B, K_max, N_LOGIT_SCALE, device=dev)
+    all_eps = torch.empty(B, K_max, N_LOGIT_SCALE, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
     for t in range(K_max):
-        bt_l, bd_l, cd_l, md_l, scales, h_gate, h_cand = model._forward_from_obs_pre_with_scales(obs_pre[:, t], h_t)
+        bt_l, bd_l, cd_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
         z = torch.sigmoid(h_gate)
         h_t = (1.0 - z) * h_t + z * h_cand
 
@@ -1493,16 +1520,16 @@ def _recurrent_actor_pass(
         bd_l = bd_l.masked_fill(~bd_mask[:, t], -1e9)
         cd_l = cd_l.masked_fill(~cd_mask, -1e9)
 
-        bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[:, t])
-        bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[:, t])
-        cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act[:, t])
-        md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[:, t])
+        bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[:, t], bt_mask[:, t], eps[:, 0])
+        bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[:, t], bd_mask[:, t], eps[:, 1])
+        cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act[:, t], cd_mask, eps[:, 2])
+        md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[:, t], eps=eps[:, 3])
 
         new_lps[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
         entropies[:, t] = bt_ent + bd_ent * bd_causal[:, t] + cd_ent * cd_causal[:, t] + md_ent
-        logit_scales[:, t] = scales
+        all_eps[:, t] = eps
 
-    return new_lps, entropies, logit_scales
+    return new_lps, entropies, all_eps
 
 
 def _sequential_logprobs(
@@ -1621,9 +1648,9 @@ def ppo_update(
     N = obs.shape[0]
     sum_pi, sum_vf, sum_ent = 0.0, 0.0, 0.0
     sum_kl, sum_clip_frac = 0.0, 0.0
-    sum_logit_scale = torch.zeros(N_LOGIT_SCALE, device=obs.device)
-    sum_logit_scale_sq = torch.zeros(N_LOGIT_SCALE, device=obs.device)
-    n_logit_scale = 0
+    sum_eps = torch.zeros(N_LOGIT_SCALE, device=obs.device)
+    sum_eps_sq = torch.zeros(N_LOGIT_SCALE, device=obs.device)
+    n_eps = 0
     n_updates = 0
 
     critic, critic_opt = get_centralized_critic()
@@ -1673,8 +1700,7 @@ def ppo_update(
             tail_perm = tail_perm[all_chunk_lens[tail_perm].argsort(descending=True, stable=True)]
 
         def _run_actor_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
-            nonlocal approx_kl_acc, n_mb, sum_kl, sum_clip_frac, sum_pi, sum_ent, n_updates
-            nonlocal sum_logit_scale, sum_logit_scale_sq, n_logit_scale
+            nonlocal approx_kl_acc, n_mb, sum_kl, sum_clip_frac, sum_pi, sum_ent, n_updates, sum_eps, sum_eps_sq, n_eps
             for cb_start in range(0, chunk_ids.shape[0], B_chunk):
                 batch_ids = chunk_ids[cb_start:cb_start + B_chunk]
                 B = batch_ids.shape[0]
@@ -1698,7 +1724,7 @@ def ppo_update(
                 all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                new_lps, entropies, logit_scales = _recurrent_actor_pass(
+                new_lps, entropies, batch_eps = _recurrent_actor_pass(
                     model,
                     all_obs_pre,
                     h[chunk_starts].detach(),
@@ -1753,16 +1779,6 @@ def ppo_update(
                     pi_loss = (torch.max(pg1, pg2) * valid_mask).sum() / valid_denom
                     ent_loss = (entropies * valid_mask).sum() / valid_denom
 
-                with torch.no_grad():
-                    if full_length:
-                        valid_scales = logit_scales.reshape(-1, N_LOGIT_SCALE)
-                    else:
-                        valid_scales = logit_scales[valid_mask]
-                    if valid_scales.numel() > 0:
-                        sum_logit_scale += valid_scales.sum(dim=0)
-                        sum_logit_scale_sq += (valid_scales * valid_scales).sum(dim=0)
-                        n_logit_scale += int(valid_scales.shape[0])
-
                 if profile is not None:
                     profile["ppo_policy_loss_s"] = profile.get("ppo_policy_loss_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -1775,6 +1791,15 @@ def ppo_update(
                 sum_pi += pi_loss.item()
                 sum_ent += ent_loss.item()
                 n_updates += 1
+
+                with torch.no_grad():
+                    if full_length:
+                        flat_eps = batch_eps.reshape(-1, N_LOGIT_SCALE)
+                    else:
+                        flat_eps = batch_eps[valid_mask]
+                    sum_eps += flat_eps.sum(dim=0)
+                    sum_eps_sq += flat_eps.square().sum(dim=0)
+                    n_eps += flat_eps.shape[0]
 
         if full_perm.numel() > 0:
             _run_actor_group(full_perm, full_length=True)
@@ -1858,13 +1883,12 @@ def ppo_update(
             if profile is not None:
                 profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_value)
 
-    if n_logit_scale > 0:
-        mean_logit_scale = sum_logit_scale / n_logit_scale
-        var_logit_scale = (sum_logit_scale_sq / n_logit_scale) - mean_logit_scale.square()
-        std_logit_scale = var_logit_scale.clamp_min(0.0).sqrt()
+    if n_eps > 0:
+        mean_eps = sum_eps / n_eps
+        std_eps = (sum_eps_sq / n_eps - mean_eps.square()).clamp_min(0.0).sqrt()
     else:
-        mean_logit_scale = torch.ones(N_LOGIT_SCALE, device=obs.device)
-        std_logit_scale = torch.zeros(N_LOGIT_SCALE, device=obs.device)
+        mean_eps = torch.full((N_LOGIT_SCALE,), EPS_MIN, device=obs.device)
+        std_eps = torch.zeros(N_LOGIT_SCALE, device=obs.device)
 
     return {
         "pi_loss": sum_pi / max(n_updates, 1),
@@ -1873,15 +1897,15 @@ def ppo_update(
         "approx_kl": sum_kl / max(n_updates, 1),
         "clip_frac": sum_clip_frac / max(n_updates, 1),
         "explained_var": round(ev, 4),
-        "ls_bt_mean": mean_logit_scale[0].item(),
-        "ls_bd_mean": mean_logit_scale[1].item(),
-        "ls_cd_mean": mean_logit_scale[2].item(),
-        "ls_md_mean": mean_logit_scale[3].item(),
-        "ls_bt_std": std_logit_scale[0].item(),
-        "ls_bd_std": std_logit_scale[1].item(),
-        "ls_cd_std": std_logit_scale[2].item(),
-        "ls_md_std": std_logit_scale[3].item(),
         "n_updates": n_updates,
+        "ls_bt_mean": mean_eps[0].item(),
+        "ls_bd_mean": mean_eps[1].item(),
+        "ls_cd_mean": mean_eps[2].item(),
+        "ls_md_mean": mean_eps[3].item(),
+        "ls_bt_std": std_eps[0].item(),
+        "ls_bd_std": std_eps[1].item(),
+        "ls_cd_std": std_eps[2].item(),
+        "ls_md_std": std_eps[3].item(),
     }
 
 
@@ -2546,7 +2570,7 @@ def distill(
     with torch.no_grad():
         for i in range(0, N, 8192):
             packed = torch.cat([obs[i:i + 8192], h[i:i + 8192]], dim=-1)
-            bt_l, bd_l, cd_l, md_l, _ = teacher.infer_packed(packed)
+            bt_l, bd_l, cd_l, md_l, _eps, _ = teacher.infer_packed(packed)
             t_bt.append(bt_l)
             t_bd.append(bd_l)
             t_cd.append(cd_l)
@@ -2564,7 +2588,7 @@ def distill(
         perm = torch.randperm(N, device=DEVICE)
         for start in range(0, N, minibatch_size):
             idx = perm[start:start + minibatch_size]
-            s_bt, s_bd, s_cd, s_md, _ = student(obs[idx], h[idx])
+            s_bt, s_bd, s_cd, s_md, _eps, _ = student(obs[idx], h[idx])
 
             # KL(teacher || student) on softened logits
             loss = (

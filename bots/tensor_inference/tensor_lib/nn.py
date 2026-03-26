@@ -11,8 +11,7 @@ import math
 from .tensor import Tensor
 
 _DOT = math.sumprod
-_LOGIT_SCALE_LOG_BOUND = 0.35
-_LOGIT_SCALE_HEADS = ("build_type", "build_dir", "conv_dir", "move_dir")
+_TEMP_HEADS = ("build_type", "build_dir", "conv_dir", "move_dir")
 
 
 class Linear:
@@ -709,15 +708,8 @@ class MLP:
         results: dict[str, list[float]] = {}
         for name, (start, end) in zip(head_names, head_slices):
             results[name] = fused_out[start:end]
-        raw_logit_scale = results.pop("logit_scale", None)
-        if raw_logit_scale is not None:
-            scales = [
-                math.exp(_LOGIT_SCALE_LOG_BOUND * math.tanh(v))
-                for v in raw_logit_scale[:len(_LOGIT_SCALE_HEADS)]
-            ]
-            for name, scale in zip(_LOGIT_SCALE_HEADS, scales):
-                if name in results:
-                    results[name] = [x * scale for x in results[name]]
+        # Pop eps head — unimix doesn't change argmax ranking.
+        results.pop("logit_scale", None)
         return results
 
     def save(self) -> list[list[float]]:

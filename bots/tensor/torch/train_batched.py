@@ -696,7 +696,7 @@ def collect_games_batched(
                     else:
                         # Fallback: ungraphed inference
                         obs_t = all_t[:, :OBS_SIZE]
-                        bt_l, bd_l, cd_l, md_l, h_next = opp_m.infer_packed(all_t)
+                        bt_l, bd_l, cd_l, md_l, _eps, h_next = opp_m.infer_packed(all_t)
                         if profile is not None:
                             dt = time.perf_counter() - t_phase
                             profile["forward_b_s"] = profile.get("forward_b_s", 0.0) + dt
@@ -707,10 +707,10 @@ def collect_games_batched(
                         cd_m = conveyor_dir_mask(obs_t.device, obs_t.shape[0])
                         bt_l.masked_fill_(~bt_m, -1e9)
                         cd_l.masked_fill_(~cd_m, -1e9)
-                        bt_act, _ = sample_logits_gumbel(bt_l, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        bt_act, _ = sample_logits_gumbel(bt_l, _OPP_GRAPH_TEMP, mask=bt_m, return_log_prob=False)
                         bd_l.masked_fill_(~bd_m, -1e9)
-                        bd_act, _ = sample_logits_gumbel(bd_l, _OPP_GRAPH_TEMP, return_log_prob=False)
-                        cd_act, _ = sample_logits_gumbel(cd_l, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        bd_act, _ = sample_logits_gumbel(bd_l, _OPP_GRAPH_TEMP, mask=bd_m, return_log_prob=False)
+                        cd_act, _ = sample_logits_gumbel(cd_l, _OPP_GRAPH_TEMP, mask=cd_m, return_log_prob=False)
                         md_act, _ = sample_logits_gumbel(md_l, _OPP_GRAPH_TEMP, return_log_prob=False)
                         acts_cpu = torch.stack([bt_act, bd_act, cd_act, md_act]).cpu()
                         h_cpu = h_next.cpu().contiguous()
@@ -1160,10 +1160,10 @@ def main():
             "approx_kl": round(stats.get("approx_kl", 0), 6),
             "clip_frac": round(stats.get("clip_frac", 0), 4),
             "explained_var": stats.get("explained_var", 0),
-            "ls_bt_mean": round(stats.get("ls_bt_mean", 1), 4),
-            "ls_bd_mean": round(stats.get("ls_bd_mean", 1), 4),
-            "ls_cd_mean": round(stats.get("ls_cd_mean", 1), 4),
-            "ls_md_mean": round(stats.get("ls_md_mean", 1), 4),
+            "ls_bt_mean": round(stats.get("ls_bt_mean", 0), 4),
+            "ls_bd_mean": round(stats.get("ls_bd_mean", 0), 4),
+            "ls_cd_mean": round(stats.get("ls_cd_mean", 0), 4),
+            "ls_md_mean": round(stats.get("ls_md_mean", 0), 4),
             "ls_bt_std": round(stats.get("ls_bt_std", 0), 4),
             "ls_bd_std": round(stats.get("ls_bd_std", 0), 4),
             "ls_cd_std": round(stats.get("ls_cd_std", 0), 4),
