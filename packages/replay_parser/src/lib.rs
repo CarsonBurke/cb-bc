@@ -807,7 +807,11 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                 if let Some(src) = entities.get_mut(&src_id) {
                                     if src.kind.is_storing() {
                                         moved_res = if src.stored > 0 { src.stored } else { 1 };
-                                        src.stored = 0;
+                                        // Harvester stored is resourceType (permanent),
+                                        // not a consumable slot — don't clear it.
+                                        if src.kind != EntityKind::Harvester {
+                                            src.stored = 0;
+                                        }
                                     }
                                 }
                             }
@@ -819,11 +823,19 @@ fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                 }
                             }
                             if let (
-                                Some((src_kind, src_team, _src_stored)),
+                                Some((src_kind, src_team, src_stored)),
                                 Some((_dst_kind, dst_team)),
                             ) = (src_meta, dst_meta)
                             {
-                                if src_kind.is_storing() && src_team == dst_team {
+                                // Skip raw axionite (stored==2) transfers: the
+                                // engine discards raw axionite at cores and
+                                // turrets (ammo=0), creating infinite sinks.
+                                // Only titanium / refined axionite chains are
+                                // productive.
+                                if src_kind.is_storing()
+                                    && src_team == dst_team
+                                    && src_stored != 2
+                                {
                                     // Flow-aligned: only count if dst is strictly closer to core.
                                     // Weight 1/sqrt(dist) — sub-linear decay keeps far hops
                                     // meaningful while still favoring near-core transfers.
