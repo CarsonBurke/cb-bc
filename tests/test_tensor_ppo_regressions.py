@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -23,8 +24,7 @@ from model import (
     GLOBAL_SCALAR_DIM,
     H_DIM,
     HARVESTER_BUILD_TYPE,
-    LOGIT_SCALE_LOG_BOUND,
-    N_LOGIT_SCALE,
+    EPS_MIN,
     NUM_BUCKETS,
     OBS_SIZE,
     TILE_FEATURES,
@@ -33,7 +33,6 @@ from model import (
     _OBS_AX,
     _OBS_SCALE,
     _OBS_TI,
-    _bounded_logit_scales,
     _build_bptt_chunks,
     _compute_gae,
     _make_bucket_centers,
@@ -41,7 +40,7 @@ from model import (
     _precompute_policy_masks,
     _recurrent_actor_pass,
     _recurrent_logprob_pass,
-    _scale_head_logits,
+    _unimix_logits,
     _sequential_logprobs,
     _split_chunk_ids,
     action_log_prob_and_entropy,
@@ -93,7 +92,7 @@ def _manual_rollout_episode(
     for local_step in range(length):
         step_idx = offset + local_step
         obs = _make_obs(step_idx).unsqueeze(0).to(device)
-        bt_l, bd_l, cd_l, md_l, h_next = model(obs, h_prev)
+        bt_l, bd_l, cd_l, md_l, eps, h_next = model(obs, h_prev)
 
         bt_mask, bd_mask = compute_action_masks(obs)
         harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
@@ -126,10 +125,10 @@ def _manual_rollout_episode(
         bd_l = bd_l.masked_fill(~bd_mask, -1e9)
         cd_l = cd_l.masked_fill(~cd_mask, -1e9)
 
-        bt_lp, _ = action_log_prob_and_entropy(bt_l, bt_act_t)
-        bd_lp, _ = action_log_prob_and_entropy(bd_l, bd_act_t)
-        cd_lp, _ = action_log_prob_and_entropy(cd_l, cd_act_t)
-        md_lp, _ = action_log_prob_and_entropy(md_l, md_act_t)
+        bt_lp, _ = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask, eps[:, 0])
+        bd_lp, _ = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask, eps[:, 1])
+        cd_lp, _ = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, eps[:, 2])
+        md_lp, _ = action_log_prob_and_entropy(md_l, md_act_t, eps=eps[:, 3])
         bd_causal = 1.0 if bt_act != 0 else 0.0
         cd_causal = 1.0 if bt_act in CONVEYOR_BUILD_TYPES else 0.0
         total_lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
@@ -299,22 +298,26 @@ class TestActionLogProbAndEntropy:
     """Verify log_prob and entropy computation against manual formulas."""
 
     def test_log_prob_matches_manual(self):
-        """Log prob of chosen action should match manual log_softmax + gather."""
+        """Log prob should match manual softmax + unimix + gather."""
         logits = torch.tensor([[2.0, 1.0, 0.5]])
         action = torch.tensor([1])
 
         lp, _ = action_log_prob_and_entropy(logits, action)
-        expected = F.log_softmax(logits, dim=-1)[0, 1]
+        probs = F.softmax(logits, dim=-1)
+        mixed = (1 - EPS_MIN) * probs + EPS_MIN / logits.shape[-1]
+        expected = mixed.log()[0, 1]
         assert lp.item() == pytest.approx(expected.item(), abs=1e-6)
 
     def test_entropy_matches_manual(self):
-        """Entropy should match -sum(p * log(p))."""
+        """Entropy should match -sum(p * log(p)) over unimixed distribution."""
         logits = torch.tensor([[2.0, 1.0, 0.5]])
         action = torch.tensor([0])
 
         _, ent = action_log_prob_and_entropy(logits, action)
         probs = F.softmax(logits, dim=-1)
-        expected_ent = -(probs * probs.log()).sum(dim=-1)
+        mixed = (1 - EPS_MIN) * probs + EPS_MIN / logits.shape[-1]
+        log_mixed = mixed.log()
+        expected_ent = -(mixed * log_mixed).sum(dim=-1)
         assert ent.item() == pytest.approx(expected_ent.item(), abs=1e-6)
 
     def test_uniform_logits_max_entropy(self):
@@ -327,14 +330,14 @@ class TestActionLogProbAndEntropy:
         max_ent = torch.log(torch.tensor(float(n)))
         assert ent.item() == pytest.approx(max_ent.item(), abs=1e-5)
 
-    def test_deterministic_logits_zero_entropy(self):
-        """One-hot logits (very peaked) should produce near-zero entropy."""
+    def test_peaked_logits_has_entropy_floor(self):
+        """Peaked logits should still have nonzero entropy due to unimix."""
         logits = torch.tensor([[-100.0, 100.0, -100.0]])
         action = torch.tensor([1])
 
         lp, ent = action_log_prob_and_entropy(logits, action)
-        assert ent.item() == pytest.approx(0.0, abs=1e-4)
-        assert lp.item() == pytest.approx(0.0, abs=1e-4)  # log(1) = 0
+        assert ent.item() > 0.0
+        assert lp.item() < 0.0
 
     def test_log_prob_always_negative_or_zero(self):
         """Log probabilities must be <= 0."""
@@ -351,7 +354,6 @@ class TestActionLogProbAndEntropy:
         actions = torch.tensor([0, 1])
 
         lp, ent = action_log_prob_and_entropy(logits, actions)
-        # Both chose the higher-logit action, should have the same log prob
         assert lp[0].item() == pytest.approx(lp[1].item(), abs=1e-6)
         assert ent[0].item() == pytest.approx(ent[1].item(), abs=1e-6)
 
@@ -448,38 +450,31 @@ class TestDistributionalValuePrediction:
 # =====================================================================
 
 class TestDistributionalValueLoss:
-    def test_distributional_critic_clip_should_not_ignore_logit_shape(self):
+    def test_distributional_critic_clip_can_select_clipped_branch(self):
         bins = _make_bucket_centers()
         center = bins.shape[0] // 2
 
         logits_a = torch.full((1, bins.shape[0]), -30.0)
         logits_a[0, center] = 0.0
 
-        logits_b = torch.full((1, bins.shape[0]), -30.0)
-        logits_b[0, center - 1] = 0.0
-        logits_b[0, center + 1] = 0.0
-
-        old_values = torch.tensor([-2.0], dtype=torch.float32)
-        returns = torch.tensor([2.0], dtype=torch.float32)
+        old_values = torch.tensor([10.0], dtype=torch.float32)
+        returns = torch.tensor([0.0], dtype=torch.float32)
         target = value_target_probs(returns, bins)
 
         unclipped_a = soft_cross_entropy_from_logits(logits_a, target)
-        unclipped_b = soft_cross_entropy_from_logits(logits_b, target)
-        assert not torch.isclose(unclipped_a, unclipped_b, atol=1e-6, rtol=1e-6)
-
         newvalue_a = decode_value(logits_a, bins)
-        newvalue_b = decode_value(logits_b, bins)
-        assert torch.isclose(newvalue_a, newvalue_b, atol=1e-4, rtol=1e-4)
+
+        clipped_values = old_values + (newvalue_a - old_values).clamp(-0.4, 0.4)
+        clipped_branch = soft_cross_entropy_from_logits(
+            value_target_probs(clipped_values, bins), target,
+        )
+        assert clipped_branch > unclipped_a
 
         clipped_a = distributional_value_loss(
             logits_a, newvalue_a, returns, bins,
             old_values=old_values, clip_vloss=True, value_clip=0.4,
         )
-        clipped_b = distributional_value_loss(
-            logits_b, newvalue_b, returns, bins,
-            old_values=old_values, clip_vloss=True, value_clip=0.4,
-        )
-        assert not torch.isclose(clipped_a, clipped_b, atol=1e-6, rtol=1e-6)
+        assert torch.allclose(clipped_a, clipped_branch, atol=1e-6)
 
     def test_no_clip_equals_raw_cross_entropy(self):
         """With clip_vloss=False, loss should equal plain cross-entropy."""
@@ -526,18 +521,10 @@ class TestDistributionalValueLoss:
             assert (loss >= -1e-6).all()
 
     def test_clip_selects_pessimistic_branch(self):
-        """Clipping should select the branch with higher scalar loss (pessimistic).
-
-        PPO value clipping: use_clipped = scalar_loss_clipped > scalar_loss_unclipped.
-        When the clipped branch has higher scalar loss, we use the clipped CE target.
-        """
+        """Dreamer4 clipping should take the max of unclipped and clipped losses."""
         bins = _make_bucket_centers()
-        # Set up: old_value far from return, new value closer.
-        # Clipped value = old + clip(new - old), will be closer to old than to return.
-        # So scalar_loss_clipped > scalar_loss_unclipped => we use the clipped CE.
         old_values = torch.tensor([0.0])
         returns = torch.tensor([10.0])
-        # Logits that predict ~10 (close to return)
         logits = torch.full((1, bins.shape[0]), -30.0)
         target_idx = (bins - 10.0).abs().argmin()
         logits[0, target_idx] = 10.0
@@ -550,15 +537,42 @@ class TestDistributionalValueLoss:
         loss_noclip = distributional_value_loss(
             logits, values, returns, bins, clip_vloss=False,
         )
-        # With clipping active, the value target is the clipped value (0.4),
-        # which produces a DIFFERENT CE target than the true return (10.0).
-        # The scalar space check should pick the clipped branch (further from return).
         clipped_val = old_values + (values - old_values).clamp(-0.4, 0.4)
-        scalar_unclipped = (values - returns).square()
-        scalar_clipped = (clipped_val - returns).square()
-        if scalar_clipped > scalar_unclipped:
-            # Clipped branch selected — loss should differ from unclipped
-            assert not torch.allclose(loss, loss_noclip, atol=1e-4)
+        clipped_loss = soft_cross_entropy_from_logits(
+            value_target_probs(clipped_val, bins),
+            value_target_probs(returns, bins),
+        )
+        expected = torch.maximum(loss_noclip, clipped_loss)
+        assert torch.allclose(loss, expected, atol=1e-6)
+
+    def test_clipped_branch_backprops_through_values(self):
+        bins = _make_bucket_centers()
+        old_values = torch.tensor([0.0], dtype=torch.float32)
+        target_idx = (bins - 100.0).abs().argmin()
+        returns = bins[target_idx:target_idx + 1].clone().detach()
+        logits = torch.full((1, bins.shape[0]), -30.0)
+        logits[0, target_idx] = 10.0
+        values = torch.tensor([0.1], dtype=torch.float32, requires_grad=True)
+        loss = distributional_value_loss(
+            logits, values, returns, bins,
+            old_values=old_values, clip_vloss=True, value_clip=0.4,
+        )
+        unclipped = soft_cross_entropy_from_logits(
+            logits, value_target_probs(returns, bins),
+        )
+        clipped = soft_cross_entropy_from_logits(
+            value_target_probs(
+                old_values + (values - old_values).clamp(-0.4, 0.4),
+                bins,
+            ),
+            value_target_probs(returns, bins),
+        )
+
+        assert clipped.item() > unclipped.item()
+        assert torch.allclose(loss, torch.maximum(unclipped, clipped), atol=1e-6)
+        loss.backward()
+        assert values.grad is not None
+        assert values.grad.abs().sum().item() > 0.0
 
 
 # =====================================================================
@@ -851,8 +865,30 @@ class TestCentralizedCritic:
         expected = decode_value(logits, critic.bucket_centers)
         assert torch.allclose(values, expected, atol=1e-5)
 
+    def test_critic_starts_with_nonuniform_logits(self):
+        """Dreamer4 create_mlp uses standard linear init, not zero logits."""
+        torch.manual_seed(0)
+        critic = CentralizedCritic().eval()
+        R = 2
+        H, W = 8, 8
+        map_tensor = torch.randn(R, GLOBAL_MAP_CHANNELS, H, W)
+        valid_mask = torch.ones(R, 1, H, W)
+        feat = critic.encode_map(map_tensor, valid_mask)
+        scalars = torch.randn(R, GLOBAL_SCALAR_DIM)
+        B = 5
+        round_idx = torch.randint(0, R, (B,))
+        unit_xy = torch.randint(0, 8, (B, 2))
+        unit_ctx = torch.randn(B, UNIT_CONTEXT_DIM)
+        actor_latent = torch.randn(B, ACTOR_LATENT_DIM)
+
+        values, logits = critic.unit_value_logits(
+            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
+        )
+        assert not torch.allclose(logits, torch.zeros_like(logits), atol=1e-7)
+        assert values.abs().max().item() > 1e-7
+
     def test_critic_gradients_flow(self):
-        """Verify gradients flow through the critic from value loss."""
+        """Verify gradients flow through the critic from supervised value loss."""
         torch.manual_seed(0)
         critic = CentralizedCritic()
         B = 2
@@ -864,8 +900,15 @@ class TestCentralizedCritic:
         unit_ctx = torch.randn(B, UNIT_CONTEXT_DIM)
         actor_latent = torch.randn(B, ACTOR_LATENT_DIM)
 
-        values = critic(map_tensor, valid_mask, scalars, unit_xy, unit_ctx, actor_latent)
-        loss = values.sum()
+        feat = critic.encode_map(map_tensor, valid_mask)
+        round_idx = torch.arange(B)
+        values, logits = critic.unit_value_logits(
+            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
+        )
+        returns = torch.tensor([1.0, -1.0], dtype=torch.float32)
+        loss = distributional_value_loss(
+            logits, values, returns, critic.bucket_centers, clip_vloss=False,
+        ).sum()
         loss.backward()
 
         has_grad = False
@@ -874,6 +917,10 @@ class TestCentralizedCritic:
                 has_grad = True
                 break
         assert has_grad, "No gradients flowed through critic"
+
+        last_weight_grad = critic.unit_head[-1].weight.grad
+        assert last_weight_grad is not None
+        assert last_weight_grad.abs().sum().item() > 0.0
 
     def test_fully_masked_map_produces_zero_features(self):
         """A fully zeroed valid_mask should produce all-zero feature maps."""
@@ -886,24 +933,20 @@ class TestCentralizedCritic:
         feat = critic.encode_map(map_tensor, valid_mask)
         assert (feat == 0).all(), "Fully masked map should produce zero features"
 
-    def test_different_maps_same_mask_different_values(self):
-        """Different map content in valid region should produce different values."""
+    def test_different_maps_same_mask_different_features(self):
+        """Different map content in valid region should change encoded features."""
         torch.manual_seed(0)
         critic = CentralizedCritic().eval()
         H, W = 10, 10
         valid_mask = torch.ones(1, 1, H, W)
-        scalars = torch.randn(1, GLOBAL_SCALAR_DIM)
-        unit_xy = torch.tensor([[5, 5]])
-        unit_ctx = torch.randn(1, UNIT_CONTEXT_DIM)
-        actor_latent = torch.randn(1, ACTOR_LATENT_DIM)
 
         map_a = torch.randn(1, GLOBAL_MAP_CHANNELS, H, W)
         map_b = torch.randn(1, GLOBAL_MAP_CHANNELS, H, W) * 5
 
-        val_a = critic(map_a, valid_mask, scalars, unit_xy, unit_ctx, actor_latent)
-        val_b = critic(map_b, valid_mask, scalars, unit_xy, unit_ctx, actor_latent)
-        assert not torch.allclose(val_a, val_b, atol=1e-3), \
-            "Different maps should produce different values"
+        feat_a = critic.encode_map(map_a, valid_mask)
+        feat_b = critic.encode_map(map_b, valid_mask)
+        assert not torch.allclose(feat_a, feat_b, atol=1e-3), \
+            "Different maps should produce different encoded features"
 
 
 # =====================================================================
@@ -925,3 +968,292 @@ class TestAdvantageNormalization:
         assert not torch.isnan(norm_adv).any()
         # Should be all ~0
         assert norm_adv.abs().max().item() < 1e-4
+
+
+# =====================================================================
+# Logit scaling
+# =====================================================================
+
+class TestUnimix:
+    """Verify fixed unimix mechanism."""
+
+    def test_unimix_with_mask_zeros_invalid(self):
+        """Masked actions should get zero probability from unimix."""
+        logits = torch.randn(2, 5)
+        mask = torch.tensor([[True, True, False, False, False],
+                             [True, True, True, True, True]])
+        logits[~mask] = -1e9
+        log_probs = _unimix_logits(logits, mask)
+        assert log_probs[0, 2].item() == float('-inf')
+        assert log_probs[0, 3].item() == float('-inf')
+        assert log_probs[0, 0].isfinite()
+        assert log_probs[1, 4].isfinite()
+
+    def test_unimix_with_mask_matches_valid_support_mix(self):
+        """Masked unimix should match a valid-only Dreamer-style probability mix."""
+        logits = torch.tensor([[3.0, -7.0, 1.0, -9.0]])
+        mask = torch.tensor([[True, False, True, False]])
+        eps = 0.01
+
+        log_probs = _unimix_logits(logits, mask, eps=eps)
+        probs = log_probs.exp()
+
+        valid_logits = logits[0, mask[0]]
+        valid_probs = torch.softmax(valid_logits, dim=-1)
+        expected_valid = (1.0 - eps) * valid_probs + eps * (1.0 / valid_probs.numel())
+
+        assert probs[0, 1].item() == pytest.approx(0.0, abs=1e-12)
+        assert probs[0, 3].item() == pytest.approx(0.0, abs=1e-12)
+        assert probs[0, mask[0]].tolist() == pytest.approx(expected_valid.tolist(), abs=1e-7)
+
+    def test_unimix_provides_entropy_floor(self):
+        """Even peaked logits should have nonzero entropy from unimix."""
+        logits = torch.tensor([[-100.0, 100.0, -100.0]])
+        log_probs = _unimix_logits(logits)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).nan_to_num().sum(dim=-1)
+        assert entropy.item() > 0.0
+
+    def test_unimix_masked_logprob_backward_stays_finite(self):
+        """Masked-out zero-prob actions must not create NaN gradients in backward."""
+        logits = torch.tensor([[3.0, -1e9, 1.0, -1e9]], requires_grad=True)
+        mask = torch.tensor([[True, False, True, False]])
+        action = torch.tensor([0])
+
+        log_probs = _unimix_logits(logits, mask)
+        loss = -log_probs.gather(1, action.unsqueeze(1)).mean()
+        loss.backward()
+
+        assert torch.isfinite(logits.grad).all()
+        assert logits.grad[0, 1].item() == pytest.approx(0.0, abs=1e-12)
+        assert logits.grad[0, 3].item() == pytest.approx(0.0, abs=1e-12)
+
+
+# =====================================================================
+# _recurrent_logprob_pass vs _recurrent_actor_pass consistency
+# =====================================================================
+
+class TestRecurrentPassConsistency:
+    """Verify that the logprob-only and full actor recurrent passes produce
+    the same log probabilities (the actor pass adds entropy/scales)."""
+
+    def test_logprob_pass_matches_actor_pass(self):
+        torch.manual_seed(42)
+        model = BuilderMLP().eval()
+
+        ep = _manual_rollout_episode(model, 6, offset=0)
+        device = next(model.parameters()).device
+        obs = torch.stack(ep[0]).to(device)
+        bt = torch.tensor(ep[2], dtype=torch.long, device=device)
+        bd = torch.tensor(ep[3], dtype=torch.long, device=device)
+        cd = torch.tensor(ep[4], dtype=torch.long, device=device)
+        md = torch.tensor(ep[5], dtype=torch.long, device=device)
+        h0 = torch.stack(ep[1][:1]).to(device)
+
+        bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+
+        # Reshape for recurrent pass: (B=1, K=6, ...)
+        obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
+        bt_a = bt.unsqueeze(0)
+        bd_a = bd.unsqueeze(0)
+        cd_a = cd.unsqueeze(0)
+        md_a = md.unsqueeze(0)
+        bt_m = bt_mask.unsqueeze(0)
+        bd_m = bd_mask.unsqueeze(0)
+        bd_c = bd_causal.unsqueeze(0)
+        cd_c = cd_causal.unsqueeze(0)
+
+        with torch.no_grad():
+            lp_only = _recurrent_logprob_pass(
+                model, obs_pre, h0, bt_a, bd_a, cd_a, md_a, bt_m, bd_m, bd_c, cd_c,
+            )
+            lp_actor, ent, _eps = _recurrent_actor_pass(
+                model, obs_pre, h0, bt_a, bd_a, cd_a, md_a, bt_m, bd_m, bd_c, cd_c,
+            )
+
+        assert torch.allclose(lp_only, lp_actor, atol=1e-5), \
+            f"Log prob mismatch: max diff {(lp_only - lp_actor).abs().max()}"
+
+    def test_entropy_is_nonnegative(self):
+        """Entropy from the actor pass should always be >= 0."""
+        torch.manual_seed(7)
+        model = BuilderMLP().eval()
+        ep = _manual_rollout_episode(model, 4, offset=0)
+        device = next(model.parameters()).device
+        obs = torch.stack(ep[0]).to(device)
+        bt = torch.tensor(ep[2], dtype=torch.long, device=device)
+        bd = torch.tensor(ep[3], dtype=torch.long, device=device)
+        cd = torch.tensor(ep[4], dtype=torch.long, device=device)
+        md = torch.tensor(ep[5], dtype=torch.long, device=device)
+        h0 = torch.stack(ep[1][:1]).to(device)
+
+        bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+        obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
+
+        with torch.no_grad():
+            _, ent, _eps = _recurrent_actor_pass(
+                model, obs_pre, h0,
+                bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0), md.unsqueeze(0),
+                bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
+                bd_causal.unsqueeze(0), cd_causal.unsqueeze(0),
+            )
+
+        assert (ent >= -1e-6).all(), f"Negative entropy found: {ent.min()}"
+
+
+# =====================================================================
+# _precompute_policy_masks
+# =====================================================================
+
+class TestPrecomputePolicyMasks:
+    def test_bd_causal_zero_for_no_build(self):
+        """bd_causal should be 0 when bt_act is 0 (no build)."""
+        obs = _make_obs(0).unsqueeze(0)
+        bt = torch.tensor([0])
+        _, _, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+        assert bd_causal[0].item() == 0.0
+        assert cd_causal[0].item() == 0.0
+
+    def test_bd_causal_one_for_harvester(self):
+        obs = _make_obs(0).unsqueeze(0)
+        bt = torch.tensor([HARVESTER_BUILD_TYPE])
+        _, _, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+        assert bd_causal[0].item() == 1.0
+        assert cd_causal[0].item() == 0.0  # harvester is not conveyor
+
+    def test_cd_causal_one_for_conveyor(self):
+        obs = _make_obs(0).unsqueeze(0)
+        for cbt in CONVEYOR_BUILD_TYPES:
+            bt = torch.tensor([cbt])
+            _, _, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+            assert bd_causal[0].item() == 1.0, f"bd_causal should be 1 for conveyor type {cbt}"
+            assert cd_causal[0].item() == 1.0, f"cd_causal should be 1 for conveyor type {cbt}"
+
+
+# =====================================================================
+# _split_chunk_ids
+# =====================================================================
+
+class TestSplitChunkIds:
+    def test_all_full_length(self):
+        """When all chunks are bptt_k, tail should be empty."""
+        lens = torch.tensor([4, 4, 4, 4])
+        full, tail = _split_chunk_ids(lens, bptt_k=4)
+        assert full.shape[0] == 4
+        assert tail.shape[0] == 0
+
+    def test_all_tail(self):
+        """When no chunk is bptt_k, full should be empty."""
+        lens = torch.tensor([1, 2, 3])
+        full, tail = _split_chunk_ids(lens, bptt_k=4)
+        assert full.shape[0] == 0
+        assert tail.shape[0] == 3
+
+    def test_tails_sorted_descending(self):
+        """Tail chunk ids should be sorted by length descending."""
+        lens = torch.tensor([4, 1, 3, 4, 2])
+        _, tail = _split_chunk_ids(lens, bptt_k=4)
+        tail_lens = lens[tail]
+        for i in range(len(tail_lens) - 1):
+            assert tail_lens[i] >= tail_lens[i + 1]
+
+    def test_full_plus_tail_covers_all(self):
+        """Full + tail ids should cover all chunk indices."""
+        lens = torch.tensor([4, 2, 4, 1, 4, 3])
+        full, tail = _split_chunk_ids(lens, bptt_k=4)
+        all_ids = torch.cat([full, tail]).sort().values
+        expected = torch.arange(6)
+        assert torch.equal(all_ids, expected)
+
+
+# =====================================================================
+# _normalize_actor_latent_dim
+# =====================================================================
+
+class TestNormalizeActorLatent:
+    def test_exact_dim_is_identity(self):
+        x = torch.randn(3, ACTOR_LATENT_DIM)
+        assert torch.equal(_normalize_actor_latent_dim(x), x)
+
+    def test_larger_dim_truncates(self):
+        x = torch.randn(3, ACTOR_LATENT_DIM + 10)
+        out = _normalize_actor_latent_dim(x)
+        assert out.shape == (3, ACTOR_LATENT_DIM)
+        assert torch.equal(out, x[:, :ACTOR_LATENT_DIM])
+
+    def test_smaller_dim_zero_pads(self):
+        x = torch.randn(3, ACTOR_LATENT_DIM - 5)
+        out = _normalize_actor_latent_dim(x)
+        assert out.shape == (3, ACTOR_LATENT_DIM)
+        assert torch.equal(out[:, :ACTOR_LATENT_DIM - 5], x)
+        assert (out[:, ACTOR_LATENT_DIM - 5:] == 0).all()
+
+
+# =====================================================================
+# Actor gradient flow (PPO actor loss backward)
+# =====================================================================
+
+class TestActorGradientFlow:
+    """Verify gradients flow through the actor from the PPO surrogate loss."""
+
+    def test_actor_loss_backward_produces_gradients(self):
+        torch.manual_seed(0)
+        model = BuilderMLP()
+        model.train()
+
+        ep = _manual_rollout_episode(model, 4, offset=0)
+        device = next(model.parameters()).device
+        obs = torch.stack(ep[0]).to(device)
+        bt = torch.tensor(ep[2], dtype=torch.long, device=device)
+        bd = torch.tensor(ep[3], dtype=torch.long, device=device)
+        cd = torch.tensor(ep[4], dtype=torch.long, device=device)
+        md = torch.tensor(ep[5], dtype=torch.long, device=device)
+        old_lps = torch.tensor(ep[6], dtype=torch.float32, device=device)
+        h0 = torch.zeros(1, H_DIM, device=device)
+
+        bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+        obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
+
+        new_lps, ent, _eps = _recurrent_actor_pass(
+            model, obs_pre, h0,
+            bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0), md.unsqueeze(0),
+            bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
+            bd_causal.unsqueeze(0), cd_causal.unsqueeze(0),
+        )
+        new_lps = new_lps.squeeze(0)
+        ent = ent.squeeze(0)
+
+        # Build PPO surrogate loss
+        advantages = torch.randn_like(old_lps)
+        ratio = (new_lps - old_lps.detach()).exp()
+        clip_eps = 0.2
+        pg1 = -advantages * ratio
+        pg2 = -advantages * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+        pi_loss = torch.max(pg1, pg2).mean()
+        actor_loss = pi_loss - 0.01 * ent.mean()
+
+        actor_loss.backward()
+
+        has_grad = False
+        for p in model.parameters():
+            if p.grad is not None and p.grad.abs().sum() > 0:
+                has_grad = True
+                break
+        assert has_grad, "No gradients flowed through actor"
+
+    def test_no_grad_leak_through_old_log_probs(self):
+        """old_log_probs should be detached — no gradient should flow through them."""
+        torch.manual_seed(0)
+        model = BuilderMLP()
+
+        ep = _manual_rollout_episode(model, 3, offset=0)
+        old_lps = torch.tensor(ep[6], dtype=torch.float32, requires_grad=True)
+
+        # Simulate ratio computation with detached old_lps
+        new_lps = torch.randn(3, requires_grad=True)
+        ratio = (new_lps - old_lps.detach()).exp()
+        loss = ratio.mean()
+        loss.backward()
+
+        assert old_lps.grad is None or (old_lps.grad == 0).all(), \
+            "Gradients leaked through old_log_probs"
