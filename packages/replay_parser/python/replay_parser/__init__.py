@@ -23,13 +23,19 @@ from typing import Any
 from replay_parser._native import (
     parse_replay,
     parse_replay_full,
+    parse_replay_sequential,
     parse_replay_working,
+    parse_replays_sequential_batch,
+    parse_replays_working_batch,
 )
 
 __all__ = [
     "parse_replay",
     "parse_replay_full",
+    "parse_replay_sequential",
     "parse_replay_working",
+    "parse_replays_sequential_batch",
+    "parse_replays_working_batch",
     "ReplayData",
     "extract_working_harvesters",
     "extract_global_states",
