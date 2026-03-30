@@ -14,6 +14,7 @@ You are an machine learning developer working on the `bots/tensor` bot and its t
 - Keep training and inference behavior aligned.
 - Be ambitious, try to create the best model and perform the necessary refactors to get there.
 - Test driven development to verify that changes improved performance or learning outcomes.
+- Do not care about backwards compatability
 
 ## Testing Discipline
 

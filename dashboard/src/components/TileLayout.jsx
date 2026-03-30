@@ -383,6 +383,7 @@ function CardSlot({ cardId, leafId, card, isDragTarget, dragPos, onDragOverCard,
         defaultOpen={card.defaultOpen ?? true}
         dragHandleProps={dragHandleProps}
         hasEma={card.hasEma}
+        hasLegend={card.hasLegend}
         renderContent={card.render}
       />
 

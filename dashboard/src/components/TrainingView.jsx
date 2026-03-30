@@ -1,13 +1,16 @@
-import { createContext, memo, useContext } from 'react'
+import { createContext, memo, useContext, useMemo, useState } from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { viewerAtom, viewerMinimizedAtom, trainSessionAtom } from '../store'
 import { Line, Bar } from 'react-chartjs-2'
 import { viewerUrl } from '../api'
 import {
   useGameLogQuery,
+  useGameLogEpisodesQuery,
+  useGameLogForEpisodeQuery,
   useLeagueQuery,
   useTrainLogQuery,
   useTrainReplaysQuery,
+  useTrainStepLogQuery,
 } from '../hooks/useDashboardQueries'
 import '../chartjs'
 
@@ -21,6 +24,11 @@ const TrainConfigCtx = createContext({})
 const TrainLoadingCtx = createContext(true)
 const TrainLeagueCtx = createContext([])
 const TrainGameLogCtx = createContext({})
+const TrainStepLogCtx = createContext([])
+const SelectedEpisodeCtx = createContext({
+  episode: null, setEpisode: () => {},
+  range: [null, null], setRange: () => {},
+})
 const EMPTY_ARRAY = []
 const EMPTY_OBJECT = {}
 
@@ -30,6 +38,10 @@ function useTrainEpisodes() {
 
 function useTrainConfig() {
   return useContext(TrainConfigCtx)
+}
+
+function useTrainMode() {
+  return useTrainConfig().mode || 'batched-gpu'
 }
 
 function useTrainLoading() {
@@ -44,8 +56,34 @@ function useTrainGameLog() {
   return useContext(TrainGameLogCtx)
 }
 
+function useTrainStepLog() {
+  return useContext(TrainStepLogCtx)
+}
+
+function useSelectedEpisode() {
+  return useContext(SelectedEpisodeCtx)
+}
+
+function useEpisodeRange() {
+  const { range } = useSelectedEpisode()
+  return range
+}
+
+function useRangedEpisodes() {
+  const episodes = useTrainEpisodes()
+  const [rangeMin, rangeMax] = useEpisodeRange()
+  return useMemo(() => {
+    if (rangeMin == null && rangeMax == null) return episodes
+    return episodes.filter(e =>
+      (rangeMin == null || e.episode >= rangeMin) &&
+      (rangeMax == null || e.episode <= rangeMax)
+    )
+  }, [episodes, rangeMin, rangeMax])
+}
+
 function TrainingDataProvider({ session, children }) {
   const trainLogQuery = useTrainLogQuery(session)
+  const trainStepLogQuery = useTrainStepLogQuery(session)
   const leagueQuery = useLeagueQuery(session)
   const gameLogQuery = useGameLogQuery(session)
 
@@ -54,6 +92,7 @@ function TrainingDataProvider({ session, children }) {
   const loading = trainLogQuery.isPending && !episodes.length
   const leagueModels = leagueQuery.data ?? EMPTY_ARRAY
   const gameLog = gameLogQuery.data?.map ?? EMPTY_OBJECT
+  const stepLog = trainStepLogQuery.data?.steps ?? EMPTY_ARRAY
 
   return (
     <TrainEpisodesCtx.Provider value={episodes}>
@@ -61,7 +100,9 @@ function TrainingDataProvider({ session, children }) {
         <TrainLoadingCtx.Provider value={loading}>
           <TrainLeagueCtx.Provider value={leagueModels}>
             <TrainGameLogCtx.Provider value={gameLog}>
-              {children}
+              <TrainStepLogCtx.Provider value={stepLog}>
+                {children}
+              </TrainStepLogCtx.Provider>
             </TrainGameLogCtx.Provider>
           </TrainLeagueCtx.Provider>
         </TrainLoadingCtx.Provider>
@@ -97,6 +138,35 @@ function downsample(arr, max = MAX_CHART_POINTS) {
       }
     }
     // Preserve episode number from the last element in the bucket for x-axis
+    averaged.episode = bucket[bucket.length - 1].episode
+    result.push(averaged)
+  }
+  return result
+}
+
+function downsampleSteps(arr, max = MAX_CHART_POINTS) {
+  if (arr.length <= max) return arr
+  const bucketSize = Math.ceil(arr.length / max)
+  const result = []
+  for (let i = 0; i < arr.length; i += bucketSize) {
+    const end = Math.min(i + bucketSize, arr.length)
+    const bucket = arr.slice(i, end)
+    const mid = bucket[Math.floor((bucket.length - 1) / 2)]
+    const averaged = { ...mid }
+    for (const key of Object.keys(mid)) {
+      if (typeof mid[key] === 'number') {
+        let sum = 0
+        let count = 0
+        for (let j = 0; j < bucket.length; j++) {
+          const v = bucket[j][key]
+          if (v != null) {
+            sum += v
+            count += 1
+          }
+        }
+        averaged[key] = count > 0 ? sum / count : mid[key]
+      }
+    }
     averaged.episode = bucket[bucket.length - 1].episode
     result.push(averaged)
   }
@@ -167,6 +237,7 @@ function chartBase(yViewport = null) {
 function StatusPanel() {
   const episodes = useTrainEpisodes()
   const config = useTrainConfig()
+  const mode = useTrainMode()
   const loading = useTrainLoading()
   const latest = episodes[episodes.length - 1]
   const progress = config.total_episodes
@@ -184,10 +255,25 @@ function StatusPanel() {
     )
   }
 
+  if (mode === 'critic_pretrain') {
+    return (
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <Stat label="Epochs" value={progress} />
+        <Stat label="Last Value Loss" value={fmt(latest?.value_loss ?? latest?.loss, 4)} />
+        <Stat label="Expl. Variance" value={fmt(latest?.explained_var, 3)} />
+        <Stat label="Batches" value={fmt(latest?.n_batches, 0)} />
+        <Stat label="Samples" value={fmt(latest?.n_samples ?? latest?.n_rounds, 0)} />
+        <Stat label="Elapsed" value={latest ? `${latest.elapsed}s` : '\u2014'} />
+        {config.lr && <Stat label="LR" value={config.lr} />}
+      </div>
+    )
+  }
+
   return (
     <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
       <Stat label="Episodes" value={progress} />
       <Stat label="Last Reward / Unit" value={fmt(latest?.reward, 3)} />
+      <Stat label="Outcome Reward" value={fmt(latest?.r_outcome, 2)} />
       <Stat label="Last Resources" value={fmt(latest?.resources, 1)} />
       <Stat label="Expl. Variance" value={fmt(latest?.explained_var, 3)} />
       <Stat label="Entropy" value={fmt(latest?.entropy, 3)} />
@@ -199,7 +285,7 @@ function StatusPanel() {
 }
 
 const RewardChart = memo(function RewardChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -222,7 +308,7 @@ const RewardChart = memo(function RewardChart() {
 })
 
 const RewardBreakdownChart = memo(function RewardBreakdownChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -231,6 +317,7 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
     { key: 'r_work', altKey: 'r_flow', label: 'Flow', color: '#f9e2af' },
     { key: 'r_dmg', label: 'Damage', color: '#f38ba8' },
     { key: 'r_own_dmg', label: 'Own Core Dmg', color: '#cba6f7' },
+    { key: 'r_outcome', label: 'Outcome', color: '#a6e3a1' },
   ]
   const datasets = series.flatMap(({ key, altKey, label, color }) => {
     const raw = ds.map(e => e[key] ?? e[altKey] ?? 0)
@@ -261,7 +348,7 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
 })
 
 const HarvesterDebugChart = memo(function HarvesterDebugChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -301,7 +388,7 @@ const HarvesterDebugChart = memo(function HarvesterDebugChart() {
 })
 
 const ConveyorDebugChart = memo(function ConveyorDebugChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -343,7 +430,7 @@ const ConveyorDebugChart = memo(function ConveyorDebugChart() {
 function makeSimpleChart(label, dataKey, color, opts = {}) {
   return memo(function SimpleChart() {
     "use no memo"
-    const episodes = useTrainEpisodes()
+    const episodes = useRangedEpisodes()
     const { ema: emaOn, bands: bandsOn } = useCardSettings()
     if (episodes.length <= 1) return <NoData />
     const ds = downsample(episodes)
@@ -372,12 +459,60 @@ function makeSimpleChart(label, dataKey, color, opts = {}) {
 const ResourcesChart = makeSimpleChart('Resources', 'resources', '#89b4fa')
 const WinRateChart = makeSimpleChart('Win Rate', 'winrate', '#cba6f7')
 const EntropyChart = makeSimpleChart('Entropy', 'entropy', '#cba6f7', { fill: '#cba6f720' })
-const ExplVarChart = makeSimpleChart('Explained Var', 'explained_var', '#a6e3a1', { fill: '#a6e3a120' })
 const KLChart = makeSimpleChart('KL', 'approx_kl', '#fab387')
 const ClipChart = makeSimpleChart('Clip Frac', 'clip_frac', '#f9e2af')
 
+const ExplVarChart = memo(function ExplVarChart() {
+  const episodes = useRangedEpisodes()
+  const steps = useTrainStepLog()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
+
+  const stepRows = downsampleSteps(steps).filter(e => e.explained_var != null)
+  const episodeRows = downsample(episodes).filter(e => e.explained_var != null)
+  const useSteps = stepRows.length > 1
+  const rows = useSteps ? stepRows : episodeRows
+  if (rows.length <= 1) return <NoData />
+
+  const raw = rows.map(e => e.explained_var)
+  const datasets = [{
+    label: 'Explained Var',
+    data: raw,
+    borderColor: emaOn ? '#a6e3a140' : '#a6e3a1',
+    tension: 0,
+    pointRadius: 0,
+    borderWidth: emaOn ? 1 : 1.5,
+    spanGaps: true,
+  }]
+  if (emaOn) {
+    datasets.push({
+      label: 'Explained Var EMA',
+      data: ema(raw),
+      borderColor: '#a6e3a1',
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0.3,
+      spanGaps: true,
+    })
+  }
+  const yViewport = bandsOn
+    ? percentileViewport(raw.filter(v => v != null))
+    : null
+  const labels = rows.map(e => e.episode)
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels, datasets }}
+        options={{
+          ...chartBase(yViewport),
+          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+})
+
 const LogitScaleChart = memo(function LogitScaleChart({ series }) {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -437,17 +572,20 @@ const LogitScaleStdChart = memo(function LogitScaleStdChart() {
 })
 
 const LossChart = memo(function LossChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
+  const mode = useTrainMode()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const dim = emaOn
   const ds = downsample(episodes)
-  const series = [
-    { key: 'pi_loss', label: 'Policy Loss', color: '#f38ba8' },
-    { key: 'vf_loss', label: 'Value Loss', color: '#f9e2af' },
-  ]
-  const datasets = series.flatMap(({ key, label, color }) => {
-    const raw = ds.map(e => e[key])
+  const series = mode === 'critic_pretrain'
+    ? [{ key: 'value_loss', altKey: 'loss', label: 'Value Loss', color: '#f9e2af' }]
+    : [
+        { key: 'pi_loss', label: 'Policy Loss', color: '#f38ba8' },
+        { key: 'vf_loss', label: 'Value Loss', color: '#f9e2af' },
+      ]
+  const datasets = series.flatMap(({ key, altKey, label, color }) => {
+    const raw = ds.map(e => e[key] ?? e[altKey] ?? null)
     const result = [{
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
@@ -459,7 +597,7 @@ const LossChart = memo(function LossChart() {
     return result
   })
   const yViewport = bandsOn
-    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key])))
+    ? percentileViewport(series.flatMap(({ key, altKey }) => ds.map(e => e[key] ?? e[altKey] ?? null).filter(v => v != null)))
     : null
   return (
     <div className="min-h-[200px]">
@@ -470,6 +608,75 @@ const LossChart = memo(function LossChart() {
           plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
         }}
       />
+    </div>
+  )
+})
+
+const StepLossChart = memo(function StepLossChart() {
+  const steps = useTrainStepLog()
+  const mode = useTrainMode()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  if (steps.length <= 1) return <NoData />
+  const ds = downsampleSteps(steps)
+  const dim = emaOn
+  const series = mode === 'critic_pretrain'
+    ? [{ key: 'value_loss', altKey: 'loss', label: 'Value Loss', color: '#f9e2af' }]
+    : [
+        { key: 'loss', label: 'Total', color: '#f38ba8' },
+        { key: 'loss_bt', label: 'Build Type', color: '#89b4fa' },
+        { key: 'loss_bd', label: 'Build Dir', color: '#f9e2af' },
+        { key: 'loss_cd', label: 'Conv Dir', color: '#94e2d5' },
+        { key: 'loss_brt', label: 'Bridge Target', color: '#cba6f7' },
+        { key: 'loss_md', label: 'Move Dir', color: '#a6e3a1' },
+      ]
+  const datasets = series.flatMap(({ key, altKey, label, color }) => {
+    const raw = ds.map(e => e[key] ?? e[altKey] ?? null)
+    const result = [{
+      label, data: raw, borderColor: dim ? color + '40' : color,
+      tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
+    }]
+    if (emaOn) result.push({
+      label: `${label} EMA`, data: ema(raw), borderColor: color,
+      borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
+    })
+    return result
+  })
+  const yViewport = bandsOn
+    ? percentileViewport(series.flatMap(({ key, altKey }) => ds.map(e => e[key] ?? e[altKey] ?? null).filter(v => v != null)))
+    : null
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels: ds.map(e => e.episode), datasets }}
+        options={{
+          ...chartBase(yViewport),
+          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+})
+
+const GradNormChart = memo(function GradNormChart() {
+  const steps = useTrainStepLog()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const rows = downsampleSteps(steps).filter(e => e.grad_norm != null)
+  if (rows.length <= 1) return <NoData />
+  const raw = rows.map(e => e.grad_norm)
+  const dim = emaOn
+  const datasets = [{
+    label: 'Grad Norm', data: raw,
+    borderColor: dim ? '#fab38740' : '#fab387',
+    tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
+  }]
+  if (emaOn) datasets.push({
+    label: 'Grad Norm EMA', data: ema(raw),
+    borderColor: '#fab387', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
+  })
+  const yViewport = bandsOn ? percentileViewport(raw) : null
+  return (
+    <div className="min-h-[200px]">
+      <Line data={{ labels: rows.map(e => e.episode), datasets }} options={chartBase(yViewport)} />
     </div>
   )
 })
@@ -542,9 +749,19 @@ function EpisodeLogTable() {
 function TrainingReplaysContent() {
   const session = useAtomValue(trainSessionAtom)
   const gameLog = useTrainGameLog()
-  const replays = useTrainReplaysQuery(session).data || []
+  const allReplays = useTrainReplaysQuery(session).data || []
+  const { episode: selectedEp } = useSelectedEpisode()
   const setViewer = useSetAtom(viewerAtom)
   const setMinimized = useSetAtom(viewerMinimizedAtom)
+
+  // Filter to selected episode (or the first episode if none selected)
+  const episodeNumbers = sortEpisodeNumbersAsc(
+    allReplays.map(r => replayEpisode(r.name)).filter(e => e != null)
+  )
+  const targetEp = selectedEp ?? lastEpisode(episodeNumbers)
+  const replays = targetEp != null
+    ? allReplays.filter(r => replayEpisode(r.name) === targetEp)
+    : allReplays
 
   function openReplay(name) {
     const sessionQs = session ? `?session=${encodeURIComponent(session)}` : ''
@@ -599,9 +816,29 @@ function TrainingReplaysContent() {
 // ---- Small helpers ----
 
 function parseReplayName(name) {
-  const m = name.match(/^ep(\d+)_game(\d+)\.replay26$/)
-  if (m) return `Episode ${m[1]}, Game ${m[2]}`
+  // ep1_gen_0_g0.replay26 → Episode 1, gen_0 G0
+  const m = name.match(/^ep(\d+)_(.+)_g(\d+)\.replay26$/)
+  if (m) return `Ep ${m[1]}, ${m[2]} G${m[3]}`
+  const m2 = name.match(/^ep(\d+)_game(\d+)\.replay26$/)
+  if (m2) return `Ep ${m2[1]}, Game ${m2[2]}`
   return name.replace('.replay26', '')
+}
+
+function replayEpisode(name) {
+  const m = name.match(/^ep(\d+)_/)
+  return m ? Number(m[1]) : null
+}
+
+function sortEpisodeNumbersAsc(values) {
+  return [...values].sort((a, b) => a - b)
+}
+
+function firstEpisode(values) {
+  return values.length ? values[0] : null
+}
+
+function lastEpisode(values) {
+  return values.length ? values[values.length - 1] : null
 }
 
 
@@ -619,6 +856,208 @@ function NoData() {
   return <p className="text-[12px] text-overlay0/50 py-3">Waiting for data...</p>
 }
 
+const WIN_CONF_COLORS = {
+  a: '#a6e3a1', // win — green
+  b: '#f38ba8', // loss — red
+  null: '#a6adc8', // draw/unknown — gray
+}
+
+const WinConfidenceChart = memo(function WinConfidenceChart() {
+  const session = useAtomValue(trainSessionAtom)
+  const epsData = useGameLogEpisodesQuery(session).data
+  const gameLogEps = epsData?.episodes ?? []
+  const { episode: selectedEp } = useSelectedEpisode()
+  const { legend: legendOn } = useCardSettings()
+
+  const latestEp = epsData?.latestEp ?? null
+  const isLatest = selectedEp == null || selectedEp === latestEp
+  const targetEp = isLatest ? null : selectedEp
+  const epQuery = useGameLogForEpisodeQuery(session, targetEp)
+  const rawGames = isLatest ? (epsData?.latestGames ?? []) : (epQuery.data?.games ?? [])
+  const epGames = rawGames.filter(g => g.win_confidence?.length)
+  if (!epGames.length) return <NoData />
+
+  const maxRound = Math.max(...epGames.map(g => (g.round_offset ?? 0) + g.win_confidence.length))
+  const labels = Array.from({ length: maxRound }, (_, i) => i)
+
+  const datasets = epGames.map((g) => {
+    const known = g.winner === 'a' || g.winner === 'b'
+    const target = g.winner === 'a' ? 100 : g.winner === 'b' ? 0 : null
+    const offset = g.round_offset ?? 0
+    const raw = g.win_confidence.map(v => v * 100)
+    const data = [...Array(offset).fill(null), ...raw]
+
+    if (!known) {
+      return {
+        label: `${g.game}`,
+        data,
+        borderColor: '#a6adc8',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.2,
+        spanGaps: false,
+      }
+    }
+
+    const correct = target > 50 ? v => v > 50 : v => v < 50
+    const segColors = data.map(v =>
+      v == null ? '#a6adc8' : correct(v) ? '#a6e3a1' : '#f38ba8'
+    )
+    return {
+      label: `${g.game}`,
+      data,
+      segment: { borderColor: ctx => segColors[ctx.p0DataIndex] || '#a6adc8' },
+      borderColor: segColors[0] || '#a6adc8',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.2,
+      spanGaps: false,
+    }
+  })
+
+
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels, datasets }}
+        options={{
+          ...chartBase(),
+          scales: {
+            ...chartScales(),
+            y: { ...chartScales().y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
+            x: { ...chartScales().x, title: { display: true, text: 'Round', color: CHART_THEME.subtext } },
+          },
+          plugins: { legend: { display: legendOn, labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+})
+
+const WinPredictionAccuracyChart = memo(function WinPredictionAccuracyChart() {
+  const session = useAtomValue(trainSessionAtom)
+  const { ema: emaOn } = useCardSettings()
+  const data = useGameLogEpisodesQuery(session).data
+  const summaries = data?.summaries ?? []
+  const [rangeMin, rangeMax] = useEpisodeRange()
+
+  const valid = summaries.filter(s =>
+    s.accuracy != null &&
+    (rangeMin == null || s.episode >= rangeMin) &&
+    (rangeMax == null || s.episode <= rangeMax)
+  )
+  if (valid.length <= 1) return <NoData />
+
+  const labels = valid.map(s => s.episode)
+  const accRaw = valid.map(s => s.accuracy * 100)
+  const confRaw = valid.map(s => (s.mean_confidence ?? 0) * 100)
+
+  const dim = emaOn
+  const datasets = [
+    {
+      label: 'Accuracy',
+      data: accRaw,
+      borderColor: dim ? '#a6e3a140' : '#a6e3a1',
+      borderWidth: dim ? 1 : 1.5,
+      pointRadius: 0, tension: 0, spanGaps: true,
+    },
+    {
+      label: 'Mean Confidence',
+      data: confRaw,
+      borderColor: dim ? '#89b4fa40' : '#89b4fa',
+      borderWidth: dim ? 1 : 1.5,
+      pointRadius: 0, tension: 0, spanGaps: true,
+    },
+  ]
+  if (emaOn) {
+    datasets.push(
+      { label: 'Accuracy EMA', data: ema(accRaw), borderColor: '#a6e3a1', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true },
+      { label: 'Confidence EMA', data: ema(confRaw), borderColor: '#89b4fa', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true },
+    )
+  }
+
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels, datasets }}
+        options={{
+          ...chartBase({ min: 0, max: 100 }),
+          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+})
+
+const RoundAccuracyChart = memo(function RoundAccuracyChart() {
+  const gameLog = useTrainGameLog()
+  const [rangeMin, rangeMax] = useEpisodeRange()
+
+  const games = useMemo(() => {
+    return Object.values(gameLog).filter(g =>
+      g.win_confidence?.length && g.winner != null &&
+      (rangeMin == null || g.episode >= rangeMin) &&
+      (rangeMax == null || g.episode <= rangeMax)
+    )
+  }, [gameLog, rangeMin, rangeMax])
+
+  if (!games.length) return <NoData />
+
+  // For each round, accumulate correct/total predictions
+  const roundCorrect = []
+  const roundTotal = []
+  for (const g of games) {
+    const offset = g.round_offset ?? 0
+    const wc = g.win_confidence
+    for (let i = 0; i < wc.length; i++) {
+      const r = offset + i
+      while (roundCorrect.length <= r) { roundCorrect.push(0); roundTotal.push(0) }
+      roundTotal[r]++
+      const pred = wc[i] > 0.5 ? 'a' : 'b'
+      if (pred === g.winner) roundCorrect[r]++
+    }
+  }
+
+  const labels = []
+  const accData = []
+  for (let r = 0; r < roundTotal.length; r++) {
+    if (roundTotal[r] >= 3) {
+      labels.push(r)
+      accData.push((roundCorrect[r] / roundTotal[r]) * 100)
+    }
+  }
+  if (labels.length < 2) return <NoData />
+
+  const datasets = [
+    {
+      label: 'Accuracy',
+      data: accData,
+      borderColor: '#a6e3a1',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.3,
+    },
+  ]
+
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels, datasets }}
+        options={{
+          ...chartBase(),
+          scales: {
+            ...chartScales(),
+            y: { ...chartScales().y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
+            x: { ...chartScales().x, title: { display: true, text: 'Round', color: CHART_THEME.subtext } },
+          },
+          plugins: { legend: { display: false } },
+        }}
+      />
+    </div>
+  )
+})
+
+
 // ---- Card registry (module-level, stable reference) ----
 
 const TRAINING_CARDS = {
@@ -629,11 +1068,16 @@ const TRAINING_CARDS = {
   'train-conv-debug':       { title: 'Conveyor Debug',      subtitle: 'per unit', hasEma: true, render: () => <ConveyorDebugChart /> },
   'train-ep-res':           { title: 'Resources / Episode', hasEma: true, render: () => <ResourcesChart /> },
   'train-winrate':          { title: 'Win Rate',            hasEma: true, render: () => <WinRateChart /> },
+  'train-win-confidence':   { title: 'Win Confidence',      subtitle: 'per round', hasLegend: true, render: () => <WinConfidenceChart /> },
+  'train-prediction-acc':   { title: 'Prediction Accuracy', subtitle: 'per episode', hasEma: true, render: () => <WinPredictionAccuracyChart /> },
+  'train-round-accuracy':   { title: 'Round Accuracy',      subtitle: 'by absolute round', render: () => <RoundAccuracyChart /> },
   'train-elo':              { title: 'League ELO',          render: () => <LeagueEloCard /> },
   'train-loss-chart':       { title: 'Loss',                defaultOpen: false, hasEma: true, render: () => <LossChart /> },
+  'train-step-loss':        { title: 'Loss / Optimizer Step', defaultOpen: false, hasEma: true, render: () => <StepLossChart /> },
   'train-entropy':          { title: 'Entropy',             defaultOpen: false, hasEma: true, render: () => <EntropyChart /> },
   'train-ev':               { title: 'Explained Variance',  hasEma: true, render: () => <ExplVarChart /> },
   'train-kl':               { title: 'Approx KL',           defaultOpen: false, hasEma: true, render: () => <KLChart /> },
+  'train-grad-norm':        { title: 'Grad Norm',            defaultOpen: false, hasEma: true, render: () => <GradNormChart /> },
   'train-clip':             { title: 'Clip Fraction',       defaultOpen: false, hasEma: true, render: () => <ClipChart /> },
   'train-logit-scale-mean': { title: 'Logit Scale Mean',    defaultOpen: false, hasEma: true, render: () => <LogitScaleMeanChart /> },
   'train-logit-scale-std':  { title: 'Logit Scale Std',     defaultOpen: false, hasEma: true, render: () => <LogitScaleStdChart /> },
@@ -648,16 +1092,88 @@ const DEFAULT_LAYOUT = {
 
 // ---- Main export ----
 
+function EpisodeSelector() {
+  const episodes = useTrainEpisodes()
+  const session = useAtomValue(trainSessionAtom)
+  const gameLogEps = useGameLogEpisodesQuery(session).data?.episodes ?? EMPTY_ARRAY
+  const { episode, setEpisode, range, setRange } = useSelectedEpisode()
+
+  // Merge episode numbers from train_log and game_log
+  const allEpNums = useMemo(() => {
+    const nums = new Set(episodes.map(e => e.episode))
+    for (const ep of gameLogEps) nums.add(ep)
+    return sortEpisodeNumbersAsc(nums)
+  }, [episodes, gameLogEps])
+
+  if (!allEpNums.length) return null
+
+  const current = episode ?? lastEpisode(allEpNums)
+  const minEp = firstEpisode(allEpNums)
+  const maxEp = lastEpisode(allEpNums)
+
+  const inputClass = 'bg-surface0 text-text text-[12px] rounded px-1.5 py-0.5 border border-surface1 outline-none w-16'
+
+  return (
+    <div className="flex items-center gap-4 px-2 py-1.5 mb-2">
+      <div className="flex items-center gap-2">
+        <label className="text-[12px] text-overlay0">Episode</label>
+        <select
+          className="bg-surface0 text-text text-[12px] rounded px-2 py-1 border border-surface1 outline-none"
+          value={current ?? ''}
+          onChange={e => {
+            const v = Number(e.target.value)
+            setEpisode(v === lastEpisode(allEpNums) ? null : v)
+          }}
+        >
+          {[...allEpNums].reverse().map(ep => (
+            <option key={ep} value={ep}>
+              {ep}{ep === maxEp ? ' (latest)' : ''}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <label className="text-[12px] text-overlay0">Range</label>
+        <input
+          type="number"
+          className={inputClass}
+          placeholder={String(minEp)}
+          value={range[0] ?? ''}
+          onChange={e => setRange([e.target.value ? Number(e.target.value) : null, range[1]])}
+        />
+        <span className="text-[12px] text-overlay0">–</span>
+        <input
+          type="number"
+          className={inputClass}
+          placeholder={String(maxEp)}
+          value={range[1] ?? ''}
+          onChange={e => setRange([range[0], e.target.value ? Number(e.target.value) : null])}
+        />
+      </div>
+    </div>
+  )
+}
+
 export default function TrainingView() {
   const session = useAtomValue(trainSessionAtom)
+  const [episode, setEpisode] = useState(null)
+  const [range, setRange] = useState([null, null])
+  const ctx = useMemo(() => ({ episode, setEpisode, range, setRange }), [episode, range])
 
   return (
     <TrainingDataProvider session={session}>
-      <TileLayout
-        cards={TRAINING_CARDS}
-        storageKey="training-tiles"
-        defaultLayout={DEFAULT_LAYOUT}
-      />
+      <SelectedEpisodeCtx.Provider value={ctx}>
+        <div className="flex flex-col h-full">
+          <EpisodeSelector />
+          <div className="flex-1 min-h-0">
+            <TileLayout
+              cards={TRAINING_CARDS}
+              storageKey="training-tiles"
+              defaultLayout={DEFAULT_LAYOUT}
+            />
+          </div>
+        </div>
+      </SelectedEpisodeCtx.Provider>
     </TrainingDataProvider>
   )
 }

@@ -35,8 +35,8 @@ _TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
 # Struct-based binary IPC protocol
 _OBS_FLOATS = INPUT_SIZE + H_DIM  # obs + h_prev
 _OBS_BYTES = _OBS_FLOATS * 4
-_ACT_HEAD = struct.Struct('=iiii')
-_ACT_INTS = 4  # bt, bd, cd, md
+_ACT_HEAD = struct.Struct('=iiiii')
+_ACT_INTS = 5  # bt, bd, cd, brt, md
 _ACT_FLOATS = H_DIM + 1  # h_next + old_lp
 _ACT_SIZE = _ACT_INTS * 4 + _ACT_FLOATS * 4
 _H_BYTES = H_DIM * 4
@@ -101,11 +101,11 @@ def _recv_action(act_rfd):
     data = _read_exact(act_rfd, _ACT_SIZE)
     if data is None:
         return None
-    bt, bd, cd, md = _ACT_HEAD.unpack_from(data, 0)
+    bt, bd, cd, brt, md = _ACT_HEAD.unpack_from(data, 0)
     h_next = array("f")
     h_next.frombytes(data[_ACT_INTS * 4:_ACT_INTS * 4 + _H_BYTES])
     old_lp = _LP_STRUCT.unpack_from(data, _ACT_INTS * 4 + _H_BYTES)[0]
-    return bt, bd, cd, md, 0.0, h_next, old_lp
+    return bt, bd, cd, brt, md, 0.0, h_next, old_lp
 
 
 class Player:
@@ -176,25 +176,27 @@ class Player:
             _send_obs(obs_wfd, obs, h_in)
             result = _recv_action(act_rfd)
             if result is not None:
-                build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx, value, h_next, old_log_prob = result
+                build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, value, h_next, old_log_prob = result
                 self.h_prev = h_next
             else:
                 build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
                 build_dir_idx = random.randint(0, 8)
                 conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
+                bridge_target_idx = 0
                 move_dir_idx = random.randint(0, 8)
                 value, old_log_prob = 0.0, 0.0
         else:
             build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
             build_dir_idx = random.randint(0, 8)
             conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
+            bridge_target_idx = 0
             move_dir_idx = random.randint(0, 8)
             value, old_log_prob = 0.0, 0.0
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = CONV_DIR_4[conv_dir_idx]
-        _harv_aux, _conv_aux, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team)
+        _harv_aux, _conv_aux, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team, bridge_target_idx)
         harv_reward = 0.0
         conv_reward = 0.0
 
@@ -205,15 +207,15 @@ class Player:
         self._prev_resources = (ti_after, ax_after)
 
         if self._train_log is not None:
-            # Replay augmentation appends ti_delivered, ax_delivered at indices 22, 23.
             self._train_log.append((
-                obs.tolist(), list(h_in),
+                obs.tobytes(), h_in.tobytes(),
                 build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx,
                 value, 0, conv_reward, ti_after,
                 harv_reward, GameState.enemy_core_dmg, old_log_prob,
                 dbg[0], dbg[1], dbg[2], dbg[3],
                 dbg[4], dbg[5], dbg[6], dbg[7],
                 GameState.own_core_dmg,
+                bridge_target_idx,
             ))
             if ct.get_current_round() >= 1999:
                 self._flush_log()

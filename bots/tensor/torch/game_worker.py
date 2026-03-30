@@ -8,6 +8,7 @@ import ast  # noqa: F401 - engine startup can expect ast in sys.modules
 import json
 import os
 import pickle
+import struct
 import sys
 from pathlib import Path
 
@@ -19,7 +20,14 @@ if str(REPLAY_PARSER_PYTHON) not in sys.path:
 from replay_parser import ReplayData
 
 
-def _run_game_proxy(args):
+def _write_bytes(path: Path, data: bytes | bytearray) -> str | None:
+    if not data:
+        return None
+    path.write_bytes(data)
+    return str(path)
+
+
+def _run_game_proxy(args, result_path: str):
     bot_a, bot_b, map_path, engine_root, replay_path, log_path, seed = args
     os.environ["TENSOR_TRAIN_LOG"] = log_path
     try:
@@ -29,16 +37,48 @@ def _run_game_proxy(args):
         rd = ReplayData.from_file(replay_path, team=0)
         working = rd.working_harvesters_dict()
         winner = rd.winner_str
+        base = Path(result_path)
+        state_path = _write_bytes(base.with_suffix(".states.bin"), rd.states_bytes)
+        scalars_path = _write_bytes(base.with_suffix(".scalars.bin"), rd.scalars_bytes)
+        transfers_path = _write_bytes(
+            base.with_suffix(".transfers.bin"),
+            rd.resource_transfers_bytes,
+        )
+        # Extract team A core position from round 0 state grid
+        # Channel 11 = core presence (both teams), channel 12 = team sign (+1 friendly)
+        core_x, core_y = 0, 0
+        try:
+            n_ch, map_h, map_w = rd.n_channels, rd.map_h, rd.map_w
+            turn0_bytes = rd.state_bytes_for_turn(0)
+            plane = map_h * map_w
+            ch11_offset = 11 * plane
+            ch12_offset = 12 * plane
+            for cy in range(map_h):
+                for cx in range(map_w):
+                    flat_idx = cy * map_w + cx
+                    presence = struct.unpack_from("<f", turn0_bytes, (ch11_offset + flat_idx) * 4)[0]
+                    team_sign = struct.unpack_from("<f", turn0_bytes, (ch12_offset + flat_idx) * 4)[0]
+                    if presence > 0.5 and team_sign > 0.5:  # friendly core
+                        core_x, core_y = cx, cy
+                        break
+                else:
+                    continue
+                break
+        except Exception:
+            pass
+
         global_states = {
-            "states_buf": rd.states_bytes,
-            "scalars_buf": rd.scalars_bytes,
-            "transfer_events_buf": rd.resource_transfers_bytes,
+            "states_path": state_path,
+            "scalars_path": scalars_path,
+            "transfer_events_path": transfers_path,
             "state_stride": rd.state_stride,
             "map_w": rd.map_w,
             "map_h": rd.map_h,
             "n_turns": rd.n_turns,
             "n_channels": rd.n_channels,
             "n_scalars": rd.n_scalars,
+            "core_x": core_x,
+            "core_y": core_y,
         }
     except BaseException as e:
         print(f"  Game error: {e}")
@@ -70,7 +110,7 @@ def main(argv=None):
     os.environ["TENSOR_OBS_WFD_B"] = str(obs_w_b)
     os.environ["TENSOR_ACT_RFD_B"] = str(act_r_b)
     try:
-        result = _run_game_proxy(tuple(json.loads(args.game_args)))
+        result = _run_game_proxy(tuple(json.loads(args.game_args)), args.result)
     finally:
         for key in ("TENSOR_OBS_WFD", "TENSOR_ACT_RFD", "TENSOR_OBS_WFD_B", "TENSOR_ACT_RFD_B"):
             os.environ.pop(key, None)

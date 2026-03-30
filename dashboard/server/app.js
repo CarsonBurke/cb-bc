@@ -17,6 +17,7 @@ const TENSOR_DIR = resolve(PROJECT_ROOT, 'bots/tensor')
 const trainSessionLogCache = new Map()
 const replayCache = new Map()
 const trainLogCache = new Map()
+const trainStepLogCache = new Map()
 const gameLogCache = new Map()
 const leagueCache = new Map()
 
@@ -397,27 +398,97 @@ async function handleRequest(req, res) {
     return
   }
 
+  if (pathname === '/api/train-step-log') {
+    const after = Number.parseInt(url.searchParams.get('after') || '0', 10)
+    const baseDir = sessionDir(url) || TENSOR_DIR
+    const logPath = resolve(baseDir, 'train_step_log.jsonl')
+    try {
+      const entry = readIncrementalJsonl(trainStepLogCache, logPath)
+      const steps = after > 0 && after <= entry.rows.length ? entry.rows.slice(after) : entry.rows
+      sendJson(res, { steps, total: entry.rows.length })
+    } catch {
+      sendJson(res, { steps: [], total: 0 })
+    }
+    return
+  }
+
   if (pathname === '/api/game-log') {
     const after = Number.parseInt(url.searchParams.get('after') || '0', 10)
+    const episode = url.searchParams.get('episode')
     const baseDir = sessionDir(url) || TENSOR_DIR
     const logPath = resolve(baseDir, 'game_log.jsonl')
     try {
       const entry = readIncrementalJsonl(gameLogCache, logPath)
-      const games = after > 0 && after <= entry.rows.length ? entry.rows.slice(after) : entry.rows
-      sendJson(res, { games, total: entry.rows.length })
+      if (episode != null) {
+        const ep = Number(episode)
+        const games = entry.rows.filter(g => g.episode === ep)
+        sendJson(res, { games, total: entry.rows.length })
+      } else {
+        const games = after > 0 && after <= entry.rows.length ? entry.rows.slice(after) : entry.rows
+        sendJson(res, { games, total: entry.rows.length })
+      }
     } catch {
       sendJson(res, { games: [], total: 0 })
     }
     return
   }
 
+  if (pathname === '/api/game-log-episodes') {
+    const baseDir = sessionDir(url) || TENSOR_DIR
+    const logPath = resolve(baseDir, 'game_log.jsonl')
+    try {
+      const entry = readIncrementalJsonl(gameLogCache, logPath)
+      // Group by episode, compute per-episode prediction accuracy
+      const byEp = new Map()
+      for (const g of entry.rows) {
+        if (g.episode == null) continue
+        if (!byEp.has(g.episode)) byEp.set(g.episode, [])
+        byEp.get(g.episode).push(g)
+      }
+      const summaries = []
+      for (const [ep, games] of byEp) {
+        let correct = 0, total = 0, confSum = 0, confCount = 0
+        for (const g of games) {
+          const wc = g.win_confidence
+          if (!wc || !wc.length) continue
+          const finalConf = wc[wc.length - 1]
+          confSum += finalConf
+          confCount++
+          if (g.winner != null) {
+            total++
+            const pred = finalConf > 0.5 ? 'a' : 'b'
+            if (pred === g.winner) correct++
+          }
+        }
+        summaries.push({
+          episode: ep,
+          n_games: games.length,
+          accuracy: total > 0 ? correct / total : null,
+          mean_confidence: confCount > 0 ? confSum / confCount : null,
+        })
+      }
+      summaries.sort((a, b) => a.episode - b.episode)
+      const latestEp = summaries.length ? summaries[summaries.length - 1].episode : null
+      const latestGames = latestEp != null ? (byEp.get(latestEp) || []) : []
+      sendJson(res, { episodes: summaries.map(s => s.episode), summaries, latestEp, latestGames })
+    } catch {
+      sendJson(res, { episodes: [], summaries: [] })
+    }
+    return
+  }
+
   if (pathname === '/api/league') {
     const baseDir = sessionDir(url) ? resolve(sessionDir(url), 'league') : resolve(TENSOR_DIR, 'league')
-    const leaguePath = resolve(baseDir, 'league.json')
+    const modelsPath = resolve(baseDir, 'models.json')
+    const legacyPath = resolve(baseDir, 'league.json')
     try {
-      sendBuffer(res, Buffer.from(readLeagueData(leaguePath)), 'application/json; charset=utf-8')
+      const raw = existsSync(modelsPath) ? readLeagueData(modelsPath) : readLeagueData(legacyPath)
+      const parsed = JSON.parse(raw)
+      // models.json is a bare array; legacy league.json wraps in {models: [...]}
+      const models = Array.isArray(parsed) ? parsed : (parsed.models || [])
+      sendJson(res, { models })
     } catch {
-      sendJson(res, [])
+      sendJson(res, { models: [] })
     }
     return
   }
@@ -509,7 +580,7 @@ export function createDashboardServer() {
   })
 }
 
-export function startDashboardServer({ host = '127.0.0.1', port = 5173 } = {}) {
+export function startDashboardServer({ host = '127.0.0.1', port = 5174 } = {}) {
   const server = createDashboardServer()
   return new Promise((resolveServer, reject) => {
     server.once('error', reject)

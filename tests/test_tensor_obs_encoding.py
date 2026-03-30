@@ -269,8 +269,6 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
             features.extend((0.0, 0.0))
 
     rnd = ct.get_current_round() / 2000.0
-    x_norm = pos.x / max(ct.get_map_width(), 1)
-    y_norm = pos.y / max(ct.get_map_height(), 1)
     ti, ax = ct.get_global_resources()
     scale = ct.get_scale_percent() / 500.0
 
@@ -310,6 +308,14 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
         ecore_dx = edx / d
         ecore_dy = edy / d
 
+    # Core-relative position (team-symmetric, after entity scan discovers core)
+    if player.core_center is not None:
+        x_norm = (pos.x - player.core_center.x) / max(ct.get_map_width(), 1)
+        y_norm = (pos.y - player.core_center.y) / max(ct.get_map_height(), 1)
+    else:
+        x_norm = 0.0
+        y_norm = 0.0
+
     ti_delta, ax_delta = 0.0, 0.0
     if player._prev_resources is not None:
         prev_ti, prev_ax = player._prev_resources
@@ -324,7 +330,11 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
         ti_delta, ax_delta, hp_advantage,
         player._spawn_round / 2000.0 if player._spawn_round >= 0 else 0.0,
     ))
-    features.extend(player.pos_encoder.encode(pos.x, pos.y))
+    # Core-relative positional embedding (team-symmetric)
+    if player.core_center is not None:
+        features.extend(player.pos_encoder.encode(pos.x - player.core_center.x, pos.y - player.core_center.y))
+    else:
+        features.extend(player.pos_encoder.encode(0, 0))
     return features
 
 
@@ -374,10 +384,11 @@ def test_obs_encodes_expected_tiles_and_globals():
 
     global_idx = tensor_main._GLOBAL_OBS_START
     globals_slice = obs[global_idx:global_idx + tensor_main.GLOBAL_FEATURES]
+    # Core at (8,10), unit at (10,10): x_rel=2/30, y_rel=0/30
     assert globals_slice == [
         0.4,
-        ct.pos.x / ct.width,
-        ct.pos.y / ct.height,
+        2.0 / 30.0,  # core-relative x
+        0.0,          # core-relative y
         0.4,
         0.1,
         0.3,
@@ -392,5 +403,6 @@ def test_obs_encodes_expected_tiles_and_globals():
         0.06,
     ]
 
-    pos_embed = player.pos_encoder.encode(ct.pos.x, ct.pos.y)
+    # Core-relative pos embed: encode(10-8, 10-10) = encode(2, 0)
+    pos_embed = player.pos_encoder.encode(ct.pos.x - 8, ct.pos.y - 10)
     assert obs[-tensor_main.POS_EMBED_DIM:] == list(pos_embed)

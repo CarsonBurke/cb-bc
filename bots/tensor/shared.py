@@ -639,7 +639,7 @@ _ZERO_DBG = [0, 0, 0, 0, 0, 0, 0, 0]
 
 
 def execute_build(ct: Controller, action: str, direction: Direction,
-                  conv_direction: Direction, my_team) -> tuple[float, float, list]:
+                  conv_direction: Direction, my_team, bridge_target_idx: int = 0) -> tuple[float, float, list]:
     """Execute build action. Returns (harv_reward, conv_reward, dbg)."""
     if action == "none":
         return 0.0, 0.0, _ZERO_DBG

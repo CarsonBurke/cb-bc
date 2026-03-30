@@ -104,6 +104,44 @@ export function useLeagueQuery(session) {
   })
 }
 
+export function useTrainStepLogQuery(session) {
+  const visible = usePageVisible()
+  const queryClient = useQueryClient()
+
+  return useQuery({
+    queryKey: ['train-step-log', session || null],
+    queryFn: async ({ signal, queryKey }) => {
+      const previous = queryClient.getQueryData(queryKey)
+      const after = previous?.total || 0
+      const params = new URLSearchParams()
+      if (session) params.set('session', session)
+      if (after > 0) params.set('after', String(after))
+      const qs = params.toString() ? `?${params}` : ''
+      const payload = await fetchJsonApi(`/api/train-step-log${qs}`, { signal })
+      const newSteps = payload.steps || []
+      const serverTotal = payload.total ?? (after + newSteps.length)
+
+      if (!previous || after === 0) {
+        return {
+          steps: newSteps,
+          total: serverTotal,
+        }
+      }
+
+      if (newSteps.length === 0 && serverTotal === previous.total) {
+        return previous
+      }
+
+      return {
+        steps: previous.steps.concat(newSteps),
+        total: serverTotal,
+      }
+    },
+    refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
+    staleTime: 0,
+  })
+}
+
 export function useTrainReplaysQuery(session) {
   const visible = usePageVisible()
 
@@ -113,6 +151,40 @@ export function useTrainReplaysQuery(session) {
       const qs = session ? `?session=${encodeURIComponent(session)}` : ''
       return fetchJsonApi(`/api/train-replays${qs}`, { signal })
     },
+    refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
+    staleTime: 0,
+  })
+}
+
+export function useGameLogEpisodesQuery(session) {
+  const visible = usePageVisible()
+
+  return useQuery({
+    queryKey: ['game-log-episodes', session || null],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams()
+      if (session) params.set('session', session)
+      const qs = params.toString() ? `?${params}` : ''
+      return fetchJsonApi(`/api/game-log-episodes${qs}`, { signal })
+    },
+    refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
+    staleTime: 0,
+  })
+}
+
+export function useGameLogForEpisodeQuery(session, episode) {
+  const visible = usePageVisible()
+
+  return useQuery({
+    queryKey: ['game-log-episode', session || null, episode],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams()
+      if (session) params.set('session', session)
+      if (episode != null) params.set('episode', String(episode))
+      const qs = params.toString() ? `?${params}` : ''
+      return fetchJsonApi(`/api/game-log${qs}`, { signal })
+    },
+    enabled: episode != null,
     refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
     staleTime: 0,
   })

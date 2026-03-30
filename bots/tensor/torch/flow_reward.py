@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
 # Obs feature indices
 _OBS_GLOBAL_START = 5 * 5 * 19  # GRID_SIZE^2 * TILE_FEATURES = 475
+_OBS_ROUND_BYTE_OFFSET = _OBS_GLOBAL_START * 4  # byte offset for float32 obs
 
 
 def compute_dense_flow_rewards(
@@ -19,6 +21,10 @@ def compute_dense_flow_rewards(
     for the requested team.
     """
     buf = global_states.get("transfer_events_buf", b"")
+    if not buf:
+        transfer_path = global_states.get("transfer_events_path")
+        if transfer_path:
+            buf = Path(transfer_path).read_bytes()
     n_turns = global_states.get("n_turns", 0)
     if not buf or n_turns == 0:
         return {}
@@ -56,7 +62,11 @@ def augment_trajectories_with_flow_rewards(
                 step = list(step)
                 traj[i] = step
             obs = step[0]
-            rnd = int(round(obs[_OBS_GLOBAL_START] * 2000.0))
+            if isinstance(obs, (bytes, bytearray, memoryview)):
+                rnd_val = struct.unpack_from('<f', obs, _OBS_ROUND_BYTE_OFFSET)[0]
+            else:
+                rnd_val = obs[_OBS_GLOBAL_START]
+            rnd = int(round(rnd_val * 2000.0))
             rnd = max(0, min(rnd, 1999))
             slot = 7 if len(step) > 12 else 6  # n_working slot
             step[slot] = rewards.get(rnd, 0.0)

@@ -70,6 +70,22 @@ impl EntityKind {
         }
     }
 
+    /// Scale contribution in millipercent (1000 = 100% base).
+    /// Roads +0.5%, conveyors/barriers/bridges/splitters +1%,
+    /// combat/harvesters +10%, foundries +100%.
+    pub fn scale_milli(self) -> i32 {
+        match self {
+            Self::Road => 5,
+            Self::Conveyor | Self::ArmouredConveyor | Self::Barrier
+            | Self::Bridge | Self::Splitter => 10,
+            Self::Gunner | Self::Sentinel | Self::Breach
+            | Self::Launcher | Self::Harvester => 100,
+            Self::Foundry => 1000,
+            // BuilderBot, Marker, Core don't contribute to scale
+            _ => 0,
+        }
+    }
+
     pub fn proto_name(self) -> &'static str {
         match self {
             Self::BuilderBot => "builderBot",

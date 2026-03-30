@@ -1,13 +1,13 @@
 import { useMemo, useRef } from 'react'
 import { useAtom } from 'jotai'
-import { cardOpenAtom, cardSizeAtom, cardEmaAtom, cardBandsAtom } from '../store'
+import { cardOpenAtom, cardSizeAtom, cardEmaAtom, cardBandsAtom, cardLegendAtom } from '../store'
 import { CardSettingsCtx } from './CardSettingsContext'
 
 const SIZES = ['sm', 'md', 'lg', 'xl']
 const SIZE_LABELS = { sm: 'S', md: 'M', lg: 'L', xl: 'XL' }
 const SIZE_HEIGHTS = { sm: 150, md: null, lg: 450, xl: 780 }
 
-export default function Card({ title, subtitle, children, className = '', defaultOpen = true, id, dragHandleProps, hasEma, renderContent }) {
+export default function Card({ title, subtitle, children, className = '', defaultOpen = true, id, dragHandleProps, hasEma, hasLegend, renderContent }) {
   const cardId = id || title || 'untitled'
   const openAtom = useMemo(() => cardOpenAtom(cardId, defaultOpen), [cardId, defaultOpen])
   const sizeAtom = useMemo(() => cardSizeAtom(cardId), [cardId])
@@ -17,6 +17,8 @@ export default function Card({ title, subtitle, children, className = '', defaul
   const [size, setSize] = useAtom(sizeAtom)
   const [ema, setEma] = useAtom(emaAtom)
   const [bands, setBands] = useAtom(bandsAtom)
+  const legendAtom = useMemo(() => cardLegendAtom(cardId), [cardId])
+  const [legend, setLegend] = useAtom(legendAtom)
   const didDrag = useRef(false)
 
   const headerDragProps = dragHandleProps ? {
@@ -51,12 +53,17 @@ export default function Card({ title, subtitle, children, className = '', defaul
     setBands(!bands)
   }
 
+  const toggleLegend = (e) => {
+    e.stopPropagation()
+    setLegend(!legend)
+  }
+
   return (
     <div className={`bg-base border border-surface0 mb-3 rounded-md overflow-hidden ${className}`}>
       {title && (
         <div
           {...headerDragProps}
-          className={`flex items-center gap-2 px-5 py-3 border-surface0 transition-colors select-none ${
+          className={`flex items-center gap-2 px-5 py-3 border-surface0 transition-colors ${
             open ? 'border-b' : ''
           } cursor-pointer hover:bg-surface0/30`}
           onClick={handleClick}
@@ -100,6 +107,22 @@ export default function Card({ title, subtitle, children, className = '', defaul
               </button>
             </>
           )}
+          {open && hasLegend && (
+            <button
+              onClick={toggleLegend}
+              className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-colors ${
+                legend ? 'text-blue bg-blue/10' : 'text-overlay0 hover:text-subtext0 hover:bg-surface0/50'
+              }`}
+              title={legend ? 'Legend on (click to hide)' : 'Show legend'}
+            >
+              <svg className="w-3.5 h-3" viewBox="0 0 16 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                <line x1="1" y1="3" x2="5" y2="3" />
+                <line x1="7" y1="3" x2="15" y2="3" />
+                <line x1="1" y1="9" x2="5" y2="9" />
+                <line x1="7" y1="9" x2="15" y2="9" />
+              </svg>
+            </button>
+          )}
           {open && (
             <button
               onClick={cycleSize}
@@ -123,7 +146,7 @@ export default function Card({ title, subtitle, children, className = '', defaul
       )}
       {open && (
         <div className="overflow-hidden">
-          <CardSettingsCtx.Provider value={{ ema, bands }}>
+          <CardSettingsCtx.Provider value={{ ema, bands, legend }}>
             <div
               className={`${title ? 'px-5 pt-4 pb-5' : 'p-5'} ${
                 SIZE_HEIGHTS[size] ? 'flex flex-col overflow-hidden [&>div]:flex-1 [&>div]:min-h-0 [&>div]:max-h-none' : ''
