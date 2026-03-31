@@ -1,10 +1,12 @@
-import { createContext, memo, useContext } from 'react'
+import { createContext, memo, useContext, useMemo, useState } from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { viewerAtom, viewerMinimizedAtom, trainSessionAtom } from '../store'
 import { Line, Bar } from 'react-chartjs-2'
 import { viewerUrl } from '../api'
 import {
   useGameLogQuery,
+  useGameLogEpisodesQuery,
+  useGameLogForEpisodeQuery,
   useLeagueQuery,
   useTrainLogQuery,
   useTrainReplaysQuery,
@@ -199,7 +201,7 @@ function StatusPanel() {
 }
 
 const RewardChart = memo(function RewardChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -222,7 +224,7 @@ const RewardChart = memo(function RewardChart() {
 })
 
 const RewardBreakdownChart = memo(function RewardBreakdownChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -261,7 +263,7 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
 })
 
 const HarvesterDebugChart = memo(function HarvesterDebugChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -301,7 +303,7 @@ const HarvesterDebugChart = memo(function HarvesterDebugChart() {
 })
 
 const ConveyorDebugChart = memo(function ConveyorDebugChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -343,7 +345,7 @@ const ConveyorDebugChart = memo(function ConveyorDebugChart() {
 function makeSimpleChart(label, dataKey, color, opts = {}) {
   return memo(function SimpleChart() {
     "use no memo"
-    const episodes = useTrainEpisodes()
+    const episodes = useRangedEpisodes()
     const { ema: emaOn, bands: bandsOn } = useCardSettings()
     if (episodes.length <= 1) return <NoData />
     const ds = downsample(episodes)
@@ -377,7 +379,7 @@ const KLChart = makeSimpleChart('KL', 'approx_kl', '#fab387')
 const ClipChart = makeSimpleChart('Clip Frac', 'clip_frac', '#f9e2af')
 
 const LogitScaleChart = memo(function LogitScaleChart({ series }) {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const ds = downsample(episodes)
@@ -437,7 +439,7 @@ const LogitScaleStdChart = memo(function LogitScaleStdChart() {
 })
 
 const LossChart = memo(function LossChart() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
   if (episodes.length <= 1) return <NoData />
   const dim = emaOn
@@ -503,7 +505,7 @@ const LeagueEloCard = memo(function LeagueEloCard() {
 })
 
 function EpisodeLogTable() {
-  const episodes = useTrainEpisodes()
+  const episodes = useRangedEpisodes()
   if (!episodes.length) return <NoData />
   return (
     <div className="max-h-96 overflow-y-auto">
@@ -542,7 +544,8 @@ function EpisodeLogTable() {
 function TrainingReplaysContent() {
   const session = useAtomValue(trainSessionAtom)
   const gameLog = useTrainGameLog()
-  const replays = useTrainReplaysQuery(session).data || []
+  const [rangeMin, rangeMax] = useEpisodeRange()
+  const replays = useTrainReplaysQuery(session, rangeMin, rangeMax).data || []
   const setViewer = useSetAtom(viewerAtom)
   const setMinimized = useSetAtom(viewerMinimizedAtom)
 
@@ -619,6 +622,289 @@ function NoData() {
   return <p className="text-[12px] text-overlay0/50 py-3">Waiting for data...</p>
 }
 
+// ---- Episode selection for game-log charts ----
+
+const SelectedEpisodeCtx = createContext({ episode: null, setEpisode: () => {}, range: [null, null], setRange: () => {} })
+
+function useSelectedEpisode() {
+  return useContext(SelectedEpisodeCtx)
+}
+
+function useEpisodeRange() {
+  const { range } = useSelectedEpisode()
+  return range
+}
+
+function useRangedEpisodes() {
+  const episodes = useTrainEpisodes()
+  const [rangeMin, rangeMax] = useEpisodeRange()
+  return useMemo(() => {
+    if (rangeMin == null && rangeMax == null) return episodes
+    return episodes.filter(e =>
+      (rangeMin == null || e.episode >= rangeMin) &&
+      (rangeMax == null || e.episode <= rangeMax)
+    )
+  }, [episodes, rangeMin, rangeMax])
+}
+
+const WinConfidenceChart = memo(function WinConfidenceChart() {
+  const session = useAtomValue(trainSessionAtom)
+  const [rangeMin, rangeMax] = useEpisodeRange()
+  const epsData = useGameLogEpisodesQuery(session, rangeMin, rangeMax).data
+  const gameLogEps = epsData?.episodes ?? []
+  const { episode: selectedEp } = useSelectedEpisode()
+  const { legend: legendOn } = useCardSettings()
+
+  const targetEp = selectedEp ?? gameLogEps[gameLogEps.length - 1] ?? null
+  const epQuery = useGameLogForEpisodeQuery(session, targetEp)
+  const epGames = (epQuery.data?.games ?? []).filter(g => g.win_confidence?.length)
+  if (!epGames.length) return <NoData />
+
+  const maxRound = Math.max(...epGames.map(g => (g.round_offset ?? 0) + g.win_confidence.length))
+  const labels = Array.from({ length: maxRound }, (_, i) => i)
+
+  const datasets = epGames.map((g) => {
+    const known = g.winner === 'a' || g.winner === 'b'
+    const target = g.winner === 'a' ? 100 : g.winner === 'b' ? 0 : null
+    const tag = g.winner === 'a' ? 'W' : g.winner === 'b' ? 'L' : '-'
+    const offset = g.round_offset ?? 0
+    const raw = g.win_confidence.map(v => v * 100)
+    const data = [...Array(offset).fill(null), ...raw]
+
+    if (!known) {
+      return {
+        label: `${g.game}`,
+        data,
+        borderColor: '#a6adc8',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.2,
+        spanGaps: false,
+      }
+    }
+
+    const correct = target > 50 ? v => v > 50 : v => v < 50
+    const segColors = data.map(v =>
+      v == null ? '#a6adc8' : correct(v) ? '#a6e3a1' : '#f38ba8'
+    )
+    return {
+      label: `${g.game}`,
+      data,
+      segment: { borderColor: ctx => segColors[ctx.p0DataIndex] || '#a6adc8' },
+      borderColor: segColors[0] || '#a6adc8',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.2,
+      spanGaps: false,
+    }
+  })
+
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels, datasets }}
+        options={{
+          ...chartBase(),
+          scales: {
+            ...chartScales(),
+            y: { ...chartScales().y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
+            x: { ...chartScales().x, title: { display: true, text: 'Round', color: CHART_THEME.subtext } },
+          },
+          plugins: { legend: { display: legendOn, labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+})
+
+const WinPredictionAccuracyChart = memo(function WinPredictionAccuracyChart() {
+  const session = useAtomValue(trainSessionAtom)
+  const { ema: emaOn } = useCardSettings()
+  const [rangeMin, rangeMax] = useEpisodeRange()
+  const data = useGameLogEpisodesQuery(session, rangeMin, rangeMax).data
+  const summaries = data?.summaries ?? []
+
+  const valid = summaries.filter(s => s.accuracy != null)
+  if (valid.length <= 1) return <NoData />
+
+  const labels = valid.map(s => s.episode)
+  const accRaw = valid.map(s => s.accuracy * 100)
+  const confRaw = valid.map(s => (s.mean_confidence ?? 0) * 100)
+
+  const dim = emaOn
+  const datasets = [
+    {
+      label: 'Accuracy',
+      data: accRaw,
+      borderColor: dim ? '#a6e3a140' : '#a6e3a1',
+      borderWidth: dim ? 1 : 1.5,
+      pointRadius: 0, tension: 0, spanGaps: true,
+    },
+    {
+      label: 'Mean Confidence',
+      data: confRaw,
+      borderColor: dim ? '#89b4fa40' : '#89b4fa',
+      borderWidth: dim ? 1 : 1.5,
+      pointRadius: 0, tension: 0, spanGaps: true,
+    },
+  ]
+  if (emaOn) {
+    datasets.push(
+      { label: 'Accuracy EMA', data: ema(accRaw), borderColor: '#a6e3a1', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true },
+      { label: 'Confidence EMA', data: ema(confRaw), borderColor: '#89b4fa', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true },
+    )
+  }
+
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels, datasets }}
+        options={{
+          ...chartBase(),
+          scales: {
+            ...chartScales(),
+            y: { ...chartScales().y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
+          },
+          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
+    </div>
+  )
+})
+
+const RoundAccuracyChart = memo(function RoundAccuracyChart() {
+  const gameLog = useTrainGameLog()
+
+  const games = useMemo(() => {
+    return Object.values(gameLog).filter(g =>
+      g.win_confidence?.length && g.winner != null
+    )
+  }, [gameLog])
+
+  if (!games.length) return <NoData />
+
+  const roundCorrect = []
+  const roundTotal = []
+  for (const g of games) {
+    const offset = g.round_offset ?? 0
+    const wc = g.win_confidence
+    for (let i = 0; i < wc.length; i++) {
+      const r = offset + i
+      while (roundCorrect.length <= r) { roundCorrect.push(0); roundTotal.push(0) }
+      roundTotal[r]++
+      const pred = wc[i] > 0.5 ? 'a' : 'b'
+      if (pred === g.winner) roundCorrect[r]++
+    }
+  }
+
+  const labels = []
+  const accData = []
+  for (let r = 0; r < roundTotal.length; r++) {
+    if (roundTotal[r] >= 3) {
+      labels.push(r)
+      accData.push((roundCorrect[r] / roundTotal[r]) * 100)
+    }
+  }
+  if (labels.length < 2) return <NoData />
+
+  const datasets = [
+    {
+      label: 'Accuracy',
+      data: accData,
+      borderColor: '#a6e3a1',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.3,
+    },
+  ]
+
+  return (
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels, datasets }}
+        options={{
+          ...chartBase(),
+          scales: {
+            ...chartScales(),
+            y: { ...chartScales().y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
+            x: { ...chartScales().x, title: { display: true, text: 'Round', color: CHART_THEME.subtext } },
+          },
+          plugins: { legend: { display: false } },
+        }}
+      />
+    </div>
+  )
+})
+
+function EpisodeSelector() {
+  const session = useAtomValue(trainSessionAtom)
+  const episodes = useTrainEpisodes()
+  const epsData = useGameLogEpisodesQuery(session).data
+  const gameLogEps = epsData?.episodes ?? []
+  const { episode, setEpisode, range, setRange } = useSelectedEpisode()
+  const [rangeMin, rangeMax] = range
+
+  const hasGameLog = gameLogEps.length > 0
+  const current = episode ?? (hasGameLog ? gameLogEps[gameLogEps.length - 1] : null)
+  const idx = hasGameLog ? gameLogEps.indexOf(current) : -1
+
+  const firstEp = episodes.length ? episodes[0].episode : null
+  const lastEp = episodes.length ? episodes[episodes.length - 1].episode : null
+
+  const parseRange = (v) => { const n = parseInt(v, 10); return isNaN(n) ? null : n }
+
+  return (
+    <div className="flex items-center gap-3 px-5 py-2 text-[11px] text-overlay0">
+      {hasGameLog && (
+        <div className="flex items-center gap-1.5">
+          <button
+            disabled={idx <= 0}
+            onClick={() => setEpisode(gameLogEps[idx - 1])}
+            className="disabled:opacity-30"
+          >◀</button>
+          <span className="text-text font-semibold">Ep {current}</span>
+          <button
+            disabled={idx >= gameLogEps.length - 1}
+            onClick={() => setEpisode(gameLogEps[idx + 1])}
+            className="disabled:opacity-30"
+          >▶</button>
+          <button
+            onClick={() => setEpisode(null)}
+            className={`ml-1 px-1.5 py-0.5 rounded ${episode == null ? 'text-blue bg-blue/10' : 'hover:text-subtext0 hover:bg-surface0/50'}`}
+            title="Follow latest"
+          >latest</button>
+        </div>
+      )}
+      {episodes.length > 1 && (
+        <div className="flex items-center gap-1.5">
+          <span>Range:</span>
+          <input
+            type="number"
+            className="w-14 px-1 py-0.5 rounded bg-surface0 text-text text-[11px] border border-surface1 text-center"
+            placeholder={firstEp ?? ''}
+            value={rangeMin ?? ''}
+            onChange={e => setRange([parseRange(e.target.value), rangeMax])}
+          />
+          <span>–</span>
+          <input
+            type="number"
+            className="w-14 px-1 py-0.5 rounded bg-surface0 text-text text-[11px] border border-surface1 text-center"
+            placeholder={lastEp ?? ''}
+            value={rangeMax ?? ''}
+            onChange={e => setRange([rangeMin, parseRange(e.target.value)])}
+          />
+          {(rangeMin != null || rangeMax != null) && (
+            <button
+              onClick={() => setRange([null, null])}
+              className="px-1.5 py-0.5 rounded text-overlay0 hover:text-subtext0 hover:bg-surface0/50"
+            >✕</button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ---- Card registry (module-level, stable reference) ----
 
 const TRAINING_CARDS = {
@@ -629,6 +915,9 @@ const TRAINING_CARDS = {
   'train-conv-debug':       { title: 'Conveyor Debug',      subtitle: 'per unit', hasEma: true, render: () => <ConveyorDebugChart /> },
   'train-ep-res':           { title: 'Resources / Episode', hasEma: true, render: () => <ResourcesChart /> },
   'train-winrate':          { title: 'Win Rate',            hasEma: true, render: () => <WinRateChart /> },
+  'train-win-confidence':   { title: 'Win Confidence',      subtitle: 'per round', hasLegend: true, render: () => <WinConfidenceChart /> },
+  'train-prediction-acc':   { title: 'Prediction Accuracy', subtitle: 'per episode', hasEma: true, render: () => <WinPredictionAccuracyChart /> },
+  'train-round-accuracy':   { title: 'Round Accuracy',      subtitle: 'by absolute round', render: () => <RoundAccuracyChart /> },
   'train-elo':              { title: 'League ELO',          render: () => <LeagueEloCard /> },
   'train-loss-chart':       { title: 'Loss',                defaultOpen: false, hasEma: true, render: () => <LossChart /> },
   'train-entropy':          { title: 'Entropy',             defaultOpen: false, hasEma: true, render: () => <EntropyChart /> },
@@ -650,14 +939,20 @@ const DEFAULT_LAYOUT = {
 
 export default function TrainingView() {
   const session = useAtomValue(trainSessionAtom)
+  const [episode, setEpisode] = useState(null)
+  const [range, setRange] = useState([null, null])
+  const ctx = useMemo(() => ({ episode, setEpisode, range, setRange }), [episode, range])
 
   return (
     <TrainingDataProvider session={session}>
-      <TileLayout
-        cards={TRAINING_CARDS}
-        storageKey="training-tiles"
-        defaultLayout={DEFAULT_LAYOUT}
-      />
+      <SelectedEpisodeCtx.Provider value={ctx}>
+        <EpisodeSelector />
+        <TileLayout
+          cards={TRAINING_CARDS}
+          storageKey="training-tiles"
+          defaultLayout={DEFAULT_LAYOUT}
+        />
+      </SelectedEpisodeCtx.Provider>
     </TrainingDataProvider>
   )
 }

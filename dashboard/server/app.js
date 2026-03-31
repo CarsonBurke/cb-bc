@@ -351,8 +351,29 @@ async function handleRequest(req, res) {
 
   if (pathname === '/api/train-replays') {
     const dir = sessionDir(url) ? resolve(sessionDir(url), 'replays') : TRAINING_REPLAYS_DIR
+    const minEp = url.searchParams.has('min_ep') ? Number(url.searchParams.get('min_ep')) : null
+    const maxEp = url.searchParams.has('max_ep') ? Number(url.searchParams.get('max_ep')) : null
     try {
-      sendJson(res, getReplayListing(dir))
+      let replays = getReplayListing(dir)
+      if (minEp != null || maxEp != null) {
+        const baseDir = sessionDir(url) || TENSOR_DIR
+        const logPath = resolve(baseDir, 'game_log.jsonl')
+        try {
+          const entry = readIncrementalJsonl(gameLogCache, logPath)
+          const epByReplay = new Map()
+          for (const g of entry.rows) {
+            if (g.replay != null && g.episode != null) epByReplay.set(g.replay, g.episode)
+          }
+          replays = replays.filter(r => {
+            const ep = epByReplay.get(r.name)
+            if (ep == null) return true
+            return (minEp == null || ep >= minEp) && (maxEp == null || ep <= maxEp)
+          })
+        } catch {
+          // game log unavailable, return unfiltered
+        }
+      }
+      sendJson(res, replays)
     } catch {
       sendJson(res, [])
     }
@@ -376,13 +397,21 @@ async function handleRequest(req, res) {
 
   if (pathname === '/api/train-log') {
     const after = Number.parseInt(url.searchParams.get('after') || '0', 10)
+    const minEp = url.searchParams.has('min_ep') ? Number(url.searchParams.get('min_ep')) : null
+    const maxEp = url.searchParams.has('max_ep') ? Number(url.searchParams.get('max_ep')) : null
     const baseDir = sessionDir(url) || TENSOR_DIR
     const jsonlPath = resolve(baseDir, 'train_log.jsonl')
     const jsonPath = resolve(baseDir, 'train_log.json')
     try {
       if (existsSync(jsonlPath)) {
         const entry = readIncrementalJsonl(trainLogCache, jsonlPath, true)
-        const episodes = after > 0 && after <= entry.rows.length ? entry.rows.slice(after) : entry.rows
+        let episodes = after > 0 && after <= entry.rows.length ? entry.rows.slice(after) : entry.rows
+        if (minEp != null || maxEp != null) {
+          episodes = episodes.filter(e =>
+            (minEp == null || e.episode >= minEp) &&
+            (maxEp == null || e.episode <= maxEp)
+          )
+        }
         sendJson(res, {
           episodes,
           config: entry.config,
@@ -399,11 +428,26 @@ async function handleRequest(req, res) {
 
   if (pathname === '/api/game-log') {
     const after = Number.parseInt(url.searchParams.get('after') || '0', 10)
+    const episode = url.searchParams.get('episode')
+    const minEp = url.searchParams.has('min_ep') ? Number(url.searchParams.get('min_ep')) : null
+    const maxEp = url.searchParams.has('max_ep') ? Number(url.searchParams.get('max_ep')) : null
     const baseDir = sessionDir(url) || TENSOR_DIR
     const logPath = resolve(baseDir, 'game_log.jsonl')
     try {
       const entry = readIncrementalJsonl(gameLogCache, logPath)
-      const games = after > 0 && after <= entry.rows.length ? entry.rows.slice(after) : entry.rows
+      let games
+      if (episode != null) {
+        const ep = Number(episode)
+        games = entry.rows.filter(g => g.episode === ep)
+      } else {
+        games = after > 0 && after <= entry.rows.length ? entry.rows.slice(after) : entry.rows
+      }
+      if (minEp != null || maxEp != null) {
+        games = games.filter(g =>
+          (minEp == null || g.episode >= minEp) &&
+          (maxEp == null || g.episode <= maxEp)
+        )
+      }
       sendJson(res, { games, total: entry.rows.length })
     } catch {
       sendJson(res, { games: [], total: 0 })
@@ -411,13 +455,61 @@ async function handleRequest(req, res) {
     return
   }
 
+  if (pathname === '/api/game-log-episodes') {
+    const baseDir = sessionDir(url) || TENSOR_DIR
+    const logPath = resolve(baseDir, 'game_log.jsonl')
+    const minEp = url.searchParams.has('min_ep') ? Number(url.searchParams.get('min_ep')) : null
+    const maxEp = url.searchParams.has('max_ep') ? Number(url.searchParams.get('max_ep')) : null
+    try {
+      const entry = readIncrementalJsonl(gameLogCache, logPath)
+      const byEp = new Map()
+      for (const g of entry.rows) {
+        if (g.episode == null) continue
+        if (minEp != null && g.episode < minEp) continue
+        if (maxEp != null && g.episode > maxEp) continue
+        if (!byEp.has(g.episode)) byEp.set(g.episode, [])
+        byEp.get(g.episode).push(g)
+      }
+      const summaries = []
+      for (const [ep, games] of byEp) {
+        let correct = 0, total = 0, confSum = 0, confCount = 0
+        for (const g of games) {
+          const wc = g.win_confidence
+          if (!wc || !wc.length) continue
+          const finalConf = wc[wc.length - 1]
+          confSum += finalConf
+          confCount++
+          if (g.winner != null) {
+            total++
+            const pred = finalConf > 0.5 ? 'a' : 'b'
+            if (pred === g.winner) correct++
+          }
+        }
+        summaries.push({
+          episode: ep,
+          n_games: games.length,
+          accuracy: total > 0 ? correct / total : null,
+          mean_confidence: confCount > 0 ? confSum / confCount : null,
+        })
+      }
+      summaries.sort((a, b) => a.episode - b.episode)
+      const latestEp = summaries.length ? summaries[summaries.length - 1].episode : null
+      const latestGames = latestEp != null ? (byEp.get(latestEp) || []) : []
+      sendJson(res, { episodes: summaries.map(s => s.episode), summaries, latestEp, latestGames })
+    } catch {
+      sendJson(res, { episodes: [], summaries: [] })
+    }
+    return
+  }
+
   if (pathname === '/api/league') {
     const baseDir = sessionDir(url) ? resolve(sessionDir(url), 'league') : resolve(TENSOR_DIR, 'league')
-    const leaguePath = resolve(baseDir, 'league.json')
+    const modelsPath = resolve(baseDir, 'models.json')
     try {
-      sendBuffer(res, Buffer.from(readLeagueData(leaguePath)), 'application/json; charset=utf-8')
+      const models = JSON.parse(readLeagueData(modelsPath))
+      sendJson(res, { models })
     } catch {
-      sendJson(res, [])
+      sendJson(res, { models: [] })
     }
     return
   }
@@ -509,7 +601,7 @@ export function createDashboardServer() {
   })
 }
 
-export function startDashboardServer({ host = '127.0.0.1', port = 5173 } = {}) {
+export function startDashboardServer({ host = '127.0.0.1', port = 5174 } = {}) {
   const server = createDashboardServer()
   return new Promise((resolveServer, reject) => {
     server.once('error', reject)

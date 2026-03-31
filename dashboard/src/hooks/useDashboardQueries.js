@@ -104,15 +104,55 @@ export function useLeagueQuery(session) {
   })
 }
 
-export function useTrainReplaysQuery(session) {
+export function useTrainReplaysQuery(session, minEp, maxEp) {
   const visible = usePageVisible()
 
   return useQuery({
-    queryKey: ['train-replays', session || null],
+    queryKey: ['train-replays', session || null, minEp ?? null, maxEp ?? null],
     queryFn: ({ signal }) => {
-      const qs = session ? `?session=${encodeURIComponent(session)}` : ''
+      const params = new URLSearchParams()
+      if (session) params.set('session', session)
+      if (minEp != null) params.set('min_ep', String(minEp))
+      if (maxEp != null) params.set('max_ep', String(maxEp))
+      const qs = params.toString() ? `?${params}` : ''
       return fetchJsonApi(`/api/train-replays${qs}`, { signal })
     },
+    refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
+    staleTime: 0,
+  })
+}
+
+export function useGameLogEpisodesQuery(session, minEp, maxEp) {
+  const visible = usePageVisible()
+
+  return useQuery({
+    queryKey: ['game-log-episodes', session || null, minEp ?? null, maxEp ?? null],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams()
+      if (session) params.set('session', session)
+      if (minEp != null) params.set('min_ep', String(minEp))
+      if (maxEp != null) params.set('max_ep', String(maxEp))
+      const qs = params.toString() ? `?${params}` : ''
+      return fetchJsonApi(`/api/game-log-episodes${qs}`, { signal })
+    },
+    refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
+    staleTime: 0,
+  })
+}
+
+export function useGameLogForEpisodeQuery(session, episode) {
+  const visible = usePageVisible()
+
+  return useQuery({
+    queryKey: ['game-log-episode', session || null, episode],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams()
+      if (session) params.set('session', session)
+      if (episode != null) params.set('episode', String(episode))
+      const qs = params.toString() ? `?${params}` : ''
+      return fetchJsonApi(`/api/game-log${qs}`, { signal })
+    },
+    enabled: episode != null,
     refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
     staleTime: 0,
   })
