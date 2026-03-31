@@ -86,7 +86,9 @@ class TestAugmentTrajectories:
         augment_trajectories_with_flow_rewards(trajs, {10: 3.0})
         data = _parse_trajectories(trajs, traj_game_map=[0, 0])
         assert data is not None
-        assert data["rewards"].tolist() == [3.0 * REWARD_BUILD_CREDIT, 3.0 * REWARD_BUILD_CREDIT]
+        expected = 3.0 * REWARD_BUILD_CREDIT
+        assert abs(data["rewards"][0].item() - expected) < 1e-6
+        assert abs(data["rewards"][1].item() - expected) < 1e-6
 
     @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
     def test_shared_flow_reward_total_counts_each_round_once(self):

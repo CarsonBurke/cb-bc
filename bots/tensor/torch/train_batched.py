@@ -70,10 +70,12 @@ from model import (
     REWARD_BUILD_CREDIT,
     TILE_FEATURES,
     TEACHER_HIDDEN,
+    get_centralized_critic,
     _parse_trajectories,
     conveyor_dir_mask,
     compute_action_masks,
     compute_conditional_build_type_mask,
+    configure_centralized_critic_runtime,
     load_centralized_critic_checkpoint,
     reset_centralized_critic,
     save_centralized_critic_checkpoint,
@@ -81,8 +83,16 @@ from model import (
     sample_logits_gumbel,
     train_on_trajectories,
     GraphedInference,
+    TERMINAL_WIN_REWARD,
+    TERMINAL_LOSS_REWARD,
+    REWARD_MODE,
+    RewardMode,
+    BRIDGE_BUILD_TYPE,
+    N_BRIDGE_TARGETS,
+    compute_harvester_build_dir_mask,
+    _unimix_logits,
 )
-from flow_reward import compute_dense_flow_rewards, augment_trajectories_with_flow_rewards
+
 
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
@@ -95,7 +105,7 @@ from training_utils import (
 # Struct-based binary IPC protocol constants
 _OBS_FLOATS = OBS_SIZE + H_DIM
 _OBS_FLOAT_BYTES = _OBS_FLOATS * 4
-_ACT_HEAD = struct.Struct('=iiii')
+_ACT_HEAD = struct.Struct('=iiiii')
 _H_STRUCT = struct.Struct(f'={H_DIM}f')
 _LP_STRUCT = struct.Struct('=f')
 _H_BYTES = H_DIM * 4
@@ -261,6 +271,41 @@ def _load_resume_state(
     return payload
 
 
+def _load_critic_init_weights(weight_path: str | Path, *, lr: float) -> bool:
+    """Load PPO critic init weights from a plain state_dict or sidecar checkpoint."""
+    path = Path(weight_path)
+    if not path.exists():
+        return False
+
+    try:
+        payload = torch.load(path, map_location=DEVICE)
+        if isinstance(payload, dict) and "critic" in payload:
+            critic_state = payload["critic"]
+            opt_state = payload.get("optimizer")
+        else:
+            critic_state = payload
+            opt_state = None
+
+        if not isinstance(critic_state, dict):
+            raise ValueError("critic weights must be a state_dict-compatible mapping")
+
+        reset_centralized_critic()
+        critic, critic_opt = get_centralized_critic(lr=lr)
+        critic.load_state_dict(critic_state)
+        if opt_state is not None:
+            critic_opt.load_state_dict(opt_state)
+        return True
+    except Exception as e:
+        print(f"Could not load critic init weights from {path}: {e}")
+        reset_centralized_critic()
+        return False
+
+
+def _load_resume_critic_checkpoint(weight_path: str | Path, *, lr: float) -> bool:
+    """Load the session-sidecar critic checkpoint for PPO resume."""
+    return load_centralized_critic_checkpoint(weight_path, lr=lr)
+
+
 def _read_exact(fd, n):
     """Read exactly n bytes from fd."""
     data = bytearray(n)
@@ -281,14 +326,14 @@ def _pipe_read_obs(fd):
     return _read_exact(fd, _OBS_FLOAT_BYTES)
 
 
-def _pipe_write_action_a(fd, bt, bd, cd, md, h_next_bytes, old_lp):
+def _pipe_write_action_a(fd, bt, bd, cd, brt, md, h_next_bytes, old_lp):
     """Write fixed-size action packet for training bot (A)."""
-    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, md), h_next_bytes, _LP_STRUCT.pack(old_lp)))
+    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, brt, md), h_next_bytes, _LP_STRUCT.pack(old_lp)))
 
 
-def _pipe_write_action_b(fd, bt, bd, cd, md, h_next_bytes):
+def _pipe_write_action_b(fd, bt, bd, cd, brt, md, h_next_bytes):
     """Write fixed-size action packet for opponent bot (B)."""
-    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, md), h_next_bytes))
+    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, brt, md), h_next_bytes))
 
 
 def _dummy_indices(device: torch.device):
@@ -530,9 +575,6 @@ def collect_games_batched(
             results[game_idx] = _load_worker_result(proc_info["result_path"])
             processes.pop(game_idx, None)
 
-    while pending_indices and len(processes) < max_workers:
-        _launch_game(pending_indices.pop(0))
-
     # Inference server loop — disable cyclic GC to avoid pauses from
     # the collector scanning the many live pipe buffers and tensor temporaries.
     gc_was_enabled = gc.isenabled()
@@ -543,6 +585,9 @@ def collect_games_batched(
     graphed_a = GraphedInference(model, max_batch=_max_a_batch)
     graphed_a.capture()
     total_inferences = 0
+
+    while pending_indices and len(processes) < max_workers:
+        _launch_game(pending_indices.pop(0))
     coalesce_s = max(coalesce_ms, 0.0) / 1000.0
     batch_a_calls = batch_a_items = batch_a_max = 0
     batch_b_calls = batch_b_items = batch_b_max = 0
@@ -614,9 +659,9 @@ def collect_games_batched(
                     profile["infer_a_s"] = profile.get("infer_a_s", 0.0) + dt
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                bt_act, bd_act, cd_act, md_act, lp, h_next = graphed_a(all_t)
+                bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next = graphed_a(all_t)
                 results_cpu = torch.stack([
-                    bt_act.float(), bd_act.float(), cd_act.float(), md_act.float(), lp,
+                    bt_act.float(), bd_act.float(), cd_act.float(), brt_act.float(), md_act.float(), lp,
                 ]).cpu()
                 h_cpu = h_next.cpu().contiguous()
                 if profile is not None:
@@ -632,7 +677,7 @@ def collect_games_batched(
                     _pipe_write_action_a(
                         act_fds[(game_idx, "a")],
                         int(results_cpu[0, i]), int(results_cpu[1, i]), int(results_cpu[2, i]),
-                        int(results_cpu[3, i]), h_view[h_start:h_start + _H_BYTES], float(results_cpu[4, i]),
+                        int(results_cpu[3, i]), int(results_cpu[4, i]), h_view[h_start:h_start + _H_BYTES], float(results_cpu[5, i]),
                     )
                 except OSError:
                     pass
@@ -660,6 +705,7 @@ def collect_games_batched(
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     obs_t = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_b, _OBS_FLOATS)[:, :OBS_SIZE]
                     bt_act, bd_act, cd_act, md_act = _dummy_policy(obs_t)
+                    brt_act = torch.zeros_like(bt_act)
                     if profile is not None:
                         profile["dummy_b_s"] = profile.get("dummy_b_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -668,7 +714,7 @@ def collect_games_batched(
                         try:
                             _pipe_write_action_b(
                                 act_fds[(game_idx, "b")],
-                                int(bt_act[i]), int(bd_act[i]), int(cd_act[i]), int(md_act[i]),
+                                int(bt_act[i]), int(bd_act[i]), int(cd_act[i]), int(brt_act[i]), int(md_act[i]),
                                 _ZERO_H_BYTES,
                             )
                         except OSError:
@@ -690,13 +736,13 @@ def collect_games_batched(
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     if opp_g is not None and n_b <= opp_g.max_batch:
                         # CUDA-graphed path: forward + mask + sample in one graph replay
-                        bt_act, bd_act, cd_act, md_act, _, h_next = opp_g(all_t)
-                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, md_act]).cpu()
+                        bt_act, bd_act, cd_act, brt_act, md_act, _, h_next = opp_g(all_t)
+                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
                         h_cpu = h_next.cpu().contiguous()
                     else:
                         # Fallback: ungraphed inference
                         obs_t = all_t[:, :OBS_SIZE]
-                        bt_l, bd_l, cd_l, md_l, _eps, h_next = opp_m.infer_packed(all_t)
+                        bt_l, bd_l, cd_l, _brt_l, md_l, _eps, h_next = opp_m.infer_packed(all_t)
                         if profile is not None:
                             dt = time.perf_counter() - t_phase
                             profile["forward_b_s"] = profile.get("forward_b_s", 0.0) + dt
@@ -711,8 +757,9 @@ def collect_games_batched(
                         bd_l.masked_fill_(~bd_m, -1e9)
                         bd_act, _ = sample_logits_gumbel(bd_l, _OPP_GRAPH_TEMP, mask=bd_m, return_log_prob=False)
                         cd_act, _ = sample_logits_gumbel(cd_l, _OPP_GRAPH_TEMP, mask=cd_m, return_log_prob=False)
+                        brt_act, _ = sample_logits_gumbel(_brt_l, _OPP_GRAPH_TEMP, return_log_prob=False)
                         md_act, _ = sample_logits_gumbel(md_l, _OPP_GRAPH_TEMP, return_log_prob=False)
-                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, md_act]).cpu()
+                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
                         h_cpu = h_next.cpu().contiguous()
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
@@ -726,7 +773,7 @@ def collect_games_batched(
                         h_start = i * _H_BYTES
                         _pipe_write_action_b(
                             act_fds[(game_idx, "b")],
-                            int(acts_cpu[0, i]), int(acts_cpu[1, i]), int(acts_cpu[2, i]), int(acts_cpu[3, i]),
+                            int(acts_cpu[0, i]), int(acts_cpu[1, i]), int(acts_cpu[2, i]), int(acts_cpu[3, i]), int(acts_cpu[4, i]),
                             h_view[h_start:h_start + _H_BYTES],
                         )
                     except OSError:
@@ -802,15 +849,14 @@ def collect_games_batched(
             per_opp_winners.setdefault(oid, []).append(None)
             continue
         game_trajs = _read_trajectory_file(log_path)
-        # Dense flow reward: use replay-derived productive transfer totals for
-        # each round. Always call augment to zero out stale n_working values.
-        flow_rewards: dict[int, float] = {}
-        if gstates and gstates.get("transfer_events_buf"):
+        # Inject replay-derived titanium income as per-step reward (training only)
+        if gstates:
             try:
+                from flow_reward import compute_dense_flow_rewards, augment_trajectories_with_flow_rewards
                 flow_rewards = compute_dense_flow_rewards(gstates)
+                game_trajs = augment_trajectories_with_flow_rewards(game_trajs, flow_rewards)
             except Exception as e:
                 print(f"  Flow reward augmentation error: {e}")
-        game_trajs = augment_trajectories_with_flow_rewards(game_trajs, flow_rewards)
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -831,6 +877,18 @@ def collect_games_batched(
         profile["batch_b_mean"] = batch_b_items / max(batch_b_calls, 1)
         profile["batch_b_max"] = float(batch_b_max)
 
+    # Read path-based buffers into memory before deleting tmpdir
+    for gs in all_global_states:
+        if gs is None:
+            continue
+        for key, buf_key in [("states_path", "states_buf"), ("scalars_path", "scalars_buf"),
+                             ("transfer_events_path", "transfer_events_buf"), ("ti_delivered_path", "ti_delivered_buf")]:
+            if gs.get(buf_key) is None and gs.get(key):
+                try:
+                    gs[buf_key] = Path(gs[key]).read_bytes()
+                except OSError:
+                    pass
+
     shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"    [{n_games} games, {total_inferences} GPU inferences]")
     return trajectories, winners, per_opp_winners, all_global_states, traj_game_map, game_origin
@@ -840,9 +898,19 @@ def _step_round_index(step) -> int | None:
     if not isinstance(step, (list, tuple)) or len(step) < 1:
         return None
     obs = step[0]
-    if not isinstance(obs, (list, tuple)) or len(obs) <= 475:
+    if isinstance(obs, (bytes, bytearray, memoryview)):
+        import struct as _struct
+        _OBS_ROUND_BYTE_OFFSET = 475 * 4
+        if len(obs) <= _OBS_ROUND_BYTE_OFFSET + 3:
+            return None
+        rnd_val = _struct.unpack_from('<f', obs, _OBS_ROUND_BYTE_OFFSET)[0]
+    elif isinstance(obs, (list, tuple)):
+        if len(obs) <= 475:
+            return None
+        rnd_val = obs[475]
+    else:
         return None
-    return max(0, min(int(round(obs[475] * 2000.0)), 1999))
+    return max(0, min(int(round(rnd_val * 2000.0)), 1999))
 
 
 def _step_build_reward(step) -> float:
@@ -874,13 +942,29 @@ def main():
     parser.add_argument("--games-per-opp", type=int, default=2)
     parser.add_argument("--dummy-episodes", type=int, default=0, help="Use only scripted dummy opponents for the first N episodes")
     parser.add_argument("--league-size", type=int, default=20)
-    parser.add_argument("--checkpoint-every", type=int, default=5)
+    parser.add_argument("--checkpoint-every", type=int, default=1)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--critic-lr", type=float, default=0, help="Critic learning rate (default: same as --lr)")
+    parser.add_argument(
+        "--critic-minibatch-size",
+        type=int,
+        default=0,
+        help="Critic PPO minibatch size (default: auto, larger than actor minibatches on CUDA)",
+    )
     parser.add_argument("--teacher", action="store_true", help="Train large teacher, distill to student")
     parser.add_argument("--distill-epochs", type=int, default=20, help="Distillation epochs")
     parser.add_argument("--distill-lr", type=float, default=1e-3, help="Distillation learning rate")
     parser.add_argument("--coalesce-ms", type=float, default=DEFAULT_COALESCE_MS)
     parser.add_argument("--session", type=str, default="")
+    parser.add_argument("--init-weights", type=str, default="", help="Initialize actor from a checkpoint")
+    parser.add_argument(
+        "--critic-init-weights",
+        type=str,
+        default="",
+        help="Initialize critic from a plain state_dict or sidecar checkpoint",
+    )
+    parser.add_argument("--critic-no-compile", action="store_true", help="Disable torch.compile for PPO critic updates")
+    parser.add_argument("--freeze-critic", action="store_true", help="Skip critic updates during PPO (actor-only training)")
     parser.add_argument("--resume", action="store_true", help="Resume a prior session from saved trainer state")
     parser.add_argument("--worker-result", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--worker-pipes", type=str, default="", help=argparse.SUPPRESS)
@@ -901,14 +985,21 @@ def main():
     game_log_path = Path(str(log_path).replace("train_log.jsonl", "game_log.jsonl"))
 
     maps = [f.name for f in (PROJECT_ROOT / "maps").glob("*.map26")]
-    league = League(sess["league_dir"], sess["league_json"], args.league_size)
+    league = League(sess["league_dir"], args.league_size)
 
     hidden = TEACHER_HIDDEN if args.teacher else None
     model = BuilderMLP(hidden=hidden).to(DEVICE)
+    configure_centralized_critic_runtime(enable_compile=not args.critic_no_compile)
     reset_centralized_critic()
+    _critic_lr = args.critic_lr if args.critic_lr > 0 else args.lr
     if args.resume:
         model.load_weights(weight_path)
-        load_centralized_critic_checkpoint(weight_path, lr=args.lr)
+        _load_resume_critic_checkpoint(weight_path, lr=_critic_lr)
+    elif args.init_weights:
+        if not model.load_weights(args.init_weights):
+            raise SystemExit(f"Could not load actor weights from {args.init_weights}")
+        print(f"Initialized actor from {args.init_weights}")
+    _deferred_critic_path = args.critic_init_weights or None
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes)
 
@@ -1024,6 +1115,11 @@ def main():
         t_collect = time.time() - t0
 
         t1 = time.time()
+        if _deferred_critic_path is not None:
+            if not _load_critic_init_weights(_deferred_critic_path, lr=_critic_lr):
+                raise SystemExit(f"Could not load critic from {_deferred_critic_path}")
+            print(f"Loaded critic init weights from {_deferred_critic_path}")
+            _deferred_critic_path = None
         model.train()
         stats = train_on_trajectories(
             model, optimizer, all_trajs,
@@ -1031,6 +1127,8 @@ def main():
             traj_game_map=traj_game_map if all_global_states else None,
             game_winners=all_winners,
             target_kl=0.03,
+            critic_minibatch_size=args.critic_minibatch_size or None,
+            freeze_critic=args.freeze_critic,
         )
         model.save_weights(weight_path)
         save_centralized_critic_checkpoint(weight_path)
@@ -1138,7 +1236,8 @@ def main():
         mean_conv_failures = sum(r[9] for r in rewards) / n_trajs
         mean_conv_prox_gate = sum(r[10] for r in rewards) / n_trajs
         mean_conv_prox_paid = sum(r[11] for r in rewards) / n_trajs
-        mean_reward = (mean_r_work + mean_r_dmg + mean_r_own_dmg)
+        r_outcome = (total_wins * TERMINAL_WIN_REWARD + total_losses * TERMINAL_LOSS_REWARD) / max(total_games, 1) if REWARD_MODE == RewardMode.OUTCOME else 0.0
+        mean_reward = (mean_r_work + r_outcome)
         mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
         elapsed = elapsed_offset + (time.time() - run_started_at)
 

@@ -170,6 +170,10 @@ class GameState:
     enemy_core_dmg_round: int = -1
     own_core_dmg: float = 0.0
     own_core_dmg_round: int = -1
+    # Titanium income tracking: ti_collected delta between rounds
+    ti_income: int = 0
+    ti_income_round: int = -1
+    _prev_ti_collected: int = 0
 
     @classmethod
     def reset(cls) -> None:
@@ -189,6 +193,9 @@ class GameState:
         cls.enemy_core_dmg_round = -1
         cls.own_core_dmg = 0.0
         cls.own_core_dmg_round = -1
+        cls.ti_income = 0
+        cls.ti_income_round = -1
+        cls._prev_ti_collected = 0
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +646,7 @@ _ZERO_DBG = [0, 0, 0, 0, 0, 0, 0, 0]
 
 
 def execute_build(ct: Controller, action: str, direction: Direction,
-                  conv_direction: Direction, my_team) -> tuple[float, float, list]:
+                  conv_direction: Direction, my_team, bridge_target_idx: int = 0) -> tuple[float, float, list]:
     """Execute build action. Returns (harv_reward, conv_reward, dbg)."""
     if action == "none":
         return 0.0, 0.0, _ZERO_DBG

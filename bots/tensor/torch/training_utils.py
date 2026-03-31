@@ -40,15 +40,24 @@ def _init_session(name: str) -> dict:
     league_dir.mkdir(exist_ok=True)
     replay_dir = d / "replays"
     replay_dir.mkdir(exist_ok=True)
+    actor_weight_path = d / "weights.pkl"
+    critic_weight_path = d / "weights.critic.pt"
     meta_path = d / "meta.json"
     if not meta_path.exists():
         with open(meta_path, "w") as f:
-            json.dump({"name": name, "created": time.time(), "mode": "self-play"}, f)
+            json.dump({
+                "name": name,
+                "created": time.time(),
+                "mode": "self-play",
+                "actor_weight_path": str(actor_weight_path),
+                "critic_weight_path": str(critic_weight_path),
+            }, f)
     return {
         "dir": d,
         "league_dir": league_dir,
-        "league_json": league_dir / "league.json",
-        "weight_path": d / "weights.pkl",
+        "actor_weight_path": actor_weight_path,
+        "critic_weight_path": critic_weight_path,
+        "weight_path": actor_weight_path,
         "log_path": d / "train_log.jsonl",
         "replay_dir": replay_dir,
     }
@@ -71,23 +80,36 @@ def _ts_elo(rating: trueskill.Rating) -> float:
 
 
 class League:
-    def __init__(self, league_dir: Path, league_json: Path, max_size: int = 20):
+    def __init__(self, league_dir: Path, max_size: int = 20):
         self.max_size = max_size
         self.league_dir = league_dir
-        self.league_json = league_json
+        self.models_json = league_dir / "models.json"
+        self.matches_jsonl = league_dir / "matches.jsonl"
         league_dir.mkdir(parents=True, exist_ok=True)
-        if league_json.exists():
-            with open(league_json) as f:
+
+        # Migrate from old league.json if present
+        old_json = league_dir / "league.json"
+        if old_json.exists() and not self.models_json.exists():
+            with open(old_json) as f:
                 data = json.load(f)
             self.models = data.get("models", [])
-            self.match_history = data.get("matches", [])
+            # Write migrated matches as JSONL
+            matches = data.get("matches", [])
+            if matches:
+                with open(self.matches_jsonl, "a") as f:
+                    for m in matches:
+                        f.write(json.dumps(m) + "\n")
+            self.save()
+            old_json.unlink()
+        elif self.models_json.exists():
+            with open(self.models_json) as f:
+                self.models = json.load(f)
         else:
             self.models = []
-            self.match_history = []
 
     def save(self):
-        with open(self.league_json, "w") as f:
-            json.dump({"models": self.models, "matches": self.match_history}, f, indent=2)
+        with open(self.models_json, "w") as f:
+            json.dump(self.models, f, indent=2)
 
     def add_model(self, weights: list[list[float]], gen: int) -> dict:
         path = str(self.league_dir / f"gen_{gen}.pkl")
@@ -210,9 +232,10 @@ class League:
         a["elo"] = _ts_elo(new_a)
         b["elo"] = _ts_elo(new_b)
 
-        self.match_history.append({
-            "a": model_a_id, "b": model_b_id, "winner": winner, "timestamp": time.time(),
-        })
+        with open(self.matches_jsonl, "a") as f:
+            f.write(json.dumps({
+                "a": model_a_id, "b": model_b_id, "winner": winner, "timestamp": time.time(),
+            }) + "\n")
 
     def get_rankings(self) -> list[dict]:
         return sorted(self.models, key=lambda m: m["elo"], reverse=True)

@@ -3,7 +3,7 @@
 Same as tensor_proxy but:
 - Reads TENSOR_OBS_WFD_B / TENSOR_ACT_RFD_B pipe env vars
 - No trajectory logging (opponent doesn't train)
-- Uses argmax (greedy) actions from server response
+- Executes the exact same shared action semantics as side A
 """
 
 from array import array
@@ -18,10 +18,12 @@ sys.path.insert(0, _TENSOR_DIR)
 from shared import (
     GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES, POS_EMBED_DIM,
     INPUT_SIZE, HIDDEN_SIZES, H_DIM,
-    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, DIR_DXY, BUILD_COSTS,
+    DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4, DIR_DXY, BUILD_COSTS,
+    _CONV_DIR_MASK,
     SinusoidalPositionEmbedding, GameState,
-    discover_ore, scan_enemy_core_dmg, scan_working_harvesters,
+    discover_ore, scan_enemy_core_dmg, scan_own_core_dmg,
     encode_state_into,
+    execute_build, execute_move,
 )
 
 from cambc import Controller, Direction, EntityType, Environment, Position
@@ -29,8 +31,8 @@ from cambc import Controller, Direction, EntityType, Environment, Position
 # Struct-based binary IPC protocol
 _OBS_FLOATS = INPUT_SIZE + H_DIM
 _OBS_BYTES = _OBS_FLOATS * 4
-_ACT_HEAD = struct.Struct('=iii')
-_ACT_INTS = 3  # bt, bd, md
+_ACT_HEAD = struct.Struct('=iiiii')
+_ACT_INTS = 5  # bt, bd, cd, brt, md
 _ACT_B_FLOATS = H_DIM  # h_next only (no log_prob for opponent)
 _ACT_B_SIZE = _ACT_INTS * 4 + _ACT_B_FLOATS * 4
 _H_BYTES = H_DIM * 4
@@ -77,10 +79,10 @@ def _recv_action(act_rfd):
     data = _read_exact(act_rfd, _ACT_B_SIZE)
     if data is None:
         return None
-    bt, bd, md = _ACT_HEAD.unpack_from(data, 0)
+    bt, bd, cd, brt, md = _ACT_HEAD.unpack_from(data, 0)
     h_next = array("f")
-    h_next.frombytes(data[12:12 + _H_BYTES])
-    return bt, bd, md, h_next
+    h_next.frombytes(data[_ACT_INTS * 4:_ACT_INTS * 4 + _H_BYTES])
+    return bt, bd, cd, brt, md, h_next
 
 
 class Player:
@@ -140,24 +142,28 @@ class Player:
             _send_obs(obs_wfd, obs, self.h_prev)
             result = _recv_action(act_rfd)
             if result is not None:
-                build_type_idx, build_dir_idx, move_dir_idx, h_next = result
+                build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, h_next = result
                 self.h_prev = h_next
             else:
                 build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
                 build_dir_idx = random.randint(0, 8)
+                conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
+                bridge_target_idx = 0
                 move_dir_idx = random.randint(0, 8)
         else:
             build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
             build_dir_idx = random.randint(0, 8)
+            conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
+            bridge_target_idx = 0
             move_dir_idx = random.randint(0, 8)
 
-        # Execute actions directly
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        self._execute_build(ct, build_action, build_dir)
+        conv_dir = CONV_DIR_4[conv_dir_idx]
+        execute_build(ct, build_action, build_dir, conv_dir, self.my_team, bridge_target_idx)
 
         move_dir = DIR_MAP_9[move_dir_idx]
-        self._execute_move(ct, move_dir)
+        execute_move(ct, move_dir)
 
         self._prev_resources = ct.get_global_resources()
 
@@ -174,83 +180,10 @@ class Player:
             except Exception:
                 continue
 
-    def _execute_build(self, ct, action, direction):
-        pos = ct.get_position()
-        build_pos = pos.add(direction)
-
-        w, h = ct.get_map_width(), ct.get_map_height()
-        if build_pos.x < 0 or build_pos.x >= w or build_pos.y < 0 or build_pos.y >= h:
-            return
-
-        bid = ct.get_tile_building_id(build_pos)
-        if bid is not None:
-            try:
-                if ct.get_team(bid) == self.my_team and ct.get_entity_type(bid) != EntityType.CORE:
-                    idx = BUILD_ACTIONS.index(action)
-                    base_ti, base_ax = BUILD_COSTS[idx]
-                    scale = ct.get_scale_percent() / 100.0
-                    ti, ax = ct.get_global_resources()
-                    if ti >= int(scale * base_ti) and ax >= int(scale * base_ax):
-                        ct.destroy(build_pos)
-                    else:
-                        return
-            except Exception:
-                pass
-
-        if action == "conveyor":
-            conv_dir = direction
-            if self.core_center:
-                conv_dir = build_pos.direction_to(self.core_center)
-                if conv_dir == Direction.CENTRE:
-                    conv_dir = direction
-            if ct.can_build_conveyor(build_pos, conv_dir):
-                ct.build_conveyor(build_pos, conv_dir)
-        elif action == "harvester":
-            if ct.can_build_harvester(build_pos):
-                ct.build_harvester(build_pos)
-        elif action == "road":
-            if ct.can_build_road(build_pos):
-                ct.build_road(build_pos)
-        elif action == "gunner":
-            if ct.can_build_gunner(build_pos, direction):
-                ct.build_gunner(build_pos, direction)
-        elif action == "sentinel":
-            if ct.can_build_sentinel(build_pos, direction):
-                ct.build_sentinel(build_pos, direction)
-        elif action == "breach":
-            if ct.can_build_breach(build_pos, direction):
-                ct.build_breach(build_pos, direction)
-        elif action == "splitter":
-            if ct.can_build_splitter(build_pos, direction):
-                ct.build_splitter(build_pos, direction)
-        elif action == "armoured_conveyor":
-            if ct.can_build_armoured_conveyor(build_pos, direction):
-                ct.build_armoured_conveyor(build_pos, direction)
-        elif action == "barrier":
-            if ct.can_build_barrier(build_pos):
-                ct.build_barrier(build_pos)
-        elif action == "foundry":
-            if ct.can_build_foundry(build_pos):
-                ct.build_foundry(build_pos)
-        elif action == "launcher":
-            if ct.can_build_launcher(build_pos):
-                ct.build_launcher(build_pos)
-
-    def _execute_move(self, ct, direction):
-        if direction == Direction.CENTRE:
-            return
-        if ct.can_move(direction):
-            ct.move(direction)
-            return
-        for alt in (direction.rotate_left(), direction.rotate_right()):
-            if ct.can_move(alt):
-                ct.move(alt)
-                return
-
     def _encode_state_buf(self, ct):
         discover_ore(ct)
-        scan_working_harvesters(ct)
         scan_enemy_core_dmg(ct)
+        scan_own_core_dmg(ct)
         del self._obs_buf[:]
         n_builders_out = [0]
         result = encode_state_into(
