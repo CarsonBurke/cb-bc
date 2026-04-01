@@ -17,6 +17,7 @@ if str(TORCH_DIR) not in sys.path:
 
 from model import (
     ACTOR_LATENT_DIM,
+    BRIDGE_BUILD_TYPE,
     BuilderMLP,
     CentralizedCritic,
     CONVEYOR_BUILD_TYPES,
@@ -77,7 +78,7 @@ def _manual_rollout_episode(
     length: int,
     *,
     offset: int = 0,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[int], list[int], list[int], list[int], list[float]]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[int], list[int], list[int], list[int], list[int], list[float]]:
     device = next(model.parameters()).device
     h_prev = torch.zeros(1, H_DIM, device=device)
 
@@ -86,13 +87,14 @@ def _manual_rollout_episode(
     bt_list: list[int] = []
     bd_list: list[int] = []
     cd_list: list[int] = []
+    brt_list: list[int] = []
     md_list: list[int] = []
     lp_list: list[float] = []
 
     for local_step in range(length):
         step_idx = offset + local_step
         obs = _make_obs(step_idx).unsqueeze(0).to(device)
-        bt_l, bd_l, cd_l, md_l, eps, h_next = model(obs, h_prev)
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = model(obs, h_prev)
 
         bt_mask, bd_mask = compute_action_masks(obs)
         harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
@@ -114,11 +116,13 @@ def _manual_rollout_episode(
         cd_mask = conveyor_dir_mask(device, 1)
 
         cd_act = step_idx % 4
+        brt_act = step_idx % 28
         md_act = (step_idx * 2) % 9
         bd_act = int(bd_act if bool(bd_mask[0, bd_act]) else bd_mask[0].float().argmax().item())
 
         bd_act_t = torch.tensor([bd_act], device=device, dtype=torch.long)
         cd_act_t = torch.tensor([cd_act], device=device, dtype=torch.long)
+        brt_act_t = torch.tensor([brt_act], device=device, dtype=torch.long)
         md_act_t = torch.tensor([md_act], device=device, dtype=torch.long)
 
         bt_l = bt_l.masked_fill(~bt_mask, -1e9)
@@ -128,22 +132,25 @@ def _manual_rollout_episode(
         bt_lp, _ = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask, eps[:, 0])
         bd_lp, _ = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask, eps[:, 1])
         cd_lp, _ = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, eps[:, 2])
-        md_lp, _ = action_log_prob_and_entropy(md_l, md_act_t, eps=eps[:, 3])
+        brt_lp, _ = action_log_prob_and_entropy(brt_l, brt_act_t, eps=eps[:, 3])
+        md_lp, _ = action_log_prob_and_entropy(md_l, md_act_t, eps=eps[:, 4])
         bd_causal = 1.0 if bt_act != 0 else 0.0
         cd_causal = 1.0 if bt_act in CONVEYOR_BUILD_TYPES else 0.0
-        total_lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
+        brt_causal = 1.0 if bt_act == BRIDGE_BUILD_TYPE else 0.0
+        total_lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
 
         obs_list.append(obs.squeeze(0).cpu())
         h_list.append(h_prev.squeeze(0).cpu())
         bt_list.append(bt_act)
         bd_list.append(bd_act)
         cd_list.append(cd_act)
+        brt_list.append(brt_act)
         md_list.append(md_act)
         lp_list.append(float(total_lp.item()))
 
         h_prev = h_next
 
-    return obs_list, h_list, bt_list, bd_list, cd_list, md_list, lp_list
+    return obs_list, h_list, bt_list, bd_list, cd_list, brt_list, md_list, lp_list
 
 
 # =====================================================================
@@ -164,8 +171,9 @@ class TestLogProbRecomputation:
         all_bt = ep1[2] + ep2[2]
         all_bd = ep1[3] + ep2[3]
         all_cd = ep1[4] + ep2[4]
-        all_md = ep1[5] + ep2[5]
-        manual_lp = torch.tensor(ep1[6] + ep2[6], dtype=torch.float32)
+        all_brt = ep1[5] + ep2[5]
+        all_md = ep1[6] + ep2[6]
+        manual_lp = torch.tensor(ep1[7] + ep2[7], dtype=torch.float32)
 
         device = next(model.parameters()).device
         obs = torch.stack(all_obs).to(device)
@@ -173,6 +181,7 @@ class TestLogProbRecomputation:
         bt = torch.tensor(all_bt, dtype=torch.long, device=device)
         bd = torch.tensor(all_bd, dtype=torch.long, device=device)
         cd = torch.tensor(all_cd, dtype=torch.long, device=device)
+        brt = torch.tensor(all_brt, dtype=torch.long, device=device)
         md = torch.tensor(all_md, dtype=torch.long, device=device)
 
         ep_boundaries = [(0, len(ep1[0])), (len(ep1[0]), len(all_obs))]
@@ -184,6 +193,7 @@ class TestLogProbRecomputation:
             bt,
             bd,
             cd,
+            brt,
             md,
             chunks,
             bptt_k=4,
@@ -204,12 +214,13 @@ class TestLogProbRecomputation:
         bt = torch.tensor(ep[2], dtype=torch.long, device=device)
         bd = torch.tensor(ep[3], dtype=torch.long, device=device)
         cd = torch.tensor(ep[4], dtype=torch.long, device=device)
-        md = torch.tensor(ep[5], dtype=torch.long, device=device)
-        manual_lp = torch.tensor(ep[6], dtype=torch.float32)
+        brt = torch.tensor(ep[5], dtype=torch.long, device=device)
+        md = torch.tensor(ep[6], dtype=torch.long, device=device)
+        manual_lp = torch.tensor(ep[7], dtype=torch.float32)
 
         chunks = _build_bptt_chunks([(0, 1)], bptt_k=4)
         recomputed = _sequential_logprobs(
-            model, obs, h, bt, bd, cd, md, chunks, bptt_k=4, batch_size=8,
+            model, obs, h, bt, bd, cd, brt, md, chunks, bptt_k=4, batch_size=8,
         ).cpu()
 
         assert torch.allclose(recomputed, manual_lp, atol=1e-5)
@@ -1047,7 +1058,8 @@ class TestRecurrentPassConsistency:
         bt = torch.tensor(ep[2], dtype=torch.long, device=device)
         bd = torch.tensor(ep[3], dtype=torch.long, device=device)
         cd = torch.tensor(ep[4], dtype=torch.long, device=device)
-        md = torch.tensor(ep[5], dtype=torch.long, device=device)
+        brt = torch.tensor(ep[5], dtype=torch.long, device=device)
+        md = torch.tensor(ep[6], dtype=torch.long, device=device)
         h0 = torch.stack(ep[1][:1]).to(device)
 
         bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
@@ -1057,6 +1069,7 @@ class TestRecurrentPassConsistency:
         bt_a = bt.unsqueeze(0)
         bd_a = bd.unsqueeze(0)
         cd_a = cd.unsqueeze(0)
+        brt_a = brt.unsqueeze(0)
         md_a = md.unsqueeze(0)
         bt_m = bt_mask.unsqueeze(0)
         bd_m = bd_mask.unsqueeze(0)
@@ -1065,10 +1078,10 @@ class TestRecurrentPassConsistency:
 
         with torch.no_grad():
             lp_only = _recurrent_logprob_pass(
-                model, obs_pre, h0, bt_a, bd_a, cd_a, md_a, bt_m, bd_m, bd_c, cd_c,
+                model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, bd_c, cd_c,
             )
             lp_actor, ent, _eps = _recurrent_actor_pass(
-                model, obs_pre, h0, bt_a, bd_a, cd_a, md_a, bt_m, bd_m, bd_c, cd_c,
+                model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, bd_c, cd_c,
             )
 
         assert torch.allclose(lp_only, lp_actor, atol=1e-5), \
@@ -1084,7 +1097,8 @@ class TestRecurrentPassConsistency:
         bt = torch.tensor(ep[2], dtype=torch.long, device=device)
         bd = torch.tensor(ep[3], dtype=torch.long, device=device)
         cd = torch.tensor(ep[4], dtype=torch.long, device=device)
-        md = torch.tensor(ep[5], dtype=torch.long, device=device)
+        brt = torch.tensor(ep[5], dtype=torch.long, device=device)
+        md = torch.tensor(ep[6], dtype=torch.long, device=device)
         h0 = torch.stack(ep[1][:1]).to(device)
 
         bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
@@ -1093,7 +1107,8 @@ class TestRecurrentPassConsistency:
         with torch.no_grad():
             _, ent, _eps = _recurrent_actor_pass(
                 model, obs_pre, h0,
-                bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0), md.unsqueeze(0),
+                bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0),
+                brt.unsqueeze(0), md.unsqueeze(0),
                 bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
                 bd_causal.unsqueeze(0), cd_causal.unsqueeze(0),
             )
@@ -1207,8 +1222,9 @@ class TestActorGradientFlow:
         bt = torch.tensor(ep[2], dtype=torch.long, device=device)
         bd = torch.tensor(ep[3], dtype=torch.long, device=device)
         cd = torch.tensor(ep[4], dtype=torch.long, device=device)
-        md = torch.tensor(ep[5], dtype=torch.long, device=device)
-        old_lps = torch.tensor(ep[6], dtype=torch.float32, device=device)
+        brt = torch.tensor(ep[5], dtype=torch.long, device=device)
+        md = torch.tensor(ep[6], dtype=torch.long, device=device)
+        old_lps = torch.tensor(ep[7], dtype=torch.float32, device=device)
         h0 = torch.zeros(1, H_DIM, device=device)
 
         bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
@@ -1216,7 +1232,8 @@ class TestActorGradientFlow:
 
         new_lps, ent, _eps = _recurrent_actor_pass(
             model, obs_pre, h0,
-            bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0), md.unsqueeze(0),
+            bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0),
+            brt.unsqueeze(0), md.unsqueeze(0),
             bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
             bd_causal.unsqueeze(0), cd_causal.unsqueeze(0),
         )
@@ -1247,7 +1264,7 @@ class TestActorGradientFlow:
         model = BuilderMLP()
 
         ep = _manual_rollout_episode(model, 3, offset=0)
-        old_lps = torch.tensor(ep[6], dtype=torch.float32, requires_grad=True)
+        old_lps = torch.tensor(ep[7], dtype=torch.float32, requires_grad=True)
 
         # Simulate ratio computation with detached old_lps
         new_lps = torch.randn(3, requires_grad=True)

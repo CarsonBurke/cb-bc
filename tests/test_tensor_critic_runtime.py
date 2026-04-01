@@ -1,0 +1,65 @@
+"""Regression coverage for PPO critic runtime configuration."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TORCH_DIR = PROJECT_ROOT / "bots" / "tensor" / "torch"
+
+if str(TORCH_DIR) not in sys.path:
+    sys.path.insert(0, str(TORCH_DIR))
+
+import model as model_mod
+
+
+def test_resolve_critic_minibatch_size_prefers_gpu_sized_auto_batch():
+    auto_cuda = model_mod._resolve_critic_minibatch_size(
+        actor_minibatch_size=2048,
+        critic_minibatch_size=None,
+        device=model_mod.torch.device("cuda"),
+    )
+    assert auto_cuda == model_mod.DEFAULT_CRITIC_MINIBATCH_SIZE
+
+    explicit = model_mod._resolve_critic_minibatch_size(
+        actor_minibatch_size=2048,
+        critic_minibatch_size=4096,
+        device=model_mod.torch.device("cuda"),
+    )
+    assert explicit == 4096
+
+    cpu_auto = model_mod._resolve_critic_minibatch_size(
+        actor_minibatch_size=2048,
+        critic_minibatch_size=None,
+        device=model_mod.torch.device("cpu"),
+    )
+    assert cpu_auto == 2048
+
+
+def test_configure_centralized_critic_runtime_forwards_compile_flag(monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_resolve(device, *, spatial_inputs, enable_compile, **_kwargs):
+        seen["device"] = device
+        seen["spatial_inputs"] = spatial_inputs
+        seen["enable_compile"] = enable_compile
+        return model_mod.PretrainCudaConfig(
+            enabled=False,
+            amp_dtype=None,
+            channels_last=False,
+            compile_model=False,
+        )
+
+    monkeypatch.setattr(model_mod, "resolve_cuda_config", fake_resolve)
+    monkeypatch.setattr(model_mod, "_centralized_critic_step", object())
+    monkeypatch.setattr(model_mod, "_centralized_critic_loss_step", object())
+
+    model_mod.configure_centralized_critic_runtime(enable_compile=False)
+
+    assert seen["device"] == model_mod.DEVICE
+    assert seen["spatial_inputs"] is True
+    assert seen["enable_compile"] is False
+    assert model_mod._centralized_critic_step is None
+    assert model_mod._centralized_critic_loss_step is None
