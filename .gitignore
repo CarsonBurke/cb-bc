@@ -8,3 +8,5 @@ ablations/REPORT.md
 sessions/
 .idea/
 target/
+.tmp/
+replay_data/
