@@ -9,6 +9,7 @@ The cookie is the value of __Secure-better-auth.session_token from your browser.
 """
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -95,8 +96,13 @@ def parse_seroval_url(data: dict) -> str:
 
 def fetch_matches(cookie: str, limit: int = 50, cursor: str | None = None,
                   team_ids: list[str] | None = None,
-                  min_rating: float | None = None) -> tuple[list[dict], str | None]:
-    """Fetch a page of matches from the REST API."""
+                  min_rating: float | None = None,
+                  since: str | None = None) -> tuple[list[dict], str | None, bool]:
+    """Fetch a page of matches from the REST API.
+
+    Returns (matches, next_cursor, hit_cutoff) where hit_cutoff is True
+    if a match was found older than the --since date.
+    """
     url = f"{BASE}/api/matches?limit={limit}"
     if cursor:
         url += f"&cursor={urllib.parse.quote(cursor)}"
@@ -107,6 +113,16 @@ def fetch_matches(cookie: str, limit: int = 50, cursor: str | None = None,
         data = json.loads(resp.read())
     matches = data.get("matches", [])
     next_cursor = data.get("nextCursor")
+    hit_cutoff = False
+    if since is not None:
+        filtered = []
+        for m in matches:
+            match_date = (m.get("completedAt") or m.get("createdAt", ""))[:10]
+            if match_date < since:
+                hit_cutoff = True
+                continue
+            filtered.append(m)
+        matches = filtered
     if min_rating is not None:
         matches = [m for m in matches
                    if m.get("teamARating", 0) >= min_rating
@@ -115,7 +131,7 @@ def fetch_matches(cookie: str, limit: int = 50, cursor: str | None = None,
         tid_set = set(team_ids)
         matches = [m for m in matches
                    if m.get("teamAId") in tid_set or m.get("teamBId") in tid_set]
-    return matches, next_cursor
+    return matches, next_cursor, hit_cutoff
 
 
 def fetch_games(cookie: str, match_id: str) -> list[dict]:
@@ -181,6 +197,8 @@ def main():
                         help="Output directory for replays")
     parser.add_argument("--delay", type=float, default=0.2,
                         help="Delay between API requests (seconds)")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Only matches on or after this date (YYYY-MM-DD or '2d' for 2 days ago)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List matches without downloading")
     args = parser.parse_args()
@@ -190,6 +208,16 @@ def main():
         args.cookie = os.environ.get("BATTLECODE_SESSION_COOKIE")
     if not args.cookie:
         parser.error("No cookie: set BATTLECODE_SESSION_COOKIE in .env or pass --cookie")
+
+    # Parse --since into YYYY-MM-DD string
+    since_date = None
+    if args.since:
+        m = re.fullmatch(r"(\d+)d", args.since)
+        if m:
+            since_date = (datetime.now(timezone.utc) - timedelta(days=int(m.group(1)))).strftime("%Y-%m-%d")
+        else:
+            since_date = args.since  # assume YYYY-MM-DD
+        print(f"Filtering matches since {since_date}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -213,12 +241,16 @@ def main():
     all_matches = []
     cursor = None
     for page in range(args.pages):
-        matches, cursor = fetch_matches(
+        matches, cursor, hit_cutoff = fetch_matches(
             args.cookie, limit=50, cursor=cursor,
             team_ids=team_ids, min_rating=args.min_rating,
+            since=since_date,
         )
         all_matches.extend(matches)
         print(f"Page {page+1}: {len(matches)} matches (total {len(all_matches)})")
+        if hit_cutoff:
+            print(f"Reached matches before {since_date}, stopping.")
+            break
         if not cursor:
             print("No more matches.")
             break
