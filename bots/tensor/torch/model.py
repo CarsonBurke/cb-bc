@@ -99,9 +99,9 @@ LAMBDA = 0.95 # GAE
 
 # ---- Dreamer4-style symexp two-hot value prediction ----
 NUM_BUCKETS = 255
-# symlog range — covers symexp(-3)≈±19.1, tight around [-10,+10] returns
-BUCKET_LOW = -6
-BUCKET_HIGH = 6
+# symlog range — covers symexp(-9)≈±8103, tight around zero
+BUCKET_LOW = -9
+BUCKET_HIGH = 9
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -1867,7 +1867,7 @@ def ppo_update(
     clip_eps: float = 0.2,
     clip_eps_higher: float | None = 0.28,
     vf_coeff: float = 0.5,
-    entropy_coeff: float = 0.01,
+    entropy_coeff: float = 0.001,
     max_grad_norm: float = 0.5,
     target_kl: float | None = None,
     clip_vloss: bool = False,
