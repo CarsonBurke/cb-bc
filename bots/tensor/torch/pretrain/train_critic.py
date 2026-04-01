@@ -376,33 +376,8 @@ def precompute_all_actor_latents(
             step_actor_latent = actor_latent_bt.index_select(0, bufs["actor_step_order"].to(torch.long))
             bufs["step_actor_latent"] = step_actor_latent
 
-            cache_path = _cache_path(cache_dir, "critic", Path(game["path"]), game["team"])
-            file_sig = _file_signature(Path(game["path"]))
-            save_entry = {
-                "version": _CRITIC_CACHE_VERSION,
-                "file_sig": list(file_sig),
-                "team": game["team"],
-                "n_turns": bufs["n_turns"],
-                "states": bufs["states"],
-                "scalars": bufs["scalars"],
-                "targets": bufs["targets"],
-                "step_rounds": bufs["step_rounds"],
-                "step_unit_xy": bufs["step_unit_xy"],
-                "step_unit_ctx": bufs["step_unit_ctx"],
-                "step_targets": bufs["step_targets"],
-                "round_offsets": bufs["round_offsets"],
-                "step_actor_latent": step_actor_latent,
-                "map_w": bufs["map_w"],
-                "map_h": bufs["map_h"],
-                "core_x": bufs.get("core_x", 0),
-                "core_y": bufs.get("core_y", 0),
-                "n_channels": bufs["n_channels"],
-                "n_scalars": bufs["n_scalars"],
-            }
-            try:
-                _atomic_torch_save(save_entry, cache_path)
-            except OSError:
-                pass
+            # Skip disk caching — states tensor is ~100MB/game, infeasible at scale.
+            # In-memory LRU in the dataset handles within-epoch reuse.
 
             bufs.pop("actor_obs_pre", None)
             bufs.pop("actor_obs", None)

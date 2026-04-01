@@ -216,6 +216,19 @@ def _materialize_group_training_tensors(
     return obs, act, prep_slots, train_slots, bt_mask, bd_mask, harv_bd_mask
 
 
+def _release_group_training_tensors(groups: list[dict]) -> None:
+    """Drop one-shot CPU staging tensors after their optimizer step finishes."""
+    for group in groups:
+        group.pop("obs", None)
+        group.pop("act", None)
+        group.pop("prep_slots", None)
+        group.pop("train_slots", None)
+        group.pop("bt_mask", None)
+        group.pop("bd_mask", None)
+        group.pop("harv_bd_mask", None)
+        group.pop("batch_h_base", None)
+
+
 def _materialize_training_batch(
     batch_groups: list[dict],
     games: list[dict],
@@ -858,15 +871,7 @@ def _prepare_tbptt_groups(
             if flat_count == 0:
                 continue
 
-            (
-                group_obs_cpu,
-                group_act_cpu,
-                group_prep_slots_cpu,
-                group_train_slots_cpu,
-                group_bt_mask_cpu,
-                group_bd_mask_cpu,
-                group_harv_bd_mask_cpu,
-            ) = _materialize_group_training_tensors(group, games)
+            group_obs_cpu, group_prep_slots_cpu = _materialize_group_prep_tensors(group, games)
             group_obs = group_obs_cpu.to(DEVICE, non_blocking=True)
             group_prep_slots = group_prep_slots_cpu.to(DEVICE, non_blocking=True)
             with autocast_context(cuda_cfg):
@@ -883,13 +888,6 @@ def _prepare_tbptt_groups(
                     )
                     h_scan.index_copy_(0, slot_ids, h_new.float())
                     offset += step_size
-
-            group["act"] = group_act_cpu
-            group["prep_slots"] = group_prep_slots_cpu
-            group["train_slots"] = group_train_slots_cpu
-            group["bt_mask"] = group_bt_mask_cpu
-            group["bd_mask"] = group_bd_mask_cpu
-            group["harv_bd_mask"] = group_harv_bd_mask_cpu
 
     return groups
 
@@ -956,6 +954,7 @@ def train_actor_bc(
     chunk_groups_per_batch: int = 1,
     grad_clip: float = 1.0,
     log_path: Path | None = None,
+    step_log_path: Path | None = None,
     step_log_every: int = 0,
     enable_compile: bool = True,
     session_dir: Path | None = None,
@@ -978,6 +977,10 @@ def train_actor_bc(
         raise ValueError("games_per_batch must be positive")
     if step_log_every < 0:
         raise ValueError("step_log_every must be non-negative")
+    if log_path is not None and step_log_path is not None and log_path != step_log_path:
+        raise ValueError("log_path and step_log_path must match when both are provided")
+    if step_log_path is not None:
+        log_path = step_log_path
 
     cuda_cfg = resolve_cuda_config(DEVICE, spatial_inputs=False, enable_compile=enable_compile)
     if cuda_cfg.enabled:
@@ -1185,9 +1188,11 @@ def train_actor_bc(
                 with ThreadPoolExecutor(max_workers=2) as prefetch_pool:
                     future = _submit_batch(prefetch_pool, 0)
                     staged_gpu = None
+                    staged_groups = None
 
                     for batch_idx in range(len(batch_group_sets)):
                         cpu_batch = future.result()
+                        current_groups = batch_group_sets[batch_idx]
                         next_idx = batch_idx + 1
                         future = _submit_batch(prefetch_pool, next_idx) if next_idx < len(batch_group_sets) else None
                         new_staged = None
@@ -1199,10 +1204,13 @@ def train_actor_bc(
                             )
                         if staged_gpu is not None:
                             _run_training_batch(staged_gpu)
+                            _release_group_training_tensors(staged_groups)
                         staged_gpu = new_staged
+                        staged_groups = current_groups
 
                     if staged_gpu is not None:
                         _run_training_batch(staged_gpu)
+                        _release_group_training_tensors(staged_groups)
             denom = max(epoch_sample_count, 1)
             avg = (epoch_nll_sum / denom).item()
             avg_bt = (epoch_nll_bt / denom).item()
@@ -1249,9 +1257,10 @@ def main():
     parser.add_argument("--output", type=str, default="")
     parser.add_argument("--step-log-every", type=int, default=1)
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--no-cache", action="store_true", help="Disable disk caching of parsed replays")
     parser.add_argument("--session", type=str, default="")
-    parser.add_argument("--winner-only", action="store_true", default=True)
-    parser.add_argument("--both-teams", dest="winner_only", action="store_false")
+    parser.add_argument("--winner-only", dest="winner_only", action="store_true")
+    parser.add_argument("--both-teams", dest="winner_only", action="store_false", default=False)
     args = parser.parse_args()
 
     replay_dir = Path(args.replay_dir)
@@ -1282,7 +1291,7 @@ def main():
         index_path=args.index_path or None,
         min_rating=args.min_rating,
         winner_only=args.winner_only,
-        cache_size=0,
+        no_cache=args.no_cache,
     )
     print(f"Indexed {ds.n_games} games (~{ds.total_samples} est. samples) in {time.time()-t0:.1f}s")
 

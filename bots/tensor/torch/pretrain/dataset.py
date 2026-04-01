@@ -25,7 +25,7 @@ from replay_parser import (
 )
 
 _CACHE_DIR_NAME = ".pretrain_cache"
-_ACTOR_CACHE_VERSION = 8  # v8: obs_size 498→548 (TILE_FEATURES 19→21)
+_ACTOR_CACHE_VERSION = 10  # v10: GLOBAL_FEATURES 15→17 (core_known, ecore_known), raw core distances
 _CRITIC_CACHE_VERSION = 14  # v14: income mode (no terminal reward)
 from model import (
     GAMMA,
@@ -322,15 +322,18 @@ class ActorBCDataset:
         winner_only: bool = True,
         builds_only: bool = False,
         cache_size: int = 4,
+        no_cache: bool = False,
     ):
         self.replay_dir = Path(replay_dir)
         self.cache_dir = _cache_dir(self.replay_dir)
         self.winner_only = winner_only
         self.builds_only = builds_only
+        self.no_cache = no_cache
 
         if index_path is None:
-            index_path = self.replay_dir / "index.jsonl"
-        entries = _load_index(index_path, min_rating)
+            entries = _auto_index(self.replay_dir, min_rating)
+        else:
+            entries = _load_index(index_path, min_rating)
 
         # Lightweight metadata per (file, team)
         self.games: list[dict] = []
@@ -395,9 +398,10 @@ class ActorBCDataset:
     def _get_parsed(
         self, path: str, team: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Load or retrieve cached (obs, actions, bot_ids, turns) for a replay.
+        """Load (obs, actions, bot_ids, turns) sorted by (bot_id, turn) for BPTT.
 
-        Returns are already sorted by (bot_id, turn) for BPTT.
+        Always parses from the replay file (not cached — cache only stores round-major).
+        Uses an in-memory LRU to avoid redundant re-parses within a session.
         """
         key = f"{path}:{team}"
         with self._cache_lock:
@@ -405,46 +409,16 @@ class ActorBCDataset:
         if cached is not None:
             return cached
 
-        path_obj = Path(path)
-        file_sig = _file_signature(path_obj)
-        cache_path = _cache_path(self.cache_dir, "actor", path_obj, team)
-        payload = _load_torch_cache(
-            cache_path,
-            version=_ACTOR_CACHE_VERSION,
-            file_sig=file_sig,
-            team=team,
+        raw_obs, raw_actions, raw_bot_ids, raw_turns = _decode_sequential_replay(
+            path, team=team,
         )
-        if payload is None:
-            raw_obs, raw_actions, raw_bot_ids, raw_turns = _decode_sequential_replay(
-                path, team=team,
-            )
-            if raw_obs.shape[0] > 0:
-                # Sort by (bot_id, turn) for BPTT
-                sort_keys = raw_bot_ids.long() * 100000 + raw_turns.long()
-                order = sort_keys.argsort()
-                raw_obs = raw_obs[order].contiguous()
-                raw_actions = raw_actions[order].contiguous()
-                raw_bot_ids = raw_bot_ids[order].contiguous()
-                raw_turns = raw_turns[order].contiguous()
-
-            payload = {
-                "version": _ACTOR_CACHE_VERSION,
-                "file_sig": list(file_sig),
-                "team": team,
-                "obs": raw_obs,
-                "actions": raw_actions,
-                "bot_ids": raw_bot_ids,
-                "turns": raw_turns,
-            }
-            try:
-                _atomic_torch_save(payload, cache_path)
-            except OSError:
-                pass
-        else:
-            raw_obs = payload["obs"]
-            raw_actions = payload["actions"]
-            raw_bot_ids = payload["bot_ids"]
-            raw_turns = payload["turns"]
+        if raw_obs.shape[0] > 0:
+            sort_keys = raw_bot_ids.long() * 100000 + raw_turns.long()
+            order = sort_keys.argsort()
+            raw_obs = raw_obs[order].contiguous()
+            raw_actions = raw_actions[order].contiguous()
+            raw_bot_ids = raw_bot_ids[order].contiguous()
+            raw_turns = raw_turns[order].contiguous()
 
         result = (raw_obs, raw_actions, raw_bot_ids, raw_turns)
         with self._cache_lock:
@@ -533,17 +507,10 @@ class ActorBCDataset:
                 round_bd_mask = torch.zeros(0, N_DIR, dtype=torch.bool)
                 round_harv_bd_mask = torch.zeros(0, N_DIR, dtype=torch.bool)
 
-            if payload is None:
-                payload = {
-                    "version": _ACTOR_CACHE_VERSION,
-                    "file_sig": list(file_sig),
-                    "team": team,
-                    "obs": obs,
-                    "actions": actions,
-                    "bot_ids": bot_ids,
-                    "turns": turns,
-                }
-            payload.update({
+            payload = {
+                "version": _ACTOR_CACHE_VERSION,
+                "file_sig": list(file_sig),
+                "team": team,
                 "round_obs": round_obs,
                 "round_actions": round_actions,
                 "round_bot_slots": round_bot_slots,
@@ -552,11 +519,12 @@ class ActorBCDataset:
                 "round_bt_mask": round_bt_mask,
                 "round_bd_mask": round_bd_mask,
                 "round_harv_bd_mask": round_harv_bd_mask,
-            })
-            try:
-                _atomic_torch_save(payload, cache_path)
-            except OSError:
-                pass
+            }
+            if not self.no_cache:
+                try:
+                    _atomic_torch_save(payload, cache_path)
+                except OSError:
+                    pass
 
         result = {
             "obs": round_obs,
@@ -658,8 +626,9 @@ class CriticBCDataset:
         self.cache_dir = _cache_dir(self.replay_dir)
 
         if index_path is None:
-            index_path = self.replay_dir / "index.jsonl"
-        entries = _load_index(index_path, min_rating)
+            entries = _auto_index(self.replay_dir, min_rating)
+        else:
+            entries = _load_index(index_path, min_rating)
 
         # Lightweight metadata per (file, team) — no raw bytes stored
         self.games: list[dict] = []
@@ -820,10 +789,8 @@ class CriticBCDataset:
                 "n_channels": n_channels,
                 "n_scalars": n_scalars,
             }
-            try:
-                _atomic_torch_save(entry, cache_path)
-            except OSError:
-                pass
+            # Skip disk caching — states tensor is ~100MB/game, infeasible at scale.
+            # In-memory LRU handles within-epoch reuse.
         else:
             cached_n_turns = int(payload.get("n_turns", payload["states"].shape[0]))
             if expected_n_turns is not None and cached_n_turns != expected_n_turns:
@@ -1096,4 +1063,83 @@ def _load_index(path: str | Path, min_rating: float = 0.0) -> list[dict]:
         ) / 2.0
         if avg_rating >= min_rating:
             entries.append(entry)
+    return entries
+
+
+def _auto_index(replay_dir: Path, min_rating: float = 0.0) -> list[dict]:
+    """Build a complete index by merging all JSONL indexes with auto-discovery.
+
+    Loads all index*.jsonl files for rating/metadata, then discovers any
+    .replay26 files not covered by an index. Applies min_rating filter
+    only to indexed files (discovered files without ratings are included).
+    """
+    # Load all index files for metadata
+    indexed: dict[str, dict] = {}
+    for idx_file in sorted(replay_dir.glob("index*.jsonl")):
+        for entry in _load_index(idx_file, min_rating=0.0):
+            fname = entry.get("file", "")
+            if fname and fname not in indexed:
+                indexed[fname] = entry
+
+    # Discover all replay files
+    all_replays = {p.name for p in replay_dir.glob("*.replay26")}
+    unindexed = all_replays - set(indexed.keys())
+
+    # Apply rating filter to indexed entries
+    entries = []
+    for fname, entry in indexed.items():
+        if fname not in all_replays:
+            continue  # file was deleted
+        avg_rating = (
+            (entry.get("team_a_rating") or 0) + (entry.get("team_b_rating") or 0)
+        ) / 2.0
+        if avg_rating >= min_rating or avg_rating == 0:
+            entries.append(entry)
+
+    # Auto-discover unindexed files
+    if unindexed:
+        discovered = _discover_replays_by_names(replay_dir, unindexed)
+        entries.extend(discovered)
+
+    print(f"  Index: {len(entries)} replays ({len(indexed)} indexed, {len(unindexed)} discovered)")
+    return entries
+
+
+def _discover_replays_by_names(replay_dir: Path, names: set[str]) -> list[dict]:
+    """Parse metadata for specific replay files one at a time."""
+    from replay_parser import parse_replay_working
+    entries = []
+    for name in sorted(names):
+        try:
+            meta = parse_replay_working(str(replay_dir / name))
+            entries.append({
+                "file": name,
+                "winner_side": meta.get("winner"),
+                "turns": meta.get("n_turns", 0),
+            })
+        except Exception:
+            pass
+    return entries
+
+
+def _discover_replays(replay_dir: Path) -> list[dict]:
+    """Auto-discover all .replay26 files and extract lightweight metadata.
+
+    Parses winner/turns in batch for files not already in an index.
+    Returns entries compatible with _scan_metadata.
+    """
+    replay_files = sorted(replay_dir.glob("*.replay26"))
+    if not replay_files:
+        return []
+    print(f"  Auto-discovering {len(replay_files)} replay files...")
+    metas = _load_working_batch(replay_files)
+    entries = []
+    for path in replay_files:
+        meta = metas.get(str(path), {})
+        entries.append({
+            "file": path.name,
+            "winner_side": meta.get("winner"),
+            "turns": meta.get("n_turns", 0),
+        })
+    print(f"  Discovered {len(entries)} replays ({sum(e['turns'] for e in entries)} total turns)")
     return entries
