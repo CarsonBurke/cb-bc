@@ -210,7 +210,7 @@ _ZERO_OBS = (0.0,) * OBS_SIZE
 
 def _build_model() -> MLP:
     model = MLP(
-        input_size=COMPRESS_DIM + 15 + 8 + H_DIM,  # compress + globals + pos_embed + h
+        input_size=COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM,
         hidden_sizes=HIDDEN_SIZES,
         output_heads={
             "build_type": len(BUILD_ACTIONS),
