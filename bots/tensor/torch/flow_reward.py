@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Obs feature indices — must stay in sync with model.py TILE_FEATURES
 _TILE_FEATURES = 21
-_OBS_GLOBAL_START = 5 * 5 * _TILE_FEATURES  # GRID_SIZE^2 * TILE_FEATURES = 525
+_OBS_GLOBAL_START = 5 * 5 * _TILE_FEATURES  # 525
 _OBS_ROUND_BYTE_OFFSET = _OBS_GLOBAL_START * 4  # byte offset for float32 obs
 
 AX_CONVERSION_RATE = 4  # GameConstants.AXIONITE_CONVERSION_TITANIUM_RATE

@@ -59,7 +59,7 @@ def main():
 
     # Create student
     student = BuilderMLP().to(DEVICE)
-    student_opt = torch.optim.Adam(student.parameters(), lr=args.lr, eps=1e-5)
+    student_opt = torch.optim.Adam(student.parameters(), lr=args.lr)
     n_student = sum(p.numel() for p in student.parameters())
     print(f"Student: {n_student:,} params")
     print(f"Device: {DEVICE}")

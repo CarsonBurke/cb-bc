@@ -113,7 +113,7 @@ def _benchmark_batched(args) -> dict:
     _load_model_compat(model, weight_path, WEIGHT_PATH)
     reset_centralized_critic()
     load_centralized_critic_checkpoint(weight_path, lr=args.lr)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()

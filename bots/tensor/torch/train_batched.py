@@ -111,6 +111,12 @@ _H_STRUCT = struct.Struct(f'={H_DIM}f')
 _LP_STRUCT = struct.Struct('=f')
 _H_BYTES = H_DIM * 4
 DEFAULT_COALESCE_MS = 0.25 if DEVICE.type == "cuda" else 0.0
+
+# KL-adaptive actor learning rate
+KL_TARGET = 0.01
+KL_EMA_ALPHA = 0.1
+ACTOR_LR_MIN = 3e-5   # lr / 10
+ACTOR_LR_MAX = 3e-3   # lr * 10
 import ctypes as _ctypes
 WORKER_LAUNCH_STAGGER_S = 0.005
 DUMMY_OPP_PATH = "__dummy__"
@@ -255,7 +261,6 @@ def _load_resume_state(
     state_path: str | Path,
     *,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler._LRScheduler,
 ) -> dict | None:
     path = Path(state_path)
     if not path.exists():
@@ -266,9 +271,6 @@ def _load_resume_state(
     opt_state = payload.get("optimizer")
     if opt_state is not None:
         optimizer.load_state_dict(opt_state)
-    sched_state = payload.get("scheduler")
-    if sched_state is not None:
-        scheduler.load_state_dict(sched_state)
     return payload
 
 
@@ -1003,8 +1005,8 @@ def main():
             raise SystemExit(f"Could not load actor weights from {args.init_weights}")
         print(f"Initialized actor from {args.init_weights}")
     _deferred_critic_path = args.critic_init_weights or None
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    _kl_ema = KL_TARGET
 
     start_episode = 0
     elapsed_offset = 0.0
@@ -1013,11 +1015,11 @@ def main():
         resume_state = _load_resume_state(
             state_path,
             optimizer=optimizer,
-            scheduler=scheduler,
         )
         if resume_state is not None:
             start_episode = int(resume_state.get("episode", 0))
             elapsed_offset = float(resume_state.get("elapsed_offset_s", 0.0))
+            _kl_ema = float(resume_state.get("kl_ema", KL_TARGET))
             resumed_exact = True
         else:
             start_episode, elapsed_offset = _read_last_logged_state(log_path)
@@ -1039,7 +1041,7 @@ def main():
         if resumed_exact:
             print(f"Resume: continuing from episode {start_episode + 1}")
         elif start_episode > 0:
-            print(f"Resume: continuing from episode {start_episode + 1} (optimizer/scheduler reset)")
+            print(f"Resume: continuing from episode {start_episode + 1} (optimizer reset)")
         else:
             print("Resume: no prior trainer state found, starting fresh")
 
@@ -1135,7 +1137,14 @@ def main():
         )
         model.save_weights(weight_path)
         save_centralized_critic_checkpoint(weight_path)
-        scheduler.step()
+        # KL-adaptive actor LR
+        ep_kl = stats.get("approx_kl", KL_TARGET)
+        _kl_ema = KL_EMA_ALPHA * ep_kl + (1 - KL_EMA_ALPHA) * _kl_ema
+        if _kl_ema > 0:
+            lr_scale = KL_TARGET / _kl_ema
+            new_lr = max(ACTOR_LR_MIN, min(ACTOR_LR_MAX, optimizer.param_groups[0]["lr"] * lr_scale))
+            for pg in optimizer.param_groups:
+                pg["lr"] = new_lr
         t_train = time.time() - t1
 
         if (ep + 1) % args.checkpoint_every == 0 or ep == 0:
@@ -1261,10 +1270,16 @@ def main():
             "pi_loss": round(stats["pi_loss"], 5), "vf_loss": round(stats["vf_loss"], 5),
             "entropy": round(stats["entropy"], 4),
             "approx_kl": round(stats.get("approx_kl", 0), 6),
+            "actor_lr": optimizer.param_groups[0]["lr"],
             "clip_frac": round(stats.get("clip_frac", 0), 4),
             "explained_var": stats.get("explained_var", 0),
             "actor_grad_norm": round(stats.get("actor_grad_norm", 0), 4),
             "critic_grad_norm": round(stats.get("critic_grad_norm", 0), 4),
+            "critic_value_delta": round(stats.get("critic_value_delta", 0), 4),
+            "ret_min": stats.get("ret_min", 0),
+            "ret_max": stats.get("ret_max", 0),
+            "ret_mean": stats.get("ret_mean", 0),
+            "ret_oob_frac": stats.get("ret_oob_frac", 0),
             "ls_bt_mean": round(stats.get("ls_bt_mean", 0), 4),
             "ls_bd_mean": round(stats.get("ls_bd_mean", 0), 4),
             "ls_cd_mean": round(stats.get("ls_cd_mean", 0), 4),
@@ -1326,7 +1341,7 @@ def main():
             "episode": ep + 1,
             "elapsed_offset_s": elapsed,
             "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
+            "kl_ema": _kl_ema,
         }, state_path)
 
         if (ep + 1) % 5 == 0 or ep == 0:
@@ -1337,6 +1352,7 @@ def main():
                 f"harv a/f/g/p={mean_harv_attempts:.2f}/{mean_harv_failures:.2f}/{mean_harv_prox_gate:.2f}/{mean_harv_prox_paid:.2f}  "
                 f"pi={stats['pi_loss']:+.4f}  "
                 f"kl={stats.get('approx_kl', 0):.4f}  "
+                f"lr={optimizer.param_groups[0]['lr']:.1e}  "
                 f"ev={stats.get('explained_var', 0):.2f}  "
                 f"collect={t_collect:.1f}s train={t_train:.1f}s  [{elapsed:.0f}s]"
             )

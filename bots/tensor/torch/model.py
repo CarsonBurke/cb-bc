@@ -41,7 +41,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 # ---- Architecture constants (must match main.py) ----
 
 TILE_FEATURES = 21
-GLOBAL_FEATURES = 15
+GLOBAL_FEATURES = 17
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN = [64, 64]
@@ -91,10 +91,10 @@ class RewardMode(Enum):
 
 REWARD_MODE = RewardMode.FLOW
 REWARD_INCOME_SCALE = 0.01  # scale for titanium income reward (income mode)
-REWARD_FLOW_SCALE = 1.0    # scale for flow reward (flow mode)
+REWARD_FLOW_SCALE = 20.0    # scale for flow reward (flow mode)
 TERMINAL_WIN_REWARD = 10.0
 TERMINAL_LOSS_REWARD = -10.0
-GAMMA = 0.99 # GAE
+GAMMA = 0.995 # GAE
 LAMBDA = 0.95 # GAE
 
 # ---- Dreamer4-style symexp two-hot value prediction ----
@@ -773,7 +773,7 @@ class CriticPpoLossStep(nn.Module):
         old_values: torch.Tensor,
         clip_mask: torch.Tensor,
         value_clip: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feat = self.critic.encode_map(states, masks)
         values, logits = self.critic.unit_value_logits(
             feat, scalars, round_idx, unit_xy, unit_context, actor_latent,
@@ -785,7 +785,7 @@ class CriticPpoLossStep(nn.Module):
         value_loss_2 = soft_cross_entropy_from_logits(clipped_value_bins, return_target)
         v_loss_elems = torch.where(clip_mask, torch.maximum(value_loss_1, value_loss_2), value_loss_1)
         loss_sum = v_loss_elems.sum()
-        return loss_sum, loss_sum.detach()
+        return loss_sum, loss_sum.detach(), values.detach()
 
 
 def _materialize_critic_inputs(centralized_data: dict) -> None:
@@ -1885,6 +1885,7 @@ def ppo_update(
     sum_pi, sum_vf, sum_ent = 0.0, 0.0, 0.0
     sum_kl, sum_clip_frac = 0.0, 0.0
     sum_actor_gn, sum_critic_gn = 0.0, 0.0
+    sum_critic_delta = 0.0
     sum_eps = torch.zeros(N_LOGIT_SCALE, device=obs.device)
     sum_eps_sq = torch.zeros(N_LOGIT_SCALE, device=obs.device)
     n_eps = 0
@@ -2088,7 +2089,7 @@ def ppo_update(
                     chunk_round_counts,
                 )
                 with autocast_context(critic_cuda_cfg):
-                    loss_sum, vf_loss_sum = critic_loss_step(
+                    loss_sum, vf_loss_sum, new_values = critic_loss_step(
                         g_obs,
                         g_mask,
                         g_scalars,
@@ -2108,6 +2109,7 @@ def ppo_update(
 
                 sum_vf += (vf_loss_sum / vf_denom).item()
                 sum_critic_gn += critic_gn.item()
+                sum_critic_delta += (new_values - mb_old_values).abs().mean().item()
                 n_critic_updates += 1
 
                 if profile is not None:
@@ -2120,6 +2122,14 @@ def ppo_update(
         mean_eps = torch.full((N_LOGIT_SCALE,), EPS_MIN, device=obs.device)
         std_eps = torch.zeros(N_LOGIT_SCALE, device=obs.device)
 
+    # Return/value bucket saturation diagnostics
+    bucket_lo = bucket_centers[0].item()
+    bucket_hi = bucket_centers[-1].item()
+    ret_min = returns.min().item()
+    ret_max = returns.max().item()
+    ret_mean = returns.mean().item()
+    ret_oob = ((returns <= bucket_lo) | (returns >= bucket_hi)).float().mean().item()
+
     return {
         "pi_loss": sum_pi / max(n_updates, 1),
         "vf_loss": sum_vf / max(n_critic_updates, 1),
@@ -2129,6 +2139,11 @@ def ppo_update(
         "explained_var": round(ev, 4),
         "actor_grad_norm": sum_actor_gn / max(n_updates, 1),
         "critic_grad_norm": sum_critic_gn / max(n_critic_updates, 1),
+        "critic_value_delta": sum_critic_delta / max(n_critic_updates, 1),
+        "ret_min": round(ret_min, 3),
+        "ret_max": round(ret_max, 3),
+        "ret_mean": round(ret_mean, 3),
+        "ret_oob_frac": round(ret_oob, 4),
         "n_updates": n_updates,
         "ls_bt_mean": mean_eps[0].item(),
         "ls_bd_mean": mean_eps[1].item(),
@@ -2668,7 +2683,7 @@ def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.o
         if cuda_cfg.channels_last:
             _centralized_critic = _centralized_critic.to(memory_format=torch.channels_last)
         _centralized_optimizer = torch.optim.Adam(
-            _centralized_critic.parameters(), lr=lr, eps=1e-5,
+            _centralized_critic.parameters(), lr=lr,
         )
         n_params = sum(p.numel() for p in _centralized_critic.parameters())
         print(
