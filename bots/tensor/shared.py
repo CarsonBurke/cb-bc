@@ -11,7 +11,7 @@ from cambc import Controller, Direction, EntityType, Environment, GameConstants,
 GRID_SIZE = 5
 GRID_HALF = GRID_SIZE // 2
 TILE_FEATURES = 21
-GLOBAL_FEATURES = 15
+GLOBAL_FEATURES = 17
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN_SIZES = [64, 64]
@@ -406,21 +406,17 @@ def encode_state_into(ct: Controller, features, core_center, enemy_core,
             pass
     n_builders_out[0] = n_builders
 
-    core_dx, core_dy = 0.0, 0.0
+    core_dx, core_dy, core_known = 0.0, 0.0, 0.0
     if _core_center is not None:
-        cdx = _core_center.x - pos.x
-        cdy = _core_center.y - pos.y
-        d = max(abs(cdx), abs(cdy), 1)
-        core_dx = cdx / d
-        core_dy = cdy / d
+        core_dx = float(_core_center.x - pos.x)
+        core_dy = float(_core_center.y - pos.y)
+        core_known = 1.0
 
-    ecore_dx, ecore_dy = 0.0, 0.0
+    ecore_dx, ecore_dy, ecore_known = 0.0, 0.0, 0.0
     if _enemy_core is not None:
-        edx = _enemy_core.x - pos.x
-        edy = _enemy_core.y - pos.y
-        d = max(abs(edx), abs(edy), 1)
-        ecore_dx = edx / d
-        ecore_dy = edy / d
+        ecore_dx = float(_enemy_core.x - pos.x)
+        ecore_dy = float(_enemy_core.y - pos.y)
+        ecore_known = 1.0
 
     ti_delta, ax_delta = 0.0, 0.0
     if prev_resources is not None:
@@ -436,6 +432,7 @@ def encode_state_into(ct: Controller, features, core_center, enemy_core,
         n_builders / 10.0,
         ti_delta, ax_delta, hp_advantage,
         spawn_round / 2000.0 if spawn_round >= 0 else 0.0,
+        core_known, ecore_known,
     ])
 
     extend(pos_encoder.encode(pos.x, pos.y))

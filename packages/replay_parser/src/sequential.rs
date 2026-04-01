@@ -14,7 +14,7 @@ use crate::types::*;
 const BC_GRID_SIZE: usize = 5;
 const BC_GRID_HALF: i32 = 2;
 const BC_TILE_FEATURES: usize = 21;
-const BC_GLOBAL_FEATURES: usize = 15;
+const BC_GLOBAL_FEATURES: usize = 17;
 const BC_POS_EMBED_DIM: usize = 8;
 pub const BC_OBS_SIZE: usize =
     BC_GRID_SIZE * BC_GRID_SIZE * BC_TILE_FEATURES + BC_GLOBAL_FEATURES + BC_POS_EMBED_DIM;
@@ -263,24 +263,20 @@ fn encode_local_obs(
     obs[g + 5] = scale_pct / 500.0;
 
     let cc = core_center[team_idx];
-    let cdx = cc.0 - bx;
-    let cdy = cc.1 - by;
-    let cmax = cdx.abs().max(cdy.abs()).max(1);
-    obs[g + 6] = cdx as f32 / cmax as f32;
-    obs[g + 7] = cdy as f32 / cmax as f32;
+    obs[g + 6] = (cc.0 - bx) as f32;
+    obs[g + 7] = (cc.1 - by) as f32;
 
     let ec = core_center[enemy_idx];
-    let edx = ec.0 - bx;
-    let edy = ec.1 - by;
-    let emax = edx.abs().max(edy.abs()).max(1);
-    obs[g + 8] = edx as f32 / emax as f32;
-    obs[g + 9] = edy as f32 / emax as f32;
+    obs[g + 8] = (ec.0 - bx) as f32;
+    obs[g + 9] = (ec.1 - by) as f32;
 
     obs[g + 10] = n_local_builders as f32 / 10.0;
     obs[g + 11] = (own.titanium as f32 - prev_own_ti) / 500.0;
     obs[g + 12] = (own.axionite as f32 - prev_own_ax) / 500.0;
     obs[g + 13] = (core_hp[team_idx] - core_hp[enemy_idx]) as f32 / 500.0;
     obs[g + 14] = spawn_round as f32 / 2000.0;
+    obs[g + 15] = 1.0; // core_known (always true in replay data)
+    obs[g + 16] = 1.0; // ecore_known (always true in replay data)
 
     // Positional embedding (8)
     sinusoidal_pos_embed(

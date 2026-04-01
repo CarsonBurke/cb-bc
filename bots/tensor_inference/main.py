@@ -42,7 +42,7 @@ GRID_HALF = GRID_SIZE // 2
 TILE_FEATURES = 21
 # Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy,
 #         n_builders, ti_delta, ax_delta, hp_advantage, spawn_round = 15
-GLOBAL_FEATURES = 15
+GLOBAL_FEATURES = 17
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
 HIDDEN_SIZES = [64, 64]
@@ -652,21 +652,17 @@ class Player:
                         enemy_hp = hp
             except Exception:
                 pass
-        core_dx, core_dy = 0.0, 0.0
+        core_dx, core_dy, core_known = 0.0, 0.0, 0.0
         if self.core_center is not None:
-            cdx = self.core_center.x - pos_x
-            cdy = self.core_center.y - pos_y
-            d = max(abs(cdx), abs(cdy), 1)
-            core_dx = cdx / d
-            core_dy = cdy / d
+            core_dx = float(self.core_center.x - pos_x)
+            core_dy = float(self.core_center.y - pos_y)
+            core_known = 1.0
 
-        ecore_dx, ecore_dy = 0.0, 0.0
+        ecore_dx, ecore_dy, ecore_known = 0.0, 0.0, 0.0
         if self.enemy_core is not None:
-            edx = self.enemy_core.x - pos_x
-            edy = self.enemy_core.y - pos_y
-            d = max(abs(edx), abs(edy), 1)
-            ecore_dx = edx / d
-            ecore_dy = edy / d
+            ecore_dx = float(self.enemy_core.x - pos_x)
+            ecore_dy = float(self.enemy_core.y - pos_y)
+            ecore_known = 1.0
 
         ti_delta, ax_delta = 0.0, 0.0
         if self._prev_resources is not None:
@@ -682,6 +678,7 @@ class Player:
             n_builders / 10.0,
             ti_delta, ax_delta, hp_advantage,
             self._spawn_round / 2000.0 if self._spawn_round >= 0 else 0.0,
+            core_known, ecore_known,
         )
         features[_GLOBAL_OBS_START + GLOBAL_FEATURES:OBS_SIZE] = self.pos_encoder.encode(pos_x, pos_y)
 
