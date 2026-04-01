@@ -413,7 +413,7 @@ def test_materialize_training_batch_interleaves_groups_by_tbptt_step():
     assert batch_train_slots.tolist() == [0, 1, 2, 0, 2]
 
 
-def test_prepare_tbptt_groups_materializes_reusable_group_tensors(monkeypatch):
+def test_prepare_tbptt_groups_defers_reusable_group_tensors_until_prefetch(monkeypatch):
     monkeypatch.setattr(train_bc, "DEVICE", torch.device("cpu"))
     model = BuilderMLP()
     obs = torch.randn(4, OBS_SIZE, dtype=torch.float32)
@@ -452,13 +452,58 @@ def test_prepare_tbptt_groups_materializes_reusable_group_tensors(monkeypatch):
 
     assert len(groups) == 1
     group = groups[0]
-    assert torch.equal(group["obs"], game["obs"])
-    assert torch.equal(group["act"], game["act"])
-    assert torch.equal(group["prep_slots"], game["global_slots"])
-    assert torch.equal(group["train_slots"], game["bot_slots"])
-    assert torch.equal(group["bt_mask"], game["bt_mask"])
-    assert torch.equal(group["bd_mask"], game["bd_mask"])
-    assert torch.equal(group["harv_bd_mask"], game["harv_bd_mask"])
+    assert "obs" not in group
+    assert "act" not in group
+    assert "prep_slots" not in group
+    assert "train_slots" not in group
+    assert "bt_mask" not in group
+    assert "bd_mask" not in group
+    assert "harv_bd_mask" not in group
+
+    (
+        group_obs,
+        group_act,
+        group_prep_slots,
+        group_train_slots,
+        group_bt_mask,
+        group_bd_mask,
+        group_harv_bd_mask,
+    ) = train_bc._materialize_group_training_tensors(group, [game])
+
+    assert torch.equal(group_obs, game["obs"])
+    assert torch.equal(group_act, game["act"])
+    assert torch.equal(group_prep_slots, game["global_slots"])
+    assert torch.equal(group_train_slots, game["bot_slots"])
+    assert torch.equal(group_bt_mask, game["bt_mask"])
+    assert torch.equal(group_bd_mask, game["bd_mask"])
+    assert torch.equal(group_harv_bd_mask, game["harv_bd_mask"])
+
+
+def test_release_group_training_tensors_clears_cached_staging():
+    h0 = torch.zeros(2, train_bc.H_DIM)
+    group = {
+        "obs": torch.randn(2, OBS_SIZE, dtype=torch.float16),
+        "act": torch.zeros(2, 5, dtype=torch.int16),
+        "prep_slots": torch.tensor([0, 1], dtype=torch.long),
+        "train_slots": torch.tensor([0, 1], dtype=torch.long),
+        "bt_mask": torch.zeros(2, train_bc.N_BUILD, dtype=torch.bool),
+        "bd_mask": torch.zeros(2, train_bc.N_DIR, dtype=torch.bool),
+        "harv_bd_mask": torch.zeros(2, train_bc.N_DIR, dtype=torch.bool),
+        "batch_h_base": 7,
+        "h0": h0,
+    }
+
+    train_bc._release_group_training_tensors([group])
+
+    assert "obs" not in group
+    assert "act" not in group
+    assert "prep_slots" not in group
+    assert "train_slots" not in group
+    assert "bt_mask" not in group
+    assert "bd_mask" not in group
+    assert "harv_bd_mask" not in group
+    assert "batch_h_base" not in group
+    assert group["h0"] is h0
 
 
 def test_train_actor_bc_uses_one_optimizer_step_per_tbptt_chunk(monkeypatch):
@@ -567,9 +612,65 @@ def test_train_actor_bc_writes_step_log_per_optimizer_step(monkeypatch, tmp_path
     rows = [json.loads(line) for line in step_log_path.read_text().splitlines() if line.strip()]
     assert len(rows) == 3
     assert [row["optimizer_step"] for row in rows] == [1, 2, 3]
-    assert all(row["episode"] == 1 for row in rows)
+    assert [row["episode"] for row in rows] == [1, 2, 3]
     assert all("loss_cd" in row and "loss_brt" in row for row in rows)
     assert stats["optimizer_steps"] == 3
+
+
+def test_train_actor_bc_releases_group_staging_after_consumption(monkeypatch):
+    model = BuilderMLP()
+    dataset = _DummyDataset()
+
+    obs = torch.randn(8, OBS_SIZE, dtype=torch.float32)
+    actions = torch.zeros(8, 5, dtype=torch.long)
+    game = {
+        "obs": obs,
+        "act": actions.to(torch.int16),
+        "bot_slots": torch.tensor([0, 1, 0, 1, 0, 1, 0, 0], dtype=torch.long),
+        "global_slots": torch.tensor([0, 1, 0, 1, 0, 1, 0, 0], dtype=torch.long),
+        "round_offsets": [0, 2, 4, 6, 7, 8],
+        "n_rounds": 5,
+        "n_slots": 2,
+        "slot_base": 0,
+    }
+
+    original_prepare = train_bc._prepare_tbptt_groups
+    captured_groups = []
+
+    def spy_prepare(*args, **kwargs):
+        groups = original_prepare(*args, **kwargs)
+        captured_groups.extend(groups)
+        return groups
+
+    monkeypatch.setattr(train_bc, "DEVICE", torch.device("cpu"))
+    monkeypatch.setattr(
+        train_bc,
+        "_load_game_batch",
+        lambda _dataset, _game_list, **_kwargs: ([game], 2, 5, 1),
+    )
+    monkeypatch.setattr(train_bc, "_prepare_tbptt_groups", spy_prepare)
+
+    stats = train_bc.train_actor_bc(
+        model,
+        dataset,
+        epochs=1,
+        lr=1e-3,
+        games_per_batch=1,
+        tbptt_len=2,
+        chunk_groups_per_batch=1,
+        enable_compile=False,
+    )
+
+    assert stats["optimizer_steps"] == 3
+    assert len(captured_groups) == 3
+    for group in captured_groups:
+        assert "obs" not in group
+        assert "act" not in group
+        assert "prep_slots" not in group
+        assert "train_slots" not in group
+        assert "bt_mask" not in group
+        assert "bd_mask" not in group
+        assert "harv_bd_mask" not in group
 
 
 def test_train_actor_bc_disables_step_logging_by_default(monkeypatch, tmp_path):
