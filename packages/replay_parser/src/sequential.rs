@@ -13,7 +13,7 @@ use crate::types::*;
 // Observation layout matching bots/tensor_inference/main.py
 const BC_GRID_SIZE: usize = 5;
 const BC_GRID_HALF: i32 = 2;
-const BC_TILE_FEATURES: usize = 19;
+const BC_TILE_FEATURES: usize = 21;
 const BC_GLOBAL_FEATURES: usize = 15;
 const BC_POS_EMBED_DIM: usize = 8;
 pub const BC_OBS_SIZE: usize =
@@ -35,16 +35,18 @@ pub struct BCSamples {
 
 // ── Action encoding helpers ──────────────────────────────────────────────
 
-/// Map EntityKind -> obs one-hot index (0-7), matching BLD_IDX in main.py.
+/// Map EntityKind -> obs one-hot index (0-9), matching BLD_IDX in main.py.
 fn bld_idx_for_obs(kind: EntityKind) -> usize {
     match kind {
         EntityKind::Harvester => 1,
         EntityKind::Conveyor | EntityKind::ArmouredConveyor => 2,
         EntityKind::Splitter => 3,
         EntityKind::Road => 4,
-        EntityKind::Barrier | EntityKind::Bridge | EntityKind::Foundry => 5,
-        EntityKind::Gunner | EntityKind::Sentinel | EntityKind::Breach | EntityKind::Launcher => 6,
-        EntityKind::Core => 7,
+        EntityKind::Barrier => 5,
+        EntityKind::Bridge => 6,
+        EntityKind::Foundry => 7,
+        EntityKind::Gunner | EntityKind::Sentinel | EntityKind::Breach | EntityKind::Launcher => 8,
+        EntityKind::Core => 9,
         _ => 0,
     }
 }
@@ -224,23 +226,23 @@ fn encode_local_obs(
                         obs[base + 4] = 0.0;
                         obs[base + 4 + bidx] = 1.0;
                     }
-                    obs[base + 12] = if ent.team == team { 1.0 } else { -1.0 };
+                    obs[base + 14] = if ent.team == team { 1.0 } else { -1.0 };
                     let d = ent.direction as usize;
                     if d < 9 {
                         let (dx, dy) = DIR_DELTA[d];
-                        obs[base + 13] = dx;
-                        obs[base + 14] = dy;
+                        obs[base + 15] = dx;
+                        obs[base + 16] = dy;
                     }
                     if ent.kind.is_storing() && ent.stored > 0 {
-                        obs[base + 16] = if ent.stored == 1 { 1.0 } else { -1.0 };
+                        obs[base + 18] = if ent.stored == 1 { 1.0 } else { -1.0 };
                     }
                 }
             }
 
             if let Some(&eid) = pos_bots.get(&(wx, wy)) {
                 if let Some(ent) = entities.get(&eid) {
-                    obs[base + 17] = 1.0;
-                    obs[base + 18] = if ent.team == team { 1.0 } else { -1.0 };
+                    obs[base + 19] = 1.0;
+                    obs[base + 20] = if ent.team == team { 1.0 } else { -1.0 };
                     if ent.team == team {
                         n_local_builders += 1;
                     }

@@ -56,16 +56,18 @@ impl EntityKind {
         )
     }
 
-    /// Map channel offset for building types (channels 4-11).
+    /// Map channel offset for building types (channels 4-13).
     pub fn building_channel(self) -> Option<usize> {
         match self {
             Self::Harvester => Some(5),
-            Self::Conveyor | Self::Foundry | Self::Bridge => Some(6),
+            Self::Conveyor | Self::ArmouredConveyor => Some(6),
             Self::Splitter => Some(7),
-            Self::Road | Self::Barrier => Some(8),
-            Self::Gunner | Self::Sentinel | Self::Breach | Self::Launcher => Some(9),
-            Self::ArmouredConveyor => Some(10),
-            Self::Core => Some(11),
+            Self::Road => Some(8),
+            Self::Barrier => Some(9),
+            Self::Bridge => Some(10),
+            Self::Foundry => Some(11),
+            Self::Gunner | Self::Sentinel | Self::Breach | Self::Launcher => Some(12),
+            Self::Core => Some(13),
             Self::BuilderBot | Self::Marker => None,
         }
     }

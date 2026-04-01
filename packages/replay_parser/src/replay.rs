@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::protobuf::*;
 use crate::types::*;
 
-pub const N_CHANNELS: usize = 19;
+pub const N_CHANNELS: usize = 21;
 pub const N_SCALARS: usize = 17;
 
 pub struct ReplayData {
@@ -156,8 +156,8 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
 
             match ent.kind {
                 EntityKind::BuilderBot => {
-                    state[15 * plane_size + base] = 1.0;
-                    state[16 * plane_size + base] = sign;
+                    state[17 * plane_size + base] = 1.0;
+                    state[18 * plane_size + base] = sign;
                     if ent.team == team {
                         n_own_builders += 1;
                     } else {
@@ -169,18 +169,18 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
                     if let Some(ch) = kind.building_channel() {
                         state[ch * plane_size + base] = 1.0;
                     }
-                    state[12 * plane_size + base] = sign;
+                    state[14 * plane_size + base] = sign;
                     let d = ent.direction as usize;
                     if d < 9 {
                         let (dx, dy) = DIR_DELTA[d];
-                        state[13 * plane_size + base] = dx;
-                        state[14 * plane_size + base] = dy;
+                        state[15 * plane_size + base] = dx;
+                        state[16 * plane_size + base] = dy;
                     }
                     if kind.is_storing() && ent.stored > 0 {
-                        state[17 * plane_size + base] = if ent.stored == 1 { 1.0 } else { -1.0 };
+                        state[19 * plane_size + base] = if ent.stored == 1 { 1.0 } else { -1.0 };
                     }
                     if kind == EntityKind::Harvester && ent.cooldown > 0 {
-                        state[18 * plane_size + base] = ent.cooldown as f32 / 3.0;
+                        state[20 * plane_size + base] = ent.cooldown as f32 / 3.0;
                         if ent.team == team {
                             n_own_working += 1;
                         } else {
