@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import nullcontext
 import gc
 import json
@@ -1720,6 +1721,57 @@ def _recurrent_logprob_pass(
     return log_probs
 
 
+def _actor_recurrent_step(
+    model: 'BuilderMLP',
+    obs_pre_t: torch.Tensor,
+    h_t: torch.Tensor,
+    bt_act_t: torch.Tensor,
+    bd_act_t: torch.Tensor,
+    cd_act_t: torch.Tensor,
+    brt_act_t: torch.Tensor,
+    md_act_t: torch.Tensor,
+    bt_mask_t: torch.Tensor,
+    bd_mask_t: torch.Tensor,
+    cd_mask: torch.Tensor,
+    bd_causal_t: torch.Tensor,
+    cd_causal_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One recurrent timestep: forward → GRU update → log-probs + entropy."""
+    bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre_t, h_t)
+    z = torch.sigmoid(h_gate)
+    h_new = (1.0 - z) * h_t + z * h_cand
+
+    bt_l = bt_l.masked_fill(~bt_mask_t, -1e9)
+    bd_l = bd_l.masked_fill(~bd_mask_t, -1e9)
+    cd_l = cd_l.masked_fill(~cd_mask, -1e9)
+
+    bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask_t, eps[:, 0])
+    bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask_t, eps[:, 1])
+    cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, eps[:, 2])
+    brt_lp, brt_ent = action_log_prob_and_entropy(brt_l, brt_act_t, eps=eps[:, 3])
+    md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act_t, eps=eps[:, 4])
+    brt_causal = (bt_act_t == BRIDGE_BUILD_TYPE).float()
+
+    new_lp = bt_lp + bd_lp * bd_causal_t + cd_lp * cd_causal_t + brt_lp * brt_causal + md_lp
+    ent = bt_ent + bd_ent * bd_causal_t + cd_ent * cd_causal_t + brt_ent * brt_causal + md_ent
+    return new_lp, ent, eps, h_new
+
+
+# Lazily compiled version of the per-timestep step function.
+_compiled_actor_step: Callable | None = None
+
+
+def _get_compiled_actor_step() -> Callable:
+    global _compiled_actor_step
+    if _compiled_actor_step is None:
+        try:
+            _compiled_actor_step = torch.compile(_actor_recurrent_step, dynamic=True)
+        except Exception as exc:
+            print(f"Warning: torch.compile disabled for actor step: {exc}")
+            _compiled_actor_step = _actor_recurrent_step
+    return _compiled_actor_step
+
+
 def _recurrent_actor_pass(
     model: 'BuilderMLP',
     obs_pre: torch.Tensor,
@@ -1733,6 +1785,8 @@ def _recurrent_actor_pass(
     bd_mask: torch.Tensor,
     bd_causal: torch.Tensor,
     cd_causal: torch.Tensor,
+    *,
+    compile: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sequential recurrent pass that returns log-probs, entropies, and per-head eps."""
     B, K_max, _ = obs_pre.shape
@@ -1743,25 +1797,13 @@ def _recurrent_actor_pass(
     all_eps = torch.empty(B, K_max, N_LOGIT_SCALE, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
+    step_fn = _get_compiled_actor_step() if compile else _actor_recurrent_step
     for t in range(K_max):
-        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
-        z = torch.sigmoid(h_gate)
-        h_t = (1.0 - z) * h_t + z * h_cand
-
-        bt_l = bt_l.masked_fill(~bt_mask[:, t], -1e9)
-        bd_l = bd_l.masked_fill(~bd_mask[:, t], -1e9)
-        cd_l = cd_l.masked_fill(~cd_mask, -1e9)
-
-        bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[:, t], bt_mask[:, t], eps[:, 0])
-        bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[:, t], bd_mask[:, t], eps[:, 1])
-        cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act[:, t], cd_mask, eps[:, 2])
-        brt_lp, brt_ent = action_log_prob_and_entropy(brt_l, brt_act[:, t], eps=eps[:, 3])
-        md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[:, t], eps=eps[:, 4])
-        brt_causal = (bt_act[:, t] == BRIDGE_BUILD_TYPE).float()
-
-        new_lps[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + brt_lp * brt_causal + md_lp
-        entropies[:, t] = bt_ent + bd_ent * bd_causal[:, t] + cd_ent * cd_causal[:, t] + brt_ent * brt_causal + md_ent
-        all_eps[:, t] = eps
+        new_lps[:, t], entropies[:, t], all_eps[:, t], h_t = step_fn(
+            model, obs_pre[:, t], h_t,
+            bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
+            bt_mask[:, t], bd_mask[:, t], cd_mask, bd_causal[:, t], cd_causal[:, t],
+        )
 
     return new_lps, entropies, all_eps
 
@@ -1862,6 +1904,7 @@ def ppo_update(
     ep_boundaries: list[tuple[int, int]] | None = None,
     ppo_epochs: int = 4,
     minibatch_size: int = 2048,
+    actor_minibatches: int = 4,
     critic_minibatch_size: int | None = None,
     bptt_k: int = BPTT_K,
     clip_eps: float = 0.2,
@@ -1910,7 +1953,6 @@ def ppo_update(
         if ep_boundaries is None:
             ep_boundaries = [(0, N)]
         bptt_chunks = _build_bptt_chunks(ep_boundaries, bptt_k)
-    B_chunk = max(1, minibatch_size // bptt_k)
     dev = obs.device
 
     # Pre-build chunk metadata as GPU tensors (avoids per-batch CPU-GPU sync)
@@ -1922,6 +1964,12 @@ def ppo_update(
     with torch.no_grad():
         bt_mask_all, bd_mask_all, bd_causal_all, cd_causal_all = _precompute_policy_masks(obs, bt_act)
     full_chunk_ids, tail_chunk_ids = _split_chunk_ids(all_chunk_lens, bptt_k)
+
+    # Derive chunks-per-minibatch from desired number of actor minibatches.
+    # Each minibatch runs the full sequential BPTT, so larger B_chunk means
+    # more samples per recurrent timestep → better GPU utilization.
+    n_total_chunks = full_chunk_ids.numel() + tail_chunk_ids.numel()
+    B_chunk = max(1, math.ceil(n_total_chunks / actor_minibatches)) if n_total_chunks > 0 else 1
 
     # ---- Phase 1: Actor updates with BPTT ----
     actor_stopped_early = False
@@ -1978,6 +2026,7 @@ def ppo_update(
                     all_bd_mask,
                     all_bd_causal,
                     all_cd_causal,
+                    compile=(dev.type == "cuda"),
                 )
                 if profile is not None:
                     profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
@@ -2061,33 +2110,55 @@ def ppo_update(
         value_clip_t = torch.tensor(float(value_clip), device=obs.device, dtype=returns.dtype)
 
         step_round_idx = centralized_data["step_round_idx"]
+
+        # Pack per-step float data once — 2 index ops → 1 + slice in the loop
+        step_unit_xy = centralized_data["step_unit_xy"]
+        step_unit_float = torch.cat([
+            centralized_data["step_unit_ctx"],
+            centralized_data["step_actor_latent"],
+        ], dim=1)
+        _ctx_dim = centralized_data["step_unit_ctx"].shape[1]
+        old_values_safe = old_values if old_values is not None else returns
+        step_rv = torch.stack([returns, old_values_safe], dim=1)
+
         for epoch in range(critic_epochs):
             perm, epoch_rounds, round_offsets, batch_ranges = _critic_round_batch_plan(
                 step_round_idx,
                 target_steps=critic_minibatch_size,
                 max_rounds=CENTRALIZED_CNN_CHUNK,
             )
-            round_offsets_cpu = round_offsets.tolist()
-            for round_start, round_end in batch_ranges:
-                t_value = time.perf_counter() if profile is not None else 0.0
-                critic_opt.zero_grad(set_to_none=True)
 
+            # Precompute per-batch idx and local_round_idx so the training
+            # loop is tight: no repeat_interleave / arange / perm slicing
+            # interleaved with forward-backward.
+            round_offsets_cpu = round_offsets.tolist()
+            batch_meta: list[tuple[torch.Tensor, torch.Tensor, int, int]] = []
+            for round_start, round_end in batch_ranges:
                 step_lo = round_offsets_cpu[round_start]
                 step_hi = round_offsets_cpu[round_end]
                 idx = perm[step_lo:step_hi]
+                n_rounds = round_end - round_start
+                chunk_round_counts = round_offsets[round_start + 1:round_end + 1] - round_offsets[round_start:round_end]
+                local_round_idx = torch.repeat_interleave(
+                    torch.arange(n_rounds, device=dev),
+                    chunk_round_counts,
+                )
+                batch_meta.append((idx, local_round_idx, round_start, round_end))
+
+            for idx, local_round_idx, round_start, round_end in batch_meta:
+                t_value = time.perf_counter() if profile is not None else 0.0
+                critic_opt.zero_grad(set_to_none=True)
+
                 vf_denom = max(idx.shape[0], 1)
                 c_rounds = epoch_rounds[round_start:round_end]
                 g_obs, g_mask, g_scalars = _load_critic_round_batch(centralized_data, c_rounds)
-                u_xy = centralized_data["step_unit_xy"][idx]
-                u_ctx = centralized_data["step_unit_ctx"][idx]
-                u_latent = centralized_data["step_actor_latent"][idx]
-                mb_returns = returns[idx]
-                mb_old_values = old_values[idx] if old_values is not None else mb_returns
-                chunk_round_counts = round_offsets[round_start + 1:round_end + 1] - round_offsets[round_start:round_end]
-                local_round_idx = torch.repeat_interleave(
-                    torch.arange(round_end - round_start, device=idx.device),
-                    chunk_round_counts,
-                )
+                u_xy = step_unit_xy[idx]
+                uf = step_unit_float[idx]
+                u_ctx = uf[:, :_ctx_dim]
+                u_latent = uf[:, _ctx_dim:]
+                rv = step_rv[idx]
+                mb_returns = rv[:, 0]
+                mb_old_values = rv[:, 1]
                 with autocast_context(critic_cuda_cfg):
                     loss_sum, vf_loss_sum, new_values = critic_loss_step(
                         g_obs,
