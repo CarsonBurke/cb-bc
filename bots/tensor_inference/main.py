@@ -10,7 +10,7 @@ import random
 # pauses within the 2ms-per-turn CPU budget.
 gc.disable()
 
-from cambc import Controller, Direction, EntityType, Environment, Position, ResourceType
+from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position, ResourceType
 
 import sys
 
@@ -36,16 +36,16 @@ from tensor_lib import MLP, SinusoidalPositionEmbedding
 GRID_SIZE = 5
 GRID_HALF = GRID_SIZE // 2
 # Per tile: is_wall(1) + ore_ti(1) + ore_ax(1) + is_impassable(1)
-#         + bld_type(8: none/harvester/conveyor/splitter/road/support/military/core)
+#         + bld_type(10: none/harvester/conveyor/splitter/road/barrier/bridge/foundry/military/core)
 #         + bld_friendly(1) + bld_dir(2) + bld_cooldown(1) + bld_stored_resource(1)
-#         + has_unit(1) + unit_friendly(1) = 19
-TILE_FEATURES = 19
+#         + has_unit(1) + unit_friendly(1) = 21
+TILE_FEATURES = 21
 # Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy,
 #         n_builders, ti_delta, ax_delta, hp_advantage, spawn_round = 15
 GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN_SIZES = [64, 48]
+HIDDEN_SIZES = [64, 64]
 H_DIM = 24  # Recurrent hidden state size
 COMPRESS_DIM = 80
 RMSNORM_LAYERS = [True, True]
@@ -66,6 +66,7 @@ BUILD_ACTIONS = [
     "barrier",
     "foundry",
     "launcher",
+    "bridge",
 ]
 _ACTION_NONE = 0
 _ACTION_HARVESTER = 1
@@ -79,6 +80,7 @@ _ACTION_ARMOURED_CONVEYOR = 8
 _ACTION_BARRIER = 9
 _ACTION_FOUNDRY = 10
 _ACTION_LAUNCHER = 11
+_ACTION_BRIDGE = 12
 
 # Maps network output index -> Direction (3x3 grid layout)
 DIR_MAP_9 = [
@@ -111,15 +113,15 @@ BLD_IDX = {
     EntityType.SPLITTER: 3,
     EntityType.ROAD: 4,
     EntityType.BARRIER: 5,
-    EntityType.BRIDGE: 5,
-    EntityType.FOUNDRY: 5,
-    EntityType.GUNNER: 6,
-    EntityType.SENTINEL: 6,
-    EntityType.BREACH: 6,
-    EntityType.LAUNCHER: 6,
-    EntityType.CORE: 7,
+    EntityType.BRIDGE: 6,
+    EntityType.FOUNDRY: 7,
+    EntityType.GUNNER: 8,
+    EntityType.SENTINEL: 8,
+    EntityType.BREACH: 8,
+    EntityType.LAUNCHER: 8,
+    EntityType.CORE: 9,
 }
-N_BLD_TYPES = 8
+N_BLD_TYPES = 10
 
 # Direction -> (dx, dy) normalized offsets
 DIR_DXY = {
@@ -134,21 +136,32 @@ DIR_DXY = {
     Direction.SOUTHEAST: (1, 1),
 }
 
-# Base build costs (titanium, axionite) indexed by BUILD_ACTIONS
+# Base build costs (titanium, axionite) indexed by BUILD_ACTIONS, derived from GameConstants
+_GC = GameConstants
 BUILD_COSTS = (
-    (0, 0),      # none
-    (80, 0),     # harvester
-    (3, 0),      # conveyor
-    (1, 0),      # road
-    (10, 0),     # gunner
-    (15, 0),     # sentinel
-    (30, 10),    # breach
-    (6, 0),      # splitter
-    (10, 5),     # armoured_conveyor
-    (3, 0),      # barrier
-    (120, 0),    # foundry
-    (20, 0),     # launcher
+    (0, 0),                           # none
+    _GC.HARVESTER_BASE_COST,          # harvester
+    _GC.CONVEYOR_BASE_COST,           # conveyor
+    _GC.ROAD_BASE_COST,               # road
+    _GC.GUNNER_BASE_COST,             # gunner
+    _GC.SENTINEL_BASE_COST,           # sentinel
+    _GC.BREACH_BASE_COST,             # breach
+    _GC.SPLITTER_BASE_COST,           # splitter
+    _GC.ARMOURED_CONVEYOR_BASE_COST,  # armoured_conveyor
+    _GC.BARRIER_BASE_COST,            # barrier
+    _GC.FOUNDRY_BASE_COST,            # foundry
+    _GC.LAUNCHER_BASE_COST,           # launcher
+    _GC.BRIDGE_BASE_COST,             # bridge
 )
+
+# Bridge target offsets: all (dx, dy) with 0 < dx²+dy² ≤ 9, row-major order.
+BRIDGE_OFFSETS = tuple(
+    (dx, dy)
+    for dy in range(-3, 4)
+    for dx in range(-3, 4)
+    if 0 < dx * dx + dy * dy <= 9
+)
+N_BRIDGE_TARGETS = len(BRIDGE_OFFSETS)  # 28
 
 # Tile indices in 5x5 grid for each build direction (matches DIR_MAP_9 order)
 _BUILD_DIR_TILE_INDICES = tuple(
@@ -188,8 +201,8 @@ def _weight_cache_key(path: str) -> tuple[str, int, int] | None:
     return path, st.st_mtime_ns, st.st_size
 
 
-TILE_FEATURES_COUNT = 19
-TILE_INPUT_DIM = TILE_FEATURES_COUNT + 2  # 21: raw features + (dx/2, dy/2)
+TILE_FEATURES_COUNT = 21
+TILE_INPUT_DIM = TILE_FEATURES_COUNT + 2  # 23: raw features + (dx/2, dy/2)
 TILE_EMBED_DIM = 8
 OBS_SIZE = _GLOBAL_OBS_START + GLOBAL_FEATURES + POS_EMBED_DIM
 _ZERO_OBS = (0.0,) * OBS_SIZE
@@ -203,8 +216,9 @@ def _build_model() -> MLP:
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
             "conv_dir": 4,
+            "bridge_target": N_BRIDGE_TARGETS,
             "move_dir": 9,
-            "logit_scale": 4,
+            "logit_scale": 5,
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },
@@ -288,6 +302,13 @@ class Player:
         self._scan_enemy_core_dmg(ct)
 
         ti, ax = ct.get_global_resources()
+
+        # Convert all available axionite into titanium (4:1 rate)
+        if ax > 0:
+            ct.convert(ax)
+            ti += ax * 4
+            ax = 0
+
         rnd = ct.get_current_round()
 
         # Reserve floor: each builder needs ~150 ti to build infrastructure
@@ -356,12 +377,13 @@ class Player:
         effective_bd_mask = harv_bd_mask if build_type_idx == 1 else bd_mask
         build_dir_idx = _argmax(outputs["build_dir"], effective_bd_mask)
         conv_dir_idx = _argmax(outputs["conv_dir"], None)
+        bridge_target_idx = _argmax(outputs["bridge_target"], None)
         move_dir_idx = _argmax(outputs["move_dir"], None)
 
         # Execute actions
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = CONV_DIR_4[conv_dir_idx]
-        self._execute_build(ct, build_type_idx, build_dir, conv_dir)
+        self._execute_build(ct, build_type_idx, build_dir, conv_dir, bridge_target_idx)
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
@@ -581,17 +603,17 @@ class Player:
                 btype = get_entity_type(bid)
                 bidx = BLD_IDX.get(btype, 3)
                 one_hot = _BLD_ONE_HOTS[bidx]
-                features[base + 4:base + 12] = one_hot
-                features[base + 12] = 1.0 if get_team(bid) == my_team else -1.0
+                features[base + 4:base + 4 + N_BLD_TYPES] = one_hot
+                features[base + 14] = 1.0 if get_team(bid) == my_team else -1.0
                 bdx, bdy = DIR_DXY.get(bdir, (0, 0))
-                features[base + 13] = float(bdx)
-                features[base + 14] = float(bdy)
-                features[base + 16] = 0.0 if sr is None else 1.0 if sr == ResourceType.TITANIUM else -1.0
+                features[base + 15] = float(bdx)
+                features[base + 16] = float(bdy)
+                features[base + 18] = 0.0 if sr is None else 1.0 if sr == ResourceType.TITANIUM else -1.0
 
             uid = get_tile_builder_bot_id(tile_pos)
             if uid is not None:
-                features[base + 17] = 1.0
-                features[base + 18] = 1.0 if get_team(uid) == my_team else -1.0
+                features[base + 19] = 1.0
+                features[base + 20] = 1.0 if get_team(uid) == my_team else -1.0
 
         rnd_n = ct.get_current_round()
         rnd = rnd_n / 2000.0
@@ -675,7 +697,8 @@ class Player:
     _PLACE_HARV = 5.0
 
     def _execute_build(
-        self, ct: Controller, action_idx: int, direction: Direction, conv_direction: Direction | None = None
+        self, ct: Controller, action_idx: int, direction: Direction,
+        conv_direction: Direction | None = None, bridge_target_idx: int = 0,
     ) -> tuple[float, float]:
         """Execute build action. Returns (harv_reward, conv_reward).
 
@@ -763,6 +786,12 @@ class Player:
         elif action_idx == _ACTION_LAUNCHER:
             if ct.can_build_launcher(build_pos):
                 ct.build_launcher(build_pos)
+        elif action_idx == _ACTION_BRIDGE:
+            if bridge_target_idx < len(BRIDGE_OFFSETS):
+                bdx, bdy = BRIDGE_OFFSETS[bridge_target_idx]
+                target = Position(build_pos.x + bdx, build_pos.y + bdy)
+                if ct.can_build_bridge(build_pos, target):
+                    ct.build_bridge(build_pos, target)
         # Punish placing non-harvester on ore (wasted tile)
         ore_key = (build_pos.x, build_pos.y)
         if ore_key in Player._all_ore_keys:
@@ -821,9 +850,9 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], l
     for d_idx in range(9):
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
         not_wall = obs[ts] == 0.0
-        no_unit = obs[ts + 17] == 0.0
+        no_unit = obs[ts + 19] == 0.0
         empty = obs[ts + 4] == 1.0
-        replaceable = obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0
+        replaceable = obs[ts + 4] == 0.0 and obs[ts + 14] == 1.0 and obs[ts + 13] == 0.0
         if not_wall and no_unit and (empty or replaceable):
             bd_mask[d_idx] = True
             any_dir = True
@@ -832,15 +861,14 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], l
     if not any_affordable or not any_dir:
         return _NONE_ONLY_BUILD_MASK, _ALL_DIRS_MASK, _ALL_DIRS_MASK
 
-    # Harvester placement is only legal on empty ore tiles.
+    # Harvester placement is legal on ore tiles that are empty or have a friendly replaceable building.
     harv_bd_mask = [False] * 9
     for d_idx in range(9):
         if not bd_mask[d_idx]:
             continue
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
         is_ore = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
-        empty = obs[ts + 4] == 1.0
-        harv_bd_mask[d_idx] = is_ore and empty
+        harv_bd_mask[d_idx] = is_ore
     if not any(harv_bd_mask):
         bt_mask[_HARVESTER_BUILD_TYPE] = False  # suppress harvester
 

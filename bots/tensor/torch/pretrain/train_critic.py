@@ -31,6 +31,7 @@ sys.path.insert(0, str(_TORCH_DIR))
 
 from model import (
     ACTOR_LATENT_DIM,
+    DEFAULT_CRITIC_MINIBATCH_SIZE,
     BuilderMLP,
     CentralizedCritic,
     DEVICE, GLOBAL_MAP_CHANNELS, GLOBAL_MAP_MAX_W, GLOBAL_MAP_MAX_H,
@@ -283,7 +284,7 @@ def _compute_actor_latents_for_replay(
             raw_latent = actor._latent_from_obs_pre(obs_pre[step_idx], h_prev)
             actor_latent[step_idx] = _normalize_actor_latent_dim(raw_latent)
             h_gate = F.linear(raw_latent, w_gate, b_gate)
-            h_cand = F.linear(raw_latent, w_cand, b_cand)
+            h_cand = torch.tanh(F.linear(raw_latent, w_cand, b_cand))
             z = torch.sigmoid(h_gate)
             h_live.index_copy_(0, active_ids, ((1.0 - z) * h_prev + z * h_cand).float())
 
@@ -294,7 +295,7 @@ def _compute_actor_obs_pre(
     actor: BuilderMLP,
     obs_bt_cpu: torch.Tensor,
     device: torch.device,
-    chunk_size: int = 8192,
+    chunk_size: int = DEFAULT_CRITIC_MINIBATCH_SIZE,
 ) -> torch.Tensor:
     """Project replay observations through the actor's obs-only encoder in chunks."""
     if obs_bt_cpu.shape[0] == 0:

@@ -1,6 +1,8 @@
 # tensor: Neural network-powered builder bot.
-# Uses a lightweight MLP (64->48 hidden) to decide what to build, where to build,
-# and where to move. Forward pass fits within ~0.7ms of the 2ms CPU budget.
+# Legacy local bot path for workspace experiments; canonical actor config lives
+# in the torch model, shared.py, and tensor_inference.
+# Uses a lightweight MLP (64->64 hidden) to decide what to build, where to build,
+# and where to move. Forward pass remains within the 2ms CPU budget target.
 # Supports online REINFORCE learning and offline weight loading.
 
 import atexit
@@ -15,7 +17,7 @@ import random
 # pauses within the 2ms-per-turn CPU budget.
 gc.disable()
 
-from cambc import Controller, Direction, EntityType, Environment, Position, ResourceType
+from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position, ResourceType
 
 import sys
 
@@ -35,7 +37,7 @@ TILE_FEATURES = 19
 GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN_SIZES = [64, 48]
+HIDDEN_SIZES = [64, 64]
 H_DIM = 24  # Recurrent hidden state size
 COMPRESS_DIM = 80
 RMSNORM_LAYERS = [True, True]
@@ -115,20 +117,21 @@ DIR_DXY = {
     Direction.SOUTHEAST: (1, 1),
 }
 
-# Base build costs (titanium, axionite) indexed by BUILD_ACTIONS
+# Base build costs (titanium, axionite) indexed by BUILD_ACTIONS, derived from GameConstants
+_GC = GameConstants
 BUILD_COSTS = (
-    (0, 0),      # none
-    (80, 0),     # harvester
-    (3, 0),      # conveyor
-    (1, 0),      # road
-    (10, 0),     # gunner
-    (15, 0),     # sentinel
-    (30, 10),    # breach
-    (6, 0),      # splitter
-    (10, 5),     # armoured_conveyor
-    (3, 0),      # barrier
-    (120, 0),    # foundry
-    (20, 0),     # launcher
+    (0, 0),                           # none
+    _GC.HARVESTER_BASE_COST,          # harvester
+    _GC.CONVEYOR_BASE_COST,           # conveyor
+    _GC.ROAD_BASE_COST,               # road
+    _GC.GUNNER_BASE_COST,             # gunner
+    _GC.SENTINEL_BASE_COST,           # sentinel
+    _GC.BREACH_BASE_COST,             # breach
+    _GC.SPLITTER_BASE_COST,           # splitter
+    _GC.ARMOURED_CONVEYOR_BASE_COST,  # armoured_conveyor
+    _GC.BARRIER_BASE_COST,            # barrier
+    _GC.FOUNDRY_BASE_COST,            # foundry
+    _GC.LAUNCHER_BASE_COST,           # launcher
 )
 
 # Tile indices in 5x5 grid for each build direction (matches DIR_MAP_9 order)
@@ -286,6 +289,13 @@ class Player:
         self._scan_own_core_dmg(ct)
 
         ti, ax = ct.get_global_resources()
+
+        # Convert all available axionite into titanium (4:1 rate)
+        if ax > 0:
+            ct.convert(ax)
+            ti += ax * 4
+            ax = 0
+
         rnd = ct.get_current_round()
 
         # Reserve floor: each builder needs ~150 ti to build infrastructure

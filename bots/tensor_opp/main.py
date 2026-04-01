@@ -21,6 +21,8 @@ from shared import (
     DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4,
     SinusoidalPositionEmbedding,
     encode_state_into, argmax,
+    execute_build,
+    N_BLD_TYPES, BRIDGE_OFFSETS,
     TILE_FEATURES, GRID_SIZE,
 )
 
@@ -50,13 +52,15 @@ def _get_shared_model(path: str):
     _tile_input_dim = TILE_FEATURES + 2  # 21
     _tile_embed_dim = 8
     model = MLP(
-        input_size=COMPRESS_DIM + POS_EMBED_DIM + 15 + H_DIM,  # 103
+        input_size=COMPRESS_DIM + POS_EMBED_DIM + 15 + H_DIM,  # 127
         hidden_sizes=HIDDEN_SIZES,
         output_heads={
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
             "conv_dir": 4,
+            "bridge_target": len(BRIDGE_OFFSETS),
             "move_dir": 9,
+            "logit_scale": 5,
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },
@@ -168,11 +172,12 @@ class Player:
         build_type_idx = argmax(outputs["build_type"])
         build_dir_idx = argmax(outputs["build_dir"])
         conv_dir_idx = argmax(outputs["conv_dir"])
+        bridge_target_idx = argmax(outputs["bridge_target"])
         move_dir_idx = argmax(outputs["move_dir"])
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
-        self._execute_build(ct, build_action, build_dir, conv_dir_idx)
+        self._execute_build(ct, build_action, build_dir, conv_dir_idx, bridge_target_idx)
 
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
@@ -206,43 +211,9 @@ class Player:
         self._n_builders_cached = n_builders_out[0]
         return features
 
-    def _execute_build(self, ct, action, direction, conv_dir_idx=0):
-        pos = ct.get_position()
-        build_pos = pos.add(direction)
+    def _execute_build(self, ct, action, direction, conv_dir_idx=0, bridge_target_idx=0):
         conv_dir = CONV_DIR_4[conv_dir_idx]
-        if action == "conveyor":
-            if ct.can_build_conveyor(build_pos, conv_dir):
-                ct.build_conveyor(build_pos, conv_dir)
-        elif action == "harvester":
-            if ct.can_build_harvester(build_pos):
-                ct.build_harvester(build_pos)
-        elif action == "road":
-            if ct.can_build_road(build_pos):
-                ct.build_road(build_pos)
-        elif action == "gunner":
-            if ct.can_build_gunner(build_pos, direction):
-                ct.build_gunner(build_pos, direction)
-        elif action == "sentinel":
-            if ct.can_build_sentinel(build_pos, direction):
-                ct.build_sentinel(build_pos, direction)
-        elif action == "breach":
-            if ct.can_build_breach(build_pos, direction):
-                ct.build_breach(build_pos, direction)
-        elif action == "splitter":
-            if ct.can_build_splitter(build_pos, conv_dir):
-                ct.build_splitter(build_pos, conv_dir)
-        elif action == "armoured_conveyor":
-            if ct.can_build_armoured_conveyor(build_pos, conv_dir):
-                ct.build_armoured_conveyor(build_pos, conv_dir)
-        elif action == "barrier":
-            if ct.can_build_barrier(build_pos):
-                ct.build_barrier(build_pos)
-        elif action == "foundry":
-            if ct.can_build_foundry(build_pos):
-                ct.build_foundry(build_pos)
-        elif action == "launcher":
-            if ct.can_build_launcher(build_pos):
-                ct.build_launcher(build_pos)
+        execute_build(ct, action, direction, conv_dir, self.my_team, bridge_target_idx)
 
     def _execute_move(self, ct, direction):
         if direction == Direction.CENTRE:

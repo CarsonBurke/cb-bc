@@ -5,60 +5,69 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-# Obs feature indices
-_OBS_GLOBAL_START = 5 * 5 * 19  # GRID_SIZE^2 * TILE_FEATURES = 475
+# Obs feature indices — must stay in sync with model.py TILE_FEATURES
+_TILE_FEATURES = 21
+_OBS_GLOBAL_START = 5 * 5 * _TILE_FEATURES  # GRID_SIZE^2 * TILE_FEATURES = 525
 _OBS_ROUND_BYTE_OFFSET = _OBS_GLOBAL_START * 4  # byte offset for float32 obs
+
+AX_CONVERSION_RATE = 4  # GameConstants.AXIONITE_CONVERSION_TITANIUM_RATE
+
+
+def _load_buf(global_states: dict, buf_key: str, path_key: str) -> bytes:
+    buf = global_states.get(buf_key, b"")
+    if not buf:
+        path = global_states.get(path_key)
+        if path:
+            buf = Path(path).read_bytes()
+    return buf
+
+
+def compute_dense_delivery_rewards(
+    global_states: dict,
+    team: int = 0,
+) -> dict[int, float]:
+    """Per-round reward from resources delivered to core (ti + ax * 4).
+
+    Requires ti_delivered and ax_delivered buffers. Raises if missing.
+    """
+    n_turns = global_states.get("n_turns", 0)
+    if n_turns == 0:
+        return {}
+
+    ti_buf = _load_buf(global_states, "ti_delivered_buf", "ti_delivered_path")
+    ax_buf = _load_buf(global_states, "ax_delivered_buf", "ax_delivered_path")
+    if not ti_buf:
+        raise ValueError("ti_delivered data missing from global_states")
+    if not ax_buf:
+        raise ValueError("ax_delivered data missing from global_states")
+
+    rewards: dict[int, float] = {}
+    for rnd in range(n_turns):
+        ti_a, ti_b = struct.unpack_from("<ii", ti_buf, rnd * 8)
+        ax_a, ax_b = struct.unpack_from("<ii", ax_buf, rnd * 8)
+        delivered = (ti_a if team == 0 else ti_b) + (ax_a if team == 0 else ax_b) * AX_CONVERSION_RATE
+        if delivered > 0:
+            rewards[rnd] = float(delivered)
+    return rewards
 
 
 def compute_dense_flow_rewards(
     global_states: dict,
     team: int = 0,
 ) -> dict[int, float]:
-    """Compute per-round reward from titanium income (delivered to core).
+    """Per-round reward from weighted conveyor hops toward core.
 
-    Primary signal: titanium_delivered — per-turn delta of titanium_collected
-    per team (i32 pairs [team_a, team_b]).
-
-    Fallback: transfer_events — weighted conveyor hop count toward core
-    (f32 pairs [team_a, team_b]).
-
-    Returns {round: reward} for the requested team.
+    Requires transfer_events buffer. Raises if missing.
     """
-    # Try titanium delivered first (cleaner signal)
-    ti_buf = global_states.get("ti_delivered_buf", b"")
-    if not ti_buf:
-        ti_path = global_states.get("ti_delivered_path")
-        if ti_path:
-            try:
-                ti_buf = Path(ti_path).read_bytes()
-            except OSError:
-                ti_buf = b""
-
     n_turns = global_states.get("n_turns", 0)
-
-    if ti_buf and n_turns > 0:
-        rewards: dict[int, float] = {}
-        for rnd in range(n_turns):
-            a_val, b_val = struct.unpack_from("<ii", ti_buf, rnd * 8)
-            delivered = a_val if team == 0 else b_val
-            if delivered > 0:
-                rewards[rnd] = float(delivered)
-        return rewards
-
-    # Fallback: transfer events (weighted conveyor hops toward core)
-    buf = global_states.get("transfer_events_buf", b"")
-    if not buf:
-        transfer_path = global_states.get("transfer_events_path")
-        if transfer_path:
-            try:
-                buf = Path(transfer_path).read_bytes()
-            except OSError:
-                buf = b""
-
-    if not buf or n_turns == 0:
+    if n_turns == 0:
         return {}
 
-    rewards = {}
+    buf = _load_buf(global_states, "transfer_events_buf", "transfer_events_path")
+    if not buf:
+        raise ValueError("transfer_events data missing from global_states")
+
+    rewards: dict[int, float] = {}
     for rnd in range(n_turns):
         a_val, b_val = struct.unpack_from("<ff", buf, rnd * 8)
         reward = a_val if team == 0 else b_val
@@ -78,7 +87,7 @@ def augment_trajectories_with_flow_rewards(
 
     Args:
         trajectories: list of trajectory lists (each step is a tuple/list)
-        rewards: {round: reward} from compute_dense_flow_rewards
+        rewards: {round: reward} from compute_dense_*_rewards
 
     Returns:
         Modified trajectories (in-place mutation + return)

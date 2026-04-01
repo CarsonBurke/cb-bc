@@ -5,18 +5,18 @@
 import math
 import random
 
-from cambc import Controller, Direction, EntityType, Environment, Position, ResourceType
+from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position, ResourceType
 
 # -- Layout constants --
 GRID_SIZE = 5
 GRID_HALF = GRID_SIZE // 2
-TILE_FEATURES = 19
+TILE_FEATURES = 21
 GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN_SIZES = [64, 48]
+HIDDEN_SIZES = [64, 64]
 H_DIM = 24
-COMPRESS_DIM = 64
+COMPRESS_DIM = 80
 RMSNORM_LAYERS = [True, True]
 
 DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
@@ -34,6 +34,7 @@ BUILD_ACTIONS = [
     "barrier",
     "foundry",
     "launcher",
+    "bridge",
 ]
 
 DIR_MAP_9 = [
@@ -65,15 +66,15 @@ BLD_IDX = {
     EntityType.SPLITTER: 3,
     EntityType.ROAD: 4,
     EntityType.BARRIER: 5,
-    EntityType.BRIDGE: 5,
-    EntityType.FOUNDRY: 5,
-    EntityType.GUNNER: 6,
-    EntityType.SENTINEL: 6,
-    EntityType.BREACH: 6,
-    EntityType.LAUNCHER: 6,
-    EntityType.CORE: 7,
+    EntityType.BRIDGE: 6,
+    EntityType.FOUNDRY: 7,
+    EntityType.GUNNER: 8,
+    EntityType.SENTINEL: 8,
+    EntityType.BREACH: 8,
+    EntityType.LAUNCHER: 8,
+    EntityType.CORE: 9,
 }
-N_BLD_TYPES = 8
+N_BLD_TYPES = 10
 
 DIR_DXY = {
     Direction.NORTHWEST: (-1, -1),
@@ -87,19 +88,31 @@ DIR_DXY = {
     Direction.SOUTHEAST: (1, 1),
 }
 
+# Base build costs (titanium, axionite) indexed by BUILD_ACTIONS, derived from GameConstants
+_GC = GameConstants
 BUILD_COSTS = (
-    (0, 0),      # none
-    (80, 0),     # harvester
-    (3, 0),      # conveyor
-    (1, 0),      # road
-    (10, 0),     # gunner
-    (15, 0),     # sentinel
-    (30, 10),    # breach
-    (6, 0),      # splitter
-    (10, 5),     # armoured_conveyor
-    (3, 0),      # barrier
-    (120, 0),    # foundry
-    (20, 0),     # launcher
+    (0, 0),                           # none
+    _GC.HARVESTER_BASE_COST,          # harvester
+    _GC.CONVEYOR_BASE_COST,           # conveyor
+    _GC.ROAD_BASE_COST,               # road
+    _GC.GUNNER_BASE_COST,             # gunner
+    _GC.SENTINEL_BASE_COST,           # sentinel
+    _GC.BREACH_BASE_COST,             # breach
+    _GC.SPLITTER_BASE_COST,           # splitter
+    _GC.ARMOURED_CONVEYOR_BASE_COST,  # armoured_conveyor
+    _GC.BARRIER_BASE_COST,            # barrier
+    _GC.FOUNDRY_BASE_COST,            # foundry
+    _GC.LAUNCHER_BASE_COST,           # launcher
+    _GC.BRIDGE_BASE_COST,             # bridge
+)
+
+# Bridge target offsets: all (dx, dy) with 0 < dx²+dy² ≤ 9, row-major order.
+# Matches the sequential index from replay_parser's bridge_target_to_idx.
+BRIDGE_OFFSETS = tuple(
+    (dx, dy)
+    for dy in range(-3, 4)
+    for dx in range(-3, 4)
+    if 0 < dx * dx + dy * dy <= 9
 )
 
 _BUILD_DIR_TILE_INDICES = tuple(
@@ -464,9 +477,9 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
     for d_idx in range(9):
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
         not_wall = obs[ts] == 0.0
-        no_unit = obs[ts + 17] == 0.0
+        no_unit = obs[ts + 19] == 0.0
         empty = obs[ts + 4] == 1.0
-        replaceable = obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0
+        replaceable = obs[ts + 4] == 0.0 and obs[ts + 14] == 1.0 and obs[ts + 13] == 0.0
         if not_wall and no_unit and (empty or replaceable):
             bd_mask[d_idx] = True
             any_dir = True
@@ -478,15 +491,14 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
 
 
 def compute_harvester_build_dir_mask(obs: list[float], bd_mask: list[bool]) -> list[bool]:
-    """Harvester placement is only legal on empty ore tiles."""
+    """Harvester placement is legal on ore tiles that are empty or have a friendly replaceable building."""
     harv_mask = [False] * 9
     for d_idx, allowed in enumerate(bd_mask):
         if not allowed:
             continue
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
-        empty = obs[ts + 4] == 1.0
         ore_here = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
-        harv_mask[d_idx] = empty and ore_here
+        harv_mask[d_idx] = ore_here
     return harv_mask
 
 
@@ -759,6 +771,12 @@ def execute_build(ct: Controller, action: str, direction: Direction,
     elif action == "launcher":
         if ct.can_build_launcher(build_pos):
             ct.build_launcher(build_pos)
+    elif action == "bridge":
+        if bridge_target_idx < len(BRIDGE_OFFSETS):
+            bdx, bdy = BRIDGE_OFFSETS[bridge_target_idx]
+            target = Position(build_pos.x + bdx, build_pos.y + bdy)
+            if ct.can_build_bridge(build_pos, target):
+                ct.build_bridge(build_pos, target)
     return 0.0, 0.0, dbg
 
 

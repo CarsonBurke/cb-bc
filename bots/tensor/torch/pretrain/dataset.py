@@ -25,13 +25,13 @@ from replay_parser import (
 )
 
 _CACHE_DIR_NAME = ".pretrain_cache"
-_ACTOR_CACHE_VERSION = 7  # v7: persist round-major actor layout plus legality masks for BC hot path
+_ACTOR_CACHE_VERSION = 8  # v8: obs_size 498→548 (TILE_FEATURES 19→21)
 _CRITIC_CACHE_VERSION = 14  # v14: income mode (no terminal reward)
 from model import (
     GAMMA,
     REWARD_MODE,
     RewardMode,
-    REWARD_BUILD_CREDIT,
+    REWARD_INCOME_SCALE,
     TERMINAL_WIN_REWARD,
     TERMINAL_LOSS_REWARD,
     HARVESTER_BUILD_TYPE,
@@ -138,19 +138,24 @@ def _critic_winloss_targets(
     base_value: float,
     gamma: float = GAMMA,
     ti_delivered: torch.Tensor | None = None,
+    ax_delivered: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Discounted returns for critic pretraining: titanium income + terminal.
+    """Discounted returns for critic pretraining: resource income + terminal.
 
-    Per-round reward = ti_delivered[t] * REWARD_BUILD_CREDIT, plus terminal
-    reward at the last step. Returns are computed via reverse-scan:
+    Per-round reward = (ti_delivered[t] + ax_delivered[t] * 4) * REWARD_BUILD_CREDIT,
+    plus terminal reward at the last step. Returns are computed via reverse-scan:
       R_t = r_t + γ * R_{t+1}
     """
+    AX_CONVERSION_RATE = 4  # GameConstants.AXIONITE_CONVERSION_TITANIUM_RATE
+
     if n_turns <= 0:
         return torch.zeros(0, dtype=torch.float32)
 
     rewards = torch.zeros(n_turns, dtype=torch.float32)
     if REWARD_MODE == RewardMode.INCOME and ti_delivered is not None and ti_delivered.shape[0] >= n_turns:
-        rewards = ti_delivered[:n_turns].float() * REWARD_BUILD_CREDIT
+        rewards = ti_delivered[:n_turns].float() * REWARD_INCOME_SCALE
+        if ax_delivered is not None and ax_delivered.shape[0] >= n_turns:
+            rewards += ax_delivered[:n_turns].float() * AX_CONVERSION_RATE * REWARD_INCOME_SCALE
     if REWARD_MODE == RewardMode.OUTCOME:
         rewards[-1] += float(base_value)
 
@@ -171,7 +176,7 @@ def _decode_sequential_replay(
     """Decode sequential replay buffers into raw tensors on CPU."""
     data = parse_replay_sequential(path, team=team)
     n = data["n_samples"]
-    obs_size = data.get("obs_size", 498)
+    obs_size = data.get("obs_size", 548)
     if n == 0:
         return (
             torch.zeros(0, obs_size, dtype=torch.float32),
@@ -519,7 +524,7 @@ class ActorBCDataset:
                 round_bt_mask[:, HARVESTER_BUILD_TYPE] &= round_harv_bd_mask.any(dim=1)
             else:
                 n_rounds = max(n_rounds_hint or 0, 0)
-                round_obs = torch.zeros(0, 498, dtype=torch.float16)
+                round_obs = torch.zeros(0, 548, dtype=torch.float16)
                 round_actions = torch.zeros(0, 5, dtype=torch.int16)
                 round_bot_slots = torch.zeros(0, dtype=torch.long)
                 round_offsets = torch.zeros(n_rounds + 1, dtype=torch.long)
@@ -598,7 +603,7 @@ class ActorBCDataset:
         if not obs_batches:
             dev = torch.device(device)
             return (
-                torch.zeros(0, 498, dtype=torch.float32, device=dev),
+                torch.zeros(0, 548, dtype=torch.float32, device=dev),
                 torch.zeros(0, 5, dtype=torch.long, device=dev),
             )
 
@@ -772,17 +777,24 @@ class CriticBCDataset:
                 core_x=core_x,
                 core_y=core_y,
             )
-            # Extract per-round titanium delivered for this team
+            # Extract per-round titanium/axionite delivered for this team
             ti_buf = data.get("titanium_delivered", b"")
             ti_delivered = None
             if ti_buf and len(ti_buf) >= full_turns * 8:
                 ti_raw = torch.frombuffer(bytearray(ti_buf), dtype=torch.int32).reshape(-1, 2)
                 ti_delivered = ti_raw[:full_turns, team].clone()
 
+            ax_buf = data.get("axionite_delivered", b"")
+            ax_delivered = None
+            if ax_buf and len(ax_buf) >= full_turns * 8:
+                ax_raw = torch.frombuffer(bytearray(ax_buf), dtype=torch.int32).reshape(-1, 2)
+                ax_delivered = ax_raw[:full_turns, team].clone()
+
             round_targets = _critic_winloss_targets(
                 full_turns,
                 base_value=base_value,
                 ti_delivered=ti_delivered,
+                ax_delivered=ax_delivered,
             )
             step_targets = round_targets.index_select(0, step_rounds.to(torch.long))
             entry = {

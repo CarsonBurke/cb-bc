@@ -67,7 +67,7 @@ from model import (
     HARVESTER_BUILD_TYPE,
     H_DIM,
     OBS_SIZE,
-    REWARD_BUILD_CREDIT,
+    REWARD_INCOME_SCALE,
     TILE_FEATURES,
     TEACHER_HIDDEN,
     get_centralized_critic,
@@ -86,6 +86,7 @@ from model import (
     TERMINAL_WIN_REWARD,
     TERMINAL_LOSS_REWARD,
     REWARD_MODE,
+    REWARD_FLOW_SCALE,
     RewardMode,
     BRIDGE_BUILD_TYPE,
     N_BRIDGE_TARGETS,
@@ -849,14 +850,14 @@ def collect_games_batched(
             per_opp_winners.setdefault(oid, []).append(None)
             continue
         game_trajs = _read_trajectory_file(log_path)
-        # Inject replay-derived titanium income as per-step reward (training only)
-        if gstates:
-            try:
-                from flow_reward import compute_dense_flow_rewards, augment_trajectories_with_flow_rewards
-                flow_rewards = compute_dense_flow_rewards(gstates)
-                game_trajs = augment_trajectories_with_flow_rewards(game_trajs, flow_rewards)
-            except Exception as e:
-                print(f"  Flow reward augmentation error: {e}")
+        # Inject replay-derived resource reward as per-step reward (training only)
+        if gstates and REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW):
+            from flow_reward import compute_dense_delivery_rewards, compute_dense_flow_rewards, augment_trajectories_with_flow_rewards
+            if REWARD_MODE == RewardMode.INCOME:
+                rewards = compute_dense_delivery_rewards(gstates)
+            else:
+                rewards = compute_dense_flow_rewards(gstates)
+            game_trajs = augment_trajectories_with_flow_rewards(game_trajs, rewards)
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -882,7 +883,8 @@ def collect_games_batched(
         if gs is None:
             continue
         for key, buf_key in [("states_path", "states_buf"), ("scalars_path", "scalars_buf"),
-                             ("transfer_events_path", "transfer_events_buf"), ("ti_delivered_path", "ti_delivered_buf")]:
+                             ("transfer_events_path", "transfer_events_buf"), ("ti_delivered_path", "ti_delivered_buf"),
+                             ("ax_delivered_path", "ax_delivered_buf")]:
             if gs.get(buf_key) is None and gs.get(key):
                 try:
                     gs[buf_key] = Path(gs[key]).read_bytes()
@@ -914,12 +916,13 @@ def _step_round_index(step) -> int | None:
 
 
 def _step_build_reward(step) -> float:
+    _credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
     if isinstance(step, (list, tuple)):
         n = len(step)
         if n > 12:
-            return float(step[7] if n > 7 else 0.0) * REWARD_BUILD_CREDIT
-        return float(step[6] if n > 6 else 0.0) * REWARD_BUILD_CREDIT
-    return float(step.get("n_working", 0.0)) * REWARD_BUILD_CREDIT
+            return float(step[7] if n > 7 else 0.0) * _credit
+        return float(step[6] if n > 6 else 0.0) * _credit
+    return float(step.get("n_working", 0.0)) * _credit
 
 
 def _shared_flow_reward_total(game_trajs: list[list]) -> float:
@@ -941,7 +944,7 @@ def main():
     parser.add_argument("--opponents", type=int, default=3)
     parser.add_argument("--games-per-opp", type=int, default=2)
     parser.add_argument("--dummy-episodes", type=int, default=0, help="Use only scripted dummy opponents for the first N episodes")
-    parser.add_argument("--league-size", type=int, default=20)
+    parser.add_argument("--league-size", type=int, default=6)
     parser.add_argument("--checkpoint-every", type=int, default=1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=0, help="Critic learning rate (default: same as --lr)")
@@ -1190,7 +1193,8 @@ def main():
                     conv_fail = s.get("conv_fail", 0)
                     conv_gate = s.get("conv_gate", 0)
                     conv_paid = s.get("conv_paid", 0)
-                r_work += n_working * REWARD_BUILD_CREDIT
+                _credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
+                r_work += n_working * _credit
                 harv_attempts += harv_attempt
                 harv_failures += harv_fail
                 harv_prox_gate += harv_gate
@@ -1259,6 +1263,8 @@ def main():
             "approx_kl": round(stats.get("approx_kl", 0), 6),
             "clip_frac": round(stats.get("clip_frac", 0), 4),
             "explained_var": stats.get("explained_var", 0),
+            "actor_grad_norm": round(stats.get("actor_grad_norm", 0), 4),
+            "critic_grad_norm": round(stats.get("critic_grad_norm", 0), 4),
             "ls_bt_mean": round(stats.get("ls_bt_mean", 0), 4),
             "ls_bd_mean": round(stats.get("ls_bd_mean", 0), 4),
             "ls_cd_mean": round(stats.get("ls_cd_mean", 0), 4),

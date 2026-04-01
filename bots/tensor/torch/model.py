@@ -40,16 +40,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # ---- Architecture constants (must match main.py) ----
 
-TILE_FEATURES = 19
+TILE_FEATURES = 21
 GLOBAL_FEATURES = 15
 POS_EMBED_DIM = 8
 OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN = [64, 48]
+HIDDEN = [64, 64]
 TEACHER_HIDDEN = [128, 128, 128, 64]
 H_DIM = 24
 INPUT_SIZE = OBS_SIZE + H_DIM
 TILE_EMBED_DIM = 8
-TILE_INPUT_DIM = TILE_FEATURES + 2  # 21: raw features + (dx/2, dy/2)
+TILE_INPUT_DIM = TILE_FEATURES + 2  # 23: raw features + (dx/2, dy/2)
 TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
 COMPRESS_DIM = 80  # tile compress output dim (spatial pooling)
 TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 119
@@ -70,34 +70,36 @@ EPS_MAX = 0.50   # max exploration ratio per head
 # Init raw eps so sigmoid(raw) ≈ EPS_MIN at start.
 _EPS_INIT_BIAS = -4.6
 INITIAL_BUILD_TYPE_BIAS = [
-    0.0,   # none
-    0.8,   # harvester
+    -2.0,  # none
+    1.1,   # harvester
     1.0,   # conveyor
     0.0,   # road
-    -0.4,  # gunner
-    -0.4,  # sentinel
-    -0.6,  # breach
+    -2.0,  # gunner
+    -2.0,  # sentinel
+    -2.0,  # breach
     0.7,   # splitter
-    0.0,   # armoured_conveyor
-    -0.3,  # barrier
-    -0.7,  # foundry
-    -0.5,  # launcher
+    -2.0,  # armoured_conveyor
+    -2.0,  # barrier
+    -2.0,  # foundry
+    -2.0,  # launcher
     -0.5,  # bridge
 ]
 class RewardMode(Enum):
     OUTCOME = "outcome"   # terminal win/loss only
-    INCOME = "income"     # titanium delivered per round
+    INCOME = "income"     # resource delivered to core per round
+    FLOW = "flow"         # weighted conveyor hops toward core per round
 
-REWARD_MODE = RewardMode.INCOME
-REWARD_BUILD_CREDIT = 0.01  # scale for titanium income reward (income mode)
+REWARD_MODE = RewardMode.FLOW
+REWARD_INCOME_SCALE = 0.01  # scale for titanium income reward (income mode)
+REWARD_FLOW_SCALE = 1.0    # scale for flow reward (flow mode)
 TERMINAL_WIN_REWARD = 10.0
 TERMINAL_LOSS_REWARD = -10.0
-GAMMA = 0.995 # GAE
-LAMBDA = 0.9 # GAE
+GAMMA = 0.99 # GAE
+LAMBDA = 0.95 # GAE
 
 # ---- Dreamer4-style symexp two-hot value prediction ----
 NUM_BUCKETS = 255
-# symlog range, ~420 in raw
+# symlog range — covers symexp(-3)≈±19.1, tight around [-10,+10] returns
 BUCKET_LOW = -6
 BUCKET_HIGH = 6
 
@@ -279,7 +281,7 @@ _MASK_BD_DY = [-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
 _CONV_DIR_MASK = [True, True, True, True]  # all 4 cardinal dirs always valid
 
 # Observation feature indices for resources/scale
-_OBS_GLOBAL_START = 5 * 5 * TILE_FEATURES  # 475
+_OBS_GLOBAL_START = 5 * 5 * TILE_FEATURES  # 525
 _OBS_TI = _OBS_GLOBAL_START + 3
 _OBS_AX = _OBS_GLOBAL_START + 4
 _OBS_SCALE = _OBS_GLOBAL_START + 5
@@ -296,9 +298,9 @@ def _mask_indices(device: torch.device):
             torch.tensor(_MASK_COSTS_AX, dtype=torch.float32, device=device),
             torch.tensor([t * TILE_FEATURES for t in _MASK_BD_TILES], dtype=torch.long, device=device),      # is_wall
             torch.tensor([t * TILE_FEATURES + 4 for t in _MASK_BD_TILES], dtype=torch.long, device=device),  # bld_none (no building)
-            torch.tensor([t * TILE_FEATURES + 17 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # has_unit
-            torch.tensor([t * TILE_FEATURES + 12 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # bld_friendly
-            torch.tensor([t * TILE_FEATURES + 11 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # bld_core
+            torch.tensor([t * TILE_FEATURES + 19 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # has_unit
+            torch.tensor([t * TILE_FEATURES + 14 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # bld_friendly
+            torch.tensor([t * TILE_FEATURES + 13 for t in _MASK_BD_TILES], dtype=torch.long, device=device), # bld_core
         )
     return _mask_idx_cache[device]
 
@@ -358,13 +360,12 @@ def _harv_mask_indices(device: torch.device):
 def compute_harvester_build_dir_mask(obs: torch.Tensor, bd_mask: torch.Tensor) -> torch.Tensor:
     """Harvester-specific direction mask.
 
-    Harvester placement is only legal on empty ore tiles.
+    Harvester placement is legal on ore tiles that are empty or have a friendly replaceable building.
+    bd_mask already filters for empty-or-replaceable, so we just need ore_here.
     """
-    _, _, _, nobld_idx, _, _, _ = _mask_indices(obs.device)
     ore_ti_idx, ore_ax_idx = _harv_mask_indices(obs.device)
     ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
-    empty = obs[:, nobld_idx] == 1.0
-    return bd_mask & ore_here & empty
+    return bd_mask & ore_here
 
 
 _conv_dir_mask_cache: dict = {}
@@ -473,11 +474,11 @@ class RMSNorm(nn.Module):
 # ---- Centralized Critic constants ----
 GLOBAL_MAP_MAX_W = 50
 GLOBAL_MAP_MAX_H = 50
-GLOBAL_MAP_CHANNELS = 19
+GLOBAL_MAP_CHANNELS = 21
 GLOBAL_SCALAR_DIM = 17  # 12 base + own_working_harv, Δti, Δax, Δcore_hp, Δworking_harv
 UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
 CENTRALIZED_CNN_CHUNK = 4096  # Larger chunks amortize critic launch/bookkeeping overhead.
-DEFAULT_CRITIC_MINIBATCH_SIZE = 8192
+DEFAULT_CRITIC_MINIBATCH_SIZE = 4096
 CRITIC_SUMMARY_DIM = 64
 CRITIC_STAGE_A_DIM = 64
 CRITIC_STAGE_B_DIM = 96
@@ -586,13 +587,10 @@ class CentralizedCritic(nn.Module):
         # Outputs NUM_BUCKETS logits for Dreamer4-style symexp two-hot prediction.
         unit_in = conv_dim + UNIT_CONTEXT_DIM + GLOBAL_SCALAR_DIM + ACTOR_LATENT_DIM
         self.unit_head = nn.Sequential(
-            nn.Linear(unit_in, 128),
-            RMSNorm(128),
+            nn.Linear(unit_in, unit_in),
+            RMSNorm(unit_in),
             nn.SiLU(),
-            nn.Linear(128, 64),
-            RMSNorm(64),
-            nn.SiLU(),
-            nn.Linear(64, NUM_BUCKETS),
+            nn.Linear(unit_in, NUM_BUCKETS),
         )
 
         # Dreamer4-style symexp-spaced bins in original value space.
@@ -616,7 +614,7 @@ class CentralizedCritic(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         # Dreamer4's create_mlp leaves the value head MLP on nn.Linear defaults.
-        for layer in (self.unit_head[0], self.unit_head[3], self.unit_head[6]):
+        for layer in (self.unit_head[0], self.unit_head[3]):
             layer.reset_parameters()
 
     def encode_map(
@@ -984,7 +982,7 @@ def sample_logits_gumbel(
     actions = (scaled + gumbel).argmax(dim=-1)
     if not return_log_prob:
         return actions, None
-    chosen = scaled.gather(1, actions.unsqueeze(1)).squeeze(1) - torch.logsumexp(scaled, dim=-1)
+    chosen = scaled.gather(1, actions.unsqueeze(1)).squeeze(1)
     return actions, chosen
 
 
@@ -1141,7 +1139,7 @@ class GraphedInference:
                         | (s_bt_act == CONVEYOR_BUILD_TYPES[2])
                     ).float()
                     brt_causal = (s_bt_act == BRIDGE_BUILD_TYPE).float()
-                    s_lp = s_bt_lp + s_bd_lp * bd_causal + s_cd_lp * cd_causal + s_md_lp
+                    s_lp = s_bt_lp + s_bd_lp * bd_causal + s_cd_lp * cd_causal + s_brt_lp * brt_causal + s_md_lp
 
         self._s_bt_act = s_bt_act
         self._s_bd_act = s_bd_act
@@ -1195,7 +1193,7 @@ class GraphedInference:
             bd_causal = (bt_act != 0).float()
             cd_causal = ((bt_act == CONVEYOR_BUILD_TYPES[0]) | (bt_act == CONVEYOR_BUILD_TYPES[1]) | (bt_act == CONVEYOR_BUILD_TYPES[2])).float()
             brt_causal = (bt_act == BRIDGE_BUILD_TYPE).float()
-            lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
+            lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
         return bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next
 
     @property
@@ -1217,6 +1215,7 @@ class BuilderMLP(nn.Module):
         super().__init__()
         hidden = hidden or HIDDEN
         self._hidden = hidden
+        head_dim = hidden[-1]
 
         # Per-tile linear encoder
         self.tile_linear = _ortho_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM))
@@ -1263,14 +1262,14 @@ class BuilderMLP(nn.Module):
         self.actor_trunk = nn.Sequential(*actor_layers)
 
         # Policy heads: small std for near-uniform initial policy
-        self.head_build_type = _ortho_init(nn.Linear(prev, N_BUILD), std=0.01)
-        self.head_build_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
-        self.head_conv_dir = _ortho_init(nn.Linear(prev, N_CONV_DIR), std=0.01)
-        self.head_bridge_target = _ortho_init(nn.Linear(prev, N_BRIDGE_TARGETS), std=0.01)
-        self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
-        self.head_logit_scale = _ortho_init(nn.Linear(prev, N_LOGIT_SCALE), std=0.01)
-        self.head_h_gate = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wz: update gate
-        self.head_h_cand = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wh: candidate
+        self.head_build_type = _ortho_init(nn.Linear(head_dim, N_BUILD), std=0.01)
+        self.head_build_dir = _ortho_init(nn.Linear(head_dim, N_DIR), std=0.01)
+        self.head_conv_dir = _ortho_init(nn.Linear(head_dim, N_CONV_DIR), std=0.01)
+        self.head_bridge_target = _ortho_init(nn.Linear(head_dim, N_BRIDGE_TARGETS), std=0.01)
+        self.head_move_dir = _ortho_init(nn.Linear(head_dim, N_DIR), std=0.01)
+        self.head_logit_scale = _ortho_init(nn.Linear(head_dim, N_LOGIT_SCALE), std=0.01)
+        self.head_h_gate = _ortho_init(nn.Linear(head_dim, H_DIM), std=0.01)  # Wz: update gate
+        self.head_h_cand = _ortho_init(nn.Linear(head_dim, H_DIM), std=0.01)  # Wh: candidate
 
         # Init eps head bias so sigmoid(raw) ≈ EPS_MIN at start.
         with torch.no_grad():
@@ -1338,7 +1337,7 @@ class BuilderMLP(nn.Module):
         return self._forward_from_hidden(h)
 
     def actor_latent(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        """Return the pre-head actor latent used for policy logits."""
+        """Return the actor trunk latent used for policy logits."""
         obs_pre = self._obs_encoder_pre(x)
         return self._latent_from_obs_pre(obs_pre, h_prev)
 
@@ -1387,6 +1386,7 @@ class BuilderMLP(nn.Module):
         # Per-head learned eps: sigmoid → [EPS_MIN, EPS_MAX]
         # eps_raw is (B, 5) — one per head: bt, bd, cd, brt, md
         eps = torch.sigmoid(eps_raw) * (EPS_MAX - EPS_MIN) + EPS_MIN
+        h_cand = torch.tanh(h_cand)
         return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand
 
     def _forward_from_hidden(self, h: torch.Tensor):
@@ -1714,7 +1714,8 @@ def _recurrent_logprob_pass(
         cd_lp = _unimix_logits(cd_l, cd_mask, eps[:, 2]).gather(1, cd_act[:, t].unsqueeze(1)).squeeze(1)
         brt_lp = _unimix_logits(brt_l, eps=eps[:, 3]).gather(1, brt_act[:, t].unsqueeze(1)).squeeze(1)
         md_lp = _unimix_logits(md_l, eps=eps[:, 4]).gather(1, md_act[:, t].unsqueeze(1)).squeeze(1)
-        log_probs[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
+        brt_causal = (bt_act[:, t] == BRIDGE_BUILD_TYPE).float()
+        log_probs[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + brt_lp * brt_causal + md_lp
 
     return log_probs
 
@@ -1758,8 +1759,8 @@ def _recurrent_actor_pass(
         md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[:, t], eps=eps[:, 4])
         brt_causal = (bt_act[:, t] == BRIDGE_BUILD_TYPE).float()
 
-        new_lps[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
-        entropies[:, t] = bt_ent + bd_ent * bd_causal[:, t] + cd_ent * cd_causal[:, t] + md_ent
+        new_lps[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + brt_lp * brt_causal + md_lp
+        entropies[:, t] = bt_ent + bd_ent * bd_causal[:, t] + cd_ent * cd_causal[:, t] + brt_ent * brt_causal + md_ent
         all_eps[:, t] = eps
 
     return new_lps, entropies, all_eps
@@ -1869,7 +1870,7 @@ def ppo_update(
     entropy_coeff: float = 0.01,
     max_grad_norm: float = 0.5,
     target_kl: float | None = None,
-    clip_vloss: bool = True,
+    clip_vloss: bool = False,
     value_clip: float = 0.4,
     profile: dict[str, float] | None = None,
     bptt_chunks: list[tuple[int, int]] | None = None,
@@ -1883,6 +1884,7 @@ def ppo_update(
     N = obs.shape[0]
     sum_pi, sum_vf, sum_ent = 0.0, 0.0, 0.0
     sum_kl, sum_clip_frac = 0.0, 0.0
+    sum_actor_gn, sum_critic_gn = 0.0, 0.0
     sum_eps = torch.zeros(N_LOGIT_SCALE, device=obs.device)
     sum_eps_sq = torch.zeros(N_LOGIT_SCALE, device=obs.device)
     n_eps = 0
@@ -1937,7 +1939,7 @@ def ppo_update(
             tail_perm = tail_perm[all_chunk_lens[tail_perm].argsort(descending=True, stable=True)]
 
         def _run_actor_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
-            nonlocal approx_kl_acc, n_mb, sum_kl, sum_clip_frac, sum_pi, sum_ent, n_updates, sum_eps, sum_eps_sq, n_eps
+            nonlocal approx_kl_acc, n_mb, sum_kl, sum_clip_frac, sum_pi, sum_ent, sum_actor_gn, n_updates, sum_eps, sum_eps_sq, n_eps
             for cb_start in range(0, chunk_ids.shape[0], B_chunk):
                 batch_ids = chunk_ids[cb_start:cb_start + B_chunk]
                 B = batch_ids.shape[0]
@@ -2015,11 +2017,12 @@ def ppo_update(
                 optimizer.zero_grad(set_to_none=True)
                 actor_loss = pi_loss - entropy_coeff * ent_loss
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                actor_gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
 
                 sum_pi += pi_loss.item()
                 sum_ent += ent_loss.item()
+                sum_actor_gn += actor_gn.item()
                 n_updates += 1
 
                 with torch.no_grad():
@@ -2100,10 +2103,11 @@ def ppo_update(
                     )
                 (vf_coeff * loss_sum / vf_denom).backward()
 
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
+                critic_gn = torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
                 critic_opt.step()
 
                 sum_vf += (vf_loss_sum / vf_denom).item()
+                sum_critic_gn += critic_gn.item()
                 n_critic_updates += 1
 
                 if profile is not None:
@@ -2123,6 +2127,8 @@ def ppo_update(
         "approx_kl": sum_kl / max(n_updates, 1),
         "clip_frac": sum_clip_frac / max(n_updates, 1),
         "explained_var": round(ev, 4),
+        "actor_grad_norm": sum_actor_gn / max(n_updates, 1),
+        "critic_grad_norm": sum_critic_gn / max(n_critic_updates, 1),
         "n_updates": n_updates,
         "ls_bt_mean": mean_eps[0].item(),
         "ls_bd_mean": mean_eps[1].item(),
@@ -2271,13 +2277,15 @@ def _parse_trajectories(
                         dmg = step.get("dmg", 0)
                         own_dmg = step.get("own_dmg", 0)
                         lp_t[i] = step.get("old_lp", 0)
-                    rw_t[i] = n_working * REWARD_BUILD_CREDIT if REWARD_MODE == RewardMode.INCOME else 0.0
+                    _credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
+                    rw_t[i] = n_working * _credit if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW) else 0.0
                 step_game_t[start:end] = game_idx
                 idx = end
                 ep_boundaries.append((start, end))
                 continue
 
-            rw_t[start:end] = n_working_t * REWARD_BUILD_CREDIT if REWARD_MODE == RewardMode.INCOME else 0.0
+            _credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
+            rw_t[start:end] = n_working_t * _credit if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW) else 0.0
             step_game_t[start:end] = game_idx
             idx = end
             ep_boundaries.append((start, end))
@@ -2926,8 +2934,8 @@ def distill(
     # Get teacher logits (no grad needed)
     t_bt, t_bd, t_cd, t_md = [], [], [], []
     with torch.no_grad():
-        for i in range(0, N, 8192):
-            packed = torch.cat([obs[i:i + 8192], h[i:i + 8192]], dim=-1)
+        for i in range(0, N, 4096):
+            packed = torch.cat([obs[i:i + 4096], h[i:i + 4096]], dim=-1)
             bt_l, bd_l, cd_l, _brt_l, md_l, _eps, _ = teacher.infer_packed(packed)
             t_bt.append(bt_l)
             t_bd.append(bd_l)

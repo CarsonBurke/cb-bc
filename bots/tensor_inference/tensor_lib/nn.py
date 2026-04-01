@@ -222,6 +222,7 @@ class MLP:
 
     __slots__ = (
         "trunk", "heads", "_infer_cache",
+        "head_projection",
         "tile_encoder", "tile_grid_n", "tile_raw_features", "tile_embed_dim", "_tile_dxdy",
         "tile_conv_w", "tile_conv_b", "tile_pointwise", "tile_post_rms",
         "tile_compress", "tile_compress_size",
@@ -232,6 +233,7 @@ class MLP:
         input_size: int,
         hidden_sizes: list[int],
         output_heads: dict[str, int],
+        head_input_size: int | None = None,
         activation: str = "relu",
         use_layernorm: bool = False,
         rmsnorm_layers: list[bool] | tuple[bool, ...] | None = None,
@@ -265,6 +267,11 @@ class MLP:
                 layers.append(Dropout(dropout))
             prev = h
         self.trunk = Sequential(*layers)
+        if head_input_size is not None and head_input_size != prev:
+            self.head_projection = Linear(prev, head_input_size)
+            prev = head_input_size
+        else:
+            self.head_projection = None
 
         self.heads: dict[str, Linear] = {}
         for name, size in output_heads.items():
@@ -313,6 +320,8 @@ class MLP:
 
     def __call__(self, x: Tensor) -> dict[str, Tensor]:
         h = self.trunk(x)
+        if self.head_projection is not None:
+            h = self.head_projection(h)
         return {name: head(h) for name, head in self.heads.items()}
 
     def parameters(self) -> list[Tensor]:
@@ -329,6 +338,8 @@ class MLP:
         if self.tile_compress is not None:
             params.extend(self.tile_compress.parameters())
         params.extend(self.trunk.parameters())
+        if self.head_projection is not None:
+            params.extend(self.head_projection.parameters())
         for head in self.heads.values():
             params.extend(head.parameters())
         return params
@@ -396,6 +407,13 @@ class MLP:
             elif isinstance(layer, Sigmoid):
                 ops.append(('sigmoid',))
             i += 1
+
+        if self.head_projection is not None:
+            w = self.head_projection.weight.data
+            N = self.head_projection.out_features
+            w_rows = [w[j::N] for j in range(N)]
+            b = list(self.head_projection.bias.data) if self.head_projection.bias is not None else None
+            ops.append(('linear', None, w_rows, b, N))
 
         # Fuse all output heads into one cached linear pass, then slice back into
         # per-head outputs. This keeps the public infer() API unchanged while
@@ -707,7 +725,10 @@ class MLP:
 
         results: dict[str, list[float]] = {}
         for name, (start, end) in zip(head_names, head_slices):
-            results[name] = fused_out[start:end]
+            values = fused_out[start:end]
+            if name == "h_cand":
+                values = [math.tanh(x) for x in values]
+            results[name] = values
         # Pop eps head — unimix doesn't change argmax ranking.
         results.pop("logit_scale", None)
         return results

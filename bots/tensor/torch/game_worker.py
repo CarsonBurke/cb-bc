@@ -48,6 +48,10 @@ def _run_game_proxy(args, result_path: str):
             base.with_suffix(".ti_delivered.bin"),
             rd.titanium_delivered_bytes,
         )
+        ax_delivered_path = _write_bytes(
+            base.with_suffix(".ax_delivered.bin"),
+            rd.axionite_delivered_bytes,
+        )
         # Extract team A core position from round 0 state grid
         # Channel 11 = core presence (both teams), channel 12 = team sign (+1 friendly)
         core_x, core_y = 0, 0
@@ -76,6 +80,7 @@ def _run_game_proxy(args, result_path: str):
             "scalars_path": scalars_path,
             "transfer_events_path": transfers_path,
             "ti_delivered_path": ti_delivered_path,
+            "ax_delivered_path": ax_delivered_path,
             "state_stride": rd.state_stride,
             "map_w": rd.map_w,
             "map_h": rd.map_h,

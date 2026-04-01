@@ -41,6 +41,7 @@ from model import (
     N_BUILD,
     N_CONV_DIR,
     N_DIR,
+    OBS_SIZE,
     compute_action_masks,
     compute_build_dir_mask_for_type,
     compute_harvester_build_dir_mask,
@@ -110,11 +111,11 @@ def _materialize_group_prep_tensors(group: dict, games: list[dict]) -> tuple[tor
     n_samples = int(group["n_samples"])
     if n_samples == 0:
         return (
-            _empty_staging_tensor((0, 498), torch.float16),
+            _empty_staging_tensor((0, OBS_SIZE), torch.float16),
             _empty_staging_tensor((0,), torch.long),
         )
 
-    obs = _empty_staging_tensor((n_samples, 498), torch.float16)
+    obs = _empty_staging_tensor((n_samples, OBS_SIZE), torch.float16)
     prep_slots = _empty_staging_tensor((n_samples,), torch.long)
     cursor = 0
     for seg_idx, local_game_idx in enumerate(group["segment_local_game_indices"]):
@@ -155,7 +156,7 @@ def _materialize_group_training_tensors(
 
     n_samples = int(group["n_samples"])
     if n_samples == 0:
-        empty_obs = _empty_staging_tensor((0, 498), torch.float16)
+        empty_obs = _empty_staging_tensor((0, OBS_SIZE), torch.float16)
         empty_act = _empty_staging_tensor((0, 5), torch.int16)
         empty_prep_slots = _empty_staging_tensor((0,), torch.long)
         empty_slots = _empty_staging_tensor((0,), torch.long)
@@ -171,7 +172,7 @@ def _materialize_group_training_tensors(
         group["harv_bd_mask"] = empty_harv_bd_mask
         return empty_obs, empty_act, empty_prep_slots, empty_slots, empty_bt_mask, empty_bd_mask, empty_harv_bd_mask
 
-    obs = _empty_staging_tensor((n_samples, 498), torch.float16)
+    obs = _empty_staging_tensor((n_samples, OBS_SIZE), torch.float16)
     act = _empty_staging_tensor((n_samples, 5), torch.int16)
     prep_slots = _empty_staging_tensor((n_samples,), torch.long)
     train_slots = _empty_staging_tensor((n_samples,), torch.long)
@@ -254,7 +255,7 @@ def _materialize_training_batch(
         h_live = torch.cat([group["h0"] for group in batch_groups], dim=0)
 
         total_obs = obs_cursor
-        batch_obs = _empty_staging_tensor((total_obs, 498), torch.float16)
+        batch_obs = _empty_staging_tensor((total_obs, OBS_SIZE), torch.float16)
         batch_act = _empty_staging_tensor((total_obs, 5), torch.int16)
         batch_train_slots = _empty_staging_tensor((total_obs,), torch.long)
         batch_bt_mask = _empty_staging_tensor((total_obs, N_BUILD), torch.bool)
@@ -314,7 +315,7 @@ def _materialize_training_batch(
         step_offsets.append(total_obs)
         total_obs += step_size
 
-    batch_obs = _empty_staging_tensor((total_obs, 498), torch.float16)
+    batch_obs = _empty_staging_tensor((total_obs, OBS_SIZE), torch.float16)
     batch_act = _empty_staging_tensor((total_obs, 5), torch.int16)
     batch_train_slots = _empty_staging_tensor((total_obs,), torch.long)
     batch_bt_mask = _empty_staging_tensor((total_obs, N_BUILD), torch.bool)
@@ -522,6 +523,7 @@ def _forward_from_obs_pre_step_fused(
         dim=-1,
     )
     z = torch.sigmoid(h_gate)
+    h_cand = torch.tanh(h_cand)
     h_next = (1.0 - z) * h_prev + z * h_cand
     return bt_l, bd_l, cd_l, brt_l, md_l, h_next
 
@@ -537,6 +539,7 @@ def _hidden_update_from_obs_pre_step_fused(
     h = model._latent_from_obs_pre(obs_pre, h_prev)
     h_gate, h_cand = F.linear(h, combined_w, combined_b).split([H_DIM, H_DIM], dim=-1)
     z = torch.sigmoid(h_gate)
+    h_cand = torch.tanh(h_cand)
     return (1.0 - z) * h_prev + z * h_cand
 
 
@@ -1149,7 +1152,7 @@ def train_actor_bc(
                         return
 
                     (chunk_nll / chunk_samples).backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    _bc_grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     optimizer.step()
                     train_model.mu_center_policy_heads()
                     n_optimizer_steps += 1
@@ -1173,6 +1176,7 @@ def train_actor_bc(
                             "loss_cd": round((chunk_nll_cd.detach() / denom).item(), 6),
                             "loss_brt": round((chunk_nll_brt.detach() / denom).item(), 6),
                             "loss_md": round((chunk_nll_md.detach() / denom).item(), 6),
+                            "grad_norm": round(_bc_grad_norm.item(), 4),
                             "elapsed": round(time.time() - t0, 1),
                             "n_samples": total_samples,
                         }
