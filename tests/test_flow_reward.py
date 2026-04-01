@@ -13,9 +13,13 @@ REPLAY_PARSER_PYTHON = PROJECT_ROOT / "packages" / "replay_parser" / "python"
 sys.path.insert(0, str(TORCH_DIR))
 sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 
-from flow_reward import compute_dense_flow_rewards, augment_trajectories_with_flow_rewards
+from flow_reward import (
+    compute_dense_flow_rewards, compute_dense_delivery_rewards,
+    augment_trajectories_with_flow_rewards, AX_CONVERSION_RATE,
+    _TILE_FEATURES, _OBS_GLOBAL_START,
+)
 
-OBS_SIZE = 5 * 5 * 19 + 15 + 8
+OBS_SIZE = 5 * 5 * _TILE_FEATURES + 17 + 8  # fallback
 try:
     from model import _compute_gae, _parse_trajectories, OBS_SIZE as MODEL_OBS_SIZE, REWARD_BUILD_CREDIT
     from train_batched import _shared_flow_reward_total
@@ -25,34 +29,81 @@ except ImportError:
     HAS_TORCH = False
 
 
-def _pack_pairs(pairs: list[tuple[float, float]]) -> bytes:
+def _pack_float_pairs(pairs: list[tuple[float, float]]) -> bytes:
     return b"".join(struct.pack("<ff", a, b) for a, b in pairs)
+
+
+def _pack_int_pairs(pairs: list[tuple[int, int]]) -> bytes:
+    return b"".join(struct.pack("<ii", a, b) for a, b in pairs)
 
 
 def _make_step(round_num: int, n_working: float = 0.0) -> list:
     obs = [0.0] * OBS_SIZE
-    obs[475] = round_num / 2000.0
+    obs[_OBS_GLOBAL_START] = round_num / 2000.0
     return [obs, [0.0] * 24, 0, 0, 0, 0, 0.0, n_working, 0, 0, 0, 0, 0]
+
+
+def _zero_delivery_bufs(n: int) -> dict:
+    """Helper: zero ti/ax delivered buffers for n turns."""
+    z = _pack_int_pairs([(0, 0)] * n)
+    return {"ti_delivered_buf": z, "ax_delivered_buf": z}
 
 
 class TestComputeDenseFlowRewards:
     def test_empty_buffer(self):
         assert compute_dense_flow_rewards({}) == {}
-        assert compute_dense_flow_rewards({"n_turns": 10}) == {}
+        # n_turns > 0 but no transfer_events → raises
+        with pytest.raises(ValueError, match="transfer_events"):
+            compute_dense_flow_rewards({"n_turns": 10})
 
     def test_decodes_team_a_rewards(self):
         gs = {
-            "transfer_events_buf": _pack_pairs([(0.0, 1.0), (2.5, 3.0), (0.0, 0.0)]),
+            "transfer_events_buf": _pack_float_pairs([(0.0, 1.0), (2.5, 3.0), (0.0, 0.0)]),
             "n_turns": 3,
+            **_zero_delivery_bufs(3),
         }
         assert compute_dense_flow_rewards(gs) == {1: 2.5}
 
     def test_decodes_team_b_rewards(self):
         gs = {
-            "transfer_events_buf": _pack_pairs([(0.0, 1.0), (2.5, 3.0), (0.0, 0.5)]),
+            "transfer_events_buf": _pack_float_pairs([(0.0, 1.0), (2.5, 3.0), (0.0, 0.5)]),
             "n_turns": 3,
+            **_zero_delivery_bufs(3),
         }
         assert compute_dense_flow_rewards(gs, team=1) == {0: 1.0, 1: 3.0, 2: 0.5}
+
+    def test_includes_core_deliveries(self):
+        """Core deliveries add weight 1.0 per resource unit (ti + ax*4)."""
+        gs = {
+            "transfer_events_buf": _pack_float_pairs([(1.0, 0.0), (0.0, 0.0)]),
+            "ti_delivered_buf": _pack_int_pairs([(3, 0), (0, 0)]),
+            "ax_delivered_buf": _pack_int_pairs([(1, 0), (0, 0)]),
+            "n_turns": 2,
+        }
+        rewards = compute_dense_flow_rewards(gs, team=0)
+        # round 0: 1.0 (flow) + 3 (ti) + 1*4 (ax) = 8.0
+        assert rewards[0] == pytest.approx(8.0)
+        assert 1 not in rewards
+
+    def test_delivery_only_no_flow(self):
+        """Rounds with zero flow but nonzero delivery still get reward."""
+        gs = {
+            "transfer_events_buf": _pack_float_pairs([(0.0, 0.0)]),
+            "ti_delivered_buf": _pack_int_pairs([(5, 0)]),
+            "ax_delivered_buf": _pack_int_pairs([(0, 0)]),
+            "n_turns": 1,
+        }
+        rewards = compute_dense_flow_rewards(gs, team=0)
+        assert rewards[0] == pytest.approx(5.0)
+
+    def test_no_delivery_bufs_flow_only(self):
+        """Missing delivery buffers → only flow signal, no error."""
+        gs = {
+            "transfer_events_buf": _pack_float_pairs([(2.0, 0.0)]),
+            "n_turns": 1,
+        }
+        rewards = compute_dense_flow_rewards(gs, team=0)
+        assert rewards[0] == pytest.approx(2.0)
 
 
 class TestAugmentTrajectories:
@@ -72,7 +123,7 @@ class TestAugmentTrajectories:
 
     def test_short_format_uses_slot_6(self):
         obs = [0.0] * OBS_SIZE
-        obs[475] = 10 / 2000.0
+        obs[_OBS_GLOBAL_START] = 10 / 2000.0
         step = [obs, [0.0] * 24, 0, 0, 0, 0, 999.0, 0, 0, 0, 0, 0]
         traj = [[step]]
         augment_trajectories_with_flow_rewards(traj, {10: 4.0})
@@ -116,6 +167,8 @@ class TestIntegration:
         rd = ReplayData.from_file(replay_path, team=0)
         gs = {
             "transfer_events_buf": rd.resource_transfers_bytes,
+            "ti_delivered_buf": rd.titanium_delivered_bytes,
+            "ax_delivered_buf": rd.axionite_delivered_bytes,
             "n_turns": rd.n_turns,
         }
         rewards = compute_dense_flow_rewards(gs)

@@ -833,6 +833,7 @@ def collect_games_batched(
     traj_game_map = []  # maps each trajectory index -> game index (for global states)
     game_counter = 0
     game_origin = []  # game_counter -> original game index i
+    game_delivery_totals: dict[int, float] = {}  # game_counter -> total delivery reward
     per_opp_winners = {}
     for i, result in enumerate(results):
         oid = opp_ids[i]
@@ -860,6 +861,12 @@ def collect_games_batched(
             else:
                 rewards = compute_dense_flow_rewards(gstates)
             game_trajs = augment_trajectories_with_flow_rewards(game_trajs, rewards)
+            # Track delivery totals separately for logging
+            try:
+                delivery_rewards = compute_dense_delivery_rewards(gstates)
+                game_delivery_totals[game_counter] = sum(delivery_rewards.values())
+            except (ValueError, KeyError):
+                pass
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -1239,6 +1246,8 @@ def main():
         }
         n_games_logged = max(len(game_shared_work), 1)
         mean_r_work = sum(game_shared_work.values()) / n_games_logged
+        _delivery_credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
+        mean_r_delivery = sum(game_delivery_totals.values()) * _delivery_credit / n_games_logged
         mean_r_dmg = sum(r[2] for r in rewards) / n_trajs
         mean_r_own_dmg = sum(r[3] for r in rewards) / n_trajs
         mean_harv_attempts = sum(r[4] for r in rewards) / n_trajs
@@ -1256,7 +1265,8 @@ def main():
 
         ep_entry = {
             "episode": ep + 1, "reward": round(mean_reward, 4),
-            "r_work": round(mean_r_work, 4), "r_dmg": round(mean_r_dmg, 4),
+            "r_work": round(mean_r_work, 4), "r_delivery": round(mean_r_delivery, 4),
+            "r_dmg": round(mean_r_dmg, 4),
             "r_own_dmg": round(mean_r_own_dmg, 4),
             "harv_attempts": round(mean_harv_attempts, 3),
             "harv_failures": round(mean_harv_failures, 3),
