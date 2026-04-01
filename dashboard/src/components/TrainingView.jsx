@@ -380,6 +380,9 @@ const KLChart = makeSimpleChart('KL', 'approx_kl', '#fab387')
 const ClipChart = makeSimpleChart('Clip Frac', 'clip_frac', '#f9e2af')
 const ActorGradNormChart = makeSimpleChart('Actor Grad Norm', 'actor_grad_norm', '#94e2d5')
 const CriticGradNormChart = makeSimpleChart('Critic Grad Norm', 'critic_grad_norm', '#74c7ec')
+const CriticValueDeltaChart = makeSimpleChart('Critic Value Delta', 'critic_value_delta', '#f2cdcd')
+const RetOobFracChart = makeSimpleChart('Return OOB Frac', 'ret_oob_frac', '#f38ba8')
+const ActorLrChart = makeSimpleChart('Actor LR', 'actor_lr', '#89dceb')
 
 const LogitScaleChart = memo(function LogitScaleChart({ series }) {
   const episodes = useRangedEpisodes()
@@ -904,32 +907,46 @@ function EpisodeSelector() {
   )
 }
 
-// ---- BC pretrain components ----
-
-function BCStatusPanel() {
-  const episodes = useTrainEpisodes()
-  const config = useTrainConfig()
-  const loading = useTrainLoading()
-  const latest = episodes[episodes.length - 1]
-
-  if (loading && !episodes.length) {
-    return <p className="text-[13px] text-overlay0 py-4">Loading training data...</p>
-  }
-  if (!episodes.length) {
-    return <p className="text-[13px] text-overlay0 py-4">No BC pretrain log found.</p>
-  }
-
+const ReturnRangeChart = memo(function ReturnRangeChart() {
+  const episodes = useRangedEpisodes()
+  const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  if (episodes.length <= 1) return <NoData />
+  const dim = emaOn
+  const ds = downsample(episodes)
+  const series = [
+    { key: 'ret_min', label: 'Min', color: '#f38ba8' },
+    { key: 'ret_mean', label: 'Mean', color: '#a6e3a1' },
+    { key: 'ret_max', label: 'Max', color: '#89b4fa' },
+  ]
+  const datasets = series.flatMap(({ key, label, color }) => {
+    const raw = ds.map(e => e[key] ?? null)
+    const result = [{
+      label, data: raw, borderColor: dim ? color + '40' : color,
+      tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
+    }]
+    if (emaOn) result.push({
+      label: `${label} EMA`, data: ema(raw), borderColor: color,
+      borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
+    })
+    return result
+  })
+  const yViewport = bandsOn
+    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key])))
+    : null
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-      <Stat label="Optim Steps" value={latest?.optimizer_step?.toLocaleString() ?? '\u2014'} />
-      <Stat label="Loss" value={fmt(latest?.loss, 4)} />
-      <Stat label="Grad Norm" value={fmt(latest?.grad_norm, 3)} />
-      <Stat label="Samples" value={latest?.n_samples?.toLocaleString() ?? '\u2014'} />
-      <Stat label="Elapsed" value={latest ? `${latest.elapsed}s` : '\u2014'} />
-      {config.lr && <Stat label="LR" value={config.lr} />}
+    <div className="min-h-[200px]">
+      <Line
+        data={{ labels: ds.map(e => e.episode), datasets }}
+        options={{
+          ...chartBase(yViewport),
+          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+        }}
+      />
     </div>
   )
-}
+})
+
+// ---- Pretrain chart components ----
 
 const BCLossChart = makeSimpleChart('Loss', 'loss', '#f38ba8')
 const BCGradNormChart = makeSimpleChart('Grad Norm', 'grad_norm', '#94e2d5')
@@ -1012,63 +1029,6 @@ function BCLogTable() {
   )
 }
 
-const BC_CARDS = {
-  'bc-status':     { title: 'BC Pretrain Status', render: () => <BCStatusPanel /> },
-  'bc-loss':       { title: 'Loss',               hasEma: true, render: () => <BCLossChart /> },
-  'bc-head-loss':  { title: 'Per-Head Loss',      hasEma: true, render: () => <BCHeadLossChart /> },
-  'bc-grad-norm':  { title: 'Grad Norm',          hasEma: true, render: () => <BCGradNormChart /> },
-  'bc-log-table':  { title: 'Step Log',           defaultOpen: false, render: () => <BCLogTable /> },
-}
-
-const BC_DEFAULT_LAYOUT = {
-  nextId: 1,
-  root: { type: 'leaf', id: 'v0', cards: Object.keys(BC_CARDS) },
-}
-
-// ---- Critic pretrain components ----
-
-function CriticPretrainStatusPanel() {
-  const episodes = useTrainEpisodes()
-  const config = useTrainConfig()
-  const loading = useTrainLoading()
-  const latest = episodes[episodes.length - 1]
-
-  if (loading && !episodes.length) {
-    return <p className="text-[13px] text-overlay0 py-4">Loading training data...</p>
-  }
-  if (!episodes.length) {
-    return <p className="text-[13px] text-overlay0 py-4">No critic pretrain log found.</p>
-  }
-
-  return (
-    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-      <Stat label="Optim Steps" value={latest?.optimizer_step?.toLocaleString() ?? '\u2014'} />
-      <Stat label="Loss" value={fmt(latest?.value_loss ?? latest?.loss, 4)} />
-      <Stat label="Expl. Variance" value={fmt(latest?.explained_var, 3)} />
-      <Stat label="Grad Norm" value={fmt(latest?.grad_norm, 3)} />
-      <Stat label="Samples" value={latest?.n_samples?.toLocaleString() ?? '\u2014'} />
-      <Stat label="Elapsed" value={latest ? `${latest.elapsed}s` : '\u2014'} />
-      {config.lr && <Stat label="LR" value={config.lr} />}
-    </div>
-  )
-}
-
-const CriticLossChart = makeSimpleChart('Value Loss', 'value_loss', '#f38ba8', { altKey: 'loss' })
-const CriticPretrainGradNormChart = makeSimpleChart('Grad Norm', 'grad_norm', '#94e2d5')
-const CriticPretrainEVChart = makeSimpleChart('Explained Var', 'explained_var', '#a6e3a1', { fill: '#a6e3a120' })
-
-const CRITIC_CARDS = {
-  'critic-status':    { title: 'Critic Pretrain Status', render: () => <CriticPretrainStatusPanel /> },
-  'critic-loss':      { title: 'Value Loss',             hasEma: true, render: () => <CriticLossChart /> },
-  'critic-ev':        { title: 'Explained Variance',     hasEma: true, render: () => <CriticPretrainEVChart /> },
-  'critic-grad-norm': { title: 'Grad Norm',              hasEma: true, render: () => <CriticPretrainGradNormChart /> },
-}
-
-const CRITIC_DEFAULT_LAYOUT = {
-  nextId: 1,
-  root: { type: 'leaf', id: 'v0', cards: Object.keys(CRITIC_CARDS) },
-}
-
 // ---- Card registry (module-level, stable reference) ----
 
 const TRAINING_CARDS = {
@@ -1090,10 +1050,18 @@ const TRAINING_CARDS = {
   'train-clip':             { title: 'Clip Fraction',       defaultOpen: false, hasEma: true, render: () => <ClipChart /> },
   'train-actor-grad-norm':  { title: 'Actor Grad Norm',     defaultOpen: false, hasEma: true, render: () => <ActorGradNormChart /> },
   'train-critic-grad-norm': { title: 'Critic Grad Norm',    defaultOpen: false, hasEma: true, render: () => <CriticGradNormChart /> },
+  'train-critic-value-delta': { title: 'Critic Value Delta', defaultOpen: false, hasEma: true, render: () => <CriticValueDeltaChart /> },
+  'train-return-range':       { title: 'Return Range',        defaultOpen: false, hasEma: true, hasLegend: true, render: () => <ReturnRangeChart /> },
+  'train-ret-oob':            { title: 'Return OOB Frac',     defaultOpen: false, hasEma: true, render: () => <RetOobFracChart /> },
+  'train-actor-lr':           { title: 'Actor LR',            defaultOpen: false, hasEma: true, render: () => <ActorLrChart /> },
   'train-logit-scale-mean': { title: 'Logit Scale Mean',    defaultOpen: false, hasEma: true, render: () => <LogitScaleMeanChart /> },
   'train-logit-scale-std':  { title: 'Logit Scale Std',     defaultOpen: false, hasEma: true, render: () => <LogitScaleStdChart /> },
   'train-log-table':        { title: 'Episode Log',         defaultOpen: false, render: () => <EpisodeLogTable /> },
   'train-replays':          { title: 'Training Replays',    render: () => <TrainingReplaysContent /> },
+  'train-pretrain-loss':    { title: 'Pretrain Loss',       defaultOpen: false, hasEma: true, render: () => <BCLossChart /> },
+  'train-head-loss':        { title: 'Per-Head Loss',       defaultOpen: false, hasEma: true, render: () => <BCHeadLossChart /> },
+  'train-grad-norm':        { title: 'Grad Norm',           defaultOpen: false, hasEma: true, render: () => <BCGradNormChart /> },
+  'train-pretrain-log':     { title: 'Pretrain Step Log',   defaultOpen: false, render: () => <BCLogTable /> },
 }
 
 const DEFAULT_LAYOUT = {
@@ -1102,27 +1070,6 @@ const DEFAULT_LAYOUT = {
 }
 
 // ---- Main export ----
-
-function TrainingTiles() {
-  const config = useTrainConfig()
-  const mode = config.mode
-  const cards = mode === 'actor_bc' ? BC_CARDS
-    : mode === 'critic_pretrain' ? CRITIC_CARDS
-    : TRAINING_CARDS
-  const layout = mode === 'actor_bc' ? BC_DEFAULT_LAYOUT
-    : mode === 'critic_pretrain' ? CRITIC_DEFAULT_LAYOUT
-    : DEFAULT_LAYOUT
-  const storageKey = mode === 'actor_bc' ? 'bc-pretrain-tiles'
-    : mode === 'critic_pretrain' ? 'critic-pretrain-tiles'
-    : 'training-tiles'
-
-  return (
-    <>
-      <EpisodeSelector />
-      <TileLayout cards={cards} storageKey={storageKey} defaultLayout={layout} />
-    </>
-  )
-}
 
 export default function TrainingView() {
   const session = useAtomValue(trainSessionAtom)
@@ -1133,7 +1080,12 @@ export default function TrainingView() {
   return (
     <TrainingDataProvider session={session}>
       <SelectedEpisodeCtx.Provider value={ctx}>
-        <TrainingTiles />
+        <EpisodeSelector />
+        <TileLayout
+          cards={TRAINING_CARDS}
+          storageKey="training-tiles"
+          defaultLayout={DEFAULT_LAYOUT}
+        />
       </SelectedEpisodeCtx.Provider>
     </TrainingDataProvider>
   )
