@@ -473,7 +473,7 @@ class RMSNorm(nn.Module):
 # ---- Centralized Critic constants ----
 GLOBAL_MAP_MAX_W = 50
 GLOBAL_MAP_MAX_H = 50
-GLOBAL_MAP_CHANNELS = 21
+GLOBAL_MAP_CHANNELS = 23
 GLOBAL_SCALAR_DIM = 19  # 12 base + own_working_harv, Δti_collected, Δax_collected, Δcore_hp, Δworking_harv, flow_reward, delivery_reward
 UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
 CENTRALIZED_CNN_CHUNK = 4096  # Larger chunks amortize critic launch/bookkeeping overhead.
@@ -826,9 +826,13 @@ def _materialize_critic_inputs(centralized_data: dict) -> None:
             mask_cpu[i, 0, :mh, :mw] = 1.0
 
     cuda_cfg = _get_critic_cuda_config()
-    centralized_data["gpu_obs"] = obs_cpu.to(device=DEVICE, dtype=gpu_dtype)
-    centralized_data["gpu_mask"] = mask_cpu.to(device=DEVICE, dtype=gpu_dtype)
+    # Non-blocking H2D: obs and mask transfers overlap on the DMA engine
+    centralized_data["gpu_obs"] = obs_cpu.to(device=DEVICE, dtype=gpu_dtype, non_blocking=True)
+    centralized_data["gpu_mask"] = mask_cpu.to(device=DEVICE, dtype=gpu_dtype, non_blocking=True)
     if cuda_cfg.channels_last:
+        # synchronize before layout conversion (needs data to have landed)
+        if DEVICE.type == "cuda":
+            torch.cuda.synchronize()
         centralized_data["gpu_obs"] = centralized_data["gpu_obs"].contiguous(memory_format=torch.channels_last)
         centralized_data["gpu_mask"] = centralized_data["gpu_mask"].contiguous(memory_format=torch.channels_last)
     centralized_data["gpu_scalars"] = centralized_data["global_scalars"].to(device=DEVICE)
@@ -912,16 +916,15 @@ def _critic_round_batch_plan(
 
 
 def _resolve_critic_minibatch_size(
-    actor_minibatch_size: int,
+    n_steps: int,
     critic_minibatch_size: int | None,
     device: torch.device,
 ) -> int:
-    """Pick a critic batch size without tying it to actor BPTT needs."""
+    """Pick a critic batch size: 8 batches per epoch (same as actor)."""
     if critic_minibatch_size is not None and critic_minibatch_size > 0:
         return critic_minibatch_size
-    if device.type != "cuda":
-        return actor_minibatch_size
-    return max(actor_minibatch_size, DEFAULT_CRITIC_MINIBATCH_SIZE)
+    # 8 batches per epoch, with a floor for very small datasets
+    return max((n_steps + 7) // 8, DEFAULT_CRITIC_MINIBATCH_SIZE)
 
 
 def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
@@ -1086,8 +1089,7 @@ class GraphedInference:
                 bd_m |= force_none.unsqueeze(1)
 
                 ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
-                empty_dir = obs[:, nobld_idx] == 1.0
-                harv_bd_m = bd_m & ore_here & empty_dir
+                harv_bd_m = bd_m & ore_here
                 bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
 
                 bt_l.masked_fill_(~bt_m, -1e9)
@@ -1681,6 +1683,55 @@ def _split_chunk_ids(
     return full_ids, tail_ids
 
 
+def _logprob_recurrent_step(
+    model: 'BuilderMLP',
+    obs_pre_t: torch.Tensor,
+    h_t: torch.Tensor,
+    bt_act_t: torch.Tensor,
+    bd_act_t: torch.Tensor,
+    cd_act_t: torch.Tensor,
+    brt_act_t: torch.Tensor,
+    md_act_t: torch.Tensor,
+    bt_mask_t: torch.Tensor,
+    bd_mask_t: torch.Tensor,
+    cd_mask: torch.Tensor,
+    bd_causal_t: torch.Tensor,
+    cd_causal_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One recurrent timestep: forward → GRU update → log-prob (no entropy)."""
+    bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre_t, h_t)
+    z = torch.sigmoid(h_gate)
+    h_new = (1.0 - z) * h_t + z * h_cand
+
+    bt_l = bt_l.masked_fill(~bt_mask_t, -1e9)
+    bd_l = bd_l.masked_fill(~bd_mask_t, -1e9)
+    cd_l = cd_l.masked_fill(~cd_mask, -1e9)
+
+    bt_lp = _unimix_logits(bt_l, bt_mask_t, eps[:, 0]).gather(1, bt_act_t.unsqueeze(1)).squeeze(1)
+    bd_lp = _unimix_logits(bd_l, bd_mask_t, eps[:, 1]).gather(1, bd_act_t.unsqueeze(1)).squeeze(1)
+    cd_lp = _unimix_logits(cd_l, cd_mask, eps[:, 2]).gather(1, cd_act_t.unsqueeze(1)).squeeze(1)
+    brt_lp = _unimix_logits(brt_l, eps=eps[:, 3]).gather(1, brt_act_t.unsqueeze(1)).squeeze(1)
+    md_lp = _unimix_logits(md_l, eps=eps[:, 4]).gather(1, md_act_t.unsqueeze(1)).squeeze(1)
+    brt_causal = (bt_act_t == BRIDGE_BUILD_TYPE).float()
+    lp = bt_lp + bd_lp * bd_causal_t + cd_lp * cd_causal_t + brt_lp * brt_causal + md_lp
+    return lp, h_new
+
+
+_compiled_logprob_step: Callable | None = None
+
+
+def _get_logprob_step_fn() -> Callable:
+    """Get the (possibly compiled) logprob recurrent step function."""
+    global _compiled_logprob_step
+    if _compiled_logprob_step is None:
+        _compiled_logprob_step = maybe_compile(
+            _logprob_recurrent_step,
+            _get_actor_cuda_config(),
+            label="logprob PPO step",
+        )
+    return _compiled_logprob_step
+
+
 def _recurrent_logprob_pass(
     model: 'BuilderMLP',
     obs_pre: torch.Tensor,
@@ -1702,22 +1753,13 @@ def _recurrent_logprob_pass(
     log_probs = torch.empty(B, K_max, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
+    step_fn = _get_logprob_step_fn()
     for t in range(K_max):
-        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
-        z = torch.sigmoid(h_gate)
-        h_t = (1.0 - z) * h_t + z * h_cand
-
-        bt_l = bt_l.masked_fill(~bt_mask[:, t], -1e9)
-        bd_l = bd_l.masked_fill(~bd_mask[:, t], -1e9)
-        cd_l = cd_l.masked_fill(~cd_mask, -1e9)
-
-        bt_lp = _unimix_logits(bt_l, bt_mask[:, t], eps[:, 0]).gather(1, bt_act[:, t].unsqueeze(1)).squeeze(1)
-        bd_lp = _unimix_logits(bd_l, bd_mask[:, t], eps[:, 1]).gather(1, bd_act[:, t].unsqueeze(1)).squeeze(1)
-        cd_lp = _unimix_logits(cd_l, cd_mask, eps[:, 2]).gather(1, cd_act[:, t].unsqueeze(1)).squeeze(1)
-        brt_lp = _unimix_logits(brt_l, eps=eps[:, 3]).gather(1, brt_act[:, t].unsqueeze(1)).squeeze(1)
-        md_lp = _unimix_logits(md_l, eps=eps[:, 4]).gather(1, md_act[:, t].unsqueeze(1)).squeeze(1)
-        brt_causal = (bt_act[:, t] == BRIDGE_BUILD_TYPE).float()
-        log_probs[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + brt_lp * brt_causal + md_lp
+        log_probs[:, t], h_t = step_fn(
+            model, obs_pre[:, t], h_t,
+            bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
+            bt_mask[:, t], bd_mask[:, t], cd_mask, bd_causal[:, t], cd_causal[:, t],
+        )
 
     return log_probs
 
@@ -1830,7 +1872,8 @@ def _sequential_logprobs(
     md_act: torch.Tensor,
     chunks: list[tuple[int, int]],
     bptt_k: int = BPTT_K,
-    batch_size: int = 2048,
+    batch_size: int = 8192,
+    obs_pre_all: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Recompute log-probs with sequential h propagation (no grad).
 
@@ -1844,7 +1887,9 @@ def _sequential_logprobs(
     B_chunk = max(1, batch_size // bptt_k)
     all_starts, all_lens = _chunk_metadata_tensors(chunks, dev, sort_desc=True)
     full_chunk_ids, tail_chunk_ids = _split_chunk_ids(all_lens, bptt_k)
-    obs_pre_all = model._obs_encoder_pre(obs)
+    if obs_pre_all is None:
+        with autocast_context(_get_actor_cuda_config()):
+            obs_pre_all = model._obs_encoder_pre(obs)
     bt_mask_all, bd_mask_all, bd_causal_all, cd_causal_all = _precompute_policy_masks(obs, bt_act)
 
     def _run_chunk_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
@@ -1936,12 +1981,13 @@ def ppo_update(
     h is recomputed sequentially so gradients flow through K timesteps.
     """
     N = obs.shape[0]
-    sum_pi, sum_vf, sum_ent = 0.0, 0.0, 0.0
-    sum_kl, sum_clip_frac = 0.0, 0.0
-    sum_actor_gn, sum_critic_gn = 0.0, 0.0
-    sum_critic_delta = 0.0
-    sum_eps = torch.zeros(N_LOGIT_SCALE, device=obs.device)
-    sum_eps_sq = torch.zeros(N_LOGIT_SCALE, device=obs.device)
+    dev = obs.device
+    # GPU-side scalar accumulators — avoids per-minibatch .item() syncs.
+    # Layout: [pi_loss, ent_loss, actor_gn, kl, clip_frac]
+    _actor_acc = torch.zeros(5, device=dev)
+    _critic_acc = torch.zeros(3, device=dev)  # [vf_loss, critic_gn, critic_delta]
+    sum_eps = torch.zeros(N_LOGIT_SCALE, device=dev)
+    sum_eps_sq = torch.zeros(N_LOGIT_SCALE, device=dev)
     n_eps = 0
     n_updates = 0
 
@@ -1964,7 +2010,6 @@ def ppo_update(
         if ep_boundaries is None:
             ep_boundaries = [(0, N)]
         bptt_chunks = _build_bptt_chunks(ep_boundaries, bptt_k)
-    dev = obs.device
 
     # Pre-build chunk metadata as GPU tensors (avoids per-batch CPU-GPU sync)
     all_chunk_starts, all_chunk_lens = _chunk_metadata_tensors(bptt_chunks, dev)
@@ -1976,15 +2021,21 @@ def ppo_update(
         bt_mask_all, bd_mask_all, bd_causal_all, cd_causal_all = _precompute_policy_masks(obs, bt_act)
     full_chunk_ids, tail_chunk_ids = _split_chunk_ids(all_chunk_lens, bptt_k)
 
-    _amb = actor_minibatch_size if actor_minibatch_size is not None else (N // 16)
-    B_chunk = max(1, _amb // bptt_k)
+    # 8 minibatches per epoch: scales B_chunk with N so GPU utilization
+    # stays high regardless of dataset size while keeping update count fixed.
+    n_chunks = len(bptt_chunks)
+    if actor_minibatch_size is not None:
+        B_chunk = max(1, actor_minibatch_size // bptt_k)
+    else:
+        B_chunk = max(1, (n_chunks + 7) // 8)
 
     # ---- Phase 1: Actor updates with BPTT ----
     actor_stopped_early = False
     actor_epochs_ran = 0
     for epoch in range(ppo_epochs):
         actor_epochs_ran += 1
-        approx_kl_acc, n_mb = 0.0, 0
+        _epoch_kl_acc = torch.zeros(1, device=dev)
+        n_mb = 0
 
         full_perm = full_chunk_ids
         if full_perm.numel() > 1:
@@ -1996,7 +2047,7 @@ def ppo_update(
             tail_perm = tail_perm[all_chunk_lens[tail_perm].argsort(descending=True, stable=True)]
 
         def _run_actor_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
-            nonlocal approx_kl_acc, n_mb, sum_kl, sum_clip_frac, sum_pi, sum_ent, sum_actor_gn, n_updates, sum_eps, sum_eps_sq, n_eps
+            nonlocal _epoch_kl_acc, n_mb, n_updates, sum_eps, sum_eps_sq, n_eps
             for cb_start in range(0, chunk_ids.shape[0], B_chunk):
                 batch_ids = chunk_ids[cb_start:cb_start + B_chunk]
                 B = batch_ids.shape[0]
@@ -2056,11 +2107,11 @@ def ppo_update(
 
                 with torch.no_grad():
                     approx_kl = (((ratio - 1) - logratio) * valid_mask).sum() / valid_denom
-                    approx_kl_acc += approx_kl.item()
+                    _epoch_kl_acc += approx_kl
                     _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
                     clip_frac = (((ratio < (1 - clip_eps)) | (ratio > (1 + _hi))).float() * valid_mask).sum() / valid_denom
-                    sum_kl += approx_kl.item()
-                    sum_clip_frac += clip_frac.item()
+                    _actor_acc[3] += approx_kl
+                    _actor_acc[4] += clip_frac
                     n_mb += 1
                 pg1 = -mb_adv * ratio
                 _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
@@ -2077,9 +2128,10 @@ def ppo_update(
                 actor_gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
 
-                sum_pi += pi_loss.item()
-                sum_ent += ent_loss.item()
-                sum_actor_gn += actor_gn.item()
+                with torch.no_grad():
+                    _actor_acc[0] += pi_loss
+                    _actor_acc[1] += ent_loss
+                    _actor_acc[2] += actor_gn
                 n_updates += 1
 
                 with torch.no_grad():
@@ -2096,7 +2148,7 @@ def ppo_update(
         if tail_perm.numel() > 0:
             _run_actor_group(tail_perm, full_length=False)
 
-        if target_kl is not None and n_mb > 0 and approx_kl_acc / n_mb > target_kl:
+        if target_kl is not None and n_mb > 0 and _epoch_kl_acc.item() / n_mb > target_kl:
             actor_stopped_early = True
             break
 
@@ -2109,7 +2161,7 @@ def ppo_update(
         critic_cuda_cfg = _get_critic_cuda_config()
         critic.train()
         critic_minibatch_size = _resolve_critic_minibatch_size(
-            minibatch_size,
+            N,
             critic_minibatch_size,
             dev,
         )
@@ -2139,7 +2191,9 @@ def ppo_update(
             # loop is tight: no repeat_interleave / arange / perm slicing
             # interleaved with forward-backward.
             round_offsets_cpu = round_offsets.tolist()
-            batch_meta: list[tuple[torch.Tensor, torch.Tensor, int, int]] = []
+            # Pre-pack per-step data for each batch: gather once, iterate fast.
+            # This turns N scattered GPU reads per batch into one contiguous read.
+            batch_meta: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]] = []
             for round_start, round_end in batch_ranges:
                 step_lo = round_offsets_cpu[round_start]
                 step_hi = round_offsets_cpu[round_end]
@@ -2150,29 +2204,30 @@ def ppo_update(
                     torch.arange(n_rounds, device=dev),
                     chunk_round_counts,
                 )
-                batch_meta.append((idx, local_round_idx, round_start, round_end))
+                # Pre-gather all per-step data in one shot
+                mb_xy = step_unit_xy[idx]
+                mb_uf = step_unit_float[idx]
+                mb_rv = step_rv[idx]
+                batch_meta.append((local_round_idx, mb_xy, mb_uf, mb_rv, round_start, round_end))
 
-            for idx, local_round_idx, round_start, round_end in batch_meta:
+            for local_round_idx, mb_xy, mb_uf, mb_rv, round_start, round_end in batch_meta:
                 t_value = time.perf_counter() if profile is not None else 0.0
                 critic_opt.zero_grad(set_to_none=True)
 
-                vf_denom = max(idx.shape[0], 1)
+                vf_denom = max(mb_xy.shape[0], 1)
                 c_rounds = epoch_rounds[round_start:round_end]
                 g_obs, g_mask, g_scalars = _load_critic_round_batch(centralized_data, c_rounds)
-                u_xy = step_unit_xy[idx]
-                uf = step_unit_float[idx]
-                u_ctx = uf[:, :_ctx_dim]
-                u_latent = uf[:, _ctx_dim:]
-                rv = step_rv[idx]
-                mb_returns = rv[:, 0]
-                mb_old_values = rv[:, 1]
+                u_ctx = mb_uf[:, :_ctx_dim]
+                u_latent = mb_uf[:, _ctx_dim:]
+                mb_returns = mb_rv[:, 0]
+                mb_old_values = mb_rv[:, 1]
                 with autocast_context(critic_cuda_cfg):
                     loss_sum, vf_loss_sum, new_values = critic_loss_step(
                         g_obs,
                         g_mask,
                         g_scalars,
                         local_round_idx,
-                        u_xy,
+                        mb_xy,
                         u_ctx,
                         u_latent,
                         mb_returns,
@@ -2185,9 +2240,10 @@ def ppo_update(
                 critic_gn = torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
                 critic_opt.step()
 
-                sum_vf += (vf_loss_sum / vf_denom).item()
-                sum_critic_gn += critic_gn.item()
-                sum_critic_delta += (new_values - mb_old_values).abs().mean().item()
+                with torch.no_grad():
+                    _critic_acc[0] += vf_loss_sum / vf_denom
+                    _critic_acc[1] += critic_gn
+                    _critic_acc[2] += (new_values - mb_old_values).abs().mean()
                 n_critic_updates += 1
 
                 if profile is not None:
@@ -2200,37 +2256,44 @@ def ppo_update(
         mean_eps = torch.full((N_LOGIT_SCALE,), EPS_MIN, device=obs.device)
         std_eps = torch.zeros(N_LOGIT_SCALE, device=obs.device)
 
-    # Return/value bucket saturation diagnostics
-    bucket_lo = bucket_centers[0].item()
-    bucket_hi = bucket_centers[-1].item()
-    ret_min = returns.min().item()
-    ret_max = returns.max().item()
-    ret_mean = returns.mean().item()
-    ret_oob = ((returns <= bucket_lo) | (returns >= bucket_hi)).float().mean().item()
-
+    # Single GPU→CPU sync for all accumulated scalars
+    with torch.no_grad():
+        bucket_lo = bucket_centers[0]
+        bucket_hi = bucket_centers[-1]
+        _diag = torch.stack([
+            returns.min(), returns.max(), returns.mean(),
+            ((returns <= bucket_lo) | (returns >= bucket_hi)).float().mean(),
+            bucket_lo.float(), bucket_hi.float(),
+        ])
+        # Batch all .item() calls into one contiguous CPU transfer
+        _all_scalars = torch.cat([_actor_acc, _critic_acc, _diag, mean_eps, std_eps]).cpu()
+    # Unpack after single sync
+    _a = _all_scalars
+    _na = max(n_updates, 1)
+    _nc = max(n_critic_updates, 1)
     return {
-        "pi_loss": sum_pi / max(n_updates, 1),
-        "vf_loss": sum_vf / max(n_critic_updates, 1),
-        "entropy": sum_ent / max(n_updates, 1),
-        "approx_kl": sum_kl / max(n_updates, 1),
-        "clip_frac": sum_clip_frac / max(n_updates, 1),
+        "pi_loss": _a[0].item() / _na,
+        "vf_loss": _a[5].item() / _nc,
+        "entropy": _a[1].item() / _na,
+        "approx_kl": _a[3].item() / _na,
+        "clip_frac": _a[4].item() / _na,
         "explained_var": round(ev, 4),
-        "actor_grad_norm": sum_actor_gn / max(n_updates, 1),
-        "critic_grad_norm": sum_critic_gn / max(n_critic_updates, 1),
-        "critic_value_delta": sum_critic_delta / max(n_critic_updates, 1),
-        "ret_min": round(ret_min, 3),
-        "ret_max": round(ret_max, 3),
-        "ret_mean": round(ret_mean, 3),
-        "ret_oob_frac": round(ret_oob, 4),
+        "actor_grad_norm": _a[2].item() / _na,
+        "critic_grad_norm": _a[6].item() / _nc,
+        "critic_value_delta": _a[7].item() / _nc,
+        "ret_min": round(_a[8].item(), 3),
+        "ret_max": round(_a[9].item(), 3),
+        "ret_mean": round(_a[10].item(), 3),
+        "ret_oob_frac": round(_a[11].item(), 4),
         "n_updates": n_updates,
-        "ls_bt_mean": mean_eps[0].item(),
-        "ls_bd_mean": mean_eps[1].item(),
-        "ls_cd_mean": mean_eps[2].item(),
-        "ls_md_mean": mean_eps[3].item(),
-        "ls_bt_std": std_eps[0].item(),
-        "ls_bd_std": std_eps[1].item(),
-        "ls_cd_std": std_eps[2].item(),
-        "ls_md_std": std_eps[3].item(),
+        "ls_bt_mean": _a[14].item(),
+        "ls_bd_mean": _a[15].item(),
+        "ls_cd_mean": _a[16].item(),
+        "ls_md_mean": _a[17].item(),
+        "ls_bt_std": _a[18].item(),
+        "ls_bd_std": _a[19].item(),
+        "ls_cd_std": _a[20].item(),
+        "ls_md_std": _a[21].item(),
     }
 
 
@@ -2410,19 +2473,34 @@ def _parse_trajectories(
                 elif w == "b":
                     rw_t[end - 1] += TERMINAL_LOSS_REWARD
 
+    # Bulk H2D: pin all CPU tensors, issue non_blocking transfers, single sync.
+    _pin = DEVICE.type == "cuda"
+    if _pin:
+        obs_t = obs_t.pin_memory()
+        h_t = h_t.pin_memory()
+        bt_t = bt_t.pin_memory()
+        bd_t = bd_t.pin_memory()
+        cd_t = cd_t.pin_memory()
+        brt_t = brt_t.pin_memory()
+        md_t = md_t.pin_memory()
+        lp_t = lp_t.pin_memory()
+        rw_t = rw_t.pin_memory()
+    _nb = _pin  # non_blocking only safe with pinned memory
     result = {
-        "obs": obs_t.to(DEVICE),
-        "h": h_t.to(DEVICE),
-        "bt": bt_t.to(DEVICE),
-        "bd": bd_t.to(DEVICE),
-        "cd": cd_t.to(DEVICE),
-        "brt": brt_t.to(DEVICE),
-        "md": md_t.to(DEVICE),
-        "old_log_probs": lp_t.to(DEVICE),
-        "rewards": rw_t.to(DEVICE),
+        "obs": obs_t.to(DEVICE, non_blocking=_nb),
+        "h": h_t.to(DEVICE, non_blocking=_nb),
+        "bt": bt_t.to(DEVICE, non_blocking=_nb),
+        "bd": bd_t.to(DEVICE, non_blocking=_nb),
+        "cd": cd_t.to(DEVICE, non_blocking=_nb),
+        "brt": brt_t.to(DEVICE, non_blocking=_nb),
+        "md": md_t.to(DEVICE, non_blocking=_nb),
+        "old_log_probs": lp_t.to(DEVICE, non_blocking=_nb),
+        "rewards": rw_t.to(DEVICE, non_blocking=_nb),
         "ep_boundaries": ep_boundaries,
         "n_steps": N,
     }
+    if _pin:
+        torch.cuda.synchronize()
 
     # Build centralized critic data if global states available
     if global_states_list and any(gs is not None for gs in global_states_list):
@@ -2469,11 +2547,14 @@ def _build_centralized_critic_data(
 
     # Reserve index 0 as a zero fallback state for games without global states.
     # Use bytearray so torch.frombuffer works uniformly for all entries.
+    _pin_nb = DEVICE.type == "cuda"  # non_blocking safe with pinned memory
     zero_state = bytearray(n_ch * 1 * 1 * 4)
     zero_scalars = [0.0] * n_sc
     unique_states: list[object] = [zero_state]  # bytearray or buffer slice
     unique_valid_masks = [(1, 1)]
-    unique_scalars: list[list[float]] = [zero_scalars]
+    unique_scalars: list[list[float]] = [zero_scalars]  # for legacy path
+    _scalar_chunks: list[torch.Tensor] = []  # batch-appended tensor chunks (bulk path)
+    _scalar_chunk_offsets: list[tuple[int, int]] = []  # (base_idx, count)
     # Per-step: index into unique states, unit xy, unit context
     step_round_idx = torch.zeros(N, dtype=torch.long)
     step_unit_xy = torch.zeros(N, 2, dtype=torch.long)
@@ -2543,11 +2624,13 @@ def _build_centralized_critic_data(
                 for rnd in range(gs_n_turns):
                     unique_states.append(all_states_t[rnd])  # tensor view, no copy
                     unique_valid_masks.append((gs_map_w, gs_map_h))
-                    if scalar_stride_bytes > 0:
-                        unique_scalars.append(all_scalars_t[rnd].tolist())
-                    else:
-                        unique_scalars.append(zero_scalars)
-                    available_unique_idx[rnd] = base_idx + rnd
+                available_unique_idx[:] = torch.arange(base_idx, base_idx + gs_n_turns, dtype=torch.long)
+                # Batch-append scalars as tensor rows (no per-round .tolist() sync)
+                if scalar_stride_bytes > 0:
+                    _scalar_chunks.append(all_scalars_t)
+                else:
+                    _scalar_chunks.append(torch.zeros(gs_n_turns, n_sc))
+                _scalar_chunk_offsets.append((base_idx, gs_n_turns))
             else:
                 gs_states = gs.get("states", {})
                 gs_scalars_d = gs.get("scalars", {})
@@ -2593,15 +2676,28 @@ def _build_centralized_critic_data(
         )
 
     global_sizes = torch.tensor(unique_valid_masks, dtype=torch.int16)
-    global_scalars = torch.tensor(unique_scalars, dtype=torch.float32)
+    # Merge list-based scalars (legacy path) with tensor chunks (bulk path)
+    if _scalar_chunks:
+        n_total = len(unique_scalars) + sum(c for _, c in _scalar_chunk_offsets)
+        global_scalars = torch.zeros(n_total, n_sc, dtype=torch.float32)
+        if unique_scalars:
+            global_scalars[:len(unique_scalars)] = torch.tensor(unique_scalars, dtype=torch.float32)
+        for chunk_t, (base_idx, count) in zip(_scalar_chunks, _scalar_chunk_offsets):
+            global_scalars[base_idx:base_idx + count, :chunk_t.shape[1]] = chunk_t
+    else:
+        global_scalars = torch.tensor(unique_scalars, dtype=torch.float32)
 
+    if _pin_nb:
+        step_round_idx = step_round_idx.pin_memory()
+        step_unit_xy = step_unit_xy.pin_memory()
+        step_unit_ctx = step_unit_ctx.pin_memory()
     return {
         "global_states": unique_states,
         "global_sizes": global_sizes,
         "global_scalars": global_scalars,
-        "step_round_idx": step_round_idx.to(DEVICE),
-        "step_unit_xy": step_unit_xy.to(DEVICE),
-        "step_unit_ctx": step_unit_ctx.to(DEVICE),
+        "step_round_idx": step_round_idx.to(DEVICE, non_blocking=_pin_nb),
+        "step_unit_xy": step_unit_xy.to(DEVICE, non_blocking=_pin_nb),
+        "step_unit_ctx": step_unit_ctx.to(DEVICE, non_blocking=_pin_nb),
         "has_centralized": True,
     }
 
@@ -2744,12 +2840,13 @@ def critic_checkpoint_path(weight_path: str | Path = WEIGHT_PATH) -> Path:
 def reset_centralized_critic() -> None:
     """Drop the singleton critic/optimizer so a fresh instance is created on demand."""
     global _centralized_critic, _centralized_optimizer, _centralized_critic_step, _centralized_critic_loss_step
-    global _compiled_actor_step, _actor_cuda_cfg
+    global _compiled_actor_step, _compiled_logprob_step, _actor_cuda_cfg
     _centralized_critic = None
     _centralized_optimizer = None
     _centralized_critic_step = None
     _centralized_critic_loss_step = None
     _compiled_actor_step = None
+    _compiled_logprob_step = None
     _actor_cuda_cfg = None
 
 
@@ -2849,7 +2946,6 @@ def _compute_all_values(
     critic: CentralizedCritic,
     data: dict,
     cnn_chunk_size: int = CENTRALIZED_CNN_CHUNK,
-    unit_chunk_size: int = 4096,
 ) -> torch.Tensor:
     """Compute per-unit critic values for all steps using chunked CNN.
 
@@ -2885,20 +2981,16 @@ def _compute_all_values(
         g_scalars = data["gpu_scalars"][c_rounds]
         feat = critic.encode_map(g_obs, g_mask)
 
-        # Compute per-unit values for these steps
+        # Compute per-unit values for these steps (all at once — unit_head is small)
         step_indices = step_order[step_lo:step_hi]
         chunk_round_counts = round_offsets[round_start + 1:round_end + 1] - round_offsets[round_start:round_end]
         local_ri = torch.repeat_interleave(
             torch.arange(round_end - round_start, device=step_indices.device),
             chunk_round_counts,
         )
-        for u_start in range(0, step_indices.shape[0], unit_chunk_size):
-            u_end = min(u_start + unit_chunk_size, step_indices.shape[0])
-            si = step_indices[u_start:u_end]
-            lr = local_ri[u_start:u_end]
-            values[si] = critic.unit_values(
-                feat, g_scalars, lr, unit_xy[si], unit_ctx[si], actor_latent[si],
-            )
+        values[step_indices] = critic.unit_values(
+            feat, g_scalars, local_ri, unit_xy[step_indices], unit_ctx[step_indices], actor_latent[step_indices],
+        )
 
     return values
 
@@ -2943,13 +3035,14 @@ def train_on_trajectories(
     if profile is not None:
         profile["materialize_s"] = time.perf_counter() - t_phase
 
-    # Freeze actor-side unit summaries once so the critic sees a stable
-    # per-step latent throughout PPO updates.
+    # Compute obs_pre once — shared by actor_latent (critic conditioning),
+    # _sequential_logprobs (old log-prob recomputation), and value baseline.
     t_phase = time.perf_counter() if profile is not None else 0.0
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), autocast_context(_get_actor_cuda_config()):
+        obs_pre = model._obs_encoder_pre(obs)
         data["step_actor_latent"] = _normalize_actor_latent_dim(
-            model.actor_latent(obs, h).detach(),
+            model._latent_from_obs_pre(obs_pre, h).detach(),
         )
     if profile is not None:
         profile["critic_latent_s"] = time.perf_counter() - t_phase
@@ -2974,8 +3067,7 @@ def train_on_trajectories(
     model.train()
 
     # Recompute old_log_probs with sequential h propagation through BPTT chunks.
-    # This ensures old_log_probs match what the BPTT training loop produces,
-    # preventing ratio drift from stored-vs-recomputed h mismatch.
+    # Reuses obs_pre from above (same model weights, no grad needed).
     t_phase = time.perf_counter() if profile is not None else 0.0
     bptt_k = int(ppo_kwargs.get("bptt_k", BPTT_K))
     bptt_chunks = _build_bptt_chunks(data["ep_boundaries"], bptt_k)
@@ -2985,6 +3077,7 @@ def train_on_trajectories(
             data["bt"], data["bd"], data["cd"], data["brt"], data["md"],
             bptt_chunks,
             bptt_k=bptt_k,
+            obs_pre_all=obs_pre,
         )
     if profile is not None:
         profile["recompute_lp_s"] = time.perf_counter() - t_phase

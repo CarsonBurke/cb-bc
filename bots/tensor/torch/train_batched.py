@@ -589,6 +589,13 @@ def collect_games_batched(
     graphed_a = GraphedInference(model, max_batch=_max_a_batch)
     graphed_a.capture()
     total_inferences = 0
+    _use_pinned = DEVICE.type == "cuda"
+    # Pre-allocate pinned staging buffers for H2D/D2H to enable non_blocking transfers.
+    # Sized for max batch; reused each iteration to avoid repeated allocation.
+    if _use_pinned:
+        _pin_h2d = torch.empty(_max_a_batch, _OBS_FLOATS, dtype=torch.float32, pin_memory=True)
+        _pin_results = torch.empty(6, _max_a_batch, dtype=torch.float32, pin_memory=True)
+        _pin_h_out = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32, pin_memory=True)
 
     while pending_indices and len(processes) < max_workers:
         _launch_game(pending_indices.pop(0))
@@ -656,7 +663,12 @@ def collect_games_batched(
 
             with torch.no_grad():
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                all_t = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_a, _OBS_FLOATS).to(DEVICE)
+                src = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_a, _OBS_FLOATS)
+                if _use_pinned:
+                    _pin_h2d[:n_a].copy_(src)
+                    all_t = _pin_h2d[:n_a].to(DEVICE, non_blocking=True)
+                else:
+                    all_t = src.to(DEVICE)
                 if profile is not None:
                     dt = time.perf_counter() - t_phase
                     profile["h2d_a_s"] = profile.get("h2d_a_s", 0.0) + dt
@@ -664,10 +676,19 @@ def collect_games_batched(
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
                 bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next = graphed_a(all_t)
-                results_cpu = torch.stack([
-                    bt_act.float(), bd_act.float(), cd_act.float(), brt_act.float(), md_act.float(), lp,
-                ]).cpu()
-                h_cpu = h_next.cpu().contiguous()
+                if _use_pinned:
+                    _pin_results[:, :n_a].copy_(torch.stack([
+                        bt_act.float(), bd_act.float(), cd_act.float(), brt_act.float(), md_act.float(), lp,
+                    ]), non_blocking=True)
+                    _pin_h_out[:n_a].copy_(h_next, non_blocking=True)
+                    torch.cuda.synchronize()
+                    results_cpu = _pin_results[:, :n_a]
+                    h_cpu = _pin_h_out[:n_a]
+                else:
+                    results_cpu = torch.stack([
+                        bt_act.float(), bd_act.float(), cd_act.float(), brt_act.float(), md_act.float(), lp,
+                    ]).cpu()
+                    h_cpu = h_next.cpu().contiguous()
                 if profile is not None:
                     dt = time.perf_counter() - t_phase
                     profile["d2h_a_s"] = profile.get("d2h_a_s", 0.0) + dt
@@ -731,7 +752,12 @@ def collect_games_batched(
                 opp_g = _get_cached_opponent_graph(opp_model_keys[wp], opp_m, n_b, _OPP_GRAPH_TEMP)
                 with torch.no_grad():
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    all_t = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_b, _OBS_FLOATS).to(DEVICE)
+                    src_b = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_b, _OBS_FLOATS)
+                    if _use_pinned and n_b <= _max_a_batch:
+                        _pin_h2d[:n_b].copy_(src_b)
+                        all_t = _pin_h2d[:n_b].to(DEVICE, non_blocking=True)
+                    else:
+                        all_t = src_b.to(DEVICE)
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
                         profile["h2d_b_s"] = profile.get("h2d_b_s", 0.0) + dt
@@ -741,8 +767,15 @@ def collect_games_batched(
                     if opp_g is not None and n_b <= opp_g.max_batch:
                         # CUDA-graphed path: forward + mask + sample in one graph replay
                         bt_act, bd_act, cd_act, brt_act, md_act, _, h_next = opp_g(all_t)
-                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
-                        h_cpu = h_next.cpu().contiguous()
+                        if _use_pinned and n_b <= _max_a_batch:
+                            _pin_results[:5, :n_b].copy_(torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]), non_blocking=True)
+                            _pin_h_out[:n_b].copy_(h_next, non_blocking=True)
+                            torch.cuda.synchronize()
+                            acts_cpu = _pin_results[:5, :n_b]
+                            h_cpu = _pin_h_out[:n_b]
+                        else:
+                            acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
+                            h_cpu = h_next.cpu().contiguous()
                     else:
                         # Fallback: ungraphed inference
                         obs_t = all_t[:, :OBS_SIZE]
@@ -763,8 +796,15 @@ def collect_games_batched(
                         cd_act, _ = sample_logits_gumbel(cd_l, _OPP_GRAPH_TEMP, mask=cd_m, return_log_prob=False)
                         brt_act, _ = sample_logits_gumbel(_brt_l, _OPP_GRAPH_TEMP, return_log_prob=False)
                         md_act, _ = sample_logits_gumbel(md_l, _OPP_GRAPH_TEMP, return_log_prob=False)
-                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
-                        h_cpu = h_next.cpu().contiguous()
+                        if _use_pinned and n_b <= _max_a_batch:
+                            _pin_results[:5, :n_b].copy_(torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]), non_blocking=True)
+                            _pin_h_out[:n_b].copy_(h_next, non_blocking=True)
+                            torch.cuda.synchronize()
+                            acts_cpu = _pin_results[:5, :n_b]
+                            h_cpu = _pin_h_out[:n_b]
+                        else:
+                            acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
+                            h_cpu = h_next.cpu().contiguous()
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
@@ -955,6 +995,12 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=0, help="Critic learning rate (default: same as --lr)")
     parser.add_argument(
+        "--actor-minibatch-size",
+        type=int,
+        default=0,
+        help="Actor PPO minibatch size (default: max(N//16, 8192) for GPU saturation)",
+    )
+    parser.add_argument(
         "--critic-minibatch-size",
         type=int,
         default=0,
@@ -1136,6 +1182,7 @@ def main():
             traj_game_map=traj_game_map if all_global_states else None,
             game_winners=all_winners,
             target_kl=0.03,
+            actor_minibatch_size=args.actor_minibatch_size or None,
             critic_minibatch_size=args.critic_minibatch_size or None,
             freeze_critic=args.freeze_critic,
         )
