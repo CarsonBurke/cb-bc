@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::protobuf::*;
 use crate::types::*;
 
-pub const N_CHANNELS: usize = 21;
+pub const N_CHANNELS: usize = 23;
 pub const N_SCALARS: usize = 19;
 
 pub struct ReplayData {
@@ -156,15 +156,26 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
     let mut titanium_delivered = vec![0i32; n_turns * 2];
     let mut axionite_delivered = vec![0i32; n_turns * 2];
 
-    // Precompute static env channels once (channels 0-3 never change)
-    let env_plane_len = 4 * plane_size; // 4 env channels
-    let mut env_base = vec![0.0f32; env_plane_len];
+    // Precompute static channels once (env 0-3 + flow distance 21-22 never change)
+    // 4 env + 2 flow distance = 6 static channels, but they're non-contiguous
+    // in the state layout, so we precompute a full-state-sized base.
+    let mut env_base = vec![0.0f32; state_stride];
     for y in 0..map_h {
         for x in 0..map_w {
             let base = y * map_w + x;
             let env_val = map.env_grid[y * map_w + x] as usize;
             if env_val <= 3 {
                 env_base[env_val * plane_size + base] = 1.0;
+            }
+            // Channel 21: own flow distance (normalized by map diagonal)
+            let own_fd = flow_dist[team_idx][base];
+            if own_fd != i32::MAX {
+                env_base[21 * plane_size + base] = own_fd as f32 / (map_w + map_h) as f32;
+            }
+            // Channel 22: enemy flow distance (normalized by map diagonal)
+            let enemy_fd = flow_dist[enemy_idx][base];
+            if enemy_fd != i32::MAX {
+                env_base[22 * plane_size + base] = enemy_fd as f32 / (map_w + map_h) as f32;
             }
         }
     }
@@ -178,8 +189,8 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
     for (turn_idx, turn_data) in turns.iter().enumerate() {
         let state = &mut states[turn_idx * state_stride..(turn_idx + 1) * state_stride];
 
-        // Copy precomputed env channels
-        state[..env_plane_len].copy_from_slice(&env_base);
+        // Copy precomputed static channels (env 0-3 + flow distance 21-22)
+        state.copy_from_slice(&env_base);
 
         // Entity channels
         let mut n_own_builders = 0i32;
