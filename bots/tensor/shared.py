@@ -680,8 +680,10 @@ def execute_build(ct: Controller, action: str, direction: Direction,
             ct.build_harvester(build_pos)
             ore_key = (build_pos.x, build_pos.y)
             if ore_key in GameState.harv_placed_ores:
+                dbg[2] = 1
                 return 0.0, 0.0, dbg
             GameState.harv_placed_ores.add(ore_key)
+            dbg[2] = 1
             dbg[3] = 1
             return PLACE_HARV, 0.0, dbg
         dbg[1] = 1
