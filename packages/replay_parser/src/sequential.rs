@@ -14,10 +14,9 @@ use crate::types::*;
 const BC_GRID_SIZE: usize = 5;
 const BC_GRID_HALF: i32 = 2;
 const BC_TILE_FEATURES: usize = 21;
-const BC_GLOBAL_FEATURES: usize = 17;
-const BC_POS_EMBED_DIM: usize = 8;
+const BC_GLOBAL_FEATURES: usize = 19;
 pub const BC_OBS_SIZE: usize =
-    BC_GRID_SIZE * BC_GRID_SIZE * BC_TILE_FEATURES + BC_GLOBAL_FEATURES + BC_POS_EMBED_DIM;
+    BC_GRID_SIZE * BC_GRID_SIZE * BC_TILE_FEATURES + BC_GLOBAL_FEATURES;
 const BC_GLOBAL_OBS_START: usize = BC_GRID_SIZE * BC_GRID_SIZE * BC_TILE_FEATURES;
 pub const BC_ACTION_SIZE: usize = 5;
 
@@ -120,24 +119,6 @@ fn proto_dir_to_conv4(dir: u8) -> u8 {
     }
 }
 
-/// 8-dim sinusoidal position embedding matching tensor_lib/embed.py.
-fn sinusoidal_pos_embed(x: i32, y: i32, out: &mut [f32]) {
-    const BASE: f64 = 10000.0;
-    const D_MODEL: usize = 8;
-    const QUARTER: usize = D_MODEL / 4;
-    let half = QUARTER * 2;
-
-    for i in 0..QUARTER {
-        let freq = 1.0 / BASE.powf(2.0 * i as f64 / D_MODEL as f64);
-        let ax = x as f64 * freq;
-        let ay = y as f64 * freq;
-        out[2 * i] = ax.sin() as f32;
-        out[2 * i + 1] = ax.cos() as f32;
-        out[half + 2 * i] = ay.sin() as f32;
-        out[half + 2 * i + 1] = ay.cos() as f32;
-    }
-}
-
 /// Check if a tile is impassable (wall or non-road building present).
 fn is_tile_impassable(
     wx: i32,
@@ -183,8 +164,8 @@ fn encode_local_obs(
     core_hp: &[i32; 2],
     turn_idx: usize,
     spawn_round: i32,
-    prev_own_ti: f32,
-    prev_own_ax: f32,
+    prev_own_ti_collected: i32,
+    prev_own_ax_collected: i32,
     pos_buildings: &HashMap<(i32, i32), i32>,
     pos_bots: &HashMap<(i32, i32), i32>,
     n_team_buildings: i32,
@@ -271,19 +252,14 @@ fn encode_local_obs(
     obs[g + 9] = (ec.1 - by) as f32;
 
     obs[g + 10] = n_local_builders as f32 / 10.0;
-    obs[g + 11] = (own.titanium as f32 - prev_own_ti) / 500.0;
-    obs[g + 12] = (own.axionite as f32 - prev_own_ax) / 500.0;
+    obs[g + 11] = (own.titanium_collected - prev_own_ti_collected) as f32 / 500.0;
+    obs[g + 12] = (own.axionite_collected - prev_own_ax_collected) as f32 / 500.0;
     obs[g + 13] = (core_hp[team_idx] - core_hp[enemy_idx]) as f32 / 500.0;
     obs[g + 14] = spawn_round as f32 / 2000.0;
     obs[g + 15] = 1.0; // core_known (always true in replay data)
     obs[g + 16] = 1.0; // ecore_known (always true in replay data)
-
-    // Positional embedding (8)
-    sinusoidal_pos_embed(
-        bx,
-        by,
-        &mut obs[g + BC_GLOBAL_FEATURES..g + BC_GLOBAL_FEATURES + BC_POS_EMBED_DIM],
-    );
+    obs[g + 17] = map_w as f32 / 50.0;
+    obs[g + 18] = map_h as f32 / 50.0;
 }
 
 // ── Per-turn pending action ──────────────────────────────────────────────
@@ -346,8 +322,8 @@ pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
 
     let mut player_res: [PlayerRes; 2] = [PlayerRes::default(), PlayerRes::default()];
     let mut spawn_rounds: HashMap<i32, i32> = HashMap::new();
-    let mut prev_own_ti: f32 = 0.0;
-    let mut prev_own_ax: f32 = 0.0;
+    let mut prev_own_ti_collected: i32 = 0;
+    let mut prev_own_ax_collected: i32 = 0;
     let team_idx = team as usize;
 
     let turns = get_repeated_submsg(&top, 3, data);
@@ -537,8 +513,8 @@ pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
                     &core_hp,
                     turn_idx,
                     sr,
-                    prev_own_ti,
-                    prev_own_ax,
+                    prev_own_ti_collected,
+                    prev_own_ax_collected,
                     &pos_buildings,
                     &pos_bots,
                     n_team_buildings,
@@ -654,8 +630,8 @@ pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
             }
         }
 
-        prev_own_ti = player_res[team_idx].titanium as f32;
-        prev_own_ax = player_res[team_idx].axionite as f32;
+        prev_own_ti_collected = player_res[team_idx].titanium_collected;
+        prev_own_ax_collected = player_res[team_idx].axionite_collected;
     }
 
     BCSamples {

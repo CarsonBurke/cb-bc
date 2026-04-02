@@ -31,23 +31,12 @@ BOT_DIR = _resolve_bot_dir()
 if BOT_DIR not in sys.path:
     sys.path.insert(0, BOT_DIR)
 from tensor_lib import MLP
-
-# -- Layout constants --
-GRID_SIZE = 5
-GRID_HALF = GRID_SIZE // 2
-# Per tile: is_wall(1) + ore_ti(1) + ore_ax(1) + is_impassable(1)
-#         + bld_type(10: none/harvester/conveyor/splitter/road/barrier/bridge/foundry/military/core)
-#         + bld_friendly(1) + bld_dir(2) + bld_cooldown(1) + bld_stored_resource(1)
-#         + has_unit(1) + unit_friendly(1) = 21
-TILE_FEATURES = 21
-# Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy,
-#         n_builders, ti_delta, ax_delta, hp_advantage, spawn_round = 15
-GLOBAL_FEATURES = 19
-INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES
-HIDDEN_SIZES = [64, 64]
-H_DIM = 24  # Recurrent hidden state size
-COMPRESS_DIM = 80
-RMSNORM_LAYERS = [True, True]
+from model_constants import (
+    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES,
+    H_DIM, HIDDEN_SIZES, COMPRESS_DIM, RMSNORM_LAYERS,
+    TILE_EMBED_DIM, TILE_INPUT_DIM, TILE_GRID_N,
+    INPUT_SIZE, OBS_SIZE, TRUNK_INPUT_SIZE,
+)
 
 DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
 
@@ -173,9 +162,6 @@ _LOCAL_TILE_OFFSETS = tuple(
     for dx in range(-GRID_HALF, GRID_HALF + 1)
 )
 
-# Offset where global features start in observation vector
-_GLOBAL_OBS_START = GRID_SIZE * GRID_SIZE * TILE_FEATURES
-
 _ZERO_TILE = (0.0,) * TILE_FEATURES
 _NO_BUILD_TILE = (1.0,) + (0.0,) * (N_BLD_TYPES - 1) + (0.0, 0.0, 0.0, 0.0, 0.0)
 _BLD_ONE_HOTS = tuple(
@@ -200,10 +186,7 @@ def _weight_cache_key(path: str) -> tuple[str, int, int] | None:
     return path, st.st_mtime_ns, st.st_size
 
 
-TILE_FEATURES_COUNT = 21
-TILE_INPUT_DIM = TILE_FEATURES_COUNT + 2  # 23: raw features + (dx/2, dy/2)
-TILE_EMBED_DIM = 8
-OBS_SIZE = _GLOBAL_OBS_START + GLOBAL_FEATURES
+_GLOBAL_OBS_START = TILE_GRID_N * TILE_FEATURES
 _ZERO_OBS = (0.0,) * OBS_SIZE
 
 
@@ -277,7 +260,7 @@ class Player:
         self.model = _get_shared_model()
         self.h_prev: list[float] = [0.0] * H_DIM
 
-        self._prev_resources: tuple[float, float] | None = None
+        self._prev_collected: tuple[int, int] | None = None
         self._spawn_round: int = -1
         self._obs_buf: list[float] = []
         self._feature_buf: list[float] = []
@@ -384,7 +367,6 @@ class Player:
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
 
-        self._prev_resources = ct.get_global_resources()
 
     @staticmethod
     def _discover_ore(ct: Controller, nearby_tiles=None) -> None:
@@ -616,6 +598,8 @@ class Player:
         x_norm = pos_x / max(w, 1)
         y_norm = pos_y / max(h, 1)
         ti, ax = ct.get_global_resources()
+        prev_collected = self._prev_collected
+        self._prev_collected = (ti, ax)
         scale = ct.get_scale_percent() / 500.0
 
         if Player._enemy_core_dmg_round != rnd_n:
@@ -660,22 +644,25 @@ class Player:
             ecore_dy = float(self.enemy_core.y - pos_y)
             ecore_known = 1.0
 
-        ti_delta, ax_delta = 0.0, 0.0
-        if self._prev_resources is not None:
-            prev_ti, prev_ax = self._prev_resources
-            ti_delta = (ti - prev_ti) / 500.0
-            ax_delta = (ax - prev_ax) / 500.0
+        ti_income, ax_income = 0.0, 0.0
+        if prev_collected is not None:
+            prev_ti, prev_ax = prev_collected
+            ti_income = (ti - prev_ti) / 500.0
+            ax_income = (ax - prev_ax) / 500.0
 
         hp_advantage = (own_hp - enemy_hp) / 500.0
+
+        Player._scan_working_harvesters(ct)
 
         features[_GLOBAL_OBS_START:_GLOBAL_OBS_START + GLOBAL_FEATURES] = (
             rnd, x_norm, y_norm, ti / 500.0, ax / 500.0, scale,
             core_dx, core_dy, ecore_dx, ecore_dy,
             n_builders / 10.0,
-            ti_delta, ax_delta, hp_advantage,
+            ti_income, ax_income, hp_advantage,
             self._spawn_round / 2000.0 if self._spawn_round >= 0 else 0.0,
             core_known, ecore_known,
             w / 50.0, h / 50.0,
+            Player._working_harv_count / 20.0,
         )
 
     def _encode_state(self, ct: Controller, nearby_tiles=None, nearby_entities=None) -> list[float]:

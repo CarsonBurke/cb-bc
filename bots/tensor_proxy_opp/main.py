@@ -16,11 +16,11 @@ _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "te
 sys.path.insert(0, _TENSOR_DIR)
 
 from shared import (
-    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES, POS_EMBED_DIM,
+    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES,
     INPUT_SIZE, HIDDEN_SIZES, H_DIM,
     DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4, DIR_DXY, BUILD_COSTS,
     _CONV_DIR_MASK,
-    SinusoidalPositionEmbedding, GameState,
+    GameState,
     discover_ore, scan_enemy_core_dmg, scan_own_core_dmg,
     encode_state_into,
     execute_build, execute_move,
@@ -91,10 +91,10 @@ class Player:
         self.enemy_core = None
         self.my_team = None
         self.num_spawned = 0
-        self.pos_encoder = SinusoidalPositionEmbedding(POS_EMBED_DIM)
+        self.pos_encoder = None
         self.h_prev = array("f", [0.0] * H_DIM)
         self._obs_buf = array("f")
-        self._prev_resources = None
+        self._prev_collected = None
         self._n_builders_cached = 1
         self._spawn_round: int = -1
         self._unit_id = id(self) % (2**31)
@@ -165,7 +165,6 @@ class Player:
         move_dir = DIR_MAP_9[move_dir_idx]
         execute_move(ct, move_dir)
 
-        self._prev_resources = ct.get_global_resources()
 
     def _find_core(self, ct):
         if self.my_team is None:
@@ -188,10 +187,10 @@ class Player:
         n_builders_out = [0]
         result = encode_state_into(
             ct, self._obs_buf, self.core_center, self.enemy_core,
-            self.my_team, self.pos_encoder, self._prev_resources,
+            self.my_team, self.pos_encoder, self._prev_collected,
             self._spawn_round, n_builders_out,
         )
         if result is not None:
-            self.core_center, self.enemy_core = result
+            self.core_center, self.enemy_core, self._prev_collected = result
         self._n_builders_cached = n_builders_out[0]
         return self._obs_buf

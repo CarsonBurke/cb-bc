@@ -108,6 +108,12 @@ class FakeController:
     def get_global_resources(self):
         return self.ti, self.ax
 
+    def get_resources_collected(self):
+        return 200, 50
+
+    def get_global_resources_full(self):
+        return self.ti, self.ax, 200, 50
+
     def get_scale_percent(self):
         return self.scale
 
@@ -240,17 +246,18 @@ def _reference_obs(player: Player, ct: FakeController) -> list[float]:
         d = max(abs(edx), abs(edy), 1)
         ecore_dx = edx / d
         ecore_dy = edy / d
-    ti_delta, ax_delta = 0.0, 0.0
-    if player._prev_resources is not None:
-        prev_ti, prev_ax = player._prev_resources
-        ti_delta = (ti - prev_ti) / 500.0
-        ax_delta = (ax - prev_ax) / 500.0
+    ti_collected, ax_collected = ct.get_resources_collected()
+    ti_income, ax_income = 0.0, 0.0
+    if player._prev_collected is not None:
+        prev_ti_c, prev_ax_c = player._prev_collected
+        ti_income = (ti_collected - prev_ti_c) / 500.0
+        ax_income = (ax_collected - prev_ax_c) / 500.0
     hp_advantage = (own_hp - enemy_hp) / 500.0
     features.extend((
         rnd, x_norm, y_norm, ti / 500.0, ax / 500.0, scale,
         core_dx, core_dy, ecore_dx, ecore_dy,
         n_builders / 10.0,
-        ti_delta, ax_delta, hp_advantage,
+        ti_income, ax_income, hp_advantage,
         player._spawn_round / 2000.0 if player._spawn_round >= 0 else 0.0,
     ))
     return features
@@ -261,7 +268,7 @@ def _bench_pipeline(ct: FakeController, iterations: int) -> tuple[float, float]:
     nearby_entities = ct.nearby_entities
     old_player = Player()
     old_player.my_team = ct.get_team()
-    old_player._prev_resources = (160.0, 35.0)
+    old_player._prev_collected = (160.0, 35.0)
     old_player._spawn_round = 100
 
     def old_pipeline() -> None:
@@ -281,7 +288,7 @@ def _bench_pipeline(ct: FakeController, iterations: int) -> tuple[float, float]:
     new_player.my_team = ct.get_team()
     new_player.core_center = Position(18, 20)
     new_player.enemy_core = Position(25, 22)
-    new_player._prev_resources = (160.0, 35.0)
+    new_player._prev_collected = (160.0, 35.0)
     new_player._spawn_round = 100
 
     def new_pipeline() -> None:
@@ -328,7 +335,7 @@ def main() -> None:
     player.my_team = ct.get_team()
     player.core_center = Position(18, 20)
     player.enemy_core = Position(25, 22)
-    player._prev_resources = (160.0, 35.0)
+    player._prev_collected = (160.0, 35.0)
     player._spawn_round = 100
 
     prefetched_us, length = _bench_encode(player, ct, args.iters, prefetched=True)

@@ -17,12 +17,13 @@ _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "te
 sys.path.insert(0, _TENSOR_DIR)
 
 from shared import (
-    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES, POS_EMBED_DIM,
+    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES,
     INPUT_SIZE, HIDDEN_SIZES, H_DIM,
     DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4, DIR_DXY, BUILD_COSTS,
     _CONV_DIR_MASK,
-    SinusoidalPositionEmbedding, GameState,
+    GameState,
     discover_ore, scan_enemy_core_dmg, scan_own_core_dmg,
+    scan_working_harvesters,
     encode_state_into,
     execute_build, execute_move,
     sample_from_logits, argmax,
@@ -115,10 +116,10 @@ class Player:
         self.my_team = None
         self.num_spawned = 0
         self.num_builders = 0
-        self.pos_encoder = SinusoidalPositionEmbedding(POS_EMBED_DIM)
+        self.pos_encoder = None  # kept for encode_state_into signature
         self.h_prev = array("f", [0.0] * H_DIM)
         self._obs_buf = array("f")
-        self._prev_resources = None
+        self._prev_collected = None
         self._n_builders_cached = 1
         self._spawn_round: int = -1
         self._train_log = [] if _TRAIN_LOG else None
@@ -203,14 +204,11 @@ class Player:
         move_dir = DIR_MAP_9[move_dir_idx]
         execute_move(ct, move_dir)
 
-        ti_after, ax_after = ct.get_global_resources()
-        self._prev_resources = (ti_after, ax_after)
-
         if self._train_log is not None:
             self._train_log.append((
                 obs.tobytes(), h_in.tobytes(),
                 build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx,
-                value, 0, conv_reward, ti_after,
+                value, 0, conv_reward, 0,  # index 9: formerly ti_after, unused by parser
                 harv_reward, GameState.enemy_core_dmg, old_log_prob,
                 dbg[0], dbg[1], dbg[2], dbg[3],
                 dbg[4], dbg[5], dbg[6], dbg[7],
@@ -241,11 +239,11 @@ class Player:
         n_builders_out = [0]
         result = encode_state_into(
             ct, self._obs_buf, self.core_center, self.enemy_core,
-            self.my_team, self.pos_encoder, self._prev_resources,
+            self.my_team, self.pos_encoder, self._prev_collected,
             self._spawn_round, n_builders_out,
         )
         if result is not None:
-            self.core_center, self.enemy_core = result
+            self.core_center, self.enemy_core, self._prev_collected = result
         self._n_builders_cached = n_builders_out[0]
         return self._obs_buf
 

@@ -11,9 +11,8 @@ from cambc import Controller, Direction, EntityType, Environment, GameConstants,
 GRID_SIZE = 5
 GRID_HALF = GRID_SIZE // 2
 TILE_FEATURES = 21
-GLOBAL_FEATURES = 17
-POS_EMBED_DIM = 8
-INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
+GLOBAL_FEATURES = 20
+INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES
 HIDDEN_SIZES = [64, 64]
 H_DIM = 24
 COMPRESS_DIM = 80
@@ -131,37 +130,6 @@ _BLD_ONE_HOTS = tuple(
 
 
 # ---------------------------------------------------------------------------
-# SinusoidalPositionEmbedding (stdlib-only, no tensor_lib)
-# ---------------------------------------------------------------------------
-
-class SinusoidalPositionEmbedding:
-    __slots__ = ("d_model", "freqs", "_quarter")
-
-    def __init__(self, d_model: int, base: float = 10000.0):
-        self.d_model = d_model
-        self._quarter = d_model // 4
-        self.freqs: list[float] = [
-            1.0 / (base ** (2.0 * i / d_model))
-            for i in range(self._quarter)
-        ]
-
-    def encode(self, x: int, y: int) -> list[float]:
-        q = self._quarter
-        freqs = self.freqs
-        vec = [0.0] * self.d_model
-        half = q * 2
-        for i in range(q):
-            angle = x * freqs[i]
-            vec[2 * i] = math.sin(angle)
-            vec[2 * i + 1] = math.cos(angle)
-        for i in range(q):
-            angle = y * freqs[i]
-            vec[half + 2 * i] = math.sin(angle)
-            vec[half + 2 * i + 1] = math.cos(angle)
-        return vec
-
-
-# ---------------------------------------------------------------------------
 # GameState — shared mutable state across all units (replaces Player class vars)
 # ---------------------------------------------------------------------------
 
@@ -183,10 +151,6 @@ class GameState:
     enemy_core_dmg_round: int = -1
     own_core_dmg: float = 0.0
     own_core_dmg_round: int = -1
-    # Titanium income tracking: ti_collected delta between rounds
-    ti_income: int = 0
-    ti_income_round: int = -1
-    _prev_ti_collected: int = 0
 
     @classmethod
     def reset(cls) -> None:
@@ -206,9 +170,6 @@ class GameState:
         cls.enemy_core_dmg_round = -1
         cls.own_core_dmg = 0.0
         cls.own_core_dmg_round = -1
-        cls.ti_income = 0
-        cls.ti_income_round = -1
-        cls._prev_ti_collected = 0
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +275,7 @@ def scan_working_harvesters(ct: Controller) -> None:
 # ---------------------------------------------------------------------------
 
 def encode_state_into(ct: Controller, features, core_center, enemy_core,
-                      my_team, pos_encoder, prev_resources, spawn_round,
+                      my_team, pos_encoder, prev_collected, spawn_round,
                       n_builders_out: list) -> None:
     """Append encoded state into a list-like float buffer.
 
@@ -418,34 +379,36 @@ def encode_state_into(ct: Controller, features, core_center, enemy_core,
         ecore_dy = float(_enemy_core.y - pos.y)
         ecore_known = 1.0
 
-    ti_delta, ax_delta = 0.0, 0.0
-    if prev_resources is not None:
-        prev_ti, prev_ax = prev_resources
-        ti_delta = (ti - prev_ti) / 500.0
-        ax_delta = (ax - prev_ax) / 500.0
+    ti_income, ax_income = 0.0, 0.0
+    if prev_collected is not None:
+        prev_ti, prev_ax = prev_collected
+        ti_income = (ti - prev_ti) / 500.0
+        ax_income = (ax - prev_ax) / 500.0
 
     hp_advantage = (own_hp - enemy_hp) / 500.0
+
+    scan_working_harvesters(ct)
 
     extend([
         rnd, x_norm, y_norm, ti / 500.0, ax / 500.0, scale,
         core_dx, core_dy, ecore_dx, ecore_dy,
         n_builders / 10.0,
-        ti_delta, ax_delta, hp_advantage,
+        ti_income, ax_income, hp_advantage,
         spawn_round / 2000.0 if spawn_round >= 0 else 0.0,
         core_known, ecore_known,
+        w / 50.0, h / 50.0,
+        GameState.working_harv_count / 20.0,
     ])
 
-    extend(pos_encoder.encode(pos.x, pos.y))
-
-    return _core_center, _enemy_core
+    return _core_center, _enemy_core, (ti, ax)
 
 
 def encode_state(ct: Controller, core_center, enemy_core, my_team,
-                 pos_encoder, prev_resources, spawn_round,
+                 pos_encoder, prev_collected, spawn_round,
                  n_builders_out: list) -> list[float]:
     features: list[float] = []
     updated = encode_state_into(ct, features, core_center, enemy_core,
-                                my_team, pos_encoder, prev_resources,
+                                my_team, pos_encoder, prev_collected,
                                 spawn_round, n_builders_out)
     return features, updated
 

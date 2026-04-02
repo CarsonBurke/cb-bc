@@ -207,9 +207,12 @@ def _make_player():
     tensor_main.Player._own_core_hp = 500.0
     tensor_main.Player._enemy_core_dmg = 0.0
     tensor_main.Player._enemy_core_dmg_round = -1
+    tensor_main.Player._working_harv_positions = set()
+    tensor_main.Player._working_harv_round = -1
+    tensor_main.Player._working_harv_count = 0
     player = tensor_main.Player()
     player.my_team = 1
-    player._prev_resources = (150.0, 20.0)
+    player._prev_collected = (150.0, 20.0)
     player._spawn_round = 120
     return player
 
@@ -309,8 +312,8 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
         ecore_known = 1.0
 
     ti_delta, ax_delta = 0.0, 0.0
-    if player._prev_resources is not None:
-        prev_ti, prev_ax = player._prev_resources
+    if player._prev_collected is not None:
+        prev_ti, prev_ax = player._prev_collected
         ti_delta = (ti - prev_ti) / 500.0
         ax_delta = (ax - prev_ax) / 500.0
 
@@ -323,16 +326,19 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
         player._spawn_round / 2000.0 if player._spawn_round >= 0 else 0.0,
         core_known, ecore_known,
         w / 50.0, h / 50.0,
+        tensor_main.Player._working_harv_count / 20.0,
     ))
     return features
 
 
 def test_prefetched_vs_internal_nearby_match():
     ct = FakeController()
-    player = _make_player()
 
-    with_prefetch = list(player._encode_state(ct, ct.nearby_tiles, ct.nearby_entities))
-    without_prefetch = list(player._encode_state(ct))
+    player1 = _make_player()
+    with_prefetch = list(player1._encode_state(ct, ct.nearby_tiles, ct.nearby_entities))
+
+    player2 = _make_player()
+    without_prefetch = list(player2._encode_state(ct))
 
     assert without_prefetch == with_prefetch
 
@@ -353,25 +359,27 @@ def test_obs_encodes_expected_tiles_and_globals():
 
     obs = list(player._encode_state(ct, ct.nearby_tiles, ct.nearby_entities))
 
+    NB = tensor_main.N_BLD_TYPES  # 10
+
     wall_idx = _tile_start(-1, -1)
     assert obs[wall_idx:wall_idx + 4] == [1.0, 0.0, 0.0, 1.0]
-    assert obs[wall_idx + 4:wall_idx + 12] == list(tensor_main._BLD_ONE_HOTS[0])
+    assert obs[wall_idx + 4:wall_idx + 4 + NB] == list(tensor_main._BLD_ONE_HOTS[0])
 
     conv_idx = _tile_start(0, -1)
     assert obs[conv_idx:conv_idx + 4] == [0.0, 0.0, 0.0, 0.0]
-    assert obs[conv_idx + 4:conv_idx + 12] == list(tensor_main._BLD_ONE_HOTS[2])
-    assert obs[conv_idx + 12:conv_idx + 17] == [1.0, 1.0, 0.0, 0.0, 0.0]
-    assert obs[conv_idx + 17:conv_idx + 19] == [0.0, 0.0]
+    assert obs[conv_idx + 4:conv_idx + 4 + NB] == list(tensor_main._BLD_ONE_HOTS[2])
+    assert obs[conv_idx + 4 + NB:conv_idx + 4 + NB + 5] == [1.0, 1.0, 0.0, 0.0, 0.0]
+    assert obs[conv_idx + 4 + NB + 5:conv_idx + 4 + NB + 7] == [0.0, 0.0]
 
     harv_idx = _tile_start(1, 0)
     assert obs[harv_idx:harv_idx + 4] == [0.0, 0.0, 1.0, 0.0]
-    assert obs[harv_idx + 4:harv_idx + 12] == list(tensor_main._BLD_ONE_HOTS[1])
-    assert obs[harv_idx + 12:harv_idx + 17] == [-1.0, 0.0, 1.0, 0.0, 1.0]
+    assert obs[harv_idx + 4:harv_idx + 4 + NB] == list(tensor_main._BLD_ONE_HOTS[1])
+    assert obs[harv_idx + 4 + NB:harv_idx + 4 + NB + 5] == [-1.0, 0.0, 1.0, 0.0, 1.0]
 
     centre_idx = _tile_start(0, 0)
-    assert obs[centre_idx + 17:centre_idx + 19] == [1.0, 1.0]
+    assert obs[centre_idx + 4 + NB + 5:centre_idx + 4 + NB + 7] == [1.0, 1.0]
 
     global_idx = tensor_main._GLOBAL_OBS_START
     globals_slice = obs[global_idx:global_idx + tensor_main.GLOBAL_FEATURES]
-    ref = _reference_encode(ct, player)
+    ref = _reference_obs(_make_player(), ct)
     assert globals_slice == ref[tensor_main._GLOBAL_OBS_START:]

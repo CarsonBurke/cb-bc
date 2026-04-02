@@ -17,14 +17,38 @@ _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "te
 sys.path.insert(0, _TENSOR_DIR)
 
 from shared import (
-    INPUT_SIZE, HIDDEN_SIZES, H_DIM, RMSNORM_LAYERS, POS_EMBED_DIM, COMPRESS_DIM,
+    INPUT_SIZE, HIDDEN_SIZES, H_DIM, RMSNORM_LAYERS, COMPRESS_DIM,
     DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4,
-    SinusoidalPositionEmbedding,
     encode_state_into, argmax,
     execute_build,
     N_BLD_TYPES, BRIDGE_OFFSETS,
     TILE_FEATURES, GRID_SIZE,
 )
+
+# Old-architecture constants for frozen opponent weights
+POS_EMBED_DIM = 8
+
+import math as _math
+
+class SinusoidalPositionEmbedding:
+    __slots__ = ("d_model", "freqs", "_quarter")
+    def __init__(self, d_model: int, base: float = 10000.0):
+        self.d_model = d_model
+        self._quarter = d_model // 4
+        self.freqs = [1.0 / (base ** (2.0 * i / d_model)) for i in range(self._quarter)]
+    def encode(self, x: int, y: int) -> list[float]:
+        q, freqs = self._quarter, self.freqs
+        vec = [0.0] * self.d_model
+        half = q * 2
+        for i in range(q):
+            angle = x * freqs[i]
+            vec[2 * i] = _math.sin(angle)
+            vec[2 * i + 1] = _math.cos(angle)
+        for i in range(q):
+            angle = y * freqs[i]
+            vec[half + 2 * i] = _math.sin(angle)
+            vec[half + 2 * i + 1] = _math.cos(angle)
+        return vec
 
 # Import MLP from tensor_inference's tensor_lib
 _INFERENCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor_inference")
@@ -98,7 +122,7 @@ class Player:
         self.my_team = None
         self.num_spawned = 0
         self.num_builders = 0
-        self._prev_resources = None
+        self._prev_collected = None
         self._n_builders_cached = 1
         self._spawn_round: int = -1
 
@@ -182,7 +206,6 @@ class Player:
         move_dir = DIR_MAP_9[move_dir_idx]
         self._execute_move(ct, move_dir)
 
-        self._prev_resources = ct.get_global_resources()
 
     def _find_core(self, ct):
         if self.my_team is None:
@@ -203,11 +226,11 @@ class Player:
         n_builders_out = [0]
         result = encode_state_into(
             ct, features, self.core_center, self.enemy_core,
-            self.my_team, self.pos_encoder, self._prev_resources,
+            self.my_team, self.pos_encoder, self._prev_collected,
             self._spawn_round, n_builders_out,
         )
         if result is not None:
-            self.core_center, self.enemy_core = result
+            self.core_center, self.enemy_core, self._prev_collected = result
         self._n_builders_cached = n_builders_out[0]
         return features
 

@@ -39,28 +39,27 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _USE_BF16 = DEVICE.type == "cuda" and torch.cuda.is_bf16_supported()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
-# ---- Architecture constants (must match main.py) ----
+# ---- Architecture constants (imported from tensor_inference/model_constants.py) ----
 
-TILE_FEATURES = 21
-GLOBAL_FEATURES = 19
-OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES
-HIDDEN = [64, 64]
+import sys as _sys
+_CONSTANTS_DIR = str(PROJECT_ROOT / "bots" / "tensor_inference")
+if _CONSTANTS_DIR not in _sys.path:
+    _sys.path.insert(0, _CONSTANTS_DIR)
+from model_constants import (
+    GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES,
+    H_DIM, HIDDEN_SIZES, COMPRESS_DIM, RMSNORM_LAYERS,
+    TILE_EMBED_DIM, TILE_INPUT_DIM, TILE_GRID_N,
+    INPUT_SIZE, OBS_SIZE, TRUNK_INPUT_SIZE, OBS_PREFIX_SIZE,
+)
+HIDDEN = HIDDEN_SIZES
 TEACHER_HIDDEN = [128, 128, 128, 64]
-H_DIM = 24
-INPUT_SIZE = OBS_SIZE + H_DIM
-TILE_EMBED_DIM = 8
-TILE_INPUT_DIM = TILE_FEATURES + 2  # 23: raw features + (dx/2, dy/2)
-TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
-COMPRESS_DIM = 80  # tile compress output dim (spatial pooling)
-TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + H_DIM
-OBS_PREFIX_SIZE = TRUNK_INPUT_SIZE - H_DIM
 ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 13
 N_DIR = 9
 N_CONV_DIR = 4  # cardinal only: N, W, E, S (indices 1, 3, 5, 7 in DIR_MAP_9)
 N_BRIDGE_TARGETS = 28  # offsets (dx,dy) with 0 < dx²+dy² ≤ 9
 N_LOGIT_SCALE = 5  # per-head eps: bt, bd, cd, brt, md
-ACTOR_RMSNORM_LAYERS = (True, True)
+ACTOR_RMSNORM_LAYERS = tuple(RMSNORM_LAYERS)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
 BRIDGE_BUILD_TYPE = 12
@@ -90,8 +89,8 @@ class RewardMode(Enum):
     FLOW = "flow"         # weighted conveyor hops toward core per round
 
 REWARD_MODE = RewardMode.FLOW
-REWARD_INCOME_SCALE = 0.01  # scale for titanium income reward (income mode)
-REWARD_FLOW_SCALE = 20.0    # scale for flow reward (flow mode)
+REWARD_INCOME_SCALE = 2.5 # since each "resource" is worth 10
+REWARD_FLOW_SCALE = 5.0
 TERMINAL_WIN_REWARD = 10.0
 TERMINAL_LOSS_REWARD = -10.0
 GAMMA = 0.995 # GAE
@@ -475,7 +474,7 @@ class RMSNorm(nn.Module):
 GLOBAL_MAP_MAX_W = 50
 GLOBAL_MAP_MAX_H = 50
 GLOBAL_MAP_CHANNELS = 21
-GLOBAL_SCALAR_DIM = 17  # 12 base + own_working_harv, Δti, Δax, Δcore_hp, Δworking_harv
+GLOBAL_SCALAR_DIM = 19  # 12 base + own_working_harv, Δti_collected, Δax_collected, Δcore_hp, Δworking_harv, flow_reward, delivery_reward
 UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
 CENTRALIZED_CNN_CHUNK = 4096  # Larger chunks amortize critic launch/bookkeeping overhead.
 DEFAULT_CRITIC_MINIBATCH_SIZE = 4096
@@ -583,10 +582,13 @@ class CentralizedCritic(nn.Module):
             nn.SiLU(),
         )
 
-        # Single per-unit value head from tile features + replay/global context.
+        # Per-unit value head from tile features + replay/global context.
         # Outputs NUM_BUCKETS logits for Dreamer4-style symexp two-hot prediction.
         unit_in = conv_dim + UNIT_CONTEXT_DIM + GLOBAL_SCALAR_DIM + ACTOR_LATENT_DIM
         self.unit_head = nn.Sequential(
+            nn.Linear(unit_in, unit_in),
+            RMSNorm(unit_in),
+            nn.SiLU(),
             nn.Linear(unit_in, unit_in),
             RMSNorm(unit_in),
             nn.SiLU(),
@@ -614,7 +616,7 @@ class CentralizedCritic(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         # Dreamer4's create_mlp leaves the value head MLP on nn.Linear defaults.
-        for layer in (self.unit_head[0], self.unit_head[3]):
+        for layer in (self.unit_head[0], self.unit_head[3], self.unit_head[6]):
             layer.reset_parameters()
 
     def encode_map(
@@ -1757,16 +1759,27 @@ def _actor_recurrent_step(
 
 
 _compiled_actor_step: Callable | None = None
+_actor_cuda_cfg: PretrainCudaConfig | None = None
+
+
+def _get_actor_cuda_config() -> PretrainCudaConfig:
+    global _actor_cuda_cfg
+    if _actor_cuda_cfg is None:
+        _actor_cuda_cfg = resolve_cuda_config(
+            DEVICE,
+            spatial_inputs=False,
+            enable_compile=True,
+        )
+    return _actor_cuda_cfg
 
 
 def _get_actor_step_fn() -> Callable:
     """Get the (possibly compiled) actor recurrent step function."""
     global _compiled_actor_step
     if _compiled_actor_step is None:
-        cuda_cfg = _get_critic_cuda_config()
         _compiled_actor_step = maybe_compile(
             _actor_recurrent_step,
-            cuda_cfg,
+            _get_actor_cuda_config(),
             label="actor PPO step",
         )
     return _compiled_actor_step
@@ -2357,15 +2370,13 @@ def _parse_trajectories(
                         dmg = step.get("dmg", 0)
                         own_dmg = step.get("own_dmg", 0)
                         lp_t[i] = step.get("old_lp", 0)
-                    _credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
-                    rw_t[i] = n_working * _credit if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW) else 0.0
+                    rw_t[i] = n_working if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW) else 0.0
                 step_game_t[start:end] = game_idx
                 idx = end
                 ep_boundaries.append((start, end))
                 continue
 
-            _credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
-            rw_t[start:end] = n_working_t * _credit if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW) else 0.0
+            rw_t[start:end] = n_working_t if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW) else 0.0
             step_game_t[start:end] = game_idx
             idx = end
             ep_boundaries.append((start, end))
@@ -2732,12 +2743,14 @@ def critic_checkpoint_path(weight_path: str | Path = WEIGHT_PATH) -> Path:
 
 def reset_centralized_critic() -> None:
     """Drop the singleton critic/optimizer so a fresh instance is created on demand."""
-    global _centralized_critic, _centralized_optimizer, _centralized_critic_step, _centralized_critic_loss_step, _compiled_actor_step
+    global _centralized_critic, _centralized_optimizer, _centralized_critic_step, _centralized_critic_loss_step
+    global _compiled_actor_step, _actor_cuda_cfg
     _centralized_critic = None
     _centralized_optimizer = None
     _centralized_critic_step = None
     _centralized_critic_loss_step = None
     _compiled_actor_step = None
+    _actor_cuda_cfg = None
 
 
 def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.optim.Optimizer]:

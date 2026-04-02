@@ -6,7 +6,7 @@ use crate::protobuf::*;
 use crate::types::*;
 
 pub const N_CHANNELS: usize = 21;
-pub const N_SCALARS: usize = 17;
+pub const N_SCALARS: usize = 19;
 
 pub struct ReplayData {
     pub states: Vec<f32>,
@@ -139,8 +139,8 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
     let mut player_res: [PlayerRes; 2] = [PlayerRes::default(), PlayerRes::default()];
     let mut prev_ti_collected: [i32; 2] = [0, 0];
     let mut prev_ax_collected: [i32; 2] = [0, 0];
-    let mut prev_own_ti: f32 = 0.0;
-    let mut prev_own_ax: f32 = 0.0;
+    let mut prev_own_ti_collected: i32 = 0;
+    let mut prev_own_ax_collected: i32 = 0;
     let mut prev_own_core_hp: f32 = 500.0;
     let mut prev_own_working: f32 = 0.0;
     let team_idx = team as usize;
@@ -253,17 +253,15 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
         sc[10] = enemy_res.resources_collected as f32 / 500.0;
         sc[11] = entities.len() as f32 / 100.0;
 
-        let cur_own_ti = own_res.titanium as f32;
-        let cur_own_ax = own_res.axionite as f32;
         let cur_own_core_hp = core_hp[team_idx] as f32;
         let cur_own_working = n_own_working as f32;
         sc[12] = cur_own_working / 20.0;
-        sc[13] = (cur_own_ti - prev_own_ti) / 500.0;
-        sc[14] = (cur_own_ax - prev_own_ax) / 500.0;
+        sc[13] = (own_res.titanium_collected - prev_own_ti_collected) as f32 / 500.0;
+        sc[14] = (own_res.axionite_collected - prev_own_ax_collected) as f32 / 500.0;
         sc[15] = (cur_own_core_hp - prev_own_core_hp) / 500.0;
         sc[16] = (cur_own_working - prev_own_working) / 20.0;
-        prev_own_ti = cur_own_ti;
-        prev_own_ax = cur_own_ax;
+        prev_own_ti_collected = own_res.titanium_collected;
+        prev_own_ax_collected = own_res.axionite_collected;
         prev_own_core_hp = cur_own_core_hp;
         prev_own_working = cur_own_working;
 
@@ -371,12 +369,13 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
                             }
                             if let (
                                 Some((src_kind, src_team, src_stored)),
-                                Some((_dst_kind, dst_team)),
+                                Some((dst_kind, dst_team)),
                             ) = (src_meta, dst_meta)
                             {
                                 if src_kind.is_storing()
+                                    && dst_kind.is_storing()
                                     && src_team == dst_team
-                                    && src_stored != 2
+                                    && src_stored > 0
                                 {
                                     // Skip reward if destination was just
                                     // rebuilt (resource-destroying rebuild).
@@ -388,8 +387,10 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                     let dst_fd = fd[to.y as usize * map_w + to.x as usize];
                                     if src_fd != i32::MAX && dst_fd != i32::MAX && dst_fd < src_fd {
                                         let improvement = src_fd - dst_fd;
+                                        // Axionite is worth 4x titanium
+                                        let res_mult = if src_stored == 2 { 4.0f32 } else { 1.0 };
                                         let weight =
-                                            improvement as f32 / (src_fd.max(1) as f32).sqrt();
+                                            res_mult * improvement as f32 / (src_fd.max(1) as f32).sqrt();
                                         resource_transfers
                                             [turn_idx * 2 + src_team as usize] += weight;
                                     }
@@ -423,6 +424,11 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
             prev_ti_collected[t] = cur_ti;
             prev_ax_collected[t] = cur_ax;
         }
+
+        // Flow reward and delivery reward for critic observation
+        let sc2 = &mut scalars[turn_idx * N_SCALARS..(turn_idx + 1) * N_SCALARS];
+        sc2[17] = resource_transfers[turn_idx * 2 + team_idx];
+        sc2[18] = (td[team_idx] + ad[team_idx] * 4) as f32;
     }
 
     ReplayData {

@@ -85,6 +85,12 @@ class FakeActionController:
     def get_global_resources(self):
         return self.ti, self.ax
 
+    def get_resources_collected(self):
+        return 200, 50
+
+    def get_global_resources_full(self):
+        return self.ti, self.ax, 200, 50
+
     def destroy(self, pos):
         self.buildings.pop((pos.x, pos.y), None)
 
@@ -351,7 +357,7 @@ def _bench_builder_tail(iterations: int) -> tuple[float, float]:
         move_dir = bot_main.DIR_MAP_9[move_dir_idx]
         _old_execute_move(ct, move_dir)
         _ = bot_main.Player._enemy_core_dmg
-        old_player._prev_resources = ct.get_global_resources()
+        old_player._prev_collected = ct.get_resources_collected()
     start = time.perf_counter()
     for _ in range(iterations):
         ct = make_template()
@@ -364,7 +370,7 @@ def _bench_builder_tail(iterations: int) -> tuple[float, float]:
         move_dir = bot_main.DIR_MAP_9[move_dir_idx]
         _old_execute_move(ct, move_dir)
         _ = bot_main.Player._enemy_core_dmg
-        old_player._prev_resources = ct.get_global_resources()
+        old_player._prev_collected = ct.get_resources_collected()
     old_us = (time.perf_counter() - start) * 1e6 / iterations
 
     new_player = _make_player()
@@ -375,7 +381,7 @@ def _bench_builder_tail(iterations: int) -> tuple[float, float]:
         new_player._execute_build(ct, build_type_idx, build_dir, conv_dir)
         move_dir = bot_main.DIR_MAP_9[move_dir_idx]
         new_player._execute_move(ct, move_dir)
-        new_player._prev_resources = ct.get_global_resources()
+        new_player._prev_collected = ct.get_resources_collected()
     start = time.perf_counter()
     for _ in range(iterations):
         ct = make_template()
@@ -384,7 +390,7 @@ def _bench_builder_tail(iterations: int) -> tuple[float, float]:
         new_player._execute_build(ct, build_type_idx, build_dir, conv_dir)
         move_dir = bot_main.DIR_MAP_9[move_dir_idx]
         new_player._execute_move(ct, move_dir)
-        new_player._prev_resources = ct.get_global_resources()
+        new_player._prev_collected = ct.get_resources_collected()
     new_us = (time.perf_counter() - start) * 1e6 / iterations
     return old_us, new_us
 
