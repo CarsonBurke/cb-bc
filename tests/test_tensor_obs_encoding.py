@@ -294,21 +294,19 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
         except Exception:
             pass
 
-    core_dx, core_dy = 0.0, 0.0
-    if player.core_center is not None:
-        cdx = player.core_center.x - pos.x
-        cdy = player.core_center.y - pos.y
-        d = max(abs(cdx), abs(cdy), 1)
-        core_dx = cdx / d
-        core_dy = cdy / d
+    w, h = ct.get_map_width(), ct.get_map_height()
 
-    ecore_dx, ecore_dy = 0.0, 0.0
+    core_dx, core_dy, core_known = 0.0, 0.0, 0.0
+    if player.core_center is not None:
+        core_dx = float(player.core_center.x - pos.x)
+        core_dy = float(player.core_center.y - pos.y)
+        core_known = 1.0
+
+    ecore_dx, ecore_dy, ecore_known = 0.0, 0.0, 0.0
     if player.enemy_core is not None:
-        edx = player.enemy_core.x - pos.x
-        edy = player.enemy_core.y - pos.y
-        d = max(abs(edx), abs(edy), 1)
-        ecore_dx = edx / d
-        ecore_dy = edy / d
+        ecore_dx = float(player.enemy_core.x - pos.x)
+        ecore_dy = float(player.enemy_core.y - pos.y)
+        ecore_known = 1.0
 
     ti_delta, ax_delta = 0.0, 0.0
     if player._prev_resources is not None:
@@ -323,8 +321,9 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
         n_builders / 10.0,
         ti_delta, ax_delta, hp_advantage,
         player._spawn_round / 2000.0 if player._spawn_round >= 0 else 0.0,
+        core_known, ecore_known,
+        w / 50.0, h / 50.0,
     ))
-    features.extend(player.pos_encoder.encode(pos.x, pos.y))
     return features
 
 
@@ -374,23 +373,5 @@ def test_obs_encodes_expected_tiles_and_globals():
 
     global_idx = tensor_main._GLOBAL_OBS_START
     globals_slice = obs[global_idx:global_idx + tensor_main.GLOBAL_FEATURES]
-    assert globals_slice == [
-        0.4,
-        ct.pos.x / ct.width,
-        ct.pos.y / ct.height,
-        0.4,
-        0.1,
-        0.3,
-        -1.0,
-        0.0,
-        1.0,
-        0.4,
-        0.1,
-        0.1,
-        0.06,
-        0.1,
-        0.06,
-    ]
-
-    pos_embed = player.pos_encoder.encode(ct.pos.x, ct.pos.y)
-    assert obs[-tensor_main.POS_EMBED_DIM:] == list(pos_embed)
+    ref = _reference_encode(ct, player)
+    assert globals_slice == ref[tensor_main._GLOBAL_OBS_START:]

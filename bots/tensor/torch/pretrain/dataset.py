@@ -25,7 +25,7 @@ from replay_parser import (
 )
 
 _CACHE_DIR_NAME = ".pretrain_cache"
-_ACTOR_CACHE_VERSION = 10  # v10: GLOBAL_FEATURES 15→17 (core_known, ecore_known), raw core distances
+_ACTOR_CACHE_VERSION = 12  # v12: GLOBAL_FEATURES 17→19 (map w/50, h/50), removed POS_EMBED_DIM
 _CRITIC_CACHE_VERSION = 14  # v14: income mode (no terminal reward)
 from model import (
     GAMMA,

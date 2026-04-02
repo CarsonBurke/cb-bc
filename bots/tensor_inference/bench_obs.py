@@ -253,7 +253,6 @@ def _reference_obs(player: Player, ct: FakeController) -> list[float]:
         ti_delta, ax_delta, hp_advantage,
         player._spawn_round / 2000.0 if player._spawn_round >= 0 else 0.0,
     ))
-    features.extend(player.pos_encoder.encode(pos.x, pos.y))
     return features
 
 

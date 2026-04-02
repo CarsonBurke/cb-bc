@@ -30,7 +30,7 @@ def _resolve_bot_dir() -> str:
 BOT_DIR = _resolve_bot_dir()
 if BOT_DIR not in sys.path:
     sys.path.insert(0, BOT_DIR)
-from tensor_lib import MLP, SinusoidalPositionEmbedding
+from tensor_lib import MLP
 
 # -- Layout constants --
 GRID_SIZE = 5
@@ -42,9 +42,8 @@ GRID_HALF = GRID_SIZE // 2
 TILE_FEATURES = 21
 # Global: round, x, y, ti, ax, scale, core_dx, core_dy, enemy_core_dx, enemy_core_dy,
 #         n_builders, ti_delta, ax_delta, hp_advantage, spawn_round = 15
-GLOBAL_FEATURES = 17
-POS_EMBED_DIM = 8
-INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
+GLOBAL_FEATURES = 19
+INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES
 HIDDEN_SIZES = [64, 64]
 H_DIM = 24  # Recurrent hidden state size
 COMPRESS_DIM = 80
@@ -204,13 +203,13 @@ def _weight_cache_key(path: str) -> tuple[str, int, int] | None:
 TILE_FEATURES_COUNT = 21
 TILE_INPUT_DIM = TILE_FEATURES_COUNT + 2  # 23: raw features + (dx/2, dy/2)
 TILE_EMBED_DIM = 8
-OBS_SIZE = _GLOBAL_OBS_START + GLOBAL_FEATURES + POS_EMBED_DIM
+OBS_SIZE = _GLOBAL_OBS_START + GLOBAL_FEATURES
 _ZERO_OBS = (0.0,) * OBS_SIZE
 
 
 def _build_model() -> MLP:
     model = MLP(
-        input_size=COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM,
+        input_size=COMPRESS_DIM + GLOBAL_FEATURES + H_DIM,
         hidden_sizes=HIDDEN_SIZES,
         output_heads={
             "build_type": len(BUILD_ACTIONS),
@@ -273,9 +272,6 @@ class Player:
         self.my_team = None
         self.num_spawned = 0
         self.num_builders = 0
-
-        # Positional encoder (fixed sinusoidal)
-        self.pos_encoder = SinusoidalPositionEmbedding(POS_EMBED_DIM)
 
         # Share weights/process-local inference cache across all unit instances.
         self.model = _get_shared_model()
@@ -679,11 +675,11 @@ class Player:
             ti_delta, ax_delta, hp_advantage,
             self._spawn_round / 2000.0 if self._spawn_round >= 0 else 0.0,
             core_known, ecore_known,
+            w / 50.0, h / 50.0,
         )
-        features[_GLOBAL_OBS_START + GLOBAL_FEATURES:OBS_SIZE] = self.pos_encoder.encode(pos_x, pos_y)
 
     def _encode_state(self, ct: Controller, nearby_tiles=None, nearby_entities=None) -> list[float]:
-        """Encode 5x5 grid (16 feat/tile) + global (14) + pos embed (8)."""
+        """Encode 5x5 grid (21 feat/tile) + global (19)."""
         features = self._obs_buf
         features.clear()
         self._encode_state_into(ct, features, nearby_tiles, nearby_entities)
