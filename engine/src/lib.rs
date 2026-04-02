@@ -1,9 +1,0 @@
-pub mod bindings;
-pub mod cli;
-pub mod common;
-pub mod game;
-pub mod game_map;
-pub mod map_loader;
-pub mod proto;
-pub mod replay;
-pub mod runner;
