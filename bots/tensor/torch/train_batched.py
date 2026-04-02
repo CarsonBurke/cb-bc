@@ -92,6 +92,7 @@ from model import (
     N_BRIDGE_TARGETS,
     compute_harvester_build_dir_mask,
     _unimix_logits,
+    _OBS_GLOBAL_START,
 )
 
 
@@ -862,11 +863,8 @@ def collect_games_batched(
                 rewards = compute_dense_flow_rewards(gstates)
             game_trajs = augment_trajectories_with_flow_rewards(game_trajs, rewards)
             # Track delivery totals separately for logging
-            try:
-                delivery_rewards = compute_dense_delivery_rewards(gstates)
-                game_delivery_totals[game_counter] = sum(delivery_rewards.values())
-            except (ValueError, KeyError):
-                pass
+            delivery_rewards = compute_dense_delivery_rewards(gstates)
+            game_delivery_totals[game_counter] = sum(delivery_rewards.values())
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -911,27 +909,26 @@ def _step_round_index(step) -> int | None:
     obs = step[0]
     if isinstance(obs, (bytes, bytearray, memoryview)):
         import struct as _struct
-        _OBS_ROUND_BYTE_OFFSET = 475 * 4
+        _OBS_ROUND_BYTE_OFFSET = _OBS_GLOBAL_START * 4
         if len(obs) <= _OBS_ROUND_BYTE_OFFSET + 3:
             return None
         rnd_val = _struct.unpack_from('<f', obs, _OBS_ROUND_BYTE_OFFSET)[0]
     elif isinstance(obs, (list, tuple)):
-        if len(obs) <= 475:
+        if len(obs) <= _OBS_GLOBAL_START:
             return None
-        rnd_val = obs[475]
+        rnd_val = obs[_OBS_GLOBAL_START]
     else:
         return None
     return max(0, min(int(round(rnd_val * 2000.0)), 1999))
 
 
 def _step_build_reward(step) -> float:
-    _credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
     if isinstance(step, (list, tuple)):
         n = len(step)
         if n > 12:
-            return float(step[7] if n > 7 else 0.0) * _credit
-        return float(step[6] if n > 6 else 0.0) * _credit
-    return float(step.get("n_working", 0.0)) * _credit
+            return float(step[7] if n > 7 else 0.0)
+        return float(step[6] if n > 6 else 0.0)
+    return float(step.get("n_working", 0.0))
 
 
 def _shared_flow_reward_total(game_trajs: list[list]) -> float:
@@ -1209,8 +1206,7 @@ def main():
                     conv_fail = s.get("conv_fail", 0)
                     conv_gate = s.get("conv_gate", 0)
                     conv_paid = s.get("conv_paid", 0)
-                _credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
-                r_flow += n_working * _credit
+                r_flow += n_working
                 harv_attempts += harv_attempt
                 harv_failures += harv_fail
                 harv_prox_gate += harv_gate
@@ -1246,8 +1242,8 @@ def main():
         }
         n_games_logged = max(len(game_shared_flow), 1)
         mean_r_flow = sum(game_shared_flow.values()) / n_games_logged
-        _delivery_credit = REWARD_FLOW_SCALE if REWARD_MODE == RewardMode.FLOW else REWARD_INCOME_SCALE
-        mean_r_delivery = sum(game_delivery_totals.values()) * _delivery_credit / n_games_logged
+        mean_r_delivery = sum(game_delivery_totals.values()) * REWARD_INCOME_SCALE / n_games_logged
+        mean_r_flow -= mean_r_delivery
         mean_r_dmg = sum(r[2] for r in rewards) / n_trajs
         mean_r_own_dmg = sum(r[3] for r in rewards) / n_trajs
         mean_harv_attempts = sum(r[4] for r in rewards) / n_trajs
@@ -1259,7 +1255,7 @@ def main():
         mean_conv_prox_gate = sum(r[10] for r in rewards) / n_trajs
         mean_conv_prox_paid = sum(r[11] for r in rewards) / n_trajs
         r_outcome = (total_wins * TERMINAL_WIN_REWARD + total_losses * TERMINAL_LOSS_REWARD) / max(total_games, 1) if REWARD_MODE == RewardMode.OUTCOME else 0.0
-        mean_reward = (mean_r_flow + r_outcome)
+        mean_reward = (mean_r_flow + mean_r_delivery + r_outcome)
         mean_ti = sum(_traj_ti(t) for t in all_trajs if t) / n_trajs
         elapsed = elapsed_offset + (time.time() - run_started_at)
 

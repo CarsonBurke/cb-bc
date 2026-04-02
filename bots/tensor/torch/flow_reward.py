@@ -5,6 +5,8 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+from model import REWARD_INCOME_SCALE, REWARD_FLOW_SCALE
+
 # Obs feature indices — must stay in sync with model.py TILE_FEATURES
 _TILE_FEATURES = 21
 _OBS_GLOBAL_START = 5 * 5 * _TILE_FEATURES  # 525
@@ -55,11 +57,12 @@ def compute_dense_flow_rewards(
     global_states: dict,
     team: int = 0,
 ) -> dict[int, float]:
-    """Per-round reward from weighted conveyor hops toward core + core deliveries.
+    """Per-round reward from weighted conveyor hops toward core + delivery.
 
-    Conveyor hops use improvement/sqrt(src_dist) weighting.
-    Core deliveries count as weight 1.0 per resource unit (ti + ax*4),
-    equivalent to a transfer arriving 0 tiles from core: 1/sqrt(1) = 1.
+    Conveyor hops use improvement/sqrt(src_dist) weighting with flow-field
+    distance. Axionite transfers are weighted 4x (AX_CONVERSION_RATE).
+    Core deliveries are added separately from the delivery buffers
+    (ti + ax * 4) so transfer hops exclude the final hop into core.
 
     Requires transfer_events buffer. Raises if missing.
     """
@@ -71,7 +74,6 @@ def compute_dense_flow_rewards(
     if not buf:
         raise ValueError("transfer_events data missing from global_states")
 
-    # Core deliveries: treat each delivered resource unit as weight 1.0
     ti_buf = _load_buf(global_states, "ti_delivered_buf", "ti_delivered_path")
     ax_buf = _load_buf(global_states, "ax_delivered_buf", "ax_delivered_path")
     has_delivery = bool(ti_buf and ax_buf)
@@ -79,12 +81,12 @@ def compute_dense_flow_rewards(
     rewards: dict[int, float] = {}
     for rnd in range(n_turns):
         a_val, b_val = struct.unpack_from("<ff", buf, rnd * 8)
-        reward = a_val if team == 0 else b_val
+        reward = (a_val if team == 0 else b_val) * REWARD_FLOW_SCALE
         if has_delivery:
             ti_a, ti_b = struct.unpack_from("<ii", ti_buf, rnd * 8)
             ax_a, ax_b = struct.unpack_from("<ii", ax_buf, rnd * 8)
             delivered = (ti_a if team == 0 else ti_b) + (ax_a if team == 0 else ax_b) * AX_CONVERSION_RATE
-            reward += float(delivered)
+            reward += float(delivered) * REWARD_INCOME_SCALE
         if reward != 0.0:
             rewards[rnd] = float(reward)
     return rewards

@@ -16,7 +16,7 @@ sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 from flow_reward import (
     compute_dense_flow_rewards, compute_dense_delivery_rewards,
     augment_trajectories_with_flow_rewards, AX_CONVERSION_RATE,
-    _TILE_FEATURES, _OBS_GLOBAL_START,
+    _TILE_FEATURES, _OBS_GLOBAL_START, REWARD_INCOME_SCALE,
 )
 
 OBS_SIZE = 5 * 5 * _TILE_FEATURES + 17 + 8  # fallback
@@ -81,8 +81,8 @@ class TestComputeDenseFlowRewards:
             "n_turns": 2,
         }
         rewards = compute_dense_flow_rewards(gs, team=0)
-        # round 0: 1.0 (flow) + 3 (ti) + 1*4 (ax) = 8.0
-        assert rewards[0] == pytest.approx(8.0)
+        # round 0: 1.0 (flow) + (3 (ti) + 1*4 (ax)) * REWARD_INCOME_SCALE
+        assert rewards[0] == pytest.approx(1.0 + 7.0 * REWARD_INCOME_SCALE)
         assert 1 not in rewards
 
     def test_delivery_only_no_flow(self):
@@ -94,7 +94,7 @@ class TestComputeDenseFlowRewards:
             "n_turns": 1,
         }
         rewards = compute_dense_flow_rewards(gs, team=0)
-        assert rewards[0] == pytest.approx(5.0)
+        assert rewards[0] == pytest.approx(5.0 * REWARD_INCOME_SCALE)
 
     def test_no_delivery_bufs_flow_only(self):
         """Missing delivery buffers → only flow signal, no error."""
