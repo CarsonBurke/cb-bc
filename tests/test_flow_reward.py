@@ -16,7 +16,7 @@ sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 from flow_reward import (
     compute_dense_flow_rewards, compute_dense_delivery_rewards,
     augment_trajectories_with_flow_rewards, AX_CONVERSION_RATE,
-    _TILE_FEATURES, _OBS_GLOBAL_START, REWARD_INCOME_SCALE,
+    _TILE_FEATURES, _OBS_GLOBAL_START, REWARD_INCOME_SCALE, REWARD_FLOW_SCALE,
 )
 
 OBS_SIZE = 5 * 5 * _TILE_FEATURES + 17 + 8  # fallback
@@ -62,7 +62,7 @@ class TestComputeDenseFlowRewards:
             "n_turns": 3,
             **_zero_delivery_bufs(3),
         }
-        assert compute_dense_flow_rewards(gs) == {1: 2.5}
+        assert compute_dense_flow_rewards(gs) == {1: 2.5 * REWARD_FLOW_SCALE}
 
     def test_decodes_team_b_rewards(self):
         gs = {
@@ -70,7 +70,11 @@ class TestComputeDenseFlowRewards:
             "n_turns": 3,
             **_zero_delivery_bufs(3),
         }
-        assert compute_dense_flow_rewards(gs, team=1) == {0: 1.0, 1: 3.0, 2: 0.5}
+        assert compute_dense_flow_rewards(gs, team=1) == {
+            0: 1.0 * REWARD_FLOW_SCALE,
+            1: 3.0 * REWARD_FLOW_SCALE,
+            2: 0.5 * REWARD_FLOW_SCALE,
+        }
 
     def test_includes_core_deliveries(self):
         """Core deliveries add weight 1.0 per resource unit (ti + ax*4)."""
@@ -81,8 +85,8 @@ class TestComputeDenseFlowRewards:
             "n_turns": 2,
         }
         rewards = compute_dense_flow_rewards(gs, team=0)
-        # round 0: 1.0 (flow) + (3 (ti) + 1*4 (ax)) * REWARD_INCOME_SCALE
-        assert rewards[0] == pytest.approx(1.0 + 7.0 * REWARD_INCOME_SCALE)
+        # round 0: 1.0 * REWARD_FLOW_SCALE (flow) + (3 (ti) + 1*4 (ax)) * REWARD_INCOME_SCALE
+        assert rewards[0] == pytest.approx(1.0 * REWARD_FLOW_SCALE + 7.0 * REWARD_INCOME_SCALE)
         assert 1 not in rewards
 
     def test_delivery_only_no_flow(self):
@@ -103,7 +107,7 @@ class TestComputeDenseFlowRewards:
             "n_turns": 1,
         }
         rewards = compute_dense_flow_rewards(gs, team=0)
-        assert rewards[0] == pytest.approx(2.0)
+        assert rewards[0] == pytest.approx(2.0 * REWARD_FLOW_SCALE)
 
 
 class TestAugmentTrajectories:
