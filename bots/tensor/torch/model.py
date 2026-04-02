@@ -42,9 +42,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 # ---- Architecture constants (must match main.py) ----
 
 TILE_FEATURES = 21
-GLOBAL_FEATURES = 17
-POS_EMBED_DIM = 8
-OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
+GLOBAL_FEATURES = 19
+OBS_SIZE = 5 * 5 * TILE_FEATURES + GLOBAL_FEATURES
 HIDDEN = [64, 64]
 TEACHER_HIDDEN = [128, 128, 128, 64]
 H_DIM = 24
@@ -53,7 +52,7 @@ TILE_EMBED_DIM = 8
 TILE_INPUT_DIM = TILE_FEATURES + 2  # 23: raw features + (dx/2, dy/2)
 TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
 COMPRESS_DIM = 80  # tile compress output dim (spatial pooling)
-TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 119
+TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + H_DIM
 OBS_PREFIX_SIZE = TRUNK_INPUT_SIZE - H_DIM
 ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
 N_BUILD = 13
@@ -1308,14 +1307,14 @@ class BuilderMLP(nn.Module):
         return self.tile_compress(h_flat)                    # (B, 80)
 
     def _build_trunk_input(self, obs: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        """Build trunk input: compressed tiles + globals + pos_embed + h_prev."""
+        """Build trunk input: compressed tiles + globals + h_prev."""
         obs_prefix = self._build_obs_prefix(obs)
         return torch.cat([obs_prefix, h_prev], dim=-1)  # (B, 103)
 
     def _build_obs_prefix(self, obs: torch.Tensor) -> torch.Tensor:
         """Build the observation-only trunk prefix."""
         tile_summary = self._encode_tiles(obs)  # (B, 64)
-        globals_pos = obs[:, TILE_GRID_N * TILE_FEATURES:]  # (B, 23) globals+pos_embed
+        globals_pos = obs[:, TILE_GRID_N * TILE_FEATURES:]  # (B, 19) globals
         return torch.cat([tile_summary, globals_pos], dim=-1)  # (B, 87)
 
     def _obs_encoder_pre(self, obs: torch.Tensor) -> torch.Tensor:
@@ -1757,18 +1756,19 @@ def _actor_recurrent_step(
     return new_lp, ent, eps, h_new
 
 
-# Lazily compiled version of the per-timestep step function.
 _compiled_actor_step: Callable | None = None
 
 
-def _get_compiled_actor_step() -> Callable:
+def _get_actor_step_fn() -> Callable:
+    """Get the (possibly compiled) actor recurrent step function."""
     global _compiled_actor_step
     if _compiled_actor_step is None:
-        try:
-            _compiled_actor_step = torch.compile(_actor_recurrent_step, dynamic=True)
-        except Exception as exc:
-            print(f"Warning: torch.compile disabled for actor step: {exc}")
-            _compiled_actor_step = _actor_recurrent_step
+        cuda_cfg = _get_critic_cuda_config()
+        _compiled_actor_step = maybe_compile(
+            _actor_recurrent_step,
+            cuda_cfg,
+            label="actor PPO step",
+        )
     return _compiled_actor_step
 
 
@@ -1785,8 +1785,6 @@ def _recurrent_actor_pass(
     bd_mask: torch.Tensor,
     bd_causal: torch.Tensor,
     cd_causal: torch.Tensor,
-    *,
-    compile: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sequential recurrent pass that returns log-probs, entropies, and per-head eps."""
     B, K_max, _ = obs_pre.shape
@@ -1797,7 +1795,7 @@ def _recurrent_actor_pass(
     all_eps = torch.empty(B, K_max, N_LOGIT_SCALE, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
-    step_fn = _get_compiled_actor_step() if compile else _actor_recurrent_step
+    step_fn = _get_actor_step_fn()
     for t in range(K_max):
         new_lps[:, t], entropies[:, t], all_eps[:, t], h_t = step_fn(
             model, obs_pre[:, t], h_t,
@@ -1904,7 +1902,7 @@ def ppo_update(
     ep_boundaries: list[tuple[int, int]] | None = None,
     ppo_epochs: int = 4,
     minibatch_size: int = 2048,
-    actor_minibatches: int = 4,
+    actor_minibatch_size: int | None = None,
     critic_minibatch_size: int | None = None,
     bptt_k: int = BPTT_K,
     clip_eps: float = 0.2,
@@ -1965,11 +1963,8 @@ def ppo_update(
         bt_mask_all, bd_mask_all, bd_causal_all, cd_causal_all = _precompute_policy_masks(obs, bt_act)
     full_chunk_ids, tail_chunk_ids = _split_chunk_ids(all_chunk_lens, bptt_k)
 
-    # Derive chunks-per-minibatch from desired number of actor minibatches.
-    # Each minibatch runs the full sequential BPTT, so larger B_chunk means
-    # more samples per recurrent timestep → better GPU utilization.
-    n_total_chunks = full_chunk_ids.numel() + tail_chunk_ids.numel()
-    B_chunk = max(1, math.ceil(n_total_chunks / actor_minibatches)) if n_total_chunks > 0 else 1
+    _amb = actor_minibatch_size if actor_minibatch_size is not None else (N // 16)
+    B_chunk = max(1, _amb // bptt_k)
 
     # ---- Phase 1: Actor updates with BPTT ----
     actor_stopped_early = False
@@ -2026,7 +2021,6 @@ def ppo_update(
                     all_bd_mask,
                     all_bd_causal,
                     all_cd_causal,
-                    compile=(dev.type == "cuda"),
                 )
                 if profile is not None:
                     profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
@@ -2738,11 +2732,12 @@ def critic_checkpoint_path(weight_path: str | Path = WEIGHT_PATH) -> Path:
 
 def reset_centralized_critic() -> None:
     """Drop the singleton critic/optimizer so a fresh instance is created on demand."""
-    global _centralized_critic, _centralized_optimizer, _centralized_critic_step, _centralized_critic_loss_step
+    global _centralized_critic, _centralized_optimizer, _centralized_critic_step, _centralized_critic_loss_step, _compiled_actor_step
     _centralized_critic = None
     _centralized_optimizer = None
     _centralized_critic_step = None
     _centralized_critic_loss_step = None
+    _compiled_actor_step = None
 
 
 def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.optim.Optimizer]:
