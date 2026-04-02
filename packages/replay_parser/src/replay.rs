@@ -1,6 +1,6 @@
 //! Full replay processing into contiguous tensor buffers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::protobuf::*;
 use crate::types::*;
@@ -19,6 +19,44 @@ pub struct ReplayData {
     pub map_h: usize,
     pub n_turns: usize,
     pub winner: Option<u8>,
+}
+
+/// BFS from all core tiles for one team, returning flow-field distance grid.
+/// Walls (env_grid == 1) are impassable. Unreachable tiles get i32::MAX.
+pub fn compute_flow_distance(
+    cores: &[(i32, u8, Pos)],
+    team: u8,
+    env_grid: &[u8],
+    map_w: usize,
+    map_h: usize,
+) -> Vec<i32> {
+    let n = map_w * map_h;
+    let mut dist = vec![i32::MAX; n];
+    let mut queue = VecDeque::new();
+    for (_id, t, pos) in cores {
+        if *t == team {
+            let idx = pos.y as usize * map_w + pos.x as usize;
+            if dist[idx] == i32::MAX {
+                dist[idx] = 0;
+                queue.push_back((pos.x as i32, pos.y as i32));
+            }
+        }
+    }
+    while let Some((x, y)) = queue.pop_front() {
+        let d = dist[y as usize * map_w + x as usize] + 1;
+        for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+            if nx < 0 || ny < 0 || nx as usize >= map_w || ny as usize >= map_h {
+                continue;
+            }
+            let ni = ny as usize * map_w + nx as usize;
+            if env_grid[ni] == 1 || dist[ni] <= d {
+                continue;
+            }
+            dist[ni] = d;
+            queue.push_back((nx, ny));
+        }
+    }
+    dist
 }
 
 /// Shared helper: compute per-team core center from map cores.
@@ -87,11 +125,15 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
 
     let mut entities: HashMap<i32, Entity> = HashMap::new();
     let mut harv_positions: HashMap<(i32, i32), i32> = HashMap::new();
+    let mut tainted: HashSet<(i32, i32)> = HashSet::new();
 
     let enemy_team = if team == 0 { 1u8 } else { 0u8 };
     let mut core_hp: [i32; 2] = [500, 500];
 
-    let core_center = compute_core_centers(&map.cores);
+    let flow_dist: [Vec<i32>; 2] = [
+        compute_flow_distance(&map.cores, 0, &map.env_grid, map_w, map_h),
+        compute_flow_distance(&map.cores, 1, &map.env_grid, map_w, map_h),
+    ];
     seed_core_entities(&map.cores, &mut entities);
 
     let mut player_res: [PlayerRes; 2] = [PlayerRes::default(), PlayerRes::default()];
@@ -269,6 +311,14 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
                             if ent.kind == EntityKind::Harvester {
                                 harv_positions.remove(&(ent.x, ent.y));
                             }
+                            // Taint tile when friendly storing entity with
+                            // a resource is destroyed (self-rebuild detection).
+                            if ent.team == team
+                                && ent.kind.is_storing()
+                                && ent.stored > 0
+                            {
+                                tainted.insert((ent.x, ent.y));
+                            }
                         }
                     }
                     UpdateEvent::UpdateHp { id, delta } => {
@@ -328,14 +378,18 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
                                     && src_team == dst_team
                                     && src_stored != 2
                                 {
-                                    let cc = core_center[src_team as usize];
-                                    let src_dist =
-                                        (from.x - cc.0).abs() + (from.y - cc.1).abs();
-                                    let dst_dist = (to.x - cc.0).abs() + (to.y - cc.1).abs();
-                                    if dst_dist < src_dist {
-                                        let improvement = (src_dist - dst_dist).max(1);
+                                    // Skip reward if destination was just
+                                    // rebuilt (resource-destroying rebuild).
+                                    if tainted.remove(&(to.x, to.y)) {
+                                        continue;
+                                    }
+                                    let fd = &flow_dist[src_team as usize];
+                                    let src_fd = fd[from.y as usize * map_w + from.x as usize];
+                                    let dst_fd = fd[to.y as usize * map_w + to.x as usize];
+                                    if src_fd != i32::MAX && dst_fd != i32::MAX && dst_fd < src_fd {
+                                        let improvement = src_fd - dst_fd;
                                         let weight =
-                                            improvement as f32 / (src_dist.max(1) as f32).sqrt();
+                                            improvement as f32 / (src_fd.max(1) as f32).sqrt();
                                         resource_transfers
                                             [turn_idx * 2 + src_team as usize] += weight;
                                     }
@@ -354,6 +408,9 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
                 }
             }
         }
+
+        // Clear taints not consumed by a transfer (e.g. enemy kills)
+        tainted.clear();
 
         // Titanium/axionite delivered delta per team
         let td = &mut titanium_delivered[turn_idx * 2..turn_idx * 2 + 2];
