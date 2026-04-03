@@ -436,10 +436,16 @@ pub fn process_replay(data: &[u8], team: u8) -> ReplayData {
             prev_ax_collected[t] = cur_ax;
         }
 
-        // Flow reward and delivery reward for critic observation
+        // Flow reward and delivery reward for critic observation.
+        // Use previous turn's values to avoid leaking the current turn's
+        // realized reward into the critic's input.
         let sc2 = &mut scalars[turn_idx * N_SCALARS..(turn_idx + 1) * N_SCALARS];
-        sc2[17] = resource_transfers[turn_idx * 2 + team_idx];
-        sc2[18] = (td[team_idx] + ad[team_idx] * 4) as f32;
+        if turn_idx > 0 {
+            sc2[17] = resource_transfers[(turn_idx - 1) * 2 + team_idx];
+            let prev_td = &titanium_delivered[(turn_idx - 1) * 2..(turn_idx - 1) * 2 + 2];
+            let prev_ad = &axionite_delivered[(turn_idx - 1) * 2..(turn_idx - 1) * 2 + 2];
+            sc2[18] = (prev_td[team_idx] + prev_ad[team_idx] * 4) as f32;
+        }
     }
 
     ReplayData {
