@@ -8,11 +8,14 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TORCH_DIR = PROJECT_ROOT / "bots" / "tensor" / "torch"
+TENSOR_DIR = PROJECT_ROOT / "bots" / "tensor"
 REPLAY_PARSER_PYTHON = PROJECT_ROOT / "packages" / "replay_parser" / "python"
 
+sys.path.insert(0, str(TENSOR_DIR))
 sys.path.insert(0, str(TORCH_DIR))
 sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 
+from trajectory_schema import make_trajectory_step
 from flow_reward import (
     compute_dense_flow_rewards, compute_dense_delivery_rewards,
     augment_trajectories_with_flow_rewards, AX_CONVERSION_RATE,
@@ -21,11 +24,13 @@ from flow_reward import (
 
 OBS_SIZE = 5 * 5 * _TILE_FEATURES + 17 + 8  # fallback
 try:
-    from model import _compute_gae, _parse_trajectories, OBS_SIZE as MODEL_OBS_SIZE, REWARD_BUILD_CREDIT
+    from model import _compute_gae, _parse_trajectories, OBS_SIZE as MODEL_OBS_SIZE, H_DIM as MODEL_H_DIM, REWARD_BUILD_CREDIT
     from train_batched import _shared_flow_reward_total
     OBS_SIZE = MODEL_OBS_SIZE
+    H_DIM = MODEL_H_DIM
     HAS_TORCH = True
 except ImportError:
+    H_DIM = 24
     HAS_TORCH = False
 
 
@@ -37,10 +42,33 @@ def _pack_int_pairs(pairs: list[tuple[int, int]]) -> bytes:
     return b"".join(struct.pack("<ii", a, b) for a, b in pairs)
 
 
-def _make_step(round_num: int, n_working: float = 0.0) -> list:
+def _make_step(round_num: int, n_working: float = 0.0):
     obs = [0.0] * OBS_SIZE
     obs[_OBS_GLOBAL_START] = round_num / 2000.0
-    return [obs, [0.0] * 24, 0, 0, 0, 0, 0.0, n_working, 0, 0, 0, 0, 0]
+    return make_trajectory_step(
+        obs=struct.pack(f"<{OBS_SIZE}f", *obs),
+        h_prev=struct.pack(f"<{H_DIM}f", *([0.0] * H_DIM)),
+        obs_bytes_len=OBS_SIZE * 4,
+        h_bytes_len=H_DIM * 4,
+        round_idx=round_num,
+        bt=0,
+        bd=0,
+        cd=0,
+        brt=0,
+        md=0,
+        reward=n_working,
+        old_log_prob=0.0,
+        enemy_core_dmg=0.0,
+        own_core_dmg=0.0,
+        harv_attempt=0,
+        harv_fail=0,
+        harv_prox_gate=0,
+        harv_prox_paid=0,
+        conv_attempt=0,
+        conv_fail=0,
+        conv_prox_gate=0,
+        conv_prox_paid=0,
+    )
 
 
 def _zero_delivery_bufs(n: int) -> dict:
@@ -109,29 +137,34 @@ class TestComputeDenseFlowRewards:
         rewards = compute_dense_flow_rewards(gs, team=0)
         assert rewards[0] == pytest.approx(2.0 * REWARD_FLOW_SCALE)
 
+    def test_path_backed_buffers_load_without_writable_copy(self, tmp_path):
+        transfer_path = tmp_path / "transfer.bin"
+        transfer_path.write_bytes(_pack_float_pairs([(2.0, 0.0)]))
+        gs = {
+            "transfer_events_path": str(transfer_path),
+            "n_turns": 1,
+        }
+
+        rewards = compute_dense_flow_rewards(gs, team=0)
+
+        assert rewards[0] == pytest.approx(2.0 * REWARD_FLOW_SCALE)
+        assert isinstance(gs["transfer_events_buf"], bytes)
+
 
 class TestAugmentTrajectories:
     def test_zeroes_stale_n_working(self):
         step = _make_step(round_num=50, n_working=999.0)
         traj = [[step]]
         augment_trajectories_with_flow_rewards(traj, {})
-        assert step[7] == 0.0
+        assert traj[0][0].reward == 0.0
 
     def test_writes_reward_to_correct_round(self):
         step10 = _make_step(round_num=10)
         step20 = _make_step(round_num=20)
         traj = [[step10, step20]]
         augment_trajectories_with_flow_rewards(traj, {10: 5.0, 20: 3.0})
-        assert step10[7] == 5.0
-        assert step20[7] == 3.0
-
-    def test_short_format_uses_slot_6(self):
-        obs = [0.0] * OBS_SIZE
-        obs[_OBS_GLOBAL_START] = 10 / 2000.0
-        step = [obs, [0.0] * 24, 0, 0, 0, 0, 999.0, 0, 0, 0, 0, 0]
-        traj = [[step]]
-        augment_trajectories_with_flow_rewards(traj, {10: 4.0})
-        assert step[6] == 4.0
+        assert traj[0][0].reward == 5.0
+        assert traj[0][1].reward == 3.0
 
     @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
     def test_shared_round_reward_is_not_multiplied_by_unit_count(self):
@@ -186,7 +219,7 @@ class TestIntegration:
         augment_trajectories_with_flow_rewards(traj, rewards)
 
         for s in steps:
-            assert isinstance(s[7], (int, float))
+            assert isinstance(s.reward, (int, float))
 
 
 @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")

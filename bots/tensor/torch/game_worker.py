@@ -13,11 +13,17 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 REPLAY_PARSER_PYTHON = PROJECT_ROOT / "packages" / "replay_parser" / "python"
 if str(REPLAY_PARSER_PYTHON) not in sys.path:
     sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 
 from replay_parser import ReplayData
+try:
+    from trajectory_schema import WorkerGameResult
+except ImportError:
+    from bots.tensor.trajectory_schema import WorkerGameResult
 
 
 def _write_bytes(path: Path, data: bytes | bytearray) -> str | None:
@@ -28,79 +34,62 @@ def _write_bytes(path: Path, data: bytes | bytearray) -> str | None:
 
 
 def _run_game_proxy(args, result_path: str):
-    bot_a, bot_b, map_path, engine_root, replay_path, log_path, seed = args
-    os.environ["TENSOR_TRAIN_LOG"] = log_path
-    try:
-        from cambc.cambc_engine import run_game
+    bot_a, bot_b, map_path, engine_root, replay_path, seed = args
+    from cambc.cambc_engine import run_game
 
-        run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
-        rd = ReplayData.from_file(replay_path, team=0)
-        working = rd.working_harvesters_dict()
-        winner = rd.winner_str
-        base = Path(result_path)
-        state_path = _write_bytes(base.with_suffix(".states.bin"), rd.states_bytes)
-        scalars_path = _write_bytes(base.with_suffix(".scalars.bin"), rd.scalars_bytes)
-        transfers_path = _write_bytes(
-            base.with_suffix(".transfers.bin"),
-            rd.resource_transfers_bytes,
-        )
-        ti_delivered_path = _write_bytes(
-            base.with_suffix(".ti_delivered.bin"),
-            rd.titanium_delivered_bytes,
-        )
-        ax_delivered_path = _write_bytes(
-            base.with_suffix(".ax_delivered.bin"),
-            rd.axionite_delivered_bytes,
-        )
-        # Extract team A core position from round 0 state grid
-        # Channel 11 = core presence (both teams), channel 12 = team sign (+1 friendly)
-        core_x, core_y = 0, 0
-        try:
-            n_ch, map_h, map_w = rd.n_channels, rd.map_h, rd.map_w
-            turn0_bytes = rd.state_bytes_for_turn(0)
-            plane = map_h * map_w
-            ch11_offset = 11 * plane
-            ch12_offset = 12 * plane
-            for cy in range(map_h):
-                for cx in range(map_w):
-                    flat_idx = cy * map_w + cx
-                    presence = struct.unpack_from("<f", turn0_bytes, (ch11_offset + flat_idx) * 4)[0]
-                    team_sign = struct.unpack_from("<f", turn0_bytes, (ch12_offset + flat_idx) * 4)[0]
-                    if presence > 0.5 and team_sign > 0.5:  # friendly core
-                        core_x, core_y = cx, cy
-                        break
-                else:
-                    continue
-                break
-        except Exception:
-            pass
-
-        global_states = {
-            "states_path": state_path,
-            "scalars_path": scalars_path,
-            "transfer_events_path": transfers_path,
-            "ti_delivered_path": ti_delivered_path,
-            "ax_delivered_path": ax_delivered_path,
-            "state_stride": rd.state_stride,
-            "map_w": rd.map_w,
-            "map_h": rd.map_h,
-            "n_turns": rd.n_turns,
-            "n_channels": rd.n_channels,
-            "n_scalars": rd.n_scalars,
-            "core_x": core_x,
-            "core_y": core_y,
-        }
-    except BaseException as e:
-        print(f"  Game error: {e}")
-        return None, None, None, None
-    finally:
-        os.environ.pop("TENSOR_TRAIN_LOG", None)
-    return (
-        (log_path if os.path.exists(log_path) else None),
-        working,
-        winner,
-        global_states,
+    run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
+    rd = ReplayData.from_file(replay_path, team=0)
+    working = rd.working_harvesters_dict()
+    winner = rd.winner_str
+    base = Path(result_path)
+    state_path = _write_bytes(base.with_suffix(".states.bin"), rd.states_bytes)
+    scalars_path = _write_bytes(base.with_suffix(".scalars.bin"), rd.scalars_bytes)
+    transfers_path = _write_bytes(
+        base.with_suffix(".transfers.bin"),
+        rd.resource_transfers_bytes,
     )
+    ti_delivered_path = _write_bytes(
+        base.with_suffix(".ti_delivered.bin"),
+        rd.titanium_delivered_bytes,
+    )
+    ax_delivered_path = _write_bytes(
+        base.with_suffix(".ax_delivered.bin"),
+        rd.axionite_delivered_bytes,
+    )
+    core_x, core_y = 0, 0
+    map_h, map_w = rd.map_h, rd.map_w
+    turn0_bytes = rd.state_bytes_for_turn(0)
+    plane = map_h * map_w
+    ch11_offset = 11 * plane
+    ch12_offset = 12 * plane
+    for cy in range(map_h):
+        for cx in range(map_w):
+            flat_idx = cy * map_w + cx
+            presence = struct.unpack_from("<f", turn0_bytes, (ch11_offset + flat_idx) * 4)[0]
+            team_sign = struct.unpack_from("<f", turn0_bytes, (ch12_offset + flat_idx) * 4)[0]
+            if presence > 0.5 and team_sign > 0.5:
+                core_x, core_y = cx, cy
+                break
+        else:
+            continue
+        break
+
+    global_states = {
+        "states_path": state_path,
+        "scalars_path": scalars_path,
+        "transfer_events_path": transfers_path,
+        "ti_delivered_path": ti_delivered_path,
+        "ax_delivered_path": ax_delivered_path,
+        "state_stride": rd.state_stride,
+        "map_w": rd.map_w,
+        "map_h": rd.map_h,
+        "n_turns": rd.n_turns,
+        "n_channels": rd.n_channels,
+        "n_scalars": rd.n_scalars,
+        "core_x": core_x,
+        "core_y": core_y,
+    }
+    return WorkerGameResult(working=working, winner=winner, global_states=global_states)
 
 
 def main(argv=None):

@@ -12,6 +12,13 @@ from pathlib import Path
 
 import trueskill
 
+try:
+    from trajectory_schema import TrajectoryStep, validate_trajectory_step
+    from shared import H_DIM, INPUT_SIZE
+except ImportError:
+    from bots.tensor.trajectory_schema import TrajectoryStep, validate_trajectory_step
+    from bots.tensor.shared import H_DIM, INPUT_SIZE
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
@@ -246,20 +253,33 @@ class League:
 
 # ---- Trajectory I/O ----
 
-def _read_trajectory_file(path: str | None) -> list[list]:
-    """Read all pickle chunks from a trajectory file (one per builder)."""
-    if not path or not os.path.exists(path):
-        return []
-    trajs = []
-    try:
-        with open(path, "rb") as f:
-            while True:
-                try:
-                    traj = pickle.load(f)
-                    if traj:
-                        trajs.append(traj)
-                except EOFError:
-                    break
-    except Exception:
-        pass
+def _read_trajectory_file(path: str | None) -> list[list[TrajectoryStep]]:
+    """Read and validate all rollout trajectories from a worker log."""
+    if not path:
+        raise ValueError("trajectory path is required")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"trajectory log missing: {path}")
+    trajs: list[list[TrajectoryStep]] = []
+    with open(path, "rb") as f:
+        while True:
+            try:
+                traj = pickle.load(f)
+            except EOFError:
+                break
+            if not isinstance(traj, list):
+                raise TypeError(f"trajectory chunk must be list, got {type(traj).__name__}")
+            if not traj:
+                continue
+            validated: list[TrajectoryStep] = []
+            for step in traj:
+                validated.append(
+                    validate_trajectory_step(
+                        step,
+                        obs_bytes_len=INPUT_SIZE * 4,
+                        h_bytes_len=H_DIM * 4,
+                    )
+                )
+            trajs.append(validated)
+    if not trajs:
+        raise RuntimeError(f"trajectory log contained no trajectories: {path}")
     return trajs

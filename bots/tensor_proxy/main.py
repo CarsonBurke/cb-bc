@@ -5,14 +5,15 @@ receives actions back. Uses shared.py for obs encoding, masks,
 rewards, and constants — no tensor_lib dependency.
 """
 
-import atexit
 from array import array
 import os
-import pickle
 import random
 import struct
 import sys
 
+_PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 _TENSOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor")
 sys.path.insert(0, _TENSOR_DIR)
 
@@ -23,40 +24,25 @@ from shared import (
     _CONV_DIR_MASK,
     GameState,
     discover_ore, scan_enemy_core_dmg, scan_own_core_dmg,
-    scan_working_harvesters,
     encode_state_into,
     execute_build, execute_move,
-    sample_from_logits, argmax,
 )
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
-_TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
-
 # Struct-based binary IPC protocol
 _OBS_FLOATS = INPUT_SIZE + H_DIM  # obs + h_prev
-_OBS_BYTES = _OBS_FLOATS * 4
+_OBS_PAYLOAD_BYTES = _OBS_FLOATS * 4
+_OBS_HEAD = struct.Struct("=ii")  # unit_id, round_idx
+_OBS_BYTES = _OBS_HEAD.size + _OBS_PAYLOAD_BYTES
 _ACT_HEAD = struct.Struct('=iiiii')
 _ACT_INTS = 5  # bt, bd, cd, brt, md
-_ACT_FLOATS = H_DIM + 1  # h_next + old_lp
+_ACT_FLOATS = H_DIM  # h_next only; training server owns behavior log-probs
 _ACT_SIZE = _ACT_INTS * 4 + _ACT_FLOATS * 4
 _H_BYTES = H_DIM * 4
-_LP_STRUCT = struct.Struct('=f')
 
 # Pipe connections opened lazily per-player
 _opened_pipes = {}
-_live_log_players = set()
-
-
-def _flush_live_logs():
-    for player in list(_live_log_players):
-        try:
-            player._flush_log()
-        except Exception:
-            pass
-
-
-atexit.register(_flush_live_logs)
 
 
 def _get_pipes():
@@ -86,11 +72,12 @@ def _read_exact(fd, n):
     return data
 
 
-def _send_obs(obs_wfd, obs, h_prev):
+def _send_obs(obs_wfd, unit_id, round_idx, obs, h_prev):
     """Send raw float32 observation + hidden state via pipe fd."""
     os.writev(
         obs_wfd,
         (
+            _OBS_HEAD.pack(unit_id, round_idx),
             memoryview(obs).cast("B"),
             memoryview(h_prev).cast("B"),
         ),
@@ -105,8 +92,7 @@ def _recv_action(act_rfd):
     bt, bd, cd, brt, md = _ACT_HEAD.unpack_from(data, 0)
     h_next = array("f")
     h_next.frombytes(data[_ACT_INTS * 4:_ACT_INTS * 4 + _H_BYTES])
-    old_lp = _LP_STRUCT.unpack_from(data, _ACT_INTS * 4 + _H_BYTES)[0]
-    return bt, bd, cd, brt, md, 0.0, h_next, old_lp
+    return bt, bd, cd, brt, md, h_next
 
 
 class Player:
@@ -122,20 +108,14 @@ class Player:
         self._prev_collected = None
         self._n_builders_cached = 1
         self._spawn_round: int = -1
-        self._train_log = [] if _TRAIN_LOG else None
         self._unit_id = id(self) % (2**31)
-        if self._train_log is not None:
-            _live_log_players.add(self)
 
     def run(self, ct):
-        try:
-            etype = ct.get_entity_type()
-            if etype == EntityType.CORE:
-                self._run_core(ct)
-            elif etype == EntityType.BUILDER_BOT:
-                self._run_builder(ct)
-        except Exception:
-            pass
+        etype = ct.get_entity_type()
+        if etype == EntityType.CORE:
+            self._run_core(ct)
+        elif etype == EntityType.BUILDER_BOT:
+            self._run_builder(ct)
 
     def _run_core(self, ct):
         if self.core_center is None:
@@ -173,50 +153,23 @@ class Player:
         obs_wfd, act_rfd = _get_pipes()
         h_in = self.h_prev
 
-        if obs_wfd is not None:
-            _send_obs(obs_wfd, obs, h_in)
-            result = _recv_action(act_rfd)
-            if result is not None:
-                build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, value, h_next, old_log_prob = result
-                self.h_prev = h_next
-            else:
-                build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
-                build_dir_idx = random.randint(0, 8)
-                conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
-                bridge_target_idx = 0
-                move_dir_idx = random.randint(0, 8)
-                value, old_log_prob = 0.0, 0.0
-        else:
-            build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
-            build_dir_idx = random.randint(0, 8)
-            conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
-            bridge_target_idx = 0
-            move_dir_idx = random.randint(0, 8)
-            value, old_log_prob = 0.0, 0.0
+        if obs_wfd is None or act_rfd is None:
+            raise RuntimeError("tensor_proxy missing actor inference pipes")
+        round_idx = ct.get_current_round()
+        _send_obs(obs_wfd, self._unit_id, round_idx, obs, h_in)
+        result = _recv_action(act_rfd)
+        if result is None:
+            raise RuntimeError("tensor_proxy actor inference pipe closed")
+        build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, h_next = result
+        self.h_prev = h_next
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = CONV_DIR_4[conv_dir_idx]
         _harv_aux, _conv_aux, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team, bridge_target_idx)
-        harv_reward = 0.0
-        conv_reward = 0.0
 
         move_dir = DIR_MAP_9[move_dir_idx]
         execute_move(ct, move_dir)
-
-        if self._train_log is not None:
-            self._train_log.append((
-                obs.tobytes(), h_in.tobytes(),
-                build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx,
-                value, 0, conv_reward, 0,  # index 9: formerly ti_after, unused by parser
-                harv_reward, GameState.enemy_core_dmg, old_log_prob,
-                dbg[0], dbg[1], dbg[2], dbg[3],
-                dbg[4], dbg[5], dbg[6], dbg[7],
-                GameState.own_core_dmg,
-                bridge_target_idx,
-            ))
-            if ct.get_current_round() >= 1999:
-                self._flush_log()
 
     def _find_core(self, ct):
         if self.my_team is None:
@@ -246,14 +199,3 @@ class Player:
             self.core_center, self.enemy_core, self._prev_collected = result
         self._n_builders_cached = n_builders_out[0]
         return self._obs_buf
-
-    def _flush_log(self):
-        if not self._train_log or not _TRAIN_LOG:
-            return
-        try:
-            with open(_TRAIN_LOG, "ab") as f:
-                pickle.dump(self._train_log, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception:
-            pass
-        self._train_log = []
-        _live_log_players.discard(self)

@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 import sys
+import warnings
 
 import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TORCH_DIR = PROJECT_ROOT / "bots" / "tensor" / "torch"
+TENSOR_DIR = PROJECT_ROOT / "bots" / "tensor"
 
 if str(TORCH_DIR) not in sys.path:
     sys.path.insert(0, str(TORCH_DIR))
+if str(TENSOR_DIR) not in sys.path:
+    sys.path.insert(0, str(TENSOR_DIR))
 
 import model as model_mod
+import replay_buffers as replay_buffers_mod
+from trajectory_schema import make_trajectory_step
 
 
 def test_critic_chunk_plan_handles_sparse_chunk_ids():
@@ -77,7 +84,7 @@ def test_compute_all_values_batches_only_sparse_unique_rounds():
         "n_steps": 2,
     }
 
-    values = model_mod._compute_all_values(fake_critic, data, cnn_chunk_size=4096, unit_chunk_size=16)
+    values = model_mod._compute_all_values(fake_critic, data, cnn_chunk_size=4096)
 
     assert values.shape == (2,)
     assert fake_critic.map_batch_sizes == [2]
@@ -105,6 +112,170 @@ def test_critic_round_batch_plan_respects_step_target_and_round_cap(monkeypatch)
     assert batch_ranges == [(0, 1), (1, 2), (2, 4)]
 
 
+def test_build_critic_epoch_plan_packs_round_major_slices(monkeypatch):
+    monkeypatch.setattr(
+        model_mod,
+        "_critic_round_grouped_perm",
+        lambda rounds: torch.arange(rounds.shape[0], device=rounds.device),
+    )
+
+    step_round_idx = torch.tensor([1, 1, 2, 2, 3], dtype=torch.long)
+    step_unit_xy = torch.tensor([[10, 0], [11, 0], [20, 0], [21, 0], [30, 0]], dtype=torch.long)
+    step_unit_float = torch.tensor([[1.0], [1.1], [2.0], [2.1], [3.0]], dtype=torch.float32)
+    step_rv = torch.tensor([[10.0, 100.0], [11.0, 101.0], [20.0, 200.0], [21.0, 201.0], [30.0, 300.0]])
+
+    plan = model_mod._build_critic_epoch_plan(
+        step_round_idx,
+        step_unit_xy,
+        step_unit_float,
+        step_rv,
+        target_steps=3,
+        max_rounds=2,
+    )
+
+    assert plan.round_ids.tolist() == [1, 2, 3]
+    assert plan.round_offsets.tolist() == [0, 2, 4, 5]
+    assert plan.batch_ranges == [(0, 1), (1, 3)]
+    assert plan.packed_xy.tolist() == [[10, 0], [11, 0], [20, 0], [21, 0], [30, 0]]
+    assert torch.allclose(
+        plan.packed_unit_float[:, 0],
+        torch.tensor([1.0, 1.1, 2.0, 2.1, 3.0], dtype=plan.packed_unit_float.dtype),
+    )
+    assert plan.local_round_idx_by_batch[0].tolist() == [0, 0]
+    assert plan.local_round_idx_by_batch[1].tolist() == [0, 0, 1]
+
+
+def test_coerce_replay_buffer_reuses_writable_bytearray():
+    buf = bytearray(range(8))
+    out = model_mod._coerce_replay_buffer(buf)
+
+    assert out is buf
+
+
+def test_load_torch_replay_buffer_only_copies_torch_backed_specs(tmp_path):
+    data_path = tmp_path / "buffer.bin"
+    data_path.write_bytes(bytes(range(8)))
+    global_states = {
+        "states_path": str(data_path),
+        "transfer_events_path": str(data_path),
+    }
+
+    transfer_buf = replay_buffers_mod.load_replay_buffer(
+        global_states,
+        replay_buffers_mod.TRANSFER_EVENTS_BUFFER,
+    )
+    state_buf = replay_buffers_mod.load_torch_replay_buffer(
+        global_states,
+        replay_buffers_mod.STATE_BUFFER,
+    )
+
+    assert isinstance(transfer_buf, bytes)
+    assert global_states["transfer_events_buf"] is transfer_buf
+    assert isinstance(state_buf, bytearray)
+    assert global_states["states_buf"] is state_buf
+
+
+def test_parse_trajectories_reads_strict_step_old_log_probs():
+    obs_bytes = struct.pack(f"<{model_mod.OBS_SIZE}f", *([0.0] * model_mod.OBS_SIZE))
+    h_bytes = struct.pack(f"<{model_mod.H_DIM}f", *([0.0] * model_mod.H_DIM))
+    trajs = [[
+        make_trajectory_step(
+            obs=obs_bytes,
+            h_prev=h_bytes,
+            obs_bytes_len=model_mod.OBS_SIZE * 4,
+            h_bytes_len=model_mod.H_DIM * 4,
+            round_idx=0,
+            bt=0,
+            bd=0,
+            cd=0,
+            brt=0,
+            md=0,
+            reward=1.25,
+            old_log_prob=2.5,
+            enemy_core_dmg=0.0,
+            own_core_dmg=0.0,
+            harv_attempt=0,
+            harv_fail=0,
+            harv_prox_gate=0,
+            harv_prox_paid=0,
+            conv_attempt=0,
+            conv_fail=0,
+            conv_prox_gate=0,
+            conv_prox_paid=0,
+        )
+    ]]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        data = model_mod._parse_trajectories(trajs)
+
+    assert data is not None
+    assert data["old_log_probs"].shape == (1,)
+    assert data["old_log_probs"][0].item() == 2.5
+    assert not any("not writable" in str(w.message) for w in caught)
+
+
+def test_compose_action_log_prob_ignores_noncausal_negative_infinities():
+    lp = model_mod._compose_action_log_prob(
+        torch.tensor([-0.5]),
+        torch.tensor([float("-inf")]),
+        torch.tensor([float("-inf")]),
+        torch.tensor([float("-inf")]),
+        torch.tensor([-0.25]),
+        bd_causal=torch.tensor([False]),
+        cd_causal=torch.tensor([False]),
+        brt_causal=torch.tensor([False]),
+    )
+
+    assert torch.isfinite(lp).all()
+    assert torch.allclose(lp, torch.tensor([-0.75]))
+
+
+def test_materialize_critic_inputs_uses_final_layout_device_buffers(monkeypatch):
+    monkeypatch.setattr(model_mod, "DEVICE", torch.device("cpu"))
+    monkeypatch.setattr(
+        model_mod,
+        "_get_critic_cuda_config",
+        lambda: type("Cfg", (), {"channels_last": True})(),
+    )
+
+    round0 = torch.arange(
+        model_mod.GLOBAL_MAP_CHANNELS * 2 * 3,
+        dtype=torch.float32,
+    ).reshape(model_mod.GLOBAL_MAP_CHANNELS, 2, 3)
+    round1 = torch.full((model_mod.GLOBAL_MAP_CHANNELS, 1, 1), 7.0, dtype=torch.float32)
+    global_scalars = torch.arange(
+        2 * model_mod.GLOBAL_SCALAR_DIM,
+        dtype=torch.float32,
+    ).reshape(2, model_mod.GLOBAL_SCALAR_DIM)
+    data = {
+        "global_states": [round0, round1],
+        "global_sizes": torch.tensor([[3, 2], [1, 1]], dtype=torch.int16),
+        "global_scalars": global_scalars.clone(),
+    }
+
+    model_mod._materialize_critic_inputs(data)
+
+    assert data["global_states"] is None
+    assert data["gpu_obs"].shape == (2, model_mod.GLOBAL_MAP_CHANNELS, 2, 3)
+    assert data["gpu_mask"].shape == (2, 1, 2, 3)
+    assert data["gpu_obs"].is_contiguous(memory_format=torch.channels_last)
+    assert data["gpu_mask"].is_contiguous(memory_format=torch.channels_last)
+    assert torch.allclose(data["gpu_obs"][0], round0.to(dtype=data["gpu_obs"].dtype))
+    assert torch.allclose(
+        data["gpu_obs"][1, :, 0, 0],
+        torch.full((model_mod.GLOBAL_MAP_CHANNELS,), 7.0, dtype=data["gpu_obs"].dtype),
+    )
+    assert torch.count_nonzero(data["gpu_obs"][1, :, 0, 1:]) == 0
+    assert torch.count_nonzero(data["gpu_obs"][1, :, 1:, :]) == 0
+    assert torch.equal(data["gpu_mask"][0, 0], torch.ones(2, 3, dtype=data["gpu_mask"].dtype))
+    assert torch.equal(
+        data["gpu_mask"][1, 0],
+        torch.tensor([[1, 0, 0], [0, 0, 0]], dtype=data["gpu_mask"].dtype),
+    )
+    assert torch.allclose(data["gpu_scalars"], global_scalars)
+
+
 def test_freeze_critic_skips_critic_singleton_and_compile(monkeypatch):
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("critic singleton should not be constructed when frozen")
@@ -130,6 +301,7 @@ def test_freeze_critic_skips_critic_singleton_and_compile(monkeypatch):
         optimizer=optimizer,
         obs=obs,
         h=h,
+        obs_pre_all=None,
         bt_act=bt,
         bd_act=bd,
         cd_act=cd,
@@ -145,3 +317,78 @@ def test_freeze_critic_skips_critic_singleton_and_compile(monkeypatch):
 
     assert stats["n_updates"] == 0
     assert stats["vf_loss"] == 0.0
+
+
+def test_ppo_update_reuses_cached_obs_pre_for_actor_minibatches(monkeypatch):
+    class TinyActor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+        def _obs_encoder_pre(self, _obs):
+            raise AssertionError("_obs_encoder_pre should not be called when obs_pre_all is cached")
+
+    captured_obs_pre: list[torch.Tensor] = []
+
+    def fake_recurrent_actor_pass(
+        model,
+        obs_pre,
+        h0,
+        bt_act,
+        bd_act,
+        cd_act,
+        brt_act,
+        md_act,
+        bt_mask,
+        bd_mask,
+        bd_causal,
+        cd_causal,
+    ):
+        del h0, bt_act, bd_act, cd_act, brt_act, md_act, bt_mask, bd_mask, bd_causal, cd_causal
+        captured_obs_pre.append(obs_pre.detach().cpu())
+        new_lps = obs_pre[..., 0] * model.scale
+        entropies = torch.zeros_like(new_lps)
+        eps = torch.zeros(*new_lps.shape, model_mod.N_LOGIT_SCALE, device=new_lps.device)
+        return new_lps, entropies, eps
+
+    monkeypatch.setattr(model_mod, "_recurrent_actor_pass", fake_recurrent_actor_pass)
+
+    model = TinyActor()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    obs = torch.zeros(2, model_mod.OBS_SIZE)
+    h = torch.zeros(2, model_mod.H_DIM)
+    obs_pre_all = torch.tensor([[1.0], [2.0]])
+    bt = torch.zeros(2, dtype=torch.long)
+    bd = torch.zeros(2, dtype=torch.long)
+    cd = torch.zeros(2, dtype=torch.long)
+    brt = torch.zeros(2, dtype=torch.long)
+    md = torch.zeros(2, dtype=torch.long)
+    old_log_probs = torch.zeros(2)
+    advantages = torch.ones(2)
+    returns = torch.zeros(2)
+
+    stats = model_mod.ppo_update(
+        model=model,
+        optimizer=optimizer,
+        obs=obs,
+        h=h,
+        obs_pre_all=obs_pre_all,
+        bt_act=bt,
+        bd_act=bd,
+        cd_act=cd,
+        brt_act=brt,
+        md_act=md,
+        old_log_probs=old_log_probs,
+        advantages=advantages,
+        returns=returns,
+        centralized_data={},
+        ep_boundaries=[(0, 2)],
+        ppo_epochs=1,
+        bptt_k=2,
+        actor_minibatch_size=2,
+        freeze_critic=True,
+    )
+
+    assert stats["n_updates"] == 1
+    assert len(captured_obs_pre) == 1
+    assert torch.equal(captured_obs_pre[0], obs_pre_all.unsqueeze(0))

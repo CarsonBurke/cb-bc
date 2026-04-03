@@ -100,14 +100,11 @@ class Player:
         self._unit_id = id(self) % (2**31)
 
     def run(self, ct):
-        try:
-            etype = ct.get_entity_type()
-            if etype == EntityType.CORE:
-                self._run_core(ct)
-            elif etype == EntityType.BUILDER_BOT:
-                self._run_builder(ct)
-        except Exception:
-            pass
+        etype = ct.get_entity_type()
+        if etype == EntityType.CORE:
+            self._run_core(ct)
+        elif etype == EntityType.BUILDER_BOT:
+            self._run_builder(ct)
 
     def _run_core(self, ct):
         if self.core_center is None:
@@ -138,24 +135,14 @@ class Player:
         obs = self._encode_state_buf(ct)
         obs_wfd, act_rfd = _get_pipes()
 
-        if obs_wfd is not None:
-            _send_obs(obs_wfd, obs, self.h_prev)
-            result = _recv_action(act_rfd)
-            if result is not None:
-                build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, h_next = result
-                self.h_prev = h_next
-            else:
-                build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
-                build_dir_idx = random.randint(0, 8)
-                conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
-                bridge_target_idx = 0
-                move_dir_idx = random.randint(0, 8)
-        else:
-            build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
-            build_dir_idx = random.randint(0, 8)
-            conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
-            bridge_target_idx = 0
-            move_dir_idx = random.randint(0, 8)
+        if obs_wfd is None or act_rfd is None:
+            raise RuntimeError("tensor_proxy_opp missing inference pipes")
+        _send_obs(obs_wfd, obs, self.h_prev)
+        result = _recv_action(act_rfd)
+        if result is None:
+            raise RuntimeError("tensor_proxy_opp inference pipe closed")
+        build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, h_next = result
+        self.h_prev = h_next
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
