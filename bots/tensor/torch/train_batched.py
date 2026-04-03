@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import ast  # noqa: F401 — engine imports can still expect ast in sys.modules
 from collections import OrderedDict
+from dataclasses import asdict, dataclass
 import gc
 import json
 import math
@@ -119,8 +120,13 @@ from model import (
     REWARD_FLOW_SCALE,
     RewardMode,
     BRIDGE_BUILD_TYPE,
+    N_BUILD,
+    N_CONV_DIR,
     N_BRIDGE_TARGETS,
+    N_DIR,
+    N_LOGIT_SCALE,
     compute_harvester_build_dir_mask,
+    _sample_actions_from_policy_heads,
     _unimix_logits,
     _OBS_GLOBAL_START,
 )
@@ -163,6 +169,28 @@ _opp_graph_cache: OrderedDict[tuple[object, ...], GraphedInference] = OrderedDic
 _opp_graph_failures: set[tuple[object, ...]] = set()
 
 
+@dataclass(frozen=True, slots=True)
+class GameLaunchSpec:
+    game_idx: int
+    opponent_id: str
+    opponent_weight_path: str
+    map_path: str
+    replay_path: str
+    seed: int
+    bot_a: str
+    bot_b: str
+    engine_root: str
+
+    def worker_args(self) -> tuple[str, str, str, str, str, int]:
+        return (self.bot_a, self.bot_b, self.map_path, self.engine_root, self.replay_path, self.seed)
+
+    def metadata(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["map_name"] = Path(self.map_path).name
+        payload["bot_b_kind"] = "dummy" if self.opponent_weight_path == DUMMY_OPP_PATH else "proxy"
+        return payload
+
+
 def _cache_put(cache: OrderedDict, key, value, max_items: int) -> None:
     cache[key] = value
     cache.move_to_end(key)
@@ -188,6 +216,72 @@ def _graph_batch_bucket(batch_size: int) -> int | None:
 
 def _opponent_model_cache_key(weight_path: str, hidden: list[int] | None) -> tuple[object, ...]:
     return (weight_path, _hidden_key(hidden), *_weight_sig(weight_path), DEVICE.type)
+
+
+def _resolve_benchmark_maps(maps: list[str], spec: str) -> list[str]:
+    """Resolve a comma-separated benchmark map selection against the available map names."""
+    if not spec.strip():
+        return maps
+    requested: list[str] = []
+    seen: set[str] = set()
+    for chunk in spec.split(","):
+        map_name = chunk.strip()
+        if not map_name or map_name in seen:
+            continue
+        seen.add(map_name)
+        requested.append(map_name)
+    if not requested:
+        raise ValueError("benchmark map list is empty")
+    available = set(maps)
+    missing = [map_name for map_name in requested if map_name not in available]
+    if missing:
+        raise ValueError(f"unknown benchmark map(s): {', '.join(missing)}")
+    return requested
+
+
+def _build_game_launch_specs(
+    *,
+    opp_weight_paths: list[str],
+    opp_ids: list[str],
+    maps: list[str],
+    episode_num: int,
+    replay_dir: Path,
+    bot_a: str,
+    bot_b_proxy: str,
+    bot_b_dummy: str,
+    engine_root: str,
+    benchmark_seed: int | None = None,
+    benchmark_maps: list[str] | None = None,
+) -> list[GameLaunchSpec]:
+    """Build per-game launch specs, optionally from a deterministic benchmark workload."""
+    if benchmark_maps is None:
+        candidate_maps = sorted(maps) if benchmark_seed is not None else list(maps)
+    else:
+        candidate_maps = list(benchmark_maps)
+    if not candidate_maps:
+        raise ValueError("at least one map is required to launch games")
+
+    rng = random if benchmark_seed is None else random.Random(benchmark_seed + episode_num * 1_000_003)
+    game_specs: list[GameLaunchSpec] = []
+    for i, (opp_id, opp_weight_path) in enumerate(zip(opp_ids, opp_weight_paths, strict=True)):
+        map_name = rng.choice(candidate_maps)
+        replay_path = str(replay_dir / f"ep{episode_num}_{opp_id}_g{i}.replay26")
+        seed = rng.randint(1, 2**31)
+        bot_b = bot_b_dummy if opp_weight_path == DUMMY_OPP_PATH else bot_b_proxy
+        game_specs.append(
+            GameLaunchSpec(
+                game_idx=i,
+                opponent_id=opp_id,
+                opponent_weight_path=opp_weight_path,
+                map_path=str(PROJECT_ROOT / "maps" / map_name),
+                replay_path=replay_path,
+                seed=seed,
+                bot_a=bot_a,
+                bot_b=bot_b,
+                engine_root=engine_root,
+            )
+        )
+    return game_specs
 
 
 def _get_cached_opponent_model(weight_path: str, hidden: list[int] | None) -> BuilderMLP:
@@ -497,10 +591,12 @@ def collect_games_batched(
     replay_dir: Path,
     opp_hidden: list[int] | None = None,
     coalesce_ms: float = DEFAULT_COALESCE_MS,
+    benchmark_seed: int | None = None,
+    benchmark_maps: list[str] | None = None,
     profile: dict[str, float] | None = None,
     trace=None,
-) -> tuple[list[list[TrajectoryStep]], list[str | None], dict[str, list[str | None]], list[dict | None], list[int]]:
-    """Run all games with batched GPU inference via pipes. Returns (trajs, winners, per_opp_winners, global_states, traj_game_map)."""
+) -> tuple[list[list[TrajectoryStep]], list[str | None], dict[str, list[str | None]], list[dict | None], list[int], list[int], dict[int, float], list[GameLaunchSpec]]:
+    """Run all games with batched GPU inference via pipes."""
     t_total = time.perf_counter() if profile is not None else 0.0
     bot_a = str(PROJECT_ROOT / "bots" / "tensor_proxy" / "main.py")
     bot_b_proxy = str(PROJECT_ROOT / "bots" / "tensor_proxy_opp" / "main.py")
@@ -510,14 +606,19 @@ def collect_games_batched(
     tmpdir = tempfile.mkdtemp(prefix="batched_")
     n_games = len(opp_weight_paths)
 
-    # Build game args
-    game_args = []
-    for i in range(n_games):
-        map_path = str(PROJECT_ROOT / "maps" / random.choice(maps))
-        replay_path = str(replay_dir / f"ep{episode_num}_{opp_ids[i]}_g{i}.replay26")
-        seed = random.randint(1, 2**31)
-        bot_b = bot_b_dummy if opp_weight_paths[i] == DUMMY_OPP_PATH else bot_b_proxy
-        game_args.append((bot_a, bot_b, map_path, engine_root, replay_path, seed))
+    game_specs = _build_game_launch_specs(
+        opp_weight_paths=opp_weight_paths,
+        opp_ids=opp_ids,
+        maps=maps,
+        episode_num=episode_num,
+        replay_dir=replay_dir,
+        bot_a=bot_a,
+        bot_b_proxy=bot_b_proxy,
+        bot_b_dummy=bot_b_dummy,
+        engine_root=engine_root,
+        benchmark_seed=benchmark_seed,
+        benchmark_maps=benchmark_maps,
+    )
 
     # Load opponent models on GPU (deduplicate by weight path)
     t_phase = time.perf_counter() if profile is not None else 0.0
@@ -583,7 +684,7 @@ def collect_games_batched(
                 str(Path(__file__).resolve()),
                 "--worker-result", result_path,
                 "--worker-pipes", f"{obs_w_a},{act_r_a},{obs_w_b},{act_r_b}",
-                "--worker-game-args", json.dumps(game_args[i]),
+                "--worker-game-args", json.dumps(game_specs[i].worker_args()),
             ],
             close_fds=True,
             cwd=str(PROJECT_ROOT),
@@ -629,12 +730,11 @@ def collect_games_batched(
 
     model.eval()
     _max_a_batch = n_games * 4
-    # Side-A rollout now depends on strict behavior log-probs for PPO.
-    # The eager actor path is stable here; CUDA-graph replay has produced
-    # non-finite log-probs and device asserts on live runs.
-    graphed_a = GraphedInference(model, max_batch=_max_a_batch)
+    # Side-A rollout depends on exact behavior log-probs for PPO, so only the
+    # actor forward pass is graphed; masks/sampling/log-prob stay eager.
+    graphed_a = GraphedInference(model, max_batch=_max_a_batch, graph_sampling=False)
     total_inferences = 0
-    actor_graph_disabled = True
+    actor_graph_disabled = False
     _use_pinned = DEVICE.type == "cuda"
     # Pre-allocate pinned staging buffers for H2D/D2H to enable non_blocking transfers.
     # Sized for max batch; reused each iteration to avoid repeated allocation.
@@ -642,6 +742,12 @@ def collect_games_batched(
         _pin_h2d = torch.empty(_max_a_batch, _OBS_FLOATS, dtype=torch.float32, pin_memory=True)
         _pin_results = torch.empty(6, _max_a_batch, dtype=torch.float32, pin_memory=True)
         _pin_h_out = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32, pin_memory=True)
+        _pin_actor_bt_l = torch.empty(_max_a_batch, N_BUILD, dtype=torch.float32, pin_memory=True)
+        _pin_actor_bd_l = torch.empty(_max_a_batch, N_DIR, dtype=torch.float32, pin_memory=True)
+        _pin_actor_cd_l = torch.empty(_max_a_batch, N_CONV_DIR, dtype=torch.float32, pin_memory=True)
+        _pin_actor_brt_l = torch.empty(_max_a_batch, N_BRIDGE_TARGETS, dtype=torch.float32, pin_memory=True)
+        _pin_actor_md_l = torch.empty(_max_a_batch, N_DIR, dtype=torch.float32, pin_memory=True)
+        _pin_actor_eps = torch.empty(_max_a_batch, N_LOGIT_SCALE, dtype=torch.float32, pin_memory=True)
 
     while pending_indices and len(processes) < max_workers:
         _launch_game(pending_indices.pop(0))
@@ -714,97 +820,133 @@ def collect_games_batched(
 
             with trace_scope(trace, "collect.actor_batch"), torch.no_grad():
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                src = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_a, _OBS_FLOATS)
-                if _use_pinned:
-                    _pin_h2d[:n_a].copy_(src)
-                    all_t = _pin_h2d[:n_a].to(DEVICE, non_blocking=True)
-                else:
-                    all_t = src.to(DEVICE)
+                with trace_scope(trace, "collect.actor_h2d"):
+                    src = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_a, _OBS_FLOATS)
+                    if _use_pinned:
+                        _pin_h2d[:n_a].copy_(src)
+                        all_t = _pin_h2d[:n_a].to(DEVICE, non_blocking=True)
+                    else:
+                        all_t = src.to(DEVICE)
                 if profile is not None:
                     dt = time.perf_counter() - t_phase
                     profile["h2d_a_s"] = profile.get("h2d_a_s", 0.0) + dt
-                    profile["infer_a_s"] = profile.get("infer_a_s", 0.0) + dt
 
-                t_phase = time.perf_counter() if profile is not None else 0.0
-                bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next = graphed_a(all_t)
-                if lp is None:
-                    raise RuntimeError("actor inference must return behavior log-probs")
-                if not torch.isfinite(lp).all():
-                    if not actor_graph_disabled:
-                        print("    actor graph disabled after non-finite behavior log-prob; falling back to eager actor inference")
-                    graphed_a.disable_graph()
-                    actor_graph_disabled = True
-                    bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next = graphed_a(all_t)
-                    if lp is None or not torch.isfinite(lp).all():
+                obs_cpu = src[:, :OBS_SIZE]
+                t_infer = time.perf_counter() if profile is not None else 0.0
+                while True:
+                    bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = graphed_a.policy_heads(
+                        all_t,
+                        trace=trace,
+                        scope_prefix="collect.actor",
+                    )
+                    if profile is not None:
+                        profile["infer_a_s"] = profile.get("infer_a_s", 0.0) + (time.perf_counter() - t_infer)
+
+                    t_phase = time.perf_counter() if profile is not None else 0.0
+                    with trace_scope(trace, "collect.actor_d2h"):
+                        if _use_pinned:
+                            _pin_actor_bt_l[:n_a].copy_(bt_l, non_blocking=True)
+                            _pin_actor_bd_l[:n_a].copy_(bd_l, non_blocking=True)
+                            _pin_actor_cd_l[:n_a].copy_(cd_l, non_blocking=True)
+                            _pin_actor_brt_l[:n_a].copy_(brt_l, non_blocking=True)
+                            _pin_actor_md_l[:n_a].copy_(md_l, non_blocking=True)
+                            _pin_actor_eps[:n_a].copy_(eps, non_blocking=True)
+                            _pin_h_out[:n_a].copy_(h_next, non_blocking=True)
+                            torch.cuda.synchronize()
+                            bt_l_cpu = _pin_actor_bt_l[:n_a]
+                            bd_l_cpu = _pin_actor_bd_l[:n_a]
+                            cd_l_cpu = _pin_actor_cd_l[:n_a]
+                            brt_l_cpu = _pin_actor_brt_l[:n_a]
+                            md_l_cpu = _pin_actor_md_l[:n_a]
+                            eps_cpu = _pin_actor_eps[:n_a]
+                            h_cpu = _pin_h_out[:n_a]
+                        else:
+                            bt_l_cpu = bt_l.float().cpu()
+                            bd_l_cpu = bd_l.float().cpu()
+                            cd_l_cpu = cd_l.float().cpu()
+                            brt_l_cpu = brt_l.float().cpu()
+                            md_l_cpu = md_l.float().cpu()
+                            eps_cpu = eps.float().cpu()
+                            h_cpu = h_next.cpu().contiguous()
+                    if profile is not None:
+                        profile["d2h_a_s"] = profile.get("d2h_a_s", 0.0) + (time.perf_counter() - t_phase)
+
+                    t_phase = time.perf_counter() if profile is not None else 0.0
+                    with trace_scope(trace, "collect.actor.sample"):
+                        bt_act, bd_act, cd_act, brt_act, md_act, lp, h_cpu = _sample_actions_from_policy_heads(
+                            obs_cpu,
+                            bt_l_cpu,
+                            bd_l_cpu,
+                            cd_l_cpu,
+                            brt_l_cpu,
+                            md_l_cpu,
+                            eps_cpu,
+                            h_cpu,
+                            temperature=1.0,
+                            return_log_prob=True,
+                        )
+                    if profile is not None:
+                        profile["sample_a_s"] = profile.get("sample_a_s", 0.0) + (time.perf_counter() - t_phase)
+                    if lp is not None and torch.isfinite(lp).all():
+                        break
+                    if actor_graph_disabled:
                         bad_idx = int((~torch.isfinite(lp)).nonzero(as_tuple=False)[0, 0])
                         bad_game_idx, bad_unit_id, bad_round_idx, _ = pending_a[bad_idx]
                         raise RuntimeError(
                             "non-finite behavior log-prob after actor graph fallback "
                             f"for game {bad_game_idx}, unit {bad_unit_id}, round {bad_round_idx}: {float(lp[bad_idx])!r}"
                         )
-                if _use_pinned:
-                    _pin_results[:, :n_a].copy_(torch.stack([
-                        bt_act.float(), bd_act.float(), cd_act.float(), brt_act.float(), md_act.float(), lp,
-                    ]), non_blocking=True)
-                    _pin_h_out[:n_a].copy_(h_next, non_blocking=True)
-                    torch.cuda.synchronize()
-                    results_cpu = _pin_results[:, :n_a]
-                    h_cpu = _pin_h_out[:n_a]
-                else:
-                    results_cpu = torch.stack([
-                        bt_act.float(), bd_act.float(), cd_act.float(), brt_act.float(), md_act.float(), lp,
-                    ]).cpu()
-                    h_cpu = h_next.cpu().contiguous()
-                if profile is not None:
-                    dt = time.perf_counter() - t_phase
-                    profile["d2h_a_s"] = profile.get("d2h_a_s", 0.0) + dt
-                    profile["infer_a_s"] = profile.get("infer_a_s", 0.0) + dt
+                    print("    actor graph disabled after non-finite behavior log-prob; falling back to eager actor inference")
+                    graphed_a.disable_graph()
+                    actor_graph_disabled = True
+                    t_infer = time.perf_counter() if profile is not None else 0.0
 
             t_phase = time.perf_counter() if profile is not None else 0.0
-            h_view = _tensor_byte_view(h_cpu)
-            for i, (game_idx, unit_id, round_idx, payload) in enumerate(pending_a):
-                old_lp = float(results_cpu[5, i])
-                if not math.isfinite(old_lp):
-                    raise RuntimeError(
-                        f"non-finite behavior log-prob for game {game_idx}, unit {unit_id}, round {round_idx}: {old_lp!r}"
+            with trace_scope(trace, "collect.actor_fanout"):
+                h_view = _tensor_byte_view(h_cpu)
+                for i, (game_idx, unit_id, round_idx, payload) in enumerate(pending_a):
+                    old_lp = float(lp[i])
+                    if not math.isfinite(old_lp):
+                        raise RuntimeError(
+                            f"non-finite behavior log-prob for game {game_idx}, unit {unit_id}, round {round_idx}: {old_lp!r}"
+                        )
+                    trajectories_by_unit = actor_trajectories.setdefault(game_idx, {})
+                    unit_traj = trajectories_by_unit.setdefault(unit_id, [])
+                    unit_traj.append(
+                        make_trajectory_step(
+                            obs=payload[: OBS_SIZE * 4],
+                            h_prev=payload[OBS_SIZE * 4 :],
+                            obs_bytes_len=OBS_SIZE * 4,
+                            h_bytes_len=H_DIM * 4,
+                            round_idx=round_idx,
+                            bt=int(bt_act[i]),
+                            bd=int(bd_act[i]),
+                            cd=int(cd_act[i]),
+                            brt=int(brt_act[i]),
+                            md=int(md_act[i]),
+                            reward=0.0,
+                            old_log_prob=old_lp,
+                            enemy_core_dmg=0.0,
+                            own_core_dmg=0.0,
+                            harv_attempt=0,
+                            harv_fail=0,
+                            harv_prox_gate=0,
+                            harv_prox_paid=0,
+                            conv_attempt=0,
+                            conv_fail=0,
+                            conv_prox_gate=0,
+                            conv_prox_paid=0,
+                        )
                     )
-                trajectories_by_unit = actor_trajectories.setdefault(game_idx, {})
-                unit_traj = trajectories_by_unit.setdefault(unit_id, [])
-                unit_traj.append(
-                    make_trajectory_step(
-                        obs=payload[: OBS_SIZE * 4],
-                        h_prev=payload[OBS_SIZE * 4 :],
-                        obs_bytes_len=OBS_SIZE * 4,
-                        h_bytes_len=H_DIM * 4,
-                        round_idx=round_idx,
-                        bt=int(results_cpu[0, i]),
-                        bd=int(results_cpu[1, i]),
-                        cd=int(results_cpu[2, i]),
-                        brt=int(results_cpu[3, i]),
-                        md=int(results_cpu[4, i]),
-                        reward=0.0,
-                        old_log_prob=old_lp,
-                        enemy_core_dmg=0.0,
-                        own_core_dmg=0.0,
-                        harv_attempt=0,
-                        harv_fail=0,
-                        harv_prox_gate=0,
-                        harv_prox_paid=0,
-                        conv_attempt=0,
-                        conv_fail=0,
-                        conv_prox_gate=0,
-                        conv_prox_paid=0,
-                    )
-                )
-                try:
-                    h_start = i * _H_BYTES
-                    _pipe_write_action_a(
-                        act_fds[(game_idx, "a")],
-                        int(results_cpu[0, i]), int(results_cpu[1, i]), int(results_cpu[2, i]),
-                        int(results_cpu[3, i]), int(results_cpu[4, i]), h_view[h_start:h_start + _H_BYTES],
-                    )
-                except OSError:
-                    pass
+                    try:
+                        h_start = i * _H_BYTES
+                        _pipe_write_action_a(
+                            act_fds[(game_idx, "a")],
+                            int(bt_act[i]), int(bd_act[i]), int(cd_act[i]),
+                            int(brt_act[i]), int(md_act[i]), h_view[h_start:h_start + _H_BYTES],
+                        )
+                    except OSError:
+                        pass
             if profile is not None:
                 profile["ipc_write_a_s"] = profile.get("ipc_write_a_s", 0.0) + (time.perf_counter() - t_phase)
             total_inferences += n_a
@@ -1022,7 +1164,7 @@ def collect_games_batched(
 
     shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"    [{n_games} games, {total_inferences} GPU inferences]")
-    return trajectories, winners, per_opp_winners, all_global_states, traj_game_map, game_origin, game_delivery_totals
+    return trajectories, winners, per_opp_winners, all_global_states, traj_game_map, game_origin, game_delivery_totals, game_specs
 
 
 def _step_round_index(step: TrajectoryStep) -> int:
@@ -1070,7 +1212,13 @@ def main():
         "--critic-minibatch-size",
         type=int,
         default=0,
-        help="Critic PPO minibatch size (default: auto, larger than actor minibatches on CUDA)",
+        help="Critic PPO minibatch size (default: auto from --critic-batches-per-epoch)",
+    )
+    parser.add_argument(
+        "--critic-batches-per-epoch",
+        type=int,
+        default=8,
+        help="Auto critic batch target per PPO epoch when --critic-minibatch-size is not set",
     )
     parser.add_argument("--teacher", action="store_true", help="Train large teacher, distill to student")
     parser.add_argument("--distill-epochs", type=int, default=20, help="Distillation epochs")
@@ -1092,6 +1240,8 @@ def main():
     parser.add_argument("--profile-shapes", action="store_true", help="Record tensor shapes in end-to-end profiler output")
     parser.add_argument("--profile-memory", action="store_true", help="Record memory events in end-to-end profiler output")
     parser.add_argument("--profile-stack", action="store_true", help="Record Python stacks in end-to-end profiler output")
+    parser.add_argument("--benchmark-seed", type=int, default=None, help="Use a deterministic local RNG for map and game-seed assignment")
+    parser.add_argument("--benchmark-maps", type=str, default="", help="Optional comma-separated map filenames for deterministic benchmark runs")
     parser.add_argument("--resume", action="store_true", help="Resume a prior session from saved trainer state")
     parser.add_argument("--worker-result", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--worker-pipes", type=str, default="", help=argparse.SUPPRESS)
@@ -1124,6 +1274,7 @@ def main():
         )
 
     maps = [f.name for f in (PROJECT_ROOT / "maps").glob("*.map26")]
+    benchmark_maps = _resolve_benchmark_maps(maps, args.benchmark_maps)
     league = League(sess["league_dir"], args.league_size)
 
     hidden = TEACHER_HIDDEN if args.teacher else None
@@ -1168,6 +1319,11 @@ def main():
     print(f"Session: {session_name} [{mode}]")
     print(f"Device: {DEVICE} | {n_params:,} params")
     print(f"Self-play: {args.episodes} episodes, {args.opponents}x{args.games_per_opp} games")
+    if args.benchmark_seed is not None or args.benchmark_maps:
+        print(
+            "Benchmark workload:"
+            f" seed={args.benchmark_seed} maps={','.join(benchmark_maps)}"
+        )
     if args.dummy_episodes > 0:
         print(f"Dummy curriculum: first {args.dummy_episodes} episodes use scripted side-B")
     print(f"Workers: auto")
@@ -1238,11 +1394,13 @@ def main():
                 all_opp_ids.append(opp["id"])
 
         with trace_scope(episode_trace, "episode.collect"):
-            all_trajs, all_winners, per_opp_winners, all_global_states, traj_game_map, game_origin, game_delivery_totals = collect_games_batched(
+            all_trajs, all_winners, per_opp_winners, all_global_states, traj_game_map, game_origin, game_delivery_totals, game_specs = collect_games_batched(
                 model, all_opp_paths, all_opp_ids, maps,
                 ep + 1, replay_dir,
                 opp_hidden=hidden,
                 coalesce_ms=args.coalesce_ms,
+                benchmark_seed=args.benchmark_seed,
+                benchmark_maps=benchmark_maps if (args.benchmark_seed is not None or args.benchmark_maps) else None,
                 profile=episode_profile,
                 trace=episode_trace,
             )
@@ -1276,6 +1434,7 @@ def main():
                 target_kl=0.03,
                 actor_minibatch_size=args.actor_minibatch_size or None,
                 critic_minibatch_size=args.critic_minibatch_size or None,
+                critic_batches_per_epoch=args.critic_batches_per_epoch,
                 freeze_critic=args.freeze_critic,
                 profile=episode_profile,
                 trace=episode_trace,
@@ -1471,17 +1630,22 @@ def main():
             }, state_path)
 
         if episode_trace is not None:
+            trace_metadata = {
+                "episode": ep + 1,
+                "collect_s": t_collect,
+                "train_s": t_train,
+                "wins": total_wins,
+                "losses": total_losses,
+                "games": total_games,
+                "n_steps": stats.get("n_steps", 0),
+            }
+            if args.benchmark_seed is not None or args.benchmark_maps:
+                trace_metadata["benchmark_seed"] = args.benchmark_seed
+                trace_metadata["benchmark_maps"] = list(benchmark_maps)
+                trace_metadata["benchmark_workload"] = [spec.metadata() for spec in game_specs]
             episode_trace.finish(
                 coarse_metrics=episode_profile,
-                metadata={
-                    "episode": ep + 1,
-                    "collect_s": t_collect,
-                    "train_s": t_train,
-                    "wins": total_wins,
-                    "losses": total_losses,
-                    "games": total_games,
-                    "n_steps": stats.get("n_steps", 0),
-                },
+                metadata=trace_metadata,
             )
 
         if (ep + 1) % 5 == 0 or ep == 0:

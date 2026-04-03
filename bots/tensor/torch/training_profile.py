@@ -88,7 +88,11 @@ class EpisodeProfiler:
     def scope(self, name: str):
         start = time.perf_counter()
         profiler = self._profiler
+        pushed_nvtx = False
         try:
+            if torch.cuda.is_available():
+                torch.cuda.nvtx.range_push(name)
+                pushed_nvtx = True
             if profiler is None:
                 with nullcontext():
                     yield
@@ -96,6 +100,8 @@ class EpisodeProfiler:
                 with torch.profiler.record_function(name):
                     yield
         finally:
+            if pushed_nvtx:
+                torch.cuda.nvtx.range_pop()
             end = time.perf_counter()
             self._events.append({
                 "name": name,

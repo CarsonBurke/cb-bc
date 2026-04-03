@@ -494,6 +494,8 @@ GLOBAL_SCALAR_DIM = 19  # 12 base + own_working_harv, Δti_collected, Δax_colle
 UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
 CENTRALIZED_CNN_CHUNK = 4096  # Larger chunks amortize critic launch/bookkeeping overhead.
 DEFAULT_CRITIC_MINIBATCH_SIZE = 4096
+_NCU_CRITIC_BATCH_INDEX = int(os.environ.get("CB_NCU_CRITIC_BATCH_INDEX", "-1"))
+_NCU_CRITIC_EPOCH_INDEX = int(os.environ.get("CB_NCU_CRITIC_EPOCH_INDEX", "0"))
 CRITIC_SUMMARY_DIM = 64
 CRITIC_STAGE_A_DIM = 64
 CRITIC_STAGE_B_DIM = 96
@@ -1054,13 +1056,13 @@ def _build_critic_epoch_plan(
 def _resolve_critic_minibatch_size(
     n_steps: int,
     critic_minibatch_size: int | None,
-    device: torch.device,
+    critic_batches_per_epoch: int,
 ) -> int:
-    """Pick a critic batch size: 8 batches per epoch (same as actor)."""
+    """Pick a critic batch size from an explicit target batch count."""
     if critic_minibatch_size is not None and critic_minibatch_size > 0:
         return critic_minibatch_size
-    # 8 batches per epoch, with a floor for very small datasets
-    return max((n_steps + 7) // 8, DEFAULT_CRITIC_MINIBATCH_SIZE)
+    target_batches = max(1, int(critic_batches_per_epoch))
+    return max((n_steps + target_batches - 1) // target_batches, DEFAULT_CRITIC_MINIBATCH_SIZE)
 
 
 def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
@@ -1164,6 +1166,84 @@ def _compose_action_log_prob(
     )
 
 
+def _sample_actions_from_policy_heads(
+    obs: torch.Tensor,
+    bt_l: torch.Tensor,
+    bd_l: torch.Tensor,
+    cd_l: torch.Tensor,
+    brt_l: torch.Tensor,
+    md_l: torch.Tensor,
+    eps: torch.Tensor,
+    h_next: torch.Tensor,
+    *,
+    temperature: float,
+    return_log_prob: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Apply masks, sample actions, and optionally compose behavior log-probs."""
+    B = obs.shape[0]
+    bt_m, bd_m = compute_action_masks(obs)
+    cd_m = conveyor_dir_mask(obs.device, B)
+    harv_bd_m = compute_harvester_build_dir_mask(obs, bd_m)
+    bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
+    bt_act, bt_lp = sample_logits_gumbel(
+        bt_l,
+        temperature,
+        mask=bt_m,
+        eps=eps[:, 0],
+        return_log_prob=return_log_prob,
+    )
+    harv_rows = bt_act == HARVESTER_BUILD_TYPE
+    bd_m_final = torch.where(harv_rows.unsqueeze(1), harv_bd_m, bd_m)
+    bd_act, bd_lp = sample_logits_gumbel(
+        bd_l,
+        temperature,
+        mask=bd_m_final,
+        eps=eps[:, 1],
+        return_log_prob=return_log_prob,
+    )
+    cd_act, cd_lp = sample_logits_gumbel(
+        cd_l,
+        temperature,
+        mask=cd_m,
+        eps=eps[:, 2],
+        return_log_prob=return_log_prob,
+    )
+    brt_act, brt_lp = sample_logits_gumbel(
+        brt_l,
+        temperature,
+        eps=eps[:, 3],
+        return_log_prob=return_log_prob,
+    )
+    md_act, md_lp = sample_logits_gumbel(
+        md_l,
+        temperature,
+        eps=eps[:, 4],
+        return_log_prob=return_log_prob,
+    )
+
+    lp = None
+    if return_log_prob:
+        assert bt_lp is not None and bd_lp is not None and cd_lp is not None and brt_lp is not None and md_lp is not None
+        bd_causal = bt_act != 0
+        cd_causal = (
+            (bt_act == CONVEYOR_BUILD_TYPES[0])
+            | (bt_act == CONVEYOR_BUILD_TYPES[1])
+            | (bt_act == CONVEYOR_BUILD_TYPES[2])
+        )
+        brt_causal = bt_act == BRIDGE_BUILD_TYPE
+        lp = _compose_action_log_prob(
+            bt_lp,
+            bd_lp,
+            cd_lp,
+            brt_lp,
+            md_lp,
+            bd_causal=bd_causal,
+            cd_causal=cd_causal,
+            brt_causal=brt_causal,
+        )
+    return bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next
+
+
 def _normalize_actor_latent_dim(latent: torch.Tensor) -> torch.Tensor:
     """Pad/slice actor latents so critic input width is stable across models."""
     cur_dim = latent.shape[-1]
@@ -1190,29 +1270,42 @@ class GraphedInference:
         temperature: float = 1.0,
         *,
         return_log_prob: bool = True,
+        graph_sampling: bool = True,
     ):
         self.max_batch = max_batch
         self._model = model
         self._temperature = temperature
         self._return_log_prob = return_log_prob
+        self._graph_sampling = graph_sampling
         self._graph: torch.cuda.CUDAGraph | None = None
         # Static buffers (set during capture)
         self._static_input: torch.Tensor | None = None
         # Output references (point into graph memory)
         self._s_bt_act = self._s_bd_act = self._s_cd_act = self._s_md_act = None
         self._s_lp = self._s_h = None
+        self._s_bt_l = self._s_bd_l = self._s_cd_l = self._s_brt_l = self._s_md_l = self._s_eps = None
 
     def capture(self) -> None:
         """Capture the CUDA graph. Call once after model is on device."""
         M = self.max_batch
-        costs_ti, costs_ax, wall_idx, nobld_idx, unit_idx, friendly_idx, core_idx = _mask_indices(DEVICE)
-        ore_ti_idx, ore_ax_idx = _harv_mask_indices(DEVICE)
-        cd_mask = torch.tensor(_CONV_DIR_MASK, dtype=torch.bool, device=DEVICE)
-
         # Match model dtype for all buffers
         mdtype = next(self._model.parameters()).dtype
         self._dtype = mdtype
         self._static_input = torch.zeros(M, OBS_SIZE + H_DIM, device=DEVICE, dtype=mdtype)
+        if not self._graph_sampling:
+            with torch.no_grad():
+                self._model.infer_packed(self._static_input)
+            torch.cuda.synchronize()
+
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph):
+                with torch.no_grad():
+                    self._s_bt_l, self._s_bd_l, self._s_cd_l, self._s_brt_l, self._s_md_l, self._s_eps, self._s_h = self._model.infer_packed(self._static_input)
+            return
+
+        costs_ti, costs_ax, wall_idx, nobld_idx, unit_idx, friendly_idx, core_idx = _mask_indices(DEVICE)
+        ore_ti_idx, ore_ax_idx = _harv_mask_indices(DEVICE)
+        cd_mask = torch.tensor(_CONV_DIR_MASK, dtype=torch.bool, device=DEVICE)
         static_g_bt = torch.empty(M, N_BUILD, device=DEVICE, dtype=mdtype)
         static_g_bd = torch.empty(M, N_DIR, device=DEVICE, dtype=mdtype)
         static_g_cd = torch.empty(M, N_CONV_DIR, device=DEVICE, dtype=mdtype)
@@ -1321,64 +1414,95 @@ class GraphedInference:
         self._s_h = s_h
 
     @torch.no_grad()
-    def __call__(self, trunk_in: torch.Tensor):
+    def policy_heads(
+        self,
+        trunk_in: torch.Tensor,
+        *,
+        trace=None,
+        scope_prefix: str = "inference",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return raw actor policy heads and recurrent state after the model forward."""
+        B = trunk_in.shape[0]
+        if self._graph is not None and not self._graph_sampling:
+            self._static_input[:B].copy_(trunk_in)
+            if B < self.max_batch:
+                self._static_input[B:].zero_()
+            with trace_scope(trace, f"{scope_prefix}.forward"):
+                self._graph.replay()
+            return (
+                self._s_bt_l[:B].clone(),
+                self._s_bd_l[:B].clone(),
+                self._s_cd_l[:B].clone(),
+                self._s_brt_l[:B].clone(),
+                self._s_md_l[:B].clone(),
+                self._s_eps[:B].clone(),
+                self._s_h[:B].clone(),
+            )
+        with trace_scope(trace, f"{scope_prefix}.forward"):
+            return self._model.infer_packed(trunk_in)
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        trunk_in: torch.Tensor,
+        *,
+        trace=None,
+        scope_prefix: str = "inference",
+    ):
         """Run graphed inference. Returns (bt, bd, cd, brt, md, lp, h_next) sliced to B."""
         B = trunk_in.shape[0]
         if self._graph is not None:
             self._static_input[:B].copy_(trunk_in)
             if B < self.max_batch:
                 self._static_input[B:].zero_()
-            self._graph.replay()
+            with trace_scope(trace, f"{scope_prefix}.forward"):
+                self._graph.replay()
+            if not self._graph_sampling:
+                bt_l = self._s_bt_l[:B].clone()
+                bd_l = self._s_bd_l[:B].clone()
+                cd_l = self._s_cd_l[:B].clone()
+                brt_l = self._s_brt_l[:B].clone()
+                md_l = self._s_md_l[:B].clone()
+                eps = self._s_eps[:B].clone()
+                h_next = self._s_h[:B].clone()
+                with trace_scope(trace, f"{scope_prefix}.sample"):
+                    return _sample_actions_from_policy_heads(
+                        trunk_in[:, :OBS_SIZE],
+                        bt_l,
+                        bd_l,
+                        cd_l,
+                        brt_l,
+                        md_l,
+                        eps,
+                        h_next,
+                        temperature=self._temperature,
+                        return_log_prob=self._return_log_prob,
+                    )
             return (
                 self._s_bt_act[:B], self._s_bd_act[:B], self._s_cd_act[:B],
                 self._s_brt_act[:B], self._s_md_act[:B],
                 self._s_lp[:B] if self._s_lp is not None else None,
                 self._s_h[:B],
             )
-        # Ungraphed fallback
         obs = trunk_in[:, :OBS_SIZE]
-        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = self._model.infer_packed(trunk_in)
-        bt_m, bd_m = compute_action_masks(obs)
-        cd_m = conveyor_dir_mask(obs.device, B)
-        harv_bd_m = compute_harvester_build_dir_mask(obs, bd_m)
-        bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
-        bt_l = _unimix_logits(bt_l, bt_m, eps[:, 0])
-        bt_act = (bt_l - torch.empty_like(bt_l).exponential_().log_()).argmax(dim=-1)
-        harv_rows = bt_act == HARVESTER_BUILD_TYPE
-        bd_m_final = torch.where(harv_rows.unsqueeze(1), harv_bd_m, bd_m)
-        bd_l = _unimix_logits(bd_l, bd_m_final, eps[:, 1])
-        cd_l = _unimix_logits(cd_l, cd_m, eps[:, 2])
-        brt_l = _unimix_logits(brt_l, eps=eps[:, 3])
-        md_l = _unimix_logits(md_l, eps=eps[:, 4])
-        bd_act = (bd_l - torch.empty_like(bd_l).exponential_().log_()).argmax(dim=-1)
-        cd_act = (cd_l - torch.empty_like(cd_l).exponential_().log_()).argmax(dim=-1)
-        brt_act = (brt_l - torch.empty_like(brt_l).exponential_().log_()).argmax(dim=-1)
-        md_act = (md_l - torch.empty_like(md_l).exponential_().log_()).argmax(dim=-1)
-        lp = None
-        if self._return_log_prob:
-            bt_lp = bt_l.gather(1, bt_act.unsqueeze(1)).squeeze(1)
-            bd_lp = bd_l.gather(1, bd_act.unsqueeze(1)).squeeze(1)
-            cd_lp = cd_l.gather(1, cd_act.unsqueeze(1)).squeeze(1)
-            brt_lp = brt_l.gather(1, brt_act.unsqueeze(1)).squeeze(1)
-            md_lp = md_l.gather(1, md_act.unsqueeze(1)).squeeze(1)
-            bd_causal = bt_act != 0
-            cd_causal = (
-                (bt_act == CONVEYOR_BUILD_TYPES[0])
-                | (bt_act == CONVEYOR_BUILD_TYPES[1])
-                | (bt_act == CONVEYOR_BUILD_TYPES[2])
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = self.policy_heads(
+            trunk_in,
+            trace=trace,
+            scope_prefix=scope_prefix,
+        )
+        with trace_scope(trace, f"{scope_prefix}.sample"):
+            return _sample_actions_from_policy_heads(
+                obs,
+                bt_l,
+                bd_l,
+                cd_l,
+                brt_l,
+                md_l,
+                eps,
+                h_next,
+                temperature=self._temperature,
+                return_log_prob=self._return_log_prob,
             )
-            brt_causal = bt_act == BRIDGE_BUILD_TYPE
-            lp = _compose_action_log_prob(
-                bt_lp,
-                bd_lp,
-                cd_lp,
-                brt_lp,
-                md_lp,
-                bd_causal=bd_causal,
-                cd_causal=cd_causal,
-                brt_causal=brt_causal,
-            )
-        return bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next
 
     @property
     def captured(self) -> bool:
@@ -2164,6 +2288,7 @@ def ppo_update(
     minibatch_size: int = 2048,
     actor_minibatch_size: int | None = None,
     critic_minibatch_size: int | None = None,
+    critic_batches_per_epoch: int = 8,
     bptt_k: int = BPTT_K,
     clip_eps: float = 0.2,
     clip_eps_higher: float | None = 0.28,
@@ -2367,7 +2492,7 @@ def ppo_update(
         critic_minibatch_size = _resolve_critic_minibatch_size(
             N,
             critic_minibatch_size,
-            dev,
+            critic_batches_per_epoch,
         )
         clip_mask = torch.tensor(bool(clip_vloss and old_values is not None), device=obs.device, dtype=torch.bool)
         value_clip_t = torch.tensor(float(value_clip), device=obs.device, dtype=returns.dtype)
@@ -2401,6 +2526,15 @@ def ppo_update(
                     step_hi = epoch_plan.round_offsets_cpu[round_end]
                     t_value = time.perf_counter() if profile is not None else 0.0
                     critic_opt.zero_grad(set_to_none=True)
+                    capture_this_batch = (
+                        DEVICE.type == "cuda"
+                        and _NCU_CRITIC_BATCH_INDEX >= 0
+                        and epoch == _NCU_CRITIC_EPOCH_INDEX
+                        and batch_idx == _NCU_CRITIC_BATCH_INDEX
+                    )
+                    if capture_this_batch:
+                        torch.cuda.synchronize()
+                        torch.cuda.profiler.start()
 
                     mb_xy = epoch_plan.packed_xy[step_lo:step_hi]
                     mb_uf = epoch_plan.packed_unit_float[step_lo:step_hi]
@@ -2430,6 +2564,9 @@ def ppo_update(
 
                     critic_gn = torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
                     critic_opt.step()
+                    if capture_this_batch:
+                        torch.cuda.synchronize()
+                        torch.cuda.profiler.stop()
 
                     with torch.no_grad():
                         _critic_acc[0] += vf_loss_sum / vf_denom

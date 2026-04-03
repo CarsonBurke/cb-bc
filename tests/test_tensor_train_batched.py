@@ -97,3 +97,51 @@ def test_server_side_trajectory_step_uses_packet_payload_and_behavior_log_prob()
     assert step.old_log_prob == -0.75
     assert step.obs_bytes == obs.tobytes()
     assert step.h_prev_bytes == h_prev.tobytes()
+
+
+def test_resolve_benchmark_maps_rejects_unknown_names():
+    with pytest.raises(ValueError, match="unknown benchmark map"):
+        train_batched_mod._resolve_benchmark_maps(["a.map26", "b.map26"], "a.map26,missing.map26")
+
+
+def test_build_game_launch_specs_is_deterministic_for_benchmark_seed(tmp_path):
+    kwargs = dict(
+        opp_weight_paths=["opp_a.pkl", train_batched_mod.DUMMY_OPP_PATH, "opp_b.pkl"],
+        opp_ids=["opp-a", "dummy", "opp-b"],
+        maps=["zeta.map26", "alpha.map26", "gamma.map26"],
+        episode_num=1,
+        replay_dir=tmp_path,
+        bot_a="bot_a.py",
+        bot_b_proxy="bot_b_proxy.py",
+        bot_b_dummy="bot_b_dummy.py",
+        engine_root="/engine",
+        benchmark_seed=12345,
+        benchmark_maps=None,
+    )
+
+    first = train_batched_mod._build_game_launch_specs(**kwargs)
+    second = train_batched_mod._build_game_launch_specs(**kwargs)
+
+    assert first == second
+    assert [Path(spec.map_path).name for spec in first] == [Path(spec.map_path).name for spec in second]
+    assert [spec.seed for spec in first] == [spec.seed for spec in second]
+    assert first[1].bot_b == "bot_b_dummy.py"
+    assert first[0].bot_b == "bot_b_proxy.py"
+
+
+def test_build_game_launch_specs_uses_requested_benchmark_maps(tmp_path):
+    specs = train_batched_mod._build_game_launch_specs(
+        opp_weight_paths=["opp_a.pkl", "opp_b.pkl"],
+        opp_ids=["opp-a", "opp-b"],
+        maps=["alpha.map26", "beta.map26", "gamma.map26"],
+        episode_num=2,
+        replay_dir=tmp_path,
+        bot_a="bot_a.py",
+        bot_b_proxy="bot_b_proxy.py",
+        bot_b_dummy="bot_b_dummy.py",
+        engine_root="/engine",
+        benchmark_seed=7,
+        benchmark_maps=["beta.map26"],
+    )
+
+    assert [Path(spec.map_path).name for spec in specs] == ["beta.map26", "beta.map26"]

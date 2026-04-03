@@ -231,6 +231,40 @@ def test_compose_action_log_prob_ignores_noncausal_negative_infinities():
     assert torch.allclose(lp, torch.tensor([-0.75]))
 
 
+def test_sample_actions_from_policy_heads_returns_finite_behavior_log_prob():
+    obs = torch.zeros(2, model_mod.OBS_SIZE)
+    bt_l = torch.zeros(2, model_mod.N_BUILD)
+    bd_l = torch.zeros(2, model_mod.N_DIR)
+    cd_l = torch.zeros(2, model_mod.N_CONV_DIR)
+    brt_l = torch.zeros(2, model_mod.N_BRIDGE_TARGETS)
+    md_l = torch.zeros(2, model_mod.N_DIR)
+    eps = torch.full((2, model_mod.N_LOGIT_SCALE), model_mod.EPS_MIN)
+    h_next = torch.zeros(2, model_mod.H_DIM)
+
+    torch.manual_seed(0)
+    bt_act, bd_act, cd_act, brt_act, md_act, lp, out_h = model_mod._sample_actions_from_policy_heads(
+        obs,
+        bt_l,
+        bd_l,
+        cd_l,
+        brt_l,
+        md_l,
+        eps,
+        h_next,
+        temperature=1.0,
+        return_log_prob=True,
+    )
+
+    assert bt_act.shape == (2,)
+    assert bd_act.shape == (2,)
+    assert cd_act.shape == (2,)
+    assert brt_act.shape == (2,)
+    assert md_act.shape == (2,)
+    assert lp is not None
+    assert torch.isfinite(lp).all()
+    assert out_h.shape == h_next.shape
+
+
 def test_materialize_critic_inputs_uses_final_layout_device_buffers(monkeypatch):
     monkeypatch.setattr(model_mod, "DEVICE", torch.device("cpu"))
     monkeypatch.setattr(
@@ -274,6 +308,13 @@ def test_materialize_critic_inputs_uses_final_layout_device_buffers(monkeypatch)
         torch.tensor([[1, 0, 0], [0, 0, 0]], dtype=data["gpu_mask"].dtype),
     )
     assert torch.allclose(data["gpu_scalars"], global_scalars)
+
+
+def test_resolve_critic_minibatch_size_uses_configured_epoch_batch_target():
+    assert model_mod._resolve_critic_minibatch_size(32000, None, 8) == 4096
+    assert model_mod._resolve_critic_minibatch_size(32000, None, 4) == 8000
+    assert model_mod._resolve_critic_minibatch_size(32000, None, 1) == 32000
+    assert model_mod._resolve_critic_minibatch_size(32000, 1234, 4) == 1234
 
 
 def test_freeze_critic_skips_critic_singleton_and_compile(monkeypatch):
