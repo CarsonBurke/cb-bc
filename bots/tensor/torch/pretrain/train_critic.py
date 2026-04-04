@@ -31,12 +31,13 @@ sys.path.insert(0, str(_TORCH_DIR))
 
 from model import (
     ACTOR_LATENT_DIM,
-    DEFAULT_CRITIC_MINIBATCH_SIZE,
     BuilderMLP,
     CentralizedCritic,
     DEVICE, GLOBAL_MAP_CHANNELS, GLOBAL_MAP_MAX_W, GLOBAL_MAP_MAX_H,
     GLOBAL_SCALAR_DIM, H_DIM, UNIT_CONTEXT_DIM,
-    twohot_encode, _make_bucket_centers, _normalize_actor_latent_dim,
+    soft_cross_entropy_from_logits,
+    value_target_probs,
+    _make_bucket_centers, _normalize_actor_latent_dim,
     win_probability,
 )
 
@@ -52,6 +53,7 @@ from pretrain.gpu import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 DEFAULT_REPLAY_DIR = PROJECT_ROOT / "replay_data"
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
+DEFAULT_PRETRAIN_CHUNK_SIZE = 4096
 
 
 def _atomic_torch_save(payload: dict, path: Path) -> None:
@@ -295,7 +297,7 @@ def _compute_actor_obs_pre(
     actor: BuilderMLP,
     obs_bt_cpu: torch.Tensor,
     device: torch.device,
-    chunk_size: int = DEFAULT_CRITIC_MINIBATCH_SIZE,
+    chunk_size: int = DEFAULT_PRETRAIN_CHUNK_SIZE,
 ) -> torch.Tensor:
     """Project replay observations through the actor's obs-only encoder in chunks."""
     if obs_bt_cpu.shape[0] == 0:
@@ -746,7 +748,7 @@ def train_critic(
                     unit_ctx = unit_ctx_cpu.to(device=DEVICE, dtype=torch.float32, non_blocking=True)
                     actor_latent = actor_latent_cpu.to(device=DEVICE, dtype=torch.float32, non_blocking=True)
                     values = targets_cpu.to(device=DEVICE, non_blocking=True)
-                    targets = twohot_encode(values, bucket_centers)
+                    targets = value_target_probs(values, bucket_centers)
                     if transfer_end is not None:
                         transfer_end.record(transfer_stream)
                     if transfer_stream:
@@ -818,7 +820,7 @@ def train_critic(
                                 states, masks, scalars, round_idx,
                                 unit_xy, unit_ctx, actor_latent,
                             )
-                            loss = F.cross_entropy(logits, targets)
+                            loss = soft_cross_entropy_from_logits(logits, targets).mean()
                         if fwd_end is not None:
                             fwd_end.record(torch.cuda.current_stream(DEVICE))
                         with torch.no_grad():
@@ -939,7 +941,7 @@ def train_critic(
                             states, masks, scalars, round_idx,
                             unit_xy, unit_ctx, actor_latent,
                         )
-                        loss = F.cross_entropy(logits, targets)
+                        loss = soft_cross_entropy_from_logits(logits, targets).mean()
                     if fwd_end is not None:
                         fwd_end.record(torch.cuda.current_stream(DEVICE))
                     with torch.no_grad():

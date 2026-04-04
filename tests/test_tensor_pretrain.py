@@ -27,7 +27,7 @@ from model import (
     BuilderMLP, CentralizedCritic, DEVICE, H_DIM, N_BUILD, N_DIR,
     GLOBAL_MAP_CHANNELS, GLOBAL_MAP_MAX_W, GLOBAL_MAP_MAX_H, GLOBAL_SCALAR_DIM,
     UNIT_CONTEXT_DIM, ACTOR_LATENT_DIM,
-    twohot_encode, _make_bucket_centers,
+    soft_cross_entropy_from_logits, value_target_probs, _make_bucket_centers,
 )
 from dataset import ActorBCDataset, CriticBCDataset, _load_index
 from dataset import _critic_winloss_targets
@@ -432,7 +432,7 @@ class TestCriticPretraining:
         scalars = scalars.to(DEVICE)
         values = values.to(DEVICE)
         N = states.shape[0]
-        targets = twohot_encode(values, bucket_centers)
+        targets = value_target_probs(values, bucket_centers)
         dummy_xy = torch.zeros(N, 2, dtype=torch.long, device=DEVICE)
         dummy_ctx = torch.zeros(N, UNIT_CONTEXT_DIM, device=DEVICE)
         dummy_lat = torch.zeros(N, ACTOR_LATENT_DIM, device=DEVICE)
@@ -444,7 +444,7 @@ class TestCriticPretraining:
             _vals, logits = critic.unit_value_logits(
                 feat, scalars, round_idx, dummy_xy, dummy_ctx, dummy_lat,
             )
-            loss = torch.nn.functional.cross_entropy(logits, targets)
+            loss = soft_cross_entropy_from_logits(logits, targets).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
