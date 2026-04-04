@@ -222,7 +222,7 @@ class MLP:
 
     __slots__ = (
         "trunk", "heads", "_infer_cache",
-        "head_projection",
+        "head_projection", "head_norm",
         "tile_encoder", "tile_grid_n", "tile_raw_features", "tile_embed_dim", "_tile_dxdy",
         "tile_conv_w", "tile_conv_b", "tile_pointwise", "tile_post_rms",
         "tile_compress", "tile_compress_size",
@@ -273,6 +273,8 @@ class MLP:
         else:
             self.head_projection = None
 
+        self.head_norm = RMSNorm(prev)
+
         self.heads: dict[str, Linear] = {}
         for name, size in output_heads.items():
             self.heads[name] = Linear(prev, size)
@@ -322,6 +324,7 @@ class MLP:
         h = self.trunk(x)
         if self.head_projection is not None:
             h = self.head_projection(h)
+        h = self.head_norm(h)
         return {name: head(h) for name, head in self.heads.items()}
 
     def parameters(self) -> list[Tensor]:
@@ -340,6 +343,7 @@ class MLP:
         params.extend(self.trunk.parameters())
         if self.head_projection is not None:
             params.extend(self.head_projection.parameters())
+        params.extend(self.head_norm.parameters())
         for head in self.heads.values():
             params.extend(head.parameters())
         return params
@@ -414,6 +418,10 @@ class MLP:
             w_rows = [w[j::N] for j in range(N)]
             b = list(self.head_projection.bias.data) if self.head_projection.bias is not None else None
             ops.append(('linear', None, w_rows, b, N))
+
+        # Head norm (RMSNorm before head projections)
+        head_norm_gamma = list(self.head_norm.gamma.data)
+        head_norm_eps = self.head_norm.eps
 
         # Fuse all output heads into one cached linear pass, then slice back into
         # per-head outputs. This keeps the public infer() API unchanged while
@@ -491,7 +499,7 @@ class MLP:
             comp_eps = comp_rms.eps
             compress_cache = (comp_w_rows, comp_b, comp_N, comp_gamma, comp_eps)
 
-        return [ops, (head_names, head_slices, fused_w_rows, fused_bias, offset), tile_cache, conv_cache, compress_cache]
+        return [ops, (head_names, head_slices, fused_w_rows, fused_bias, offset), tile_cache, conv_cache, compress_cache, (head_norm_gamma, head_norm_eps)]
 
     def infer(self, features: list[float]) -> dict[str, list[float]]:
         """Fast inference for a single input — bypasses Tensor overhead.
@@ -506,7 +514,7 @@ class MLP:
 
         _exp = math.exp
         _dot = _DOT
-        ops, fused_heads, tile_cache, conv_cache, compress_cache = self._infer_cache
+        ops, fused_heads, tile_cache, conv_cache, compress_cache, head_norm_cache = self._infer_cache
 
         if tile_cache is not None:
             te_w_rows, te_bias, te_out, te_dx_w, te_dy_w = tile_cache
@@ -717,6 +725,13 @@ class MLP:
                         out[i] = e / (1.0 + e)
                 h = out
 
+        # Apply head norm (RMSNorm) before fused head projections
+        hn_gamma, hn_eps = head_norm_cache
+        hn_dim = len(h)
+        hn_mean_sq = sum(v * v for v in h) / hn_dim
+        hn_inv_rms = 1.0 / (hn_mean_sq + hn_eps) ** 0.5
+        h = [h[i] * hn_inv_rms * hn_gamma[i] for i in range(hn_dim)]
+
         head_names, head_slices, fused_w_rows, fused_bias, total_out = fused_heads
         if fused_bias is not None:
             fused_out = [_dot(h, fused_w_rows[j]) + fused_bias[j] for j in range(total_out)]
@@ -754,18 +769,22 @@ class MLP:
 
         full_params = self.parameters()
 
-        # Params without tile encoder (trunk + heads only)
+        # Params without tile encoder (trunk + head_norm + heads only)
         no_tile_params: list[Tensor] = list(self.trunk.parameters())
+        no_tile_params.extend(self.head_norm.parameters())
         no_tile_params.extend(_head_params())
 
         no_tile_no_logit_params: list[Tensor] = list(self.trunk.parameters())
+        no_tile_no_logit_params.extend(self.head_norm.parameters())
         no_tile_no_logit_params.extend(_head_params({"logit_scale"}))
 
         # Without tile encoder AND without conv_dir head
         no_tile_no_conv_params: list[Tensor] = list(self.trunk.parameters())
+        no_tile_no_conv_params.extend(self.head_norm.parameters())
         no_tile_no_conv_params.extend(_head_params({"conv_dir"}))
 
         no_tile_no_conv_no_logit_params: list[Tensor] = list(self.trunk.parameters())
+        no_tile_no_conv_no_logit_params.extend(self.head_norm.parameters())
         no_tile_no_conv_no_logit_params.extend(_head_params({"conv_dir", "logit_scale"}))
 
         no_conv_params: list[Tensor] = []
@@ -782,6 +801,7 @@ class MLP:
             no_conv_params.extend(self.tile_compress.parameters())
         for layer in self.trunk.layers:
             no_conv_params.extend(layer.parameters())
+        no_conv_params.extend(self.head_norm.parameters())
         no_conv_params.extend(_head_params({"conv_dir"}))
 
         no_logit_params: list[Tensor] = []
@@ -797,6 +817,7 @@ class MLP:
         if self.tile_compress is not None:
             no_logit_params.extend(self.tile_compress.parameters())
         no_logit_params.extend(self.trunk.parameters())
+        no_logit_params.extend(self.head_norm.parameters())
         no_logit_params.extend(_head_params({"logit_scale"}))
 
         no_conv_no_logit_params: list[Tensor] = []
@@ -813,6 +834,7 @@ class MLP:
             no_conv_no_logit_params.extend(self.tile_compress.parameters())
         for layer in self.trunk.layers:
             no_conv_no_logit_params.extend(layer.parameters())
+        no_conv_no_logit_params.extend(self.head_norm.parameters())
         no_conv_no_logit_params.extend(_head_params({"conv_dir", "logit_scale"}))
 
         legacy_params: list[Tensor] = []
