@@ -479,8 +479,7 @@ GLOBAL_MAP_MAX_H = 50
 GLOBAL_MAP_CHANNELS = 23
 GLOBAL_SCALAR_DIM = 19  # 12 base + own_working_harv, Δti_collected, Δax_collected, Δcore_hp, Δworking_harv, flow_reward, delivery_reward
 UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
-CENTRALIZED_CNN_CHUNK = 4096  # Larger chunks amortize critic launch/bookkeeping overhead.
-DEFAULT_CRITIC_MINIBATCH_SIZE = 4096
+CRITIC_BATCHES_PER_EPOCH = 12
 _NCU_CRITIC_BATCH_INDEX = int(os.environ.get("CB_NCU_CRITIC_BATCH_INDEX", "-1"))
 _NCU_CRITIC_EPOCH_INDEX = int(os.environ.get("CB_NCU_CRITIC_EPOCH_INDEX", "0"))
 CRITIC_SUMMARY_DIM = 64
@@ -1602,7 +1601,7 @@ def _critic_round_batch_plan(
     step_round_idx: torch.Tensor,
     *,
     target_steps: int,
-    max_rounds: int,
+    max_rounds: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
     """Plan round-bounded critic batches from per-step round ids."""
     perm = _critic_round_grouped_perm(step_round_idx)
@@ -1612,13 +1611,14 @@ def _critic_round_batch_plan(
         return perm, unique_rounds, round_offsets, []
 
     target_steps = max(1, int(target_steps))
-    max_rounds = max(1, int(max_rounds))
+    if max_rounds is not None:
+        max_rounds = max(1, int(max_rounds))
     offsets_cpu = round_offsets.tolist()
     n_unique_rounds = unique_rounds.shape[0]
     batch_ranges: list[tuple[int, int]] = []
     round_start = 0
     while round_start < n_unique_rounds:
-        round_cap = min(round_start + max_rounds, n_unique_rounds)
+        round_cap = n_unique_rounds if max_rounds is None else min(round_start + max_rounds, n_unique_rounds)
         step_start = offsets_cpu[round_start]
         round_end = round_start + 1
         while round_end < round_cap:
@@ -1688,7 +1688,7 @@ def _build_critic_epoch_plan(
     step_rv: torch.Tensor,
     *,
     target_steps: int,
-    max_rounds: int,
+    max_rounds: int | None = None,
 ) -> CriticEpochPlan:
     """Build one critic epoch plan with round-major packed step tensors."""
     perm, _, _, batch_ranges = _critic_round_batch_plan(
@@ -1728,14 +1728,9 @@ def _build_critic_epoch_plan(
 
 def _resolve_critic_minibatch_size(
     n_steps: int,
-    critic_minibatch_size: int | None,
-    critic_batches_per_epoch: int,
 ) -> int:
-    """Pick a critic batch size from an explicit target batch count."""
-    if critic_minibatch_size is not None and critic_minibatch_size > 0:
-        return critic_minibatch_size
-    target_batches = max(1, int(critic_batches_per_epoch))
-    return (n_steps + target_batches - 1) // target_batches
+    """Pick the fixed critic batch size target for PPO updates."""
+    return (n_steps + CRITIC_BATCHES_PER_EPOCH - 1) // CRITIC_BATCHES_PER_EPOCH
 
 
 def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
@@ -2964,8 +2959,6 @@ def ppo_update(
     ppo_epochs: int = 4,
     minibatch_size: int = 2048,
     actor_minibatch_size: int | None = None,
-    critic_minibatch_size: int | None = None,
-    critic_batches_per_epoch: int = 8,
     bptt_k: int = BPTT_K,
     clip_eps: float = 0.2,
     clip_eps_higher: float | None = 0.28,
@@ -3164,11 +3157,7 @@ def ppo_update(
         critic_loss_step = get_centralized_critic_loss_step()
         critic_cuda_cfg = _get_critic_cuda_config()
         critic.train()
-        critic_minibatch_size = _resolve_critic_minibatch_size(
-            N,
-            critic_minibatch_size,
-            critic_batches_per_epoch,
-        )
+        critic_minibatch_size = _resolve_critic_minibatch_size(N)
 
         step_round_idx = centralized_data["step_round_idx"]
 
@@ -3190,7 +3179,6 @@ def ppo_update(
                     step_unit_float,
                     step_rv,
                     target_steps=critic_minibatch_size,
-                    max_rounds=CENTRALIZED_CNN_CHUNK,
                 )
 
             for batch_idx, (round_start, round_end) in enumerate(epoch_plan.batch_ranges):
@@ -3840,7 +3828,7 @@ def save_centralized_critic_checkpoint(weight_path: str | Path = WEIGHT_PATH) ->
 def _compute_all_values(
     critic: CentralizedCritic,
     data: dict,
-    cnn_chunk_size: int = CENTRALIZED_CNN_CHUNK,
+    cnn_chunk_size: int | None = None,
 ) -> torch.Tensor:
     """Compute per-unit critic values for all steps using chunked CNN.
 
@@ -3863,8 +3851,9 @@ def _compute_all_values(
     packed_xy, packed_ctx, packed_latent = packed.tensors
     n_unique_rounds = packed.round_ids.shape[0]
 
-    for round_start in range(0, n_unique_rounds, cnn_chunk_size):
-        round_end = min(round_start + cnn_chunk_size, n_unique_rounds)
+    round_chunk = n_unique_rounds if cnn_chunk_size is None else max(1, int(cnn_chunk_size))
+    for round_start in range(0, n_unique_rounds, round_chunk):
+        round_end = min(round_start + round_chunk, n_unique_rounds)
         step_lo = packed.round_offsets_cpu[round_start]
         step_hi = packed.round_offsets_cpu[round_end]
         if step_lo == step_hi:

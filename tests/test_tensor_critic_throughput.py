@@ -434,10 +434,9 @@ def test_materialize_critic_inputs_packs_cpu_slabs_for_staged_round_loading(monk
 
 
 def test_resolve_critic_minibatch_size_uses_configured_epoch_batch_target():
-    assert model_mod._resolve_critic_minibatch_size(32000, None, 8) == 4096
-    assert model_mod._resolve_critic_minibatch_size(32000, None, 4) == 8000
-    assert model_mod._resolve_critic_minibatch_size(32000, None, 1) == 32000
-    assert model_mod._resolve_critic_minibatch_size(32000, 1234, 4) == 1234
+    assert model_mod._resolve_critic_minibatch_size(32000) == 2667
+    assert model_mod._resolve_critic_minibatch_size(12) == 1
+    assert model_mod._resolve_critic_minibatch_size(13) == 2
 
 
 def test_freeze_critic_skips_critic_singleton_and_compile(monkeypatch):
