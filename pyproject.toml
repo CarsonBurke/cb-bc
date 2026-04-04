@@ -1,0 +1,25 @@
+[project]
+name = "cb-bc"
+version = "0.1.0"
+description = "Cambridge Battlecode bots and training stack"
+requires-python = ">=3.13"
+dependencies = [
+    "cambc>=1.5",
+    "trueskill>=0.4",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.10",
+]
+dev = [
+    "pytest>=9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
