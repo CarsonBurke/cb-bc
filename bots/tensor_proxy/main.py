@@ -1,14 +1,8 @@
-"""Proxy bot for batched GPU inference training.
-
-Sends observations over pipes to the PyTorch inference server,
-receives actions back. Uses shared.py for obs encoding, masks,
-rewards, and constants — no tensor_lib dependency.
-"""
+"""Proxy bot for batched GPU inference training."""
 
 from array import array
 import os
 import random
-import struct
 import sys
 
 _PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -27,72 +21,26 @@ from shared import (
     encode_state_into,
     execute_build, execute_move,
 )
+from shared_collector import CollectorClient
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
-# Struct-based binary IPC protocol
-_OBS_FLOATS = INPUT_SIZE + H_DIM  # obs + h_prev
-_OBS_PAYLOAD_BYTES = _OBS_FLOATS * 4
-_OBS_HEAD = struct.Struct("=ii")  # unit_id, round_idx
-_OBS_BYTES = _OBS_HEAD.size + _OBS_PAYLOAD_BYTES
-_ACT_HEAD = struct.Struct('=iiiii')
-_ACT_INTS = 5  # bt, bd, cd, brt, md
-_ACT_FLOATS = H_DIM  # h_next only; training server owns behavior log-probs
-_ACT_SIZE = _ACT_INTS * 4 + _ACT_FLOATS * 4
-_H_BYTES = H_DIM * 4
-
-# Pipe connections opened lazily per-player
-_opened_pipes = {}
+_collector = None
+_unit_id_counter = 1
 
 
-def _get_pipes():
-    """Get or open pipe file objects from env var FDs."""
-    obs_wfd = int(os.environ.get("TENSOR_OBS_WFD", "-1"))
-    act_rfd = int(os.environ.get("TENSOR_ACT_RFD", "-1"))
-    if obs_wfd < 0 or act_rfd < 0:
-        return None, None
-    key = (obs_wfd, act_rfd)
-    if key not in _opened_pipes:
-        _opened_pipes[key] = (obs_wfd, act_rfd)
-    return obs_wfd, act_rfd
+def _get_collector():
+    global _collector
+    if _collector is None:
+        _collector = CollectorClient.from_env("a")
+    return _collector
 
 
-def _read_exact(fd, n):
-    """Read exactly n bytes from fd."""
-    data = bytearray(n)
-    view = memoryview(data)
-    used = 0
-    while used < n:
-        chunk = os.read(fd, n - used)
-        if not chunk:
-            return None
-        end = used + len(chunk)
-        view[used:end] = chunk
-        used = end
-    return data
-
-
-def _send_obs(obs_wfd, unit_id, round_idx, obs, h_prev):
-    """Send raw float32 observation + hidden state via pipe fd."""
-    os.writev(
-        obs_wfd,
-        (
-            _OBS_HEAD.pack(unit_id, round_idx),
-            memoryview(obs).cast("B"),
-            memoryview(h_prev).cast("B"),
-        ),
-    )
-
-
-def _recv_action(act_rfd):
-    """Receive fixed-size action packet from inference server."""
-    data = _read_exact(act_rfd, _ACT_SIZE)
-    if data is None:
-        return None
-    bt, bd, cd, brt, md = _ACT_HEAD.unpack_from(data, 0)
-    h_next = array("f")
-    h_next.frombytes(data[_ACT_INTS * 4:_ACT_INTS * 4 + _H_BYTES])
-    return bt, bd, cd, brt, md, h_next
+def _next_unit_id() -> int:
+    global _unit_id_counter
+    unit_id = _unit_id_counter
+    _unit_id_counter += 1
+    return unit_id
 
 
 class Player:
@@ -103,12 +51,11 @@ class Player:
         self.num_spawned = 0
         self.num_builders = 0
         self.pos_encoder = None  # kept for encode_state_into signature
-        self.h_prev = array("f", [0.0] * H_DIM)
         self._obs_buf = array("f")
         self._prev_collected = None
         self._n_builders_cached = 1
         self._spawn_round: int = -1
-        self._unit_id = id(self) % (2**31)
+        self._unit_id = _next_unit_id()
 
     def run(self, ct):
         etype = ct.get_entity_type()
@@ -150,18 +97,14 @@ class Player:
 
         obs = self._encode_state_buf(ct)
 
-        obs_wfd, act_rfd = _get_pipes()
-        h_in = self.h_prev
-
-        if obs_wfd is None or act_rfd is None:
-            raise RuntimeError("tensor_proxy missing actor inference pipes")
+        collector = _get_collector()
+        if collector is None:
+            raise RuntimeError("tensor_proxy missing actor collector transport")
         round_idx = ct.get_current_round()
-        _send_obs(obs_wfd, self._unit_id, round_idx, obs, h_in)
-        result = _recv_action(act_rfd)
+        result = collector.request(self._unit_id, round_idx, obs)
         if result is None:
-            raise RuntimeError("tensor_proxy actor inference pipe closed")
-        build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, h_next = result
-        self.h_prev = h_next
+            raise RuntimeError("tensor_proxy actor collector transport closed")
+        build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx = result
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]

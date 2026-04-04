@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from array import array
+import mmap
+import os
 from pathlib import Path
 import sys
+import tempfile
+import threading
 
 import pytest
 import torch
@@ -20,7 +24,25 @@ if str(TENSOR_DIR) not in sys.path:
     sys.path.insert(0, str(TENSOR_DIR))
 
 import train_batched as train_batched_mod
+from shared_collector import (
+    COLLECTOR_RING_SLOTS_DEFAULT,
+    CollectorClient,
+    CollectorServerSide,
+    OBS_BYTES,
+    REQUEST_META,
+    collector_bytes,
+    initialize_collector,
+)
 from trajectory_schema import make_trajectory_step
+
+
+def _make_collector_mmap(slot_count: int = COLLECTOR_RING_SLOTS_DEFAULT):
+    fd, path = tempfile.mkstemp(prefix="collector_test_")
+    os.unlink(path)
+    os.ftruncate(fd, collector_bytes(slot_count))
+    mm = mmap.mmap(fd, 0, access=mmap.ACCESS_WRITE)
+    initialize_collector(mm, slot_count)
+    return fd, mm
 
 
 def test_tensor_byte_view_shares_tensor_storage():
@@ -33,47 +55,51 @@ def test_tensor_byte_view_shares_tensor_storage():
     assert bytes(view[:4]) == bytes([99, 1, 2, 3])
 
 
-def test_parse_obs_packet_a_returns_metadata_and_payload_view():
-    obs = array("f", [float(i) for i in range(train_batched_mod.OBS_SIZE)])
-    h_prev = array("f", [float(1000 + i) for i in range(train_batched_mod.H_DIM)])
-    unit_id = 17
-    round_idx = 23
-    packet = (
-        train_batched_mod._OBS_A_HEAD.pack(unit_id, round_idx)
-        + obs.tobytes()
-        + h_prev.tobytes()
-    )
+def test_collector_server_side_pops_multiple_ring_requests():
+    obs0 = array("f", [float(i) for i in range(train_batched_mod.OBS_SIZE)])
+    obs1 = array("f", [float(1000 + i) for i in range(train_batched_mod.OBS_SIZE)])
+    fd, mm = _make_collector_mmap(slot_count=4)
+    slot = CollectorServerSide(mm, "a")
+    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(0), 17, 23)
+    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(1), 18, 24)
+    slot.request_obs_buffer(0)[:] = obs0.tobytes()
+    slot.request_obs_buffer(1)[:] = obs1.tobytes()
+    slot._set_req_tail(2)
 
-    parsed_unit_id, parsed_round_idx, payload = train_batched_mod._parse_obs_packet_a(packet)
+    requests = slot.pop_requests()
 
-    assert parsed_unit_id == unit_id
-    assert parsed_round_idx == round_idx
-    assert payload.readonly
-    assert bytes(payload[: train_batched_mod.OBS_SIZE * 4]) == obs.tobytes()
-    assert bytes(payload[train_batched_mod.OBS_SIZE * 4 :]) == h_prev.tobytes()
+    assert [(req.unit_id, req.round_idx, req.slot_index) for req in requests] == [(17, 23, 0), (18, 24, 1)]
+    assert bytes(requests[0].obs_buffer) == obs0.tobytes()
+    assert bytes(requests[1].obs_buffer) == obs1.tobytes()
+    assert slot._req_head() == 2
 
-
-def test_parse_obs_packet_a_rejects_wrong_size():
-    with pytest.raises(ValueError, match="side-A obs packet must be"):
-        train_batched_mod._parse_obs_packet_a(b"\x00" * 7)
+    slot.close()
+    mm.close()
+    os.close(fd)
 
 
-def test_server_side_trajectory_step_uses_packet_payload_and_behavior_log_prob():
+def test_collector_server_side_rejects_unknown_side():
+    fd, mm = _make_collector_mmap()
+    with pytest.raises(ValueError, match="unsupported collector side"):
+        CollectorServerSide(mm, "z")
+    mm.close()
+    os.close(fd)
+
+
+def test_server_side_trajectory_step_uses_shared_slot_obs_and_server_hidden_state():
     obs = array("f", [float(i) for i in range(train_batched_mod.OBS_SIZE)])
     h_prev = array("f", [float(500 + i) for i in range(train_batched_mod.H_DIM)])
-    packet = (
-        train_batched_mod._OBS_A_HEAD.pack(99, 41)
-        + obs.tobytes()
-        + h_prev.tobytes()
-    )
-    _, round_idx, payload = train_batched_mod._parse_obs_packet_a(packet)
+    fd, mm = _make_collector_mmap()
+    slot = CollectorServerSide(mm, "a")
+    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(0), 99, 41)
+    slot.request_obs_buffer(0)[:] = obs.tobytes()
 
     step = make_trajectory_step(
-        obs=payload[: train_batched_mod.OBS_SIZE * 4],
-        h_prev=payload[train_batched_mod.OBS_SIZE * 4 :],
-        obs_bytes_len=train_batched_mod.OBS_SIZE * 4,
+        obs=slot.request_obs_buffer(0),
+        h_prev=h_prev.tobytes(),
+        obs_bytes_len=OBS_BYTES,
         h_bytes_len=train_batched_mod.H_DIM * 4,
-        round_idx=round_idx,
+        round_idx=41,
         bt=1,
         bd=2,
         cd=3,
@@ -97,6 +123,43 @@ def test_server_side_trajectory_step_uses_packet_payload_and_behavior_log_prob()
     assert step.old_log_prob == -0.75
     assert step.obs_bytes == obs.tobytes()
     assert step.h_prev_bytes == h_prev.tobytes()
+
+    slot.close()
+    mm.close()
+    os.close(fd)
+
+
+def test_collector_client_and_server_exchange_over_ring():
+    obs = array("f", [float(i) for i in range(train_batched_mod.OBS_SIZE)])
+    fd, mm = _make_collector_mmap(slot_count=4)
+    req_r, req_w = os.pipe()
+    resp_r, resp_w = os.pipe()
+    client = CollectorClient(fd, req_w, resp_r, "a")
+    server = CollectorServerSide(mm, "a")
+    response = {}
+
+    def _run_client():
+        response["value"] = client.request(7, 19, obs)
+
+    thread = threading.Thread(target=_run_client)
+    thread.start()
+    assert os.read(req_r, 1) == b"\x01"
+    requests = server.pop_requests()
+    assert len(requests) == 1
+    assert requests[0].unit_id == 7
+    assert requests[0].round_idx == 19
+    assert bytes(requests[0].obs_buffer) == obs.tobytes()
+    server.write_response(1, 2, 3, 4, 5)
+    os.write(resp_w, b"\x01")
+    thread.join(timeout=2.0)
+
+    assert response["value"] == (1, 2, 3, 4, 5)
+
+    client.close()
+    server.close()
+    mm.close()
+    for pipe_fd in (req_r, req_w, resp_r, resp_w, fd):
+        os.close(pipe_fd)
 
 
 def test_resolve_benchmark_maps_rejects_unknown_names():

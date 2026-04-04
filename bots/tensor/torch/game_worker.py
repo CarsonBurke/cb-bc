@@ -95,25 +95,33 @@ def _run_game_proxy(args, result_path: str):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Batched training game worker")
     parser.add_argument("--result", required=True)
-    parser.add_argument("--pipes", required=True)
+    parser.add_argument("--collector-fds", required=True)
     parser.add_argument("--game-args", required=True)
     args = parser.parse_args(argv)
 
-    pipe_fds = tuple(int(fd) for fd in args.pipes.split(",") if fd)
-    if len(pipe_fds) != 4:
-        raise SystemExit("worker mode requires four pipe fds")
+    collector_fds = tuple(int(fd) for fd in args.collector_fds.split(",") if fd)
+    if len(collector_fds) != 5:
+        raise SystemExit("worker mode requires collector fd plus four notify pipe fds")
 
-    obs_w_a, act_r_a, obs_w_b, act_r_b = pipe_fds
-    os.environ["TENSOR_OBS_WFD"] = str(obs_w_a)
-    os.environ["TENSOR_ACT_RFD"] = str(act_r_a)
-    os.environ["TENSOR_OBS_WFD_B"] = str(obs_w_b)
-    os.environ["TENSOR_ACT_RFD_B"] = str(act_r_b)
+    collector_fd, req_w_a, resp_r_a, req_w_b, resp_r_b = collector_fds
+    os.environ["TENSOR_COLLECTOR_FD"] = str(collector_fd)
+    os.environ["TENSOR_REQ_NOTIFY_WFD_A"] = str(req_w_a)
+    os.environ["TENSOR_RESP_NOTIFY_RFD_A"] = str(resp_r_a)
+    if req_w_b >= 0 and resp_r_b >= 0:
+        os.environ["TENSOR_REQ_NOTIFY_WFD_B"] = str(req_w_b)
+        os.environ["TENSOR_RESP_NOTIFY_RFD_B"] = str(resp_r_b)
     try:
         result = _run_game_proxy(tuple(json.loads(args.game_args)), args.result)
     finally:
-        for key in ("TENSOR_OBS_WFD", "TENSOR_ACT_RFD", "TENSOR_OBS_WFD_B", "TENSOR_ACT_RFD_B"):
+        for key in (
+            "TENSOR_COLLECTOR_FD",
+            "TENSOR_REQ_NOTIFY_WFD_A",
+            "TENSOR_RESP_NOTIFY_RFD_A",
+            "TENSOR_REQ_NOTIFY_WFD_B",
+            "TENSOR_RESP_NOTIFY_RFD_B",
+        ):
             os.environ.pop(key, None)
-        for fd in pipe_fds:
+        for fd in collector_fds:
             try:
                 os.close(fd)
             except OSError:

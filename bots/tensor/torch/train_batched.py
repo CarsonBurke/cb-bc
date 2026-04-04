@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Batched GPU self-play training via pipe-based proxy bots.
+"""Batched GPU self-play training via shared-memory ring-buffer collectors.
 
 Architecture:
 - Main process: GPU model + inference server
 - Game workers (spawn): Run engine with proxy bot, no torch needed
-- Proxy bot: sends obs via OS pipe, blocks on pipe read for actions
-- Server: collects obs from all games via select(), batches on GPU, responds
+- Proxy bot: enqueues obs into shared-memory rings and waits on tiny notify pipes
+- Server: drains ready rings via select(), batches on GPU, responds
 
 Usage:
     python bots/tensor/torch/train_batched.py --episodes 50 --games 8
@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 import gc
 import json
 import math
+import mmap
 import os
 import pickle
 import random
@@ -47,12 +48,12 @@ def _maybe_run_worker_mode() -> None:
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--worker-result", required=True)
-    parser.add_argument("--worker-pipes", required=True)
+    parser.add_argument("--worker-collector-fds", required=True)
     parser.add_argument("--worker-game-args", required=True)
     args, _ = parser.parse_known_args()
     _game_worker_main([
         "--result", args.worker_result,
-        "--pipes", args.worker_pipes,
+        "--collector-fds", args.worker_collector_fds,
         "--game-args", args.worker_game_args,
     ])
     raise SystemExit(0)
@@ -65,6 +66,13 @@ import torch.nn.functional as F
 
 try:
     from replay_buffers import preload_replay_buffers
+    from shared_collector import (
+        COLLECTOR_RING_SLOTS_DEFAULT,
+        CollectorServerSide,
+        OBS_BYTES,
+        collector_bytes,
+        initialize_collector,
+    )
     from training_profile import (
         EpisodeProfilerConfig,
         parse_profile_episode_spec,
@@ -78,6 +86,13 @@ try:
     )
 except ImportError:
     from bots.tensor.torch.replay_buffers import preload_replay_buffers
+    from bots.tensor.shared_collector import (
+        COLLECTOR_RING_SLOTS_DEFAULT,
+        CollectorServerSide,
+        OBS_BYTES,
+        collector_bytes,
+        initialize_collector,
+    )
     from bots.tensor.torch.training_profile import (
         EpisodeProfilerConfig,
         parse_profile_episode_spec,
@@ -138,13 +153,8 @@ WORKER_PYTHON = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 
 from training_utils import League, _init_session, _default_session_name
 
-# Struct-based binary IPC protocol constants
+# Shared collector protocol constants
 _OBS_FLOATS = OBS_SIZE + H_DIM
-_OBS_FLOAT_BYTES = _OBS_FLOATS * 4
-_OBS_A_HEAD = struct.Struct("=ii")  # unit_id, round_idx
-_OBS_A_PACKET_BYTES = _OBS_A_HEAD.size + _OBS_FLOAT_BYTES
-_ACT_HEAD = struct.Struct('=iiiii')
-_H_STRUCT = struct.Struct(f'={H_DIM}f')
 _H_BYTES = H_DIM * 4
 DEFAULT_COALESCE_MS = 0.25 if DEVICE.type == "cuda" else 0.0
 
@@ -157,7 +167,6 @@ import ctypes as _ctypes
 WORKER_LAUNCH_STAGGER_S = 0.005
 DUMMY_OPP_PATH = "__dummy__"
 DUMMY_OPP_ID = "dummy"
-_ZERO_H_BYTES = bytes(_H_BYTES)
 _DUMMY_DIR_TILES = (6, 7, 8, 11, 12, 13, 16, 17, 18)
 _dummy_idx_cache = {}
 _OPP_GRAPH_TEMP = 0.5
@@ -189,6 +198,17 @@ class GameLaunchSpec:
         payload["map_name"] = Path(self.map_path).name
         payload["bot_b_kind"] = "dummy" if self.opponent_weight_path == DUMMY_OPP_PATH else "proxy"
         return payload
+
+
+@dataclass(slots=True)
+class ActiveCollector:
+    collector_fd: int
+    collector_mm: mmap.mmap
+    sides: dict[str, CollectorServerSide]
+    req_read_fds: dict[str, int]
+    resp_write_fds: dict[str, int]
+    obs_tensors: dict[tuple[str, int], torch.Tensor]
+
 
 
 def _cache_put(cache: OrderedDict, key, value, max_items: int) -> None:
@@ -433,49 +453,12 @@ def _load_resume_critic_checkpoint(weight_path: str | Path, *, lr: float) -> boo
     return load_centralized_critic_checkpoint(weight_path, lr=lr)
 
 
-def _read_exact(fd, n):
-    """Read exactly n bytes from fd."""
-    data = bytearray(n)
-    view = memoryview(data)
-    used = 0
-    while used < n:
-        chunk = os.read(fd, n - used)
-        if not chunk:
-            return None
-        end = used + len(chunk)
-        view[used:end] = chunk
-        used = end
-    return data
-
-
-def _pipe_read_obs_a(fd):
-    """Read fixed-size side-A packet: unit header + obs/h_prev payload."""
-    return _read_exact(fd, _OBS_A_PACKET_BYTES)
-
-
-def _pipe_read_obs_b(fd):
-    """Read fixed-size side-B packet: obs/h_prev payload only."""
-    return _read_exact(fd, _OBS_FLOAT_BYTES)
-
-
-def _parse_obs_packet_a(packet: bytes | bytearray | memoryview) -> tuple[int, int, memoryview]:
-    """Decode side-A observation packet into unit metadata plus float payload."""
-    if len(packet) != _OBS_A_PACKET_BYTES:
-        raise ValueError(
-            f"side-A obs packet must be {_OBS_A_PACKET_BYTES} bytes, got {len(packet)}"
-        )
-    unit_id, round_idx = _OBS_A_HEAD.unpack_from(packet, 0)
-    return unit_id, round_idx, memoryview(packet)[_OBS_A_HEAD.size:]
-
-
-def _pipe_write_action_a(fd, bt, bd, cd, brt, md, h_next_bytes):
-    """Write fixed-size action packet for training bot (A)."""
-    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, brt, md), h_next_bytes))
-
-
-def _pipe_write_action_b(fd, bt, bd, cd, brt, md, h_next_bytes):
-    """Write fixed-size action packet for opponent bot (B)."""
-    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, brt, md), h_next_bytes))
+def _drain_notify(fd: int) -> int | None:
+    """Drain notify bytes from a pipe. None means EOF/closed."""
+    token = os.read(fd, 4096)
+    if not token:
+        return None
+    return len(token)
 
 
 def _tensor_byte_view(tensor: torch.Tensor, *, n_bytes: int | None = None) -> memoryview:
@@ -544,6 +527,20 @@ def _load_worker_result(result_path: str) -> WorkerGameResult:
     return validate_worker_game_result(result)
 
 
+def _create_collector_fd(tmpdir: str, game_idx: int, slot_count: int) -> int:
+    """Create an anonymous mmap backing file, preferring /dev/shm."""
+    backing_dir = "/dev/shm"
+    if not os.path.isdir(backing_dir) or not os.access(backing_dir, os.W_OK):
+        backing_dir = tmpdir
+    fd, path = tempfile.mkstemp(prefix=f"tensor_collector_{game_idx}_", dir=backing_dir)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    os.ftruncate(fd, collector_bytes(slot_count))
+    return fd
+
+
 def _recommended_worker_count(n_games: int) -> int:
     """Allow moderate oversubscription while leaving one CPU thread for the server."""
     cpu = os.cpu_count() or 1
@@ -593,10 +590,11 @@ def collect_games_batched(
     coalesce_ms: float = DEFAULT_COALESCE_MS,
     benchmark_seed: int | None = None,
     benchmark_maps: list[str] | None = None,
+    collector_ring_slots: int = COLLECTOR_RING_SLOTS_DEFAULT,
     profile: dict[str, float] | None = None,
     trace=None,
 ) -> tuple[list[list[TrajectoryStep]], list[str | None], dict[str, list[str | None]], list[dict | None], list[int], list[int], dict[int, float], list[GameLaunchSpec]]:
-    """Run all games with batched GPU inference via pipes."""
+    """Run all games with batched GPU inference via shared-memory rings."""
     t_total = time.perf_counter() if profile is not None else 0.0
     bot_a = str(PROJECT_ROOT / "bots" / "tensor_proxy" / "main.py")
     bot_b_proxy = str(PROJECT_ROOT / "bots" / "tensor_proxy_opp" / "main.py")
@@ -604,6 +602,8 @@ def collect_games_batched(
     engine_root = str(PROJECT_ROOT)
     replay_dir.mkdir(parents=True, exist_ok=True)
     tmpdir = tempfile.mkdtemp(prefix="batched_")
+    if collector_ring_slots <= 0:
+        raise ValueError(f"collector_ring_slots must be > 0, got {collector_ring_slots}")
     n_games = len(opp_weight_paths)
 
     game_specs = _build_game_launch_specs(
@@ -645,12 +645,14 @@ def collect_games_batched(
     selector = selectors.DefaultSelector()
     results: list[WorkerGameResult | None] = [None] * n_games
     actor_trajectories: dict[int, dict[int, list[TrajectoryStep]]] = {}
+    actor_hidden_states: dict[tuple[int, int], torch.Tensor] = {}
+    opponent_hidden_states: dict[tuple[int, int], torch.Tensor] = {}
     processes = {}
     launch_order = sorted(range(n_games), key=lambda i: (opp_weight_paths[i], i))
     pending_indices = launch_order[:]
 
     fd_to_info = {}  # fd -> (game_idx, side)  side='a' or 'b'
-    act_fds = {}  # (game_idx, side) -> act_write_fd
+    active_collectors: dict[int, ActiveCollector] = {}
     active_fds = set()
 
     def _close_read_fd(fd: int) -> None:
@@ -665,25 +667,54 @@ def collect_games_batched(
         except OSError:
             pass
 
+    def _prune_hidden_state_for_game(game_idx: int) -> None:
+        actor_keys = [key for key in actor_hidden_states if key[0] == game_idx]
+        for key in actor_keys:
+            actor_hidden_states.pop(key, None)
+        opp_keys = [key for key in opponent_hidden_states if key[0] == game_idx]
+        for key in opp_keys:
+            opponent_hidden_states.pop(key, None)
+
+    def _close_game_collector(game_idx: int) -> None:
+        collector = active_collectors.pop(game_idx, None)
+        if collector is None:
+            return
+        for fd in collector.req_read_fds.values():
+            _close_read_fd(fd)
+        for fd in collector.resp_write_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        collector.obs_tensors.clear()
+        for side_view in collector.sides.values():
+            side_view.close()
+        collector.collector_mm.close()
+        os.close(collector.collector_fd)
+        _prune_hidden_state_for_game(game_idx)
+
     def _launch_game(i: int) -> None:
-        obs_r_a, obs_w_a = os.pipe()
-        act_r_a, act_w_a = os.pipe()
+        collector_fd = _create_collector_fd(tmpdir, i, collector_ring_slots)
+        collector_mm = mmap.mmap(collector_fd, 0, access=mmap.ACCESS_WRITE)
+        initialize_collector(collector_mm, collector_ring_slots)
+        req_r_a, req_w_a = os.pipe()
+        resp_r_a, resp_w_a = os.pipe()
         use_proxy_b = opp_weight_paths[i] != DUMMY_OPP_PATH
-        obs_r_b = obs_w_b = act_r_b = act_w_b = -1
+        req_r_b = req_w_b = resp_r_b = resp_w_b = -1
         if use_proxy_b:
-            obs_r_b, obs_w_b = os.pipe()
-            act_r_b, act_w_b = os.pipe()
+            req_r_b, req_w_b = os.pipe()
+            resp_r_b, resp_w_b = os.pipe()
         result_path = os.path.join(tmpdir, f"result_{i}.pkl")
         worker_env = os.environ.copy()
         worker_env["CUDA_VISIBLE_DEVICES"] = ""
-        worker_fds = tuple(fd for fd in (obs_w_a, act_r_a, obs_w_b, act_r_b) if fd >= 0)
+        worker_fds = tuple(fd for fd in (collector_fd, req_w_a, resp_r_a, req_w_b, resp_r_b) if fd >= 0)
         worker_python = WORKER_PYTHON if os.path.exists(WORKER_PYTHON) else sys.executable
         proc = subprocess.Popen(
             [
                 worker_python,
                 str(Path(__file__).resolve()),
                 "--worker-result", result_path,
-                "--worker-pipes", f"{obs_w_a},{act_r_a},{obs_w_b},{act_r_b}",
+                "--worker-collector-fds", f"{collector_fd},{req_w_a},{resp_r_a},{req_w_b},{resp_r_b}",
                 "--worker-game-args", json.dumps(game_specs[i].worker_args()),
             ],
             close_fds=True,
@@ -695,21 +726,41 @@ def collect_games_batched(
         if WORKER_LAUNCH_STAGGER_S > 0.0:
             time.sleep(WORKER_LAUNCH_STAGGER_S)
 
-        os.close(obs_w_a)
-        os.close(act_r_a)
+        os.close(req_w_a)
+        os.close(resp_r_a)
         if use_proxy_b:
-            os.close(obs_w_b)
-            os.close(act_r_b)
+            os.close(req_w_b)
+            os.close(resp_r_b)
 
-        fd_to_info[obs_r_a] = (i, "a")
-        act_fds[(i, "a")] = act_w_a
-        active_fds.add(obs_r_a)
-        selector.register(obs_r_a, selectors.EVENT_READ)
+        sides = {"a": CollectorServerSide(collector_mm, "a")}
+        obs_tensors = {
+            ("a", slot_index): torch.frombuffer(
+                sides["a"].request_obs_buffer(slot_index),
+                dtype=torch.float32,
+            ).reshape(OBS_SIZE)
+            for slot_index in range(sides["a"].slot_count)
+        }
+        fd_to_info[req_r_a] = (i, "a")
+        active_fds.add(req_r_a)
+        selector.register(req_r_a, selectors.EVENT_READ)
         if use_proxy_b:
-            fd_to_info[obs_r_b] = (i, "b")
-            act_fds[(i, "b")] = act_w_b
-            active_fds.add(obs_r_b)
-            selector.register(obs_r_b, selectors.EVENT_READ)
+            sides["b"] = CollectorServerSide(collector_mm, "b")
+            for slot_index in range(sides["b"].slot_count):
+                obs_tensors[("b", slot_index)] = torch.frombuffer(
+                    sides["b"].request_obs_buffer(slot_index),
+                    dtype=torch.float32,
+                ).reshape(OBS_SIZE)
+            fd_to_info[req_r_b] = (i, "b")
+            active_fds.add(req_r_b)
+            selector.register(req_r_b, selectors.EVENT_READ)
+        active_collectors[i] = ActiveCollector(
+            collector_fd=collector_fd,
+            collector_mm=collector_mm,
+            sides=sides,
+            req_read_fds={k: v for k, v in (("a", req_r_a), ("b", req_r_b)) if v >= 0},
+            resp_write_fds={k: v for k, v in (("a", resp_w_a), ("b", resp_w_b)) if v >= 0},
+            obs_tensors=obs_tensors,
+        )
 
     def _reap_processes() -> None:
         for game_idx, proc_info in list(processes.items()):
@@ -722,6 +773,7 @@ def collect_games_batched(
                 )
             results[game_idx] = _load_worker_result(proc_info["result_path"])
             processes.pop(game_idx, None)
+            _close_game_collector(game_idx)
 
     # Inference server loop — disable cyclic GC to avoid pauses from
     # the collector scanning the many live pipe buffers and tensor temporaries.
@@ -740,7 +792,8 @@ def collect_games_batched(
     # Sized for max batch; reused each iteration to avoid repeated allocation.
     if _use_pinned:
         _pin_h2d = torch.empty(_max_a_batch, _OBS_FLOATS, dtype=torch.float32, pin_memory=True)
-        _pin_results = torch.empty(6, _max_a_batch, dtype=torch.float32, pin_memory=True)
+        _pin_results = torch.empty(5, _max_a_batch, dtype=torch.float32, pin_memory=True)
+        _pin_h_prev = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32, pin_memory=True)
         _pin_h_out = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32, pin_memory=True)
         _pin_actor_bt_l = torch.empty(_max_a_batch, N_BUILD, dtype=torch.float32, pin_memory=True)
         _pin_actor_bd_l = torch.empty(_max_a_batch, N_DIR, dtype=torch.float32, pin_memory=True)
@@ -748,6 +801,11 @@ def collect_games_batched(
         _pin_actor_brt_l = torch.empty(_max_a_batch, N_BRIDGE_TARGETS, dtype=torch.float32, pin_memory=True)
         _pin_actor_md_l = torch.empty(_max_a_batch, N_DIR, dtype=torch.float32, pin_memory=True)
         _pin_actor_eps = torch.empty(_max_a_batch, N_LOGIT_SCALE, dtype=torch.float32, pin_memory=True)
+    else:
+        _pin_h2d = torch.empty(_max_a_batch, _OBS_FLOATS, dtype=torch.float32)
+        _pin_results = torch.empty(5, _max_a_batch, dtype=torch.float32)
+        _pin_h_prev = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32)
+        _pin_h_out = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32)
 
     while pending_indices and len(processes) < max_workers:
         _launch_game(pending_indices.pop(0))
@@ -784,25 +842,31 @@ def collect_games_batched(
             selector, readable, coalesce_s, fd_to_info, game_to_opp, profile=profile,
         )
 
-        # Read all available observations, split by side
-        pending_a = []  # (game_idx, unit_id, round_idx, payload_bytes)
-        pending_b = []  # (game_idx, float_bytes, opp_weight_path)
+        # Drain all available requests from shared rings, split by side.
+        pending_a = []  # (game_idx, request)
+        pending_b = []  # (game_idx, request, opp_weight_path)
         t_phase = time.perf_counter() if profile is not None else 0.0
         for fd in readable:
             game_idx, side = fd_to_info[fd]
+            notify_count = _drain_notify(fd)
+            if notify_count is None:
+                _close_read_fd(fd)
+                continue
+            collector = active_collectors.get(game_idx)
+            if collector is None:
+                continue
+            requests = collector.sides[side].pop_requests()
+            if len(requests) < notify_count:
+                raise RuntimeError(
+                    f"collector underflow for game {game_idx} side {side}: "
+                    f"{len(requests)} requests for {notify_count} notify bytes"
+                )
             if side == "a":
-                packet = _pipe_read_obs_a(fd)
-                if packet is None:
-                    _close_read_fd(fd)
-                    continue
-                unit_id, round_idx, payload = _parse_obs_packet_a(packet)
-                pending_a.append((game_idx, unit_id, round_idx, payload))
+                for request in requests:
+                    pending_a.append((game_idx, request))
             else:
-                float_bytes = _pipe_read_obs_b(fd)
-                if float_bytes is None:
-                    _close_read_fd(fd)
-                    continue
-                pending_b.append((game_idx, float_bytes, game_to_opp[game_idx]))
+                for request in requests:
+                    pending_b.append((game_idx, request, game_to_opp[game_idx]))
         if profile is not None:
             profile["ipc_read_s"] = profile.get("ipc_read_s", 0.0) + (time.perf_counter() - t_phase)
 
@@ -812,26 +876,34 @@ def collect_games_batched(
             batch_a_calls += 1
             batch_a_items += n_a
             batch_a_max = max(batch_a_max, n_a)
-            # Concatenate raw bytes → tensor (no Python float objects)
             t_phase = time.perf_counter() if profile is not None else 0.0
-            all_bytes = bytearray().join(bytes(fb) for _, _, _, fb in pending_a)
+            batch_cpu = _pin_h2d[:n_a]
+            batch_h_prev = _pin_h_prev[:n_a]
+            for row, (game_idx, request) in enumerate(pending_a):
+                unit_id = request.unit_id
+                collector = active_collectors[game_idx]
+                batch_cpu[row, :OBS_SIZE].copy_(collector.obs_tensors[("a", request.slot_index)])
+                h_prev = actor_hidden_states.get((game_idx, unit_id))
+                if h_prev is None:
+                    batch_h_prev[row].zero_()
+                else:
+                    batch_h_prev[row].copy_(h_prev)
+            batch_cpu[:, OBS_SIZE:].copy_(batch_h_prev)
             if profile is not None:
                 profile["batch_pack_a_s"] = profile.get("batch_pack_a_s", 0.0) + (time.perf_counter() - t_phase)
 
             with trace_scope(trace, "collect.actor_batch"), torch.no_grad():
                 t_phase = time.perf_counter() if profile is not None else 0.0
                 with trace_scope(trace, "collect.actor_h2d"):
-                    src = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_a, _OBS_FLOATS)
                     if _use_pinned:
-                        _pin_h2d[:n_a].copy_(src)
-                        all_t = _pin_h2d[:n_a].to(DEVICE, non_blocking=True)
+                        all_t = batch_cpu.to(DEVICE, non_blocking=True)
                     else:
-                        all_t = src.to(DEVICE)
+                        all_t = batch_cpu.to(DEVICE)
                 if profile is not None:
                     dt = time.perf_counter() - t_phase
                     profile["h2d_a_s"] = profile.get("h2d_a_s", 0.0) + dt
 
-                obs_cpu = src[:, :OBS_SIZE]
+                obs_cpu = batch_cpu[:, :OBS_SIZE]
                 t_infer = time.perf_counter() if profile is not None else 0.0
                 while True:
                     bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = graphed_a.policy_heads(
@@ -891,10 +963,10 @@ def collect_games_batched(
                         break
                     if actor_graph_disabled:
                         bad_idx = int((~torch.isfinite(lp)).nonzero(as_tuple=False)[0, 0])
-                        bad_game_idx, bad_unit_id, bad_round_idx, _ = pending_a[bad_idx]
+                        bad_game_idx, bad_request = pending_a[bad_idx]
                         raise RuntimeError(
                             "non-finite behavior log-prob after actor graph fallback "
-                            f"for game {bad_game_idx}, unit {bad_unit_id}, round {bad_round_idx}: {float(lp[bad_idx])!r}"
+                            f"for game {bad_game_idx}, unit {bad_request.unit_id}, round {bad_request.round_idx}: {float(lp[bad_idx])!r}"
                         )
                     print("    actor graph disabled after non-finite behavior log-prob; falling back to eager actor inference")
                     graphed_a.disable_graph()
@@ -903,8 +975,10 @@ def collect_games_batched(
 
             t_phase = time.perf_counter() if profile is not None else 0.0
             with trace_scope(trace, "collect.actor_fanout"):
-                h_view = _tensor_byte_view(h_cpu)
-                for i, (game_idx, unit_id, round_idx, payload) in enumerate(pending_a):
+                h_prev_view = _tensor_byte_view(batch_h_prev)
+                for i, (game_idx, request) in enumerate(pending_a):
+                    unit_id = request.unit_id
+                    round_idx = request.round_idx
                     old_lp = float(lp[i])
                     if not math.isfinite(old_lp):
                         raise RuntimeError(
@@ -914,9 +988,9 @@ def collect_games_batched(
                     unit_traj = trajectories_by_unit.setdefault(unit_id, [])
                     unit_traj.append(
                         make_trajectory_step(
-                            obs=payload[: OBS_SIZE * 4],
-                            h_prev=payload[OBS_SIZE * 4 :],
-                            obs_bytes_len=OBS_SIZE * 4,
+                            obs=request.obs_buffer,
+                            h_prev=h_prev_view[i * _H_BYTES:(i + 1) * _H_BYTES],
+                            obs_bytes_len=OBS_BYTES,
                             h_bytes_len=H_DIM * 4,
                             round_idx=round_idx,
                             bt=int(bt_act[i]),
@@ -938,13 +1012,19 @@ def collect_games_batched(
                             conv_prox_paid=0,
                         )
                     )
+                    actor_hidden_states[(game_idx, unit_id)] = h_cpu[i].clone()
+                    collector = active_collectors.get(game_idx)
+                    if collector is None:
+                        continue
                     try:
-                        h_start = i * _H_BYTES
-                        _pipe_write_action_a(
-                            act_fds[(game_idx, "a")],
-                            int(bt_act[i]), int(bd_act[i]), int(cd_act[i]),
-                            int(brt_act[i]), int(md_act[i]), h_view[h_start:h_start + _H_BYTES],
+                        collector.sides["a"].write_response(
+                            int(bt_act[i]),
+                            int(bd_act[i]),
+                            int(cd_act[i]),
+                            int(brt_act[i]),
+                            int(md_act[i]),
                         )
+                        os.write(collector.resp_write_fds["a"], b"\x01")
                     except OSError:
                         pass
             if profile is not None:
@@ -954,8 +1034,8 @@ def collect_games_batched(
         # Batch B inference grouped by opponent model (low-temp sampling for diversity)
         if pending_b:
             by_opp = {}
-            for game_idx, fb, wp in pending_b:
-                by_opp.setdefault(wp, []).append((game_idx, fb))
+            for game_idx, request, wp in pending_b:
+                by_opp.setdefault(wp, []).append((game_idx, request))
 
             for wp, items in by_opp.items():
                 n_b = len(items)
@@ -963,26 +1043,43 @@ def collect_games_batched(
                 batch_b_items += n_b
                 batch_b_max = max(batch_b_max, n_b)
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                all_bytes = bytearray().join(fb for _, fb in items)
+                batch_cpu = _pin_h2d[:n_b]
+                batch_h_prev = _pin_h_prev[:n_b]
+                for row, (game_idx, request) in enumerate(items):
+                    unit_id = request.unit_id
+                    collector = active_collectors[game_idx]
+                    batch_cpu[row, :OBS_SIZE].copy_(collector.obs_tensors[("b", request.slot_index)])
+                    h_prev = opponent_hidden_states.get((game_idx, unit_id))
+                    if h_prev is None:
+                        batch_h_prev[row].zero_()
+                    else:
+                        batch_h_prev[row].copy_(h_prev)
+                batch_cpu[:, OBS_SIZE:].copy_(batch_h_prev)
                 if profile is not None:
                     profile["batch_pack_b_s"] = profile.get("batch_pack_b_s", 0.0) + (time.perf_counter() - t_phase)
 
                 if wp == DUMMY_OPP_PATH:
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    obs_t = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_b, _OBS_FLOATS)[:, :OBS_SIZE]
+                    obs_t = batch_cpu[:, :OBS_SIZE]
                     bt_act, bd_act, cd_act, md_act = _dummy_policy(obs_t)
                     brt_act = torch.zeros_like(bt_act)
                     if profile is not None:
                         profile["dummy_b_s"] = profile.get("dummy_b_s", 0.0) + (time.perf_counter() - t_phase)
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    for i, (game_idx, _) in enumerate(items):
+                    for i, (game_idx, _request) in enumerate(items):
+                        collector = active_collectors.get(game_idx)
+                        if collector is None:
+                            continue
                         try:
-                            _pipe_write_action_b(
-                                act_fds[(game_idx, "b")],
-                                int(bt_act[i]), int(bd_act[i]), int(cd_act[i]), int(brt_act[i]), int(md_act[i]),
-                                _ZERO_H_BYTES,
+                            collector.sides["b"].write_response(
+                                int(bt_act[i]),
+                                int(bd_act[i]),
+                                int(cd_act[i]),
+                                int(brt_act[i]),
+                                int(md_act[i]),
                             )
+                            os.write(collector.resp_write_fds["b"], b"\x01")
                         except OSError:
                             pass
                     if profile is not None:
@@ -993,12 +1090,10 @@ def collect_games_batched(
                 opp_g = _get_cached_opponent_graph(opp_model_keys[wp], opp_m, n_b, _OPP_GRAPH_TEMP)
                 with trace_scope(trace, "collect.opponent_batch"), torch.no_grad():
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    src_b = torch.frombuffer(all_bytes, dtype=torch.float32).reshape(n_b, _OBS_FLOATS)
                     if _use_pinned and n_b <= _max_a_batch:
-                        _pin_h2d[:n_b].copy_(src_b)
-                        all_t = _pin_h2d[:n_b].to(DEVICE, non_blocking=True)
+                        all_t = batch_cpu.to(DEVICE, non_blocking=True)
                     else:
-                        all_t = src_b.to(DEVICE)
+                        all_t = batch_cpu.to(DEVICE)
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
                         profile["h2d_b_s"] = profile.get("h2d_b_s", 0.0) + dt
@@ -1051,15 +1146,21 @@ def collect_games_batched(
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                h_view = _tensor_byte_view(h_cpu)
-                for i, (game_idx, _) in enumerate(items):
+                for i, (game_idx, request) in enumerate(items):
+                    unit_id = request.unit_id
+                    opponent_hidden_states[(game_idx, unit_id)] = h_cpu[i].clone()
+                    collector = active_collectors.get(game_idx)
+                    if collector is None:
+                        continue
                     try:
-                        h_start = i * _H_BYTES
-                        _pipe_write_action_b(
-                            act_fds[(game_idx, "b")],
-                            int(acts_cpu[0, i]), int(acts_cpu[1, i]), int(acts_cpu[2, i]), int(acts_cpu[3, i]), int(acts_cpu[4, i]),
-                            h_view[h_start:h_start + _H_BYTES],
+                        collector.sides["b"].write_response(
+                            int(acts_cpu[0, i]),
+                            int(acts_cpu[1, i]),
+                            int(acts_cpu[2, i]),
+                            int(acts_cpu[3, i]),
+                            int(acts_cpu[4, i]),
                         )
+                        os.write(collector.resp_write_fds["b"], b"\x01")
                     except OSError:
                         pass
                 if profile is not None:
@@ -1090,6 +1191,7 @@ def collect_games_batched(
     for game_idx in list(processes):
         results[game_idx] = None
         processes.pop(game_idx, None)
+        _close_game_collector(game_idx)
     if profile is not None:
         profile["worker_join_s"] = time.perf_counter() - t_phase
 
@@ -1097,11 +1199,8 @@ def collect_games_batched(
 
     for fd in list(active_fds):
         _close_read_fd(fd)
-    for fd in act_fds.values():
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    for game_idx in list(active_collectors):
+        _close_game_collector(game_idx)
 
     if gc_was_enabled:
         gc.enable()
@@ -1208,22 +1307,16 @@ def main():
         default=0,
         help="Actor PPO minibatch size (default: max(N//16, 8192) for GPU saturation)",
     )
-    parser.add_argument(
-        "--critic-minibatch-size",
-        type=int,
-        default=0,
-        help="Critic PPO minibatch size (default: auto from --critic-batches-per-epoch)",
-    )
-    parser.add_argument(
-        "--critic-batches-per-epoch",
-        type=int,
-        default=8,
-        help="Auto critic batch target per PPO epoch when --critic-minibatch-size is not set",
-    )
     parser.add_argument("--teacher", action="store_true", help="Train large teacher, distill to student")
     parser.add_argument("--distill-epochs", type=int, default=20, help="Distillation epochs")
     parser.add_argument("--distill-lr", type=float, default=1e-3, help="Distillation learning rate")
     parser.add_argument("--coalesce-ms", type=float, default=DEFAULT_COALESCE_MS)
+    parser.add_argument(
+        "--collector-ring-slots",
+        type=int,
+        default=COLLECTOR_RING_SLOTS_DEFAULT,
+        help="Per-side shared-memory request/response ring depth",
+    )
     parser.add_argument("--session", type=str, default="")
     parser.add_argument("--init-weights", type=str, default="", help="Initialize actor from a checkpoint")
     parser.add_argument(
@@ -1244,7 +1337,7 @@ def main():
     parser.add_argument("--benchmark-maps", type=str, default="", help="Optional comma-separated map filenames for deterministic benchmark runs")
     parser.add_argument("--resume", action="store_true", help="Resume a prior session from saved trainer state")
     parser.add_argument("--worker-result", type=str, default="", help=argparse.SUPPRESS)
-    parser.add_argument("--worker-pipes", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-collector-fds", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--worker-game-args", type=str, default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -1319,6 +1412,7 @@ def main():
     print(f"Session: {session_name} [{mode}]")
     print(f"Device: {DEVICE} | {n_params:,} params")
     print(f"Self-play: {args.episodes} episodes, {args.opponents}x{args.games_per_opp} games")
+    print(f"Collector ring slots: {args.collector_ring_slots}")
     if args.benchmark_seed is not None or args.benchmark_maps:
         print(
             "Benchmark workload:"
@@ -1401,6 +1495,7 @@ def main():
                 coalesce_ms=args.coalesce_ms,
                 benchmark_seed=args.benchmark_seed,
                 benchmark_maps=benchmark_maps if (args.benchmark_seed is not None or args.benchmark_maps) else None,
+                collector_ring_slots=args.collector_ring_slots,
                 profile=episode_profile,
                 trace=episode_trace,
             )
@@ -1433,8 +1528,6 @@ def main():
                 game_winners=all_winners,
                 target_kl=0.03,
                 actor_minibatch_size=args.actor_minibatch_size or None,
-                critic_minibatch_size=args.critic_minibatch_size or None,
-                critic_batches_per_epoch=args.critic_batches_per_epoch,
                 freeze_critic=args.freeze_critic,
                 profile=episode_profile,
                 trace=episode_trace,
