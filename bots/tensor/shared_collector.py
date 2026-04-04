@@ -22,12 +22,12 @@ except ImportError:
     from bots.tensor.shared import INPUT_SIZE
 
 COLLECTOR_MAGIC = b"cbcoll01"
-COLLECTOR_VERSION = 1
+COLLECTOR_VERSION = 2
 COLLECTOR_RING_SLOTS_DEFAULT = 8
 
 FILE_HEADER = struct.Struct("=8sII")
 COUNTER = struct.Struct("=Q")
-REQUEST_META = struct.Struct("=ii")
+REQUEST_META = struct.Struct("=iiB")  # unit_id, round_idx, dbg_flags
 RESPONSE_ACTIONS = struct.Struct("=iiiii")
 
 OBS_FLOATS = INPUT_SIZE
@@ -48,6 +48,7 @@ class CollectorRequest:
     unit_id: int
     round_idx: int
     obs_buffer: memoryview
+    dbg_flags: int  # packed byte: bits 0-3 = harv (att/fail/gate/paid), bits 4-7 = conv
 
 
 def _side_index(side: str) -> int:
@@ -183,7 +184,7 @@ class CollectorServerSide(_RingAccessor):
         out: list[CollectorRequest] = []
         for seq in range(head, head + take):
             slot_index = seq % self.slot_count
-            unit_id, round_idx = REQUEST_META.unpack_from(
+            unit_id, round_idx, dbg_flags = REQUEST_META.unpack_from(
                 self._mm,
                 self._layout.request_meta_offset(slot_index),
             )
@@ -193,6 +194,7 @@ class CollectorServerSide(_RingAccessor):
                     unit_id=unit_id,
                     round_idx=round_idx,
                     obs_buffer=self._req_obs_views[slot_index],
+                    dbg_flags=dbg_flags,
                 )
             )
         self._set_req_head(head + take)
@@ -254,7 +256,7 @@ class CollectorClient(_RingAccessor):
             return None
         return cls(collector_fd, request_notify_wfd, response_notify_rfd, side)
 
-    def _push_request(self, unit_id: int, round_idx: int, obs) -> None:
+    def _push_request(self, unit_id: int, round_idx: int, obs, dbg_flags: int = 0) -> None:
         head = self._req_head()
         tail = self._req_tail()
         if tail - head >= self.slot_count:
@@ -265,6 +267,7 @@ class CollectorClient(_RingAccessor):
             self._layout.request_meta_offset(slot_index),
             int(unit_id),
             int(round_idx),
+            int(dbg_flags),
         )
         self._req_obs_views[slot_index][:] = memoryview(obs).cast("B")
         self._set_req_tail(tail + 1)
@@ -279,8 +282,8 @@ class CollectorClient(_RingAccessor):
         self._set_resp_head(head + 1)
         return result
 
-    def request(self, unit_id: int, round_idx: int, obs) -> tuple[int, int, int, int, int] | None:
-        self._push_request(unit_id, round_idx, obs)
+    def request(self, unit_id: int, round_idx: int, obs, dbg_flags: int = 0) -> tuple[int, int, int, int, int] | None:
+        self._push_request(unit_id, round_idx, obs, dbg_flags)
         os.write(self._request_notify_wfd, b"\x01")
         token = os.read(self._response_notify_rfd, 1)
         if not token:

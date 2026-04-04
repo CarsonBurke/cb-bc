@@ -60,8 +60,8 @@ def test_collector_server_side_pops_multiple_ring_requests():
     obs1 = array("f", [float(1000 + i) for i in range(train_batched_mod.OBS_SIZE)])
     fd, mm = _make_collector_mmap(slot_count=4)
     slot = CollectorServerSide(mm, "a")
-    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(0), 17, 23)
-    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(1), 18, 24)
+    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(0), 17, 23, 0)
+    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(1), 18, 24, 0)
     slot.request_obs_buffer(0)[:] = obs0.tobytes()
     slot.request_obs_buffer(1)[:] = obs1.tobytes()
     slot._set_req_tail(2)
@@ -91,7 +91,7 @@ def test_server_side_trajectory_step_uses_shared_slot_obs_and_server_hidden_stat
     h_prev = array("f", [float(500 + i) for i in range(train_batched_mod.H_DIM)])
     fd, mm = _make_collector_mmap()
     slot = CollectorServerSide(mm, "a")
-    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(0), 99, 41)
+    REQUEST_META.pack_into(mm, slot._layout.request_meta_offset(0), 99, 41, 0)
     slot.request_obs_buffer(0)[:] = obs.tobytes()
 
     step = make_trajectory_step(

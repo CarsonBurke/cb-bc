@@ -56,6 +56,7 @@ class Player:
         self._n_builders_cached = 1
         self._spawn_round: int = -1
         self._unit_id = _next_unit_id()
+        self._dbg_flags: int = 0  # packed dbg from previous action
 
     def run(self, ct):
         etype = ct.get_entity_type()
@@ -101,7 +102,7 @@ class Player:
         if collector is None:
             raise RuntimeError("tensor_proxy missing actor collector transport")
         round_idx = ct.get_current_round()
-        result = collector.request(self._unit_id, round_idx, obs)
+        result = collector.request(self._unit_id, round_idx, obs, self._dbg_flags)
         if result is None:
             raise RuntimeError("tensor_proxy actor collector transport closed")
         build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx = result
@@ -110,6 +111,10 @@ class Player:
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = CONV_DIR_4[conv_dir_idx]
         _harv_aux, _conv_aux, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team, bridge_target_idx)
+        self._dbg_flags = (
+            dbg[0] | (dbg[1] << 1) | (dbg[2] << 2) | (dbg[3] << 3)
+            | (dbg[4] << 4) | (dbg[5] << 5) | (dbg[6] << 6) | (dbg[7] << 7)
+        )
 
         move_dir = DIR_MAP_9[move_dir_idx]
         execute_move(ct, move_dir)

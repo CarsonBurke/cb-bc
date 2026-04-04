@@ -986,6 +986,20 @@ def collect_games_batched(
                         )
                     trajectories_by_unit = actor_trajectories.setdefault(game_idx, {})
                     unit_traj = trajectories_by_unit.setdefault(unit_id, [])
+                    # dbg_flags from the request reports the previous action's
+                    # debug counters — retroactively update the last step.
+                    _df = request.dbg_flags
+                    if _df and unit_traj:
+                        unit_traj[-1] = unit_traj[-1]._replace(
+                            harv_attempt=(_df) & 1,
+                            harv_fail=(_df >> 1) & 1,
+                            harv_prox_gate=(_df >> 2) & 1,
+                            harv_prox_paid=(_df >> 3) & 1,
+                            conv_attempt=(_df >> 4) & 1,
+                            conv_fail=(_df >> 5) & 1,
+                            conv_prox_gate=(_df >> 6) & 1,
+                            conv_prox_paid=(_df >> 7) & 1,
+                        )
                     unit_traj.append(
                         make_trajectory_step(
                             obs=request.obs_buffer,
