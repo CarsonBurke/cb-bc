@@ -46,8 +46,7 @@ from model import (
     _split_chunk_ids,
     action_log_prob_and_entropy,
     compute_action_masks,
-    compute_build_dir_mask_for_type,
-    compute_harvester_build_dir_mask,
+    bd_has_ore,
     conveyor_dir_mask,
     decode_value,
     distributional_value_loss,
@@ -96,30 +95,28 @@ def _manual_rollout_episode(
         bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = model(obs, h_prev)
 
         bt_mask, bd_mask = compute_action_masks(obs)
-        harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
+        cd_mask = conveyor_dir_mask(device, 1)
+
+        # Direction first, then condition build-type on ore.
+        bd_act = int(bd_mask[0].float().argmax().item())
+        bd_act_t = torch.tensor([bd_act], device=device, dtype=torch.long)
+        has_ore = bool(bd_has_ore(obs, bd_act_t)[0])
         bt_mask = bt_mask.clone()
-        bt_mask[:, HARVESTER_BUILD_TYPE] &= harv_bd_mask.any(dim=1)
+        if not has_ore:
+            bt_mask[:, HARVESTER_BUILD_TYPE] = False
 
         if local_step % 3 == 0 and bool(bt_mask[0, HARVESTER_BUILD_TYPE]):
             bt_act = HARVESTER_BUILD_TYPE
-            bd_act = int(harv_bd_mask[0].float().argmax().item())
         elif local_step % 3 == 1 and bool(bt_mask[0, CONVEYOR_BUILD_TYPES[0]]):
             bt_act = CONVEYOR_BUILD_TYPES[0]
-            bd_act = int(bd_mask[0].float().argmax().item())
         else:
             bt_act = 0
-            bd_act = 0
-
-        bt_act_t = torch.tensor([bt_act], device=device, dtype=torch.long)
-        bd_mask = compute_build_dir_mask_for_type(obs, bt_act_t, bd_mask, harv_bd_mask)
-        cd_mask = conveyor_dir_mask(device, 1)
 
         cd_act = step_idx % 4
         brt_act = step_idx % 28
         md_act = (step_idx * 2) % 9
-        bd_act = int(bd_act if bool(bd_mask[0, bd_act]) else bd_mask[0].float().argmax().item())
 
-        bd_act_t = torch.tensor([bd_act], device=device, dtype=torch.long)
+        bt_act_t = torch.tensor([bt_act], device=device, dtype=torch.long)
         cd_act_t = torch.tensor([cd_act], device=device, dtype=torch.long)
         brt_act_t = torch.tensor([brt_act], device=device, dtype=torch.long)
         md_act_t = torch.tensor([md_act], device=device, dtype=torch.long)
@@ -133,10 +130,9 @@ def _manual_rollout_episode(
         cd_lp, _ = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, eps[:, 2])
         brt_lp, _ = action_log_prob_and_entropy(brt_l, brt_act_t, eps=eps[:, 3])
         md_lp, _ = action_log_prob_and_entropy(md_l, md_act_t, eps=eps[:, 4])
-        bd_causal = 1.0 if bt_act != 0 else 0.0
         cd_causal = 1.0 if bt_act in CONVEYOR_BUILD_TYPES else 0.0
         brt_causal = 1.0 if bt_act == BRIDGE_BUILD_TYPE else 0.0
-        total_lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
+        total_lp = bd_lp + bt_lp + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
 
         obs_list.append(obs.squeeze(0).cpu())
         h_list.append(h_prev.squeeze(0).cpu())
@@ -242,12 +238,11 @@ class TestLogProbRecomputation:
         cd_lp, _ = action_log_prob_and_entropy(cd_logits, cd_act)
         md_lp, _ = action_log_prob_and_entropy(md_logits, md_act)
 
-        # With no build: bd and cd are zeroed
-        bd_causal = 0.0  # bt_act == 0
+        # With no build: bd always included (upstream), cd zeroed
         cd_causal = 0.0  # bt_act not in CONVEYOR_BUILD_TYPES
-        total = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
+        total = bd_lp + bt_lp + cd_lp * cd_causal + md_lp
 
-        assert total.item() == pytest.approx((bt_lp + md_lp).item(), abs=1e-7)
+        assert total.item() == pytest.approx((bd_lp + bt_lp + md_lp).item(), abs=1e-7)
 
     def test_causal_masking_includes_bd_for_harvester(self):
         """For harvester build, bd contributes but cd does not."""
@@ -268,11 +263,10 @@ class TestLogProbRecomputation:
         cd_lp, _ = action_log_prob_and_entropy(cd_logits, cd_act)
         md_lp, _ = action_log_prob_and_entropy(md_logits, md_act)
 
-        bd_causal = 1.0  # bt_act != 0
         cd_causal = 0.0  # harvester not in CONVEYOR_BUILD_TYPES
-        total = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
+        total = bd_lp + bt_lp + cd_lp * cd_causal + md_lp
 
-        assert total.item() == pytest.approx((bt_lp + bd_lp + md_lp).item(), abs=1e-7)
+        assert total.item() == pytest.approx((bd_lp + bt_lp + md_lp).item(), abs=1e-7)
 
     def test_causal_masking_includes_all_for_conveyor(self):
         """For conveyor build, all heads contribute."""
@@ -293,11 +287,10 @@ class TestLogProbRecomputation:
         cd_lp, _ = action_log_prob_and_entropy(cd_logits, cd_act)
         md_lp, _ = action_log_prob_and_entropy(md_logits, md_act)
 
-        bd_causal = 1.0
         cd_causal = 1.0  # conveyor type
-        total = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
+        total = bd_lp + bt_lp + cd_lp * cd_causal + md_lp
 
-        assert total.item() == pytest.approx((bt_lp + bd_lp + cd_lp + md_lp).item(), abs=1e-7)
+        assert total.item() == pytest.approx((bd_lp + bt_lp + cd_lp + md_lp).item(), abs=1e-7)
 
 
 # =====================================================================
@@ -428,6 +421,14 @@ class TestDistributionalValuePrediction:
         encoded = value_target_probs(targets, bins)
         assert (encoded >= -1e-7).all()
 
+    def test_ghl_target_probs_stay_fp32_for_bf16_targets(self):
+        """Target encoding should avoid bf16 precision loss under autocast."""
+        bins = _make_bucket_centers()
+        targets = torch.tensor([0.0, 0.5, 1.0, 5.0], dtype=torch.bfloat16)
+        encoded = value_target_probs(targets, bins)
+        assert encoded.dtype == torch.float32
+        assert torch.allclose(encoded.sum(dim=-1), torch.ones(4), atol=1e-5)
+
     def test_ghl_target_probs_spread_across_bins(self):
         """GHL should spread mass across multiple bins (unlike two-hot)."""
         bins = _make_bucket_centers()
@@ -479,6 +480,25 @@ class TestDistributionalValueLoss:
         loss_good = distributional_value_loss(good_logits, returns, bins)
         loss_bad = distributional_value_loss(bad_logits, returns, bins)
         assert loss_good.item() < loss_bad.item()
+
+    def test_clipped_value_loss_uses_pessimistic_branch(self):
+        """PPO critic loss should not improve by moving far from old values in one step."""
+        bins = _make_bucket_centers()
+        returns = torch.tensor([5.0])
+        old_values = torch.tensor([0.0])
+        # A large jump toward the target should be clipped to 0.4 for the pessimistic branch.
+        jumped_values = torch.tensor([5.0])
+        target = value_target_probs(returns, bins)
+        jumped_logits = target.clamp(min=1e-10).log()
+
+        unclipped = distributional_value_loss(
+            jumped_logits, returns, bins, values=jumped_values, old_values=old_values, clip_vloss=False,
+        )
+        clipped = distributional_value_loss(
+            jumped_logits, returns, bins, values=jumped_values, old_values=old_values, clip_vloss=True,
+        )
+
+        assert clipped.item() > unclipped.item()
 
 
 # =====================================================================
@@ -991,7 +1011,7 @@ class TestRecurrentPassConsistency:
         md = torch.tensor(ep[6], dtype=torch.long, device=device)
         h0 = torch.stack(ep[1][:1]).to(device)
 
-        bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+        bt_mask, bd_mask, cd_causal = _precompute_policy_masks(obs, bt, bd)
 
         # Reshape for recurrent pass: (B=1, K=6, ...)
         obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
@@ -1002,15 +1022,14 @@ class TestRecurrentPassConsistency:
         md_a = md.unsqueeze(0)
         bt_m = bt_mask.unsqueeze(0)
         bd_m = bd_mask.unsqueeze(0)
-        bd_c = bd_causal.unsqueeze(0)
         cd_c = cd_causal.unsqueeze(0)
 
         with torch.no_grad():
             lp_only = _recurrent_logprob_pass(
-                model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, bd_c, cd_c,
+                model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, cd_c,
             )
             lp_actor, ent, _eps = _recurrent_actor_pass(
-                model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, bd_c, cd_c,
+                model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, cd_c,
             )
 
         assert torch.allclose(lp_only, lp_actor, atol=1e-5), \
@@ -1030,7 +1049,7 @@ class TestRecurrentPassConsistency:
         md = torch.tensor(ep[6], dtype=torch.long, device=device)
         h0 = torch.stack(ep[1][:1]).to(device)
 
-        bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+        bt_mask, bd_mask, cd_causal = _precompute_policy_masks(obs, bt, bd)
         obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
 
         with torch.no_grad():
@@ -1039,7 +1058,7 @@ class TestRecurrentPassConsistency:
                 bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0),
                 brt.unsqueeze(0), md.unsqueeze(0),
                 bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
-                bd_causal.unsqueeze(0), cd_causal.unsqueeze(0),
+                cd_causal.unsqueeze(0),
             )
 
         assert (ent >= -1e-6).all(), f"Negative entropy found: {ent.min()}"
@@ -1050,27 +1069,24 @@ class TestRecurrentPassConsistency:
 # =====================================================================
 
 class TestPrecomputePolicyMasks:
-    def test_bd_causal_zero_for_no_build(self):
-        """bd_causal should be 0 when bt_act is 0 (no build)."""
+    def test_cd_causal_zero_for_no_build(self):
+        """cd_causal should be 0 when bt_act is not a conveyor type."""
         obs = _make_obs(0).unsqueeze(0)
         bt = torch.tensor([0])
-        _, _, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
-        assert bd_causal[0].item() == 0.0
+        _, _, cd_causal = _precompute_policy_masks(obs, bt, torch.tensor([0]))
         assert cd_causal[0].item() == 0.0
 
-    def test_bd_causal_one_for_harvester(self):
+    def test_cd_causal_zero_for_harvester(self):
         obs = _make_obs(0).unsqueeze(0)
         bt = torch.tensor([HARVESTER_BUILD_TYPE])
-        _, _, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
-        assert bd_causal[0].item() == 1.0
+        _, _, cd_causal = _precompute_policy_masks(obs, bt, torch.tensor([0]))
         assert cd_causal[0].item() == 0.0  # harvester is not conveyor
 
     def test_cd_causal_one_for_conveyor(self):
         obs = _make_obs(0).unsqueeze(0)
         for cbt in CONVEYOR_BUILD_TYPES:
             bt = torch.tensor([cbt])
-            _, _, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
-            assert bd_causal[0].item() == 1.0, f"bd_causal should be 1 for conveyor type {cbt}"
+            _, _, cd_causal = _precompute_policy_masks(obs, bt, torch.tensor([0]))
             assert cd_causal[0].item() == 1.0, f"cd_causal should be 1 for conveyor type {cbt}"
 
 
@@ -1156,7 +1172,7 @@ class TestActorGradientFlow:
         old_lps = torch.tensor(ep[7], dtype=torch.float32, device=device)
         h0 = torch.zeros(1, H_DIM, device=device)
 
-        bt_mask, bd_mask, bd_causal, cd_causal = _precompute_policy_masks(obs, bt)
+        bt_mask, bd_mask, cd_causal = _precompute_policy_masks(obs, bt, bd)
         obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
 
         new_lps, ent, _eps = _recurrent_actor_pass(
@@ -1164,7 +1180,7 @@ class TestActorGradientFlow:
             bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0),
             brt.unsqueeze(0), md.unsqueeze(0),
             bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
-            bd_causal.unsqueeze(0), cd_causal.unsqueeze(0),
+            cd_causal.unsqueeze(0),
         )
         new_lps = new_lps.squeeze(0)
         ent = ent.squeeze(0)

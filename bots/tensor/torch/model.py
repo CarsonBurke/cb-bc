@@ -113,6 +113,13 @@ TERMINAL_LOSS_REWARD = -10.0
 GAMMA = 0.995 # GAE
 LAMBDA = 0.95 # GAE
 
+# ---- Value prediction mode ----
+class CriticValueMode(Enum):
+    GHL = "ghl"   # Gaussian Histogram Loss (distributional)
+    MSE = "mse"   # Mean squared error (scalar, symlog space)
+
+CRITIC_VALUE_MODE = CriticValueMode.GHL
+
 # ---- Gaussian Histogram Loss (GHL) value prediction with symlog/symexp ----
 NUM_BUCKETS = 255
 # symlog range — covers symexp(±9) ≈ ±8103
@@ -223,9 +230,12 @@ def value_target_probs(
         bins: (NUM_BUCKETS,) bin centers in symlog space (unused, kept for API compat;
               support is rebuilt from global constants).
     """
+    # Keep target encoding in fp32 even under autocast; bf16 noticeably distorts
+    # the Gaussian bin masses around the peak and weakens the critic signal.
+    targets_fp32 = targets.to(dtype=torch.float32)
     _, support, sigma = _make_bucket_support()
-    support = support.to(device=targets.device, dtype=targets.dtype)
-    return _ghl_target_probs(targets, support, sigma)
+    support = support.to(device=targets.device, dtype=torch.float32)
+    return _ghl_target_probs(targets_fp32, support, sigma)
 
 
 def soft_cross_entropy_from_logits(
@@ -236,15 +246,37 @@ def soft_cross_entropy_from_logits(
     return -(target_probs * F.log_softmax(logits, dim=-1)).sum(dim=-1)
 
 
+def soft_cross_entropy_from_probs(
+    pred_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Cross-entropy for soft targets against normalized probabilities."""
+    return -(target_probs * pred_probs.clamp_min(eps).log()).sum(dim=-1)
+
+
 
 def distributional_value_loss(
     logits: torch.Tensor,
     returns: torch.Tensor,
     bins: torch.Tensor,
+    *,
+    values: torch.Tensor | None = None,
+    old_values: torch.Tensor | None = None,
+    clip_vloss: bool = False,
+    value_clip: float = 0.4,
 ) -> torch.Tensor:
-    """GHL value loss: cross-entropy between logits and Gaussian soft targets."""
+    """Distributional value loss with optional PPO-style value clipping."""
     return_target = value_target_probs(returns, bins).detach()
-    return soft_cross_entropy_from_logits(logits, return_target)
+    value_loss_1 = soft_cross_entropy_from_logits(logits, return_target)
+
+    if not clip_vloss or old_values is None or values is None:
+        return value_loss_1
+
+    clipped_values = old_values + (values - old_values).clamp(-value_clip, value_clip)
+    clipped_value_probs = value_target_probs(clipped_values, bins)
+    value_loss_2 = soft_cross_entropy_from_probs(clipped_value_probs, return_target)
+    return torch.maximum(value_loss_1, value_loss_2)
 
 
 def _require_finite(name: str, x: torch.Tensor) -> None:
@@ -359,15 +391,14 @@ def _harv_mask_indices(device: torch.device):
     return _harv_idx_cache[device]
 
 
-def compute_harvester_build_dir_mask(obs: torch.Tensor, bd_mask: torch.Tensor) -> torch.Tensor:
-    """Harvester-specific direction mask.
-
-    Harvester placement is legal on ore tiles that are empty or have a friendly replaceable building.
-    bd_mask already filters for empty-or-replaceable, so we just need ore_here.
-    """
+def bd_has_ore(obs: torch.Tensor, bd_act: torch.Tensor) -> torch.Tensor:
+    """Check if the chosen build-direction tile has ore.  Returns (B,) bool."""
     ore_ti_idx, ore_ax_idx = _harv_mask_indices(obs.device)
-    ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
-    return bd_mask & ore_here
+    # ore_ti_idx/ore_ax_idx are (9,) — gather the tile for each sample's bd_act
+    chosen_ti = ore_ti_idx[bd_act.long()]   # (B,)
+    chosen_ax = ore_ax_idx[bd_act.long()]   # (B,)
+    return (obs.gather(1, chosen_ti.unsqueeze(1)).squeeze(1) == 1.0) | \
+           (obs.gather(1, chosen_ax.unsqueeze(1)).squeeze(1) == 1.0)
 
 
 _conv_dir_mask_cache: dict = {}
@@ -378,20 +409,6 @@ def _conveyor_dir_mask_base(device: torch.device) -> torch.Tensor:
     if device not in _conv_dir_mask_cache:
         _conv_dir_mask_cache[device] = torch.tensor(_CONV_DIR_MASK, dtype=torch.bool, device=device)
     return _conv_dir_mask_cache[device]
-
-
-def compute_build_dir_mask_for_type(
-    obs: torch.Tensor,
-    bt_act: torch.Tensor,
-    bd_mask: torch.Tensor,
-    harv_bd_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Refine build_dir mask using the chosen build type."""
-    if harv_bd_mask is None:
-        harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
-    # Use where() instead of conditional indexing to avoid CPU-GPU sync
-    harv_rows = bt_act.to(torch.long) == HARVESTER_BUILD_TYPE
-    return torch.where(harv_rows.unsqueeze(1), harv_bd_mask, bd_mask)
 
 
 def conveyor_dir_mask(device: torch.device, batch_size: int) -> torch.Tensor:
@@ -1106,16 +1123,19 @@ class CriticValueHead(nn.Module):
         actor_latent_dim: int = ACTOR_LATENT_DIM,
         n_global_cls: int = 8,
         n_buckets: int = NUM_BUCKETS,
+        value_mode: CriticValueMode = CRITIC_VALUE_MODE,
     ):
         super().__init__()
+        self.value_mode = value_mode
         self.cls_weights = nn.Parameter(torch.zeros(n_global_cls))
         total_in = dim + dim + actor_latent_dim
+        out_dim = n_buckets if value_mode == CriticValueMode.GHL else 1
         self.mlp = nn.Sequential(
             nn.Linear(total_in, total_in, bias=False),
             nn.SiLU(),
             nn.Linear(total_in, total_in, bias=False),
             RMSNorm(total_in),
-            nn.Linear(total_in, n_buckets),
+            nn.Linear(total_in, out_dim),
         )
         self._init_weights()
 
@@ -1134,7 +1154,7 @@ class CriticValueHead(nn.Module):
         unit_round_idx: torch.Tensor,
         actor_latent: torch.Tensor,
     ) -> torch.Tensor:
-        """Returns logits (B, n_buckets)."""
+        """Returns logits (B, n_buckets) for GHL or (B, 1) for MSE."""
         weights = F.softmax(self.cls_weights, dim=0)
         pooled = (global_cls * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (R, dim)
         pooled_per_unit = pooled[unit_round_idx]  # (B, dim)
@@ -1163,8 +1183,9 @@ class CentralizedCritic(nn.Module):
     _N_GLOBAL_CLS = 8
     _N_BLOCKS = 3
 
-    def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS):
+    def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS, value_mode: CriticValueMode = CRITIC_VALUE_MODE):
         super().__init__()
+        self.value_mode = value_mode
         dim = self._PATCH_DIM
 
         self.tile_embed = CriticTileEmbed(map_channels, self._TILE_DIM)
@@ -1197,7 +1218,8 @@ class CentralizedCritic(nn.Module):
         self.unit_cls_builder = CriticUnitCLSBuilder(
             ACTOR_LATENT_DIM, UNIT_CONTEXT_DIM, dim,
         )
-        self.value_head = CriticValueHead(dim, ACTOR_LATENT_DIM, self._N_GLOBAL_CLS)
+        self.value_head = CriticValueHead(dim, ACTOR_LATENT_DIM, self._N_GLOBAL_CLS,
+                                          value_mode=value_mode)
 
         # GHL bin centers (uniform in symlog space).
         bucket_centers = _make_bucket_centers()
@@ -1289,6 +1311,12 @@ class CentralizedCritic(nn.Module):
 
         return global_cls, unit_cls
 
+    def _decode_head_output(self, head_out: torch.Tensor) -> torch.Tensor:
+        """Decode value head output to scalar values (B,)."""
+        if self.value_mode == CriticValueMode.MSE:
+            return symexp(head_out.squeeze(-1))
+        return decode_value(head_out, self.bucket_centers)
+
     def unit_values(
         self,
         feat: CriticMapState,
@@ -1304,9 +1332,9 @@ class CentralizedCritic(nn.Module):
             global_cls, unit_cls = self._run_global_sa(
                 feat, round_scalars, round_idx, unit_xy, unit_cls,
             )
-        logits = self.value_head(unit_cls.float(), global_cls.float(),
-                                 round_idx.long(), actor_latent.float())
-        return decode_value(logits, self.bucket_centers)
+        head_out = self.value_head(unit_cls.float(), global_cls.float(),
+                                   round_idx.long(), actor_latent.float())
+        return self._decode_head_output(head_out)
 
     def unit_value_logits(
         self,
@@ -1317,16 +1345,16 @@ class CentralizedCritic(nn.Module):
         unit_context: torch.Tensor,
         actor_latent: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Like unit_values but also returns raw logits for training loss."""
+        """Like unit_values but also returns raw head output for training loss."""
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
             unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float())
             global_cls, unit_cls = self._run_global_sa(
                 feat, round_scalars, round_idx, unit_xy, unit_cls,
             )
-        logits = self.value_head(unit_cls.float(), global_cls.float(),
-                                 round_idx.long(), actor_latent.float())
-        values = decode_value(logits, self.bucket_centers)
-        return values, logits
+        head_out = self.value_head(unit_cls.float(), global_cls.float(),
+                                   round_idx.long(), actor_latent.float())
+        values = self._decode_head_output(head_out)
+        return values, head_out
 
     def forward(
         self,
@@ -1385,13 +1413,25 @@ class CriticPpoLossStep(nn.Module):
         unit_context: torch.Tensor,
         actor_latent: torch.Tensor,
         returns: torch.Tensor,
+        old_values: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feat = self.critic.encode_map(states, masks)
-        values, logits = self.critic.unit_value_logits(
+        values, head_out = self.critic.unit_value_logits(
             feat, scalars, round_idx, unit_xy, unit_context, actor_latent,
         )
-        return_target = value_target_probs(returns, self.critic.bucket_centers).detach()
-        v_loss_elems = soft_cross_entropy_from_logits(logits, return_target)
+        if self.critic.value_mode == CriticValueMode.MSE:
+            pred_symlog = head_out.squeeze(-1)
+            target_symlog = symlog(returns)
+            v_loss_elems = (pred_symlog - target_symlog).square()
+        else:
+            v_loss_elems = distributional_value_loss(
+                head_out,
+                returns,
+                self.critic.bucket_centers,
+                values=values,
+                old_values=old_values,
+                clip_vloss=True,
+            )
         loss_sum = v_loss_elems.sum()
         return loss_sum, loss_sum.detach(), values.detach()
 
@@ -1819,15 +1859,14 @@ def _compose_action_log_prob(
     brt_lp: torch.Tensor,
     md_lp: torch.Tensor,
     *,
-    bd_causal: torch.Tensor,
     cd_causal: torch.Tensor,
     brt_causal: torch.Tensor,
 ) -> torch.Tensor:
-    """Compose per-head log-probs without propagating non-causal masked infinities."""
+    """Compose per-head log-probs: p(bd) * p(bt|bd) * p(cd|bt) * p(brt|bt) * p(md)."""
     zeros = torch.zeros_like(bt_lp)
     return (
-        bt_lp
-        + torch.where(bd_causal.to(torch.bool), bd_lp, zeros)
+        bd_lp
+        + bt_lp
         + torch.where(cd_causal.to(torch.bool), cd_lp, zeros)
         + torch.where(brt_causal.to(torch.bool), brt_lp, zeros)
         + md_lp
@@ -1851,22 +1890,21 @@ def _sample_actions_from_policy_heads(
     B = obs.shape[0]
     bt_m, bd_m = compute_action_masks(obs)
     cd_m = conveyor_dir_mask(obs.device, B)
-    harv_bd_m = compute_harvester_build_dir_mask(obs, bd_m)
-    bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
+    # Sample direction first so we can condition build-type on the target tile.
+    bd_act, bd_lp = sample_logits_gumbel(
+        bd_l,
+        temperature,
+        mask=bd_m,
+        eps=eps[:, 1],
+        return_log_prob=return_log_prob,
+    )
+    # Harvester only legal when chosen direction points at ore.
+    bt_m[:, HARVESTER_BUILD_TYPE] &= bd_has_ore(obs, bd_act)
     bt_act, bt_lp = sample_logits_gumbel(
         bt_l,
         temperature,
         mask=bt_m,
         eps=eps[:, 0],
-        return_log_prob=return_log_prob,
-    )
-    harv_rows = bt_act == HARVESTER_BUILD_TYPE
-    bd_m_final = torch.where(harv_rows.unsqueeze(1), harv_bd_m, bd_m)
-    bd_act, bd_lp = sample_logits_gumbel(
-        bd_l,
-        temperature,
-        mask=bd_m_final,
-        eps=eps[:, 1],
         return_log_prob=return_log_prob,
     )
     cd_act, cd_lp = sample_logits_gumbel(
@@ -1892,7 +1930,7 @@ def _sample_actions_from_policy_heads(
     lp = None
     if return_log_prob:
         assert bt_lp is not None and bd_lp is not None and cd_lp is not None and brt_lp is not None and md_lp is not None
-        bd_causal = bt_act != 0
+        # bd is sampled unconditionally (upstream of bt), so always include it.
         cd_causal = (
             (bt_act == CONVEYOR_BUILD_TYPES[0])
             | (bt_act == CONVEYOR_BUILD_TYPES[1])
@@ -1905,7 +1943,6 @@ def _sample_actions_from_policy_heads(
             cd_lp,
             brt_lp,
             md_lp,
-            bd_causal=bd_causal,
             cd_causal=cd_causal,
             brt_causal=brt_causal,
         )
@@ -2007,15 +2044,24 @@ class GraphedInference:
                 bt_m[:, 1:] &= ~force_none.unsqueeze(1)
                 bd_m |= force_none.unsqueeze(1)
 
-                ore_here = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
-                harv_bd_m = bd_m & ore_here
-                bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
+                # Sample direction first, then condition build-type on ore.
+                _T = self._temperature
+
+                bd_l.masked_fill_(~bd_m, -1e9)
+                if _T != 1.0:
+                    bd_l = bd_l / _T
+                    md_l = md_l / _T
+                bd_l = _unimix_logits(bd_l, bd_m, eps[:, 1])
+                md_l = _unimix_logits(md_l, eps=eps[:, 4])
+
+                static_g_bd.exponential_()
+                s_bd_act = (bd_l - static_g_bd.log_()).argmax(dim=-1)
+
+                # Harvester only legal when chosen direction has ore.
+                bt_m[:, HARVESTER_BUILD_TYPE] &= bd_has_ore(obs, s_bd_act)
 
                 bt_l.masked_fill_(~bt_m, -1e9)
                 cd_l.masked_fill_(~cd_mask, -1e9)
-
-                # Apply external temperature scaling for Gumbel-max sampling
-                _T = self._temperature
                 if _T != 1.0:
                     bt_l = bt_l / _T
                     cd_l = cd_l / _T
@@ -2027,21 +2073,9 @@ class GraphedInference:
                 static_g_bt.exponential_()
                 s_bt_act = (bt_l - static_g_bt.log_()).argmax(dim=-1)
 
-                harv_rows = s_bt_act == HARVESTER_BUILD_TYPE
-                bd_m_final = torch.where(harv_rows.unsqueeze(1), harv_bd_m, bd_m)
-                bd_l.masked_fill_(~bd_m_final, -1e9)
-                if _T != 1.0:
-                    bd_l = bd_l / _T
-                    md_l = md_l / _T
-
-                bd_l = _unimix_logits(bd_l, bd_m_final, eps[:, 1])
-                md_l = _unimix_logits(md_l, eps=eps[:, 4])
-
-                static_g_bd.exponential_()
                 static_g_cd.exponential_()
                 static_g_brt.exponential_()
                 static_g_md.exponential_()
-                s_bd_act = (bd_l - static_g_bd.log_()).argmax(dim=-1)
                 s_cd_act = (cd_l - static_g_cd.log_()).argmax(dim=-1)
                 s_brt_act = (brt_l - static_g_brt.log_()).argmax(dim=-1)
                 s_md_act = (md_l - static_g_md.log_()).argmax(dim=-1)
@@ -2055,7 +2089,6 @@ class GraphedInference:
                     s_brt_lp = brt_l.gather(1, s_brt_act.unsqueeze(1)).squeeze(1)
                     s_md_lp = md_l.gather(1, s_md_act.unsqueeze(1)).squeeze(1)
 
-                    bd_causal = s_bt_act != 0
                     cd_causal = (
                         (s_bt_act == CONVEYOR_BUILD_TYPES[0])
                         | (s_bt_act == CONVEYOR_BUILD_TYPES[1])
@@ -2068,7 +2101,6 @@ class GraphedInference:
                         s_cd_lp,
                         s_brt_lp,
                         s_md_lp,
-                        bd_causal=bd_causal,
                         cd_causal=cd_causal,
                         brt_causal=brt_causal,
                     )
@@ -2633,20 +2665,19 @@ def _chunk_metadata_tensors(
 def _precompute_policy_masks(
     obs: torch.Tensor,
     bt_act: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    bd_act: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Precompute policy masks and causal coefficients for fixed rollout actions."""
     bt_mask, bd_mask = compute_action_masks(obs)
-    harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
+    # Harvester legal only when chosen direction points at ore.
     bt_mask = bt_mask.clone()
-    bt_mask[:, HARVESTER_BUILD_TYPE] &= harv_bd_mask.any(dim=1)
-    bd_mask = compute_build_dir_mask_for_type(obs, bt_act, bd_mask, harv_bd_mask)
-    bd_causal = (bt_act != 0).float()
+    bt_mask[:, HARVESTER_BUILD_TYPE] &= bd_has_ore(obs, bd_act)
     cd_causal = (
         (bt_act == CONVEYOR_BUILD_TYPES[0])
         | (bt_act == CONVEYOR_BUILD_TYPES[1])
         | (bt_act == CONVEYOR_BUILD_TYPES[2])
     ).float()
-    return bt_mask, bd_mask, bd_causal, cd_causal
+    return bt_mask, bd_mask, cd_causal
 
 
 def _split_chunk_ids(
@@ -2674,7 +2705,6 @@ def _logprob_recurrent_step(
     bt_mask_t: torch.Tensor,
     bd_mask_t: torch.Tensor,
     cd_mask: torch.Tensor,
-    bd_causal_t: torch.Tensor,
     cd_causal_t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One recurrent timestep: forward → GRU update → log-prob (no entropy)."""
@@ -2698,7 +2728,6 @@ def _logprob_recurrent_step(
         cd_lp,
         brt_lp,
         md_lp,
-        bd_causal=bd_causal_t,
         cd_causal=cd_causal_t,
         brt_causal=brt_causal,
     )
@@ -2731,7 +2760,6 @@ def _recurrent_logprob_pass(
     md_act: torch.Tensor,
     bt_mask: torch.Tensor,
     bd_mask: torch.Tensor,
-    bd_causal: torch.Tensor,
     cd_causal: torch.Tensor,
 ) -> torch.Tensor:
     """Sequential recurrent pass that returns chosen-action log-probs."""
@@ -2746,7 +2774,7 @@ def _recurrent_logprob_pass(
         log_probs[:, t], h_t = step_fn(
             model, obs_pre[:, t], h_t,
             bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
-            bt_mask[:, t], bd_mask[:, t], cd_mask, bd_causal[:, t], cd_causal[:, t],
+            bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
         )
 
     return log_probs
@@ -2764,7 +2792,6 @@ def _actor_recurrent_step(
     bt_mask_t: torch.Tensor,
     bd_mask_t: torch.Tensor,
     cd_mask: torch.Tensor,
-    bd_causal_t: torch.Tensor,
     cd_causal_t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One recurrent timestep: forward → GRU update → log-probs + entropy."""
@@ -2789,11 +2816,10 @@ def _actor_recurrent_step(
         cd_lp,
         brt_lp,
         md_lp,
-        bd_causal=bd_causal_t,
         cd_causal=cd_causal_t,
         brt_causal=brt_causal,
     )
-    ent = bt_ent + bd_ent * bd_causal_t + cd_ent * cd_causal_t + brt_ent * brt_causal + md_ent
+    ent = bt_ent + bd_ent + cd_ent * cd_causal_t + brt_ent * brt_causal + md_ent
     return new_lp, ent, eps, h_new
 
 
@@ -2835,7 +2861,6 @@ def _recurrent_actor_pass(
     md_act: torch.Tensor,
     bt_mask: torch.Tensor,
     bd_mask: torch.Tensor,
-    bd_causal: torch.Tensor,
     cd_causal: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sequential recurrent pass that returns log-probs, entropies, and per-head eps."""
@@ -2852,7 +2877,7 @@ def _recurrent_actor_pass(
         new_lps[:, t], entropies[:, t], all_eps[:, t], h_t = step_fn(
             model, obs_pre[:, t], h_t,
             bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
-            bt_mask[:, t], bd_mask[:, t], cd_mask, bd_causal[:, t], cd_causal[:, t],
+            bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
         )
 
     return new_lps, entropies, all_eps
@@ -2887,7 +2912,7 @@ def _sequential_logprobs(
     if obs_pre_all is None:
         with autocast_context(_get_actor_cuda_config()):
             obs_pre_all = model._obs_encoder_pre(obs)
-    bt_mask_all, bd_mask_all, bd_causal_all, cd_causal_all = _precompute_policy_masks(obs, bt_act)
+    bt_mask_all, bd_mask_all, cd_causal_all = _precompute_policy_masks(obs, bt_act, bd_act)
 
     def _run_chunk_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
         for cb_start in range(0, chunk_ids.shape[0], B_chunk):
@@ -2909,7 +2934,6 @@ def _sequential_logprobs(
             all_md = md_act[flat_idx].reshape(B, K_max)
             all_bt_mask = bt_mask_all[flat_idx].reshape(B, K_max, -1)
             all_bd_mask = bd_mask_all[flat_idx].reshape(B, K_max, -1)
-            all_bd_causal = bd_causal_all[flat_idx].reshape(B, K_max)
             all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
 
             step_lps = _recurrent_logprob_pass(
@@ -2923,7 +2947,6 @@ def _sequential_logprobs(
                 all_md,
                 all_bt_mask,
                 all_bd_mask,
-                all_bd_causal,
                 all_cd_causal,
             )
 
@@ -3011,7 +3034,7 @@ def ppo_update(
     # normalization on small/correlated chunk batches from length sorting
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     with torch.no_grad():
-        bt_mask_all, bd_mask_all, bd_causal_all, cd_causal_all = _precompute_policy_masks(obs, bt_act)
+        bt_mask_all, bd_mask_all, cd_causal_all = _precompute_policy_masks(obs, bt_act, bd_act)
     full_chunk_ids, tail_chunk_ids = _split_chunk_ids(all_chunk_lens, bptt_k)
 
     # 8 minibatches per epoch: scales B_chunk with N so GPU utilization
@@ -3065,7 +3088,6 @@ def ppo_update(
                     all_adv = advantages[flat_idx].reshape(B, K_max)
                     all_bt_mask = bt_mask_all[flat_idx].reshape(B, K_max, -1)
                     all_bd_mask = bd_mask_all[flat_idx].reshape(B, K_max, -1)
-                    all_bd_causal = bd_causal_all[flat_idx].reshape(B, K_max)
                     all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
@@ -3080,7 +3102,6 @@ def ppo_update(
                         all_md,
                         all_bt_mask,
                         all_bd_mask,
-                        all_bd_causal,
                         all_cd_causal,
                     )
                     if profile is not None:
@@ -3150,8 +3171,10 @@ def ppo_update(
             break
 
     # ---- Phase 2: Critic updates with random minibatches (full GPU utilization) ----
+    # Always run full ppo_epochs for critic regardless of actor early stopping —
+    # critic has its own loss landscape and benefits from more updates.
     n_critic_updates = 0
-    critic_epochs = 0 if freeze_critic else (actor_epochs_ran if actor_stopped_early else ppo_epochs)
+    critic_epochs = 0 if freeze_critic else ppo_epochs
     if critic_epochs > 0:
         critic, critic_opt = get_centralized_critic()
         critic_loss_step = get_centralized_critic_loss_step()
@@ -3206,6 +3229,7 @@ def ppo_update(
                     u_ctx = mb_uf[:, :_ctx_dim]
                     u_latent = mb_uf[:, _ctx_dim:]
                     mb_returns = mb_rv[:, 0]
+                    mb_old_values = mb_rv[:, 1]
                     with autocast_context(critic_cuda_cfg):
                         loss_sum, vf_loss_sum, new_values = critic_loss_step(
                             g_obs,
@@ -3216,6 +3240,7 @@ def ppo_update(
                             u_ctx,
                             u_latent,
                             mb_returns,
+                            mb_old_values,
                         )
                     (vf_coeff * loss_sum / vf_denom).backward()
 
@@ -3243,13 +3268,17 @@ def ppo_update(
 
     # Single GPU→CPU sync for all accumulated scalars
     with torch.no_grad():
-        # bucket_centers are in symlog space; map to original value space for diagnostics
-        bucket_lo_orig = symexp(bucket_centers[0:1])[0]
-        bucket_hi_orig = symexp(bucket_centers[-1:])[-1]
+        if CRITIC_VALUE_MODE == CriticValueMode.GHL:
+            bucket_lo_orig = symexp(bucket_centers[0:1])[0]
+            bucket_hi_orig = symexp(bucket_centers[-1:])[-1]
+            oob_frac = ((returns <= bucket_lo_orig) | (returns >= bucket_hi_orig)).float().mean()
+        else:
+            bucket_lo_orig = torch.tensor(0.0, device=dev)
+            bucket_hi_orig = torch.tensor(0.0, device=dev)
+            oob_frac = torch.tensor(0.0, device=dev)
         _diag = torch.stack([
             returns.min(), returns.max(), returns.mean(),
-            ((returns <= bucket_lo_orig) | (returns >= bucket_hi_orig)).float().mean(),
-            bucket_lo_orig.float(), bucket_hi_orig.float(),
+            oob_frac, bucket_lo_orig.float(), bucket_hi_orig.float(),
         ])
         # Batch all .item() calls into one contiguous CPU transfer
         _all_scalars = torch.cat([_actor_acc, _critic_acc, _diag, mean_eps, std_eps]).cpu()
@@ -3313,7 +3342,6 @@ def _parse_trajectories(
     md_t = torch.empty(N, dtype=torch.long)
     lp_t = torch.empty(N, dtype=torch.float32)
     rw_t = torch.empty(N, dtype=torch.float32)
-    step_game_t = torch.empty(N, dtype=torch.int32)
     ep_boundaries = []
 
     # Disable cyclic GC — the loop creates no reference cycles, and the
@@ -3324,7 +3352,6 @@ def _parse_trajectories(
         idx = 0
         for traj_i, traj in enumerate(trajectories):
             start = idx
-            game_idx = traj_game_map[traj_i] if traj_game_map and traj_i < len(traj_game_map) else 0
             traj_len = len(traj)
             end = idx + traj_len
             if traj_len == 0:
@@ -3351,7 +3378,6 @@ def _parse_trajectories(
             lp_t[start:end] = torch.as_tensor([step.old_log_prob for step in traj], dtype=torch.float32)
             step_rewards = torch.as_tensor([step.reward for step in traj], dtype=torch.float32)
             rw_t[start:end] = step_rewards if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW) else 0.0
-            step_game_t[start:end] = game_idx
             idx = end
             ep_boundaries.append((start, end))
     finally:
@@ -3359,17 +3385,9 @@ def _parse_trajectories(
             gc.enable()
 
     round_idx_t = _round_index_from_obs(obs_t)
-    reward_keys = step_game_t.to(torch.long) * 2000 + round_idx_t
-    _, reward_inverse = reward_keys.unique(sorted=False, return_inverse=True)
-    n_round_keys = int(reward_inverse.max().item()) + 1
-    # Replay augmentation writes round-shared reward onto every active unit step.
-    # Average duplicate copies back to one shared round reward before broadcasting.
-    round_reward = torch.zeros(n_round_keys, dtype=rw_t.dtype)
-    round_counts = torch.zeros(n_round_keys, dtype=rw_t.dtype)
-    round_reward.index_add_(0, reward_inverse, rw_t)
-    round_counts.index_add_(0, reward_inverse, torch.ones_like(rw_t))
-    round_reward = round_reward / round_counts.clamp_min(1.0)
-    rw_t = round_reward[reward_inverse]
+
+    # Rewards are already per-round team-level values written identically to
+    # every unit in augment_trajectories_with_flow_rewards — no averaging needed.
 
     # Terminal reward: add win/loss bonus to the last step of each trajectory (outcome mode only)
     if REWARD_MODE == RewardMode.OUTCOME and game_winners:

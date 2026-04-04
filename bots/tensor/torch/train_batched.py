@@ -140,7 +140,7 @@ from model import (
     N_BRIDGE_TARGETS,
     N_DIR,
     N_LOGIT_SCALE,
-    compute_harvester_build_dir_mask,
+    bd_has_ore,
     _sample_actions_from_policy_heads,
     _unimix_logits,
     _OBS_GLOBAL_START,

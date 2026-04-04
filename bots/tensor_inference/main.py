@@ -349,12 +349,15 @@ class Player:
         self.h_prev = h_new
 
         # Compute action masks (which builds are affordable, which tiles are free)
-        bt_mask, bd_mask, harv_bd_mask = _compute_masks_from_obs(obs)
+        bt_mask, bd_mask = _compute_masks_from_obs(obs)
 
+        # Sample direction first, then condition build-type on the target tile.
+        build_dir_idx = _argmax(outputs["build_dir"], bd_mask)
+        # Harvester only legal when chosen direction has ore.
+        ts = _BUILD_DIR_TILE_INDICES[build_dir_idx] * TILE_FEATURES
+        if not (obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0):
+            bt_mask[_HARVESTER_BUILD_TYPE] = False
         build_type_idx = _argmax(outputs["build_type"], bt_mask)
-        # Use harvester-specific direction mask when building harvester
-        effective_bd_mask = harv_bd_mask if build_type_idx == 1 else bd_mask
-        build_dir_idx = _argmax(outputs["build_dir"], effective_bd_mask)
         conv_dir_idx = _argmax(outputs["conv_dir"], None)
         bridge_target_idx = _argmax(outputs["bridge_target"], None)
         move_dir_idx = _argmax(outputs["move_dir"], None)
@@ -801,13 +804,14 @@ class Player:
             if ct.can_move(alt):
                 ct.move(alt)
                 return
-def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], list[bool]]:
+def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
     """Compute build_type and build_dir action masks.
 
     Build directions allow both empty tiles and tiles with friendly non-core
     buildings (the execution layer auto-destroys before building).
 
-    Returns (bt_mask, bd_mask, harv_bd_mask) as lists of booleans (True = allowed).
+    Returns (bt_mask, bd_mask) as lists of booleans (True = allowed).
+    Harvester gating is done after direction sampling (caller checks ore).
     """
     g = _GLOBAL_OBS_START
     ti = obs[g + 3] * 500.0
@@ -839,20 +843,9 @@ def _compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], l
 
     # If nothing affordable or nowhere to build, force "none" (dir irrelevant)
     if not any_affordable or not any_dir:
-        return _NONE_ONLY_BUILD_MASK, _ALL_DIRS_MASK, _ALL_DIRS_MASK
+        return _NONE_ONLY_BUILD_MASK, _ALL_DIRS_MASK
 
-    # Harvester placement is legal on ore tiles that are empty or have a friendly replaceable building.
-    harv_bd_mask = [False] * 9
-    for d_idx in range(9):
-        if not bd_mask[d_idx]:
-            continue
-        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
-        is_ore = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
-        harv_bd_mask[d_idx] = is_ore
-    if not any(harv_bd_mask):
-        bt_mask[_HARVESTER_BUILD_TYPE] = False  # suppress harvester
-
-    return bt_mask, bd_mask, harv_bd_mask
+    return bt_mask, bd_mask
 
 
 def _argmax(data: list[float], mask: list[bool] | None = None) -> int:

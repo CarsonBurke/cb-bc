@@ -335,19 +335,20 @@ def test_parse_trajectories_reads_strict_step_old_log_probs():
 
 
 def test_compose_action_log_prob_ignores_noncausal_negative_infinities():
+    # bd is always included (upstream); cd and brt are zeroed when non-causal
     lp = model_mod._compose_action_log_prob(
-        torch.tensor([-0.5]),
-        torch.tensor([float("-inf")]),
-        torch.tensor([float("-inf")]),
-        torch.tensor([float("-inf")]),
-        torch.tensor([-0.25]),
-        bd_causal=torch.tensor([False]),
+        torch.tensor([-0.5]),   # bt_lp
+        torch.tensor([-0.3]),   # bd_lp (always included)
+        torch.tensor([float("-inf")]),  # cd_lp (zeroed)
+        torch.tensor([float("-inf")]),  # brt_lp (zeroed)
+        torch.tensor([-0.25]),  # md_lp
         cd_causal=torch.tensor([False]),
         brt_causal=torch.tensor([False]),
     )
 
     assert torch.isfinite(lp).all()
-    assert torch.allclose(lp, torch.tensor([-0.75]))
+    # bd_lp (-0.3) + bt_lp (-0.5) + cd_lp (0, zeroed) + brt_lp (0, zeroed) + md_lp (-0.25)
+    assert torch.allclose(lp, torch.tensor([-1.05]))
 
 
 def test_sample_actions_from_policy_heads_returns_finite_behavior_log_prob():
@@ -504,10 +505,9 @@ def test_ppo_update_reuses_cached_obs_pre_for_actor_minibatches(monkeypatch):
         md_act,
         bt_mask,
         bd_mask,
-        bd_causal,
         cd_causal,
     ):
-        del h0, bt_act, bd_act, cd_act, brt_act, md_act, bt_mask, bd_mask, bd_causal, cd_causal
+        del h0, bt_act, bd_act, cd_act, brt_act, md_act, bt_mask, bd_mask, cd_causal
         captured_obs_pre.append(obs_pre.detach().cpu())
         new_lps = obs_pre[..., 0] * model.scale
         entropies = torch.zeros_like(new_lps)
