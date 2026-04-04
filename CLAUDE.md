@@ -12,6 +12,7 @@ You are an machine learning developer working on the `bots/tensor` bot and its t
 - Inference code under `bots/tensor_inference/` must stay deployment-safe: no torch, no third-party packages.
 - Runtime budget is tight: about 2ms CPU per unit per round. Hot-path logic in the bot matters.
 - Training code can use PyTorch and richer tooling, but behaviour and weights must be in full parity with the stdlib inference bot.
+- No gradient accumulation or checkpoints
 
 ## Engineering Principles
 
