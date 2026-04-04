@@ -54,7 +54,6 @@ from model import (
     soft_cross_entropy_from_logits,
     symexp,
     symlog,
-    twohot_encode,
     value_target_probs,
 )
 
@@ -405,113 +404,57 @@ class TestDistributionalValuePrediction:
         assert val.item() == pytest.approx(0.0, abs=1e-6)
 
     def test_decode_peaked_at_bin_returns_bin_value(self):
-        """Logits peaked at one bin should decode close to that bin's value."""
+        """Logits peaked at one bin should decode close to symexp(center)."""
         bins = _make_bucket_centers()
         for idx in [0, 50, 127, 200, 254]:
             logits = torch.full((1, bins.shape[0]), -100.0)
             logits[0, idx] = 100.0
             val = decode_value(logits, bins)
-            assert val.item() == pytest.approx(bins[idx].item(), rel=1e-3, abs=1e-6)
+            expected = symexp(bins[idx:idx+1]).item()
+            assert val.item() == pytest.approx(expected, rel=1e-3, abs=1e-6)
 
-    def test_twohot_encode_sums_to_one(self):
-        """Two-hot encoding must produce valid probability distributions."""
+    def test_ghl_target_probs_sum_to_one(self):
+        """GHL encoding must produce valid probability distributions."""
         bins = _make_bucket_centers()
         targets = torch.tensor([-50.0, 0.0, 0.5, 100.0, 5000.0])
-        encoded = twohot_encode(targets, bins)
+        encoded = value_target_probs(targets, bins)
         sums = encoded.sum(dim=-1)
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 
-    def test_twohot_encode_at_most_two_nonzero(self):
-        """Each two-hot vector should have at most 2 non-zero entries."""
+    def test_ghl_target_probs_nonnegative(self):
+        """GHL probabilities must be non-negative."""
         bins = _make_bucket_centers()
         targets = torch.tensor([0.0, 1.0, -5.0, 1000.0])
-        encoded = twohot_encode(targets, bins)
-        for i in range(targets.shape[0]):
-            assert (encoded[i] > 0).sum() <= 2
+        encoded = value_target_probs(targets, bins)
+        assert (encoded >= -1e-7).all()
 
-    def test_twohot_encode_at_bin_center_is_onehot(self):
-        """Target exactly at a bin center should produce a one-hot."""
+    def test_ghl_target_probs_spread_across_bins(self):
+        """GHL should spread mass across multiple bins (unlike two-hot)."""
         bins = _make_bucket_centers()
-        target = bins[100:101]
-        encoded = twohot_encode(target, bins)
-        assert (encoded > 1e-6).sum() == 1
-        assert encoded[0, 100].item() == pytest.approx(1.0, abs=1e-5)
+        target = torch.tensor([1.0])
+        encoded = value_target_probs(target, bins)
+        assert (encoded[0] > 0.001).sum() > 2
 
-    def test_decode_roundtrip_through_twohot(self):
-        """Encoding a value as twohot then decoding via weighted sum should recover it."""
+    def test_ghl_symmetric_for_symmetric_targets(self):
+        """GHL probs for +x and -x should be mirror images."""
         bins = _make_bucket_centers()
-        # Test a range of values within bin range
-        targets = torch.tensor([-500.0, -10.0, 0.0, 10.0, 500.0])
-        encoded = twohot_encode(targets, bins)
-        # Decode: weighted sum of bins
-        recovered = (encoded * bins.unsqueeze(0)).sum(dim=-1)
-        assert torch.allclose(recovered, targets.clamp(bins[0], bins[-1]), atol=1.0)
-
-    def test_value_target_probs_matches_twohot(self):
-        """value_target_probs should be identical to twohot_encode."""
-        bins = _make_bucket_centers()
-        targets = torch.tensor([0.0, 5.0, -5.0])
-        a = value_target_probs(targets, bins)
-        b = twohot_encode(targets, bins)
-        assert torch.allclose(a, b, atol=1e-7)
+        pos = value_target_probs(torch.tensor([5.0]), bins)
+        neg = value_target_probs(torch.tensor([-5.0]), bins)
+        assert torch.allclose(pos[0], neg[0].flip(0), atol=1e-5)
 
 
 # =====================================================================
-# Distributional value loss (PPO clipping in distributional setting)
+# Distributional value loss (GHL)
 # =====================================================================
 
 class TestDistributionalValueLoss:
-    def test_distributional_critic_clip_can_select_clipped_branch(self):
-        bins = _make_bucket_centers()
-        center = bins.shape[0] // 2
-
-        logits_a = torch.full((1, bins.shape[0]), -30.0)
-        logits_a[0, center] = 0.0
-
-        old_values = torch.tensor([10.0], dtype=torch.float32)
-        returns = torch.tensor([0.0], dtype=torch.float32)
-        target = value_target_probs(returns, bins)
-
-        unclipped_a = soft_cross_entropy_from_logits(logits_a, target)
-        newvalue_a = decode_value(logits_a, bins)
-
-        clipped_values = old_values + (newvalue_a - old_values).clamp(-0.4, 0.4)
-        clipped_branch = soft_cross_entropy_from_logits(
-            value_target_probs(clipped_values, bins), target,
-        )
-        assert clipped_branch > unclipped_a
-
-        clipped_a = distributional_value_loss(
-            logits_a, newvalue_a, returns, bins,
-            old_values=old_values, clip_vloss=True, value_clip=0.4,
-        )
-        assert torch.allclose(clipped_a, clipped_branch, atol=1e-6)
-
-    def test_no_clip_equals_raw_cross_entropy(self):
-        """With clip_vloss=False, loss should equal plain cross-entropy."""
+    def test_equals_raw_cross_entropy(self):
+        """Loss should equal cross-entropy of logits against GHL target."""
         bins = _make_bucket_centers()
         logits = torch.randn(4, bins.shape[0])
-        values = decode_value(logits, bins)
         returns = torch.tensor([1.0, -1.0, 0.0, 5.0])
 
-        loss_noclip = distributional_value_loss(
-            logits, values, returns, bins, clip_vloss=False,
-        )
-        target = value_target_probs(returns, bins)
-        expected = soft_cross_entropy_from_logits(logits, target)
-        assert torch.allclose(loss_noclip, expected, atol=1e-6)
-
-    def test_clip_without_old_values_equals_unclipped(self):
-        """When old_values=None, clipping should be disabled."""
-        bins = _make_bucket_centers()
-        logits = torch.randn(3, bins.shape[0])
-        values = decode_value(logits, bins)
-        returns = torch.tensor([2.0, -2.0, 0.5])
-
-        loss = distributional_value_loss(
-            logits, values, returns, bins,
-            old_values=None, clip_vloss=True,
-        )
+        loss = distributional_value_loss(logits, returns, bins)
         target = value_target_probs(returns, bins)
         expected = soft_cross_entropy_from_logits(logits, target)
         assert torch.allclose(loss, expected, atol=1e-6)
@@ -522,68 +465,20 @@ class TestDistributionalValueLoss:
         torch.manual_seed(123)
         for _ in range(10):
             logits = torch.randn(8, bins.shape[0])
-            values = decode_value(logits, bins)
             returns = torch.randn(8) * 100
-            old_values = torch.randn(8) * 100
-            loss = distributional_value_loss(
-                logits, values, returns, bins,
-                old_values=old_values, clip_vloss=True,
-            )
+            loss = distributional_value_loss(logits, returns, bins)
             assert (loss >= -1e-6).all()
 
-    def test_clip_selects_pessimistic_branch(self):
-        """Dreamer4 clipping should take the max of unclipped and clipped losses."""
+    def test_loss_decreases_when_logits_match_target(self):
+        """Loss should be lower when logits align with the GHL target."""
         bins = _make_bucket_centers()
-        old_values = torch.tensor([0.0])
-        returns = torch.tensor([10.0])
-        logits = torch.full((1, bins.shape[0]), -30.0)
-        target_idx = (bins - 10.0).abs().argmin()
-        logits[0, target_idx] = 10.0
-        values = decode_value(logits, bins)
-
-        loss = distributional_value_loss(
-            logits, values, returns, bins,
-            old_values=old_values, clip_vloss=True, value_clip=0.4,
-        )
-        loss_noclip = distributional_value_loss(
-            logits, values, returns, bins, clip_vloss=False,
-        )
-        clipped_val = old_values + (values - old_values).clamp(-0.4, 0.4)
-        clipped_loss = soft_cross_entropy_from_logits(
-            value_target_probs(clipped_val, bins),
-            value_target_probs(returns, bins),
-        )
-        expected = torch.maximum(loss_noclip, clipped_loss)
-        assert torch.allclose(loss, expected, atol=1e-6)
-
-    def test_clipped_branch_backprops_through_values(self):
-        bins = _make_bucket_centers()
-        old_values = torch.tensor([0.0], dtype=torch.float32)
-        target_idx = (bins - 100.0).abs().argmin()
-        returns = bins[target_idx:target_idx + 1].clone().detach()
-        logits = torch.full((1, bins.shape[0]), -30.0)
-        logits[0, target_idx] = 10.0
-        values = torch.tensor([0.1], dtype=torch.float32, requires_grad=True)
-        loss = distributional_value_loss(
-            logits, values, returns, bins,
-            old_values=old_values, clip_vloss=True, value_clip=0.4,
-        )
-        unclipped = soft_cross_entropy_from_logits(
-            logits, value_target_probs(returns, bins),
-        )
-        clipped = soft_cross_entropy_from_logits(
-            value_target_probs(
-                old_values + (values - old_values).clamp(-0.4, 0.4),
-                bins,
-            ),
-            value_target_probs(returns, bins),
-        )
-
-        assert clipped.item() > unclipped.item()
-        assert torch.allclose(loss, torch.maximum(unclipped, clipped), atol=1e-6)
-        loss.backward()
-        assert values.grad is not None
-        assert values.grad.abs().sum().item() > 0.0
+        returns = torch.tensor([3.0])
+        target = value_target_probs(returns, bins)
+        good_logits = target.clamp(min=1e-10).log()
+        bad_logits = torch.randn(1, bins.shape[0])
+        loss_good = distributional_value_loss(good_logits, returns, bins)
+        loss_bad = distributional_value_loss(bad_logits, returns, bins)
+        assert loss_good.item() < loss_bad.item()
 
 
 # =====================================================================
@@ -876,8 +771,8 @@ class TestCentralizedCritic:
         expected = decode_value(logits, critic.bucket_centers)
         assert torch.allclose(values, expected, atol=1e-5)
 
-    def test_critic_starts_with_nonuniform_logits(self):
-        """Dreamer4 create_mlp uses standard linear init, not zero logits."""
+    def test_critic_starts_with_zero_logits(self):
+        """Critic value head starts at zero logits by design for stable bootstrapping."""
         torch.manual_seed(0)
         critic = CentralizedCritic().eval()
         R = 2
@@ -895,8 +790,8 @@ class TestCentralizedCritic:
         values, logits = critic.unit_value_logits(
             feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
         )
-        assert not torch.allclose(logits, torch.zeros_like(logits), atol=1e-7)
-        assert values.abs().max().item() > 1e-7
+        assert torch.allclose(logits, torch.zeros_like(logits), atol=1e-7)
+        assert values.abs().max().item() <= 1e-7
 
     def test_critic_gradients_flow(self):
         """Verify gradients flow through the critic from supervised value loss."""
@@ -918,7 +813,7 @@ class TestCentralizedCritic:
         )
         returns = torch.tensor([1.0, -1.0], dtype=torch.float32)
         loss = distributional_value_loss(
-            logits, values, returns, critic.bucket_centers, clip_vloss=False,
+            logits, returns, critic.bucket_centers,
         ).sum()
         loss.backward()
 
@@ -929,7 +824,7 @@ class TestCentralizedCritic:
                 break
         assert has_grad, "No gradients flowed through critic"
 
-        last_weight_grad = critic.unit_head[-1].weight.grad
+        last_weight_grad = critic.value_head.mlp[-1].weight.grad
         assert last_weight_grad is not None
         assert last_weight_grad.abs().sum().item() > 0.0
 
@@ -942,7 +837,7 @@ class TestCentralizedCritic:
         valid_mask = torch.zeros(1, 1, H, W)  # all masked
 
         feat = critic.encode_map(map_tensor, valid_mask)
-        assert (feat == 0).all(), "Fully masked map should produce zero features"
+        assert (feat.patches == 0).all(), "Fully masked map should produce zero patch features"
 
     def test_different_maps_same_mask_different_features(self):
         """Different map content in valid region should change encoded features."""
@@ -956,8 +851,42 @@ class TestCentralizedCritic:
 
         feat_a = critic.encode_map(map_a, valid_mask)
         feat_b = critic.encode_map(map_b, valid_mask)
-        assert not torch.allclose(feat_a, feat_b, atol=1e-3), \
+        assert not torch.allclose(feat_a.patches, feat_b.patches, atol=1e-3), \
             "Different maps should produce different encoded features"
+
+    def test_unit_value_logits_are_order_equivariant_within_round(self):
+        """Reordering unit tokens should only reorder outputs, not change them."""
+        torch.manual_seed(0)
+        critic = CentralizedCritic().eval()
+        R = 3
+        H, W = 10, 10
+        map_tensor = torch.randn(R, GLOBAL_MAP_CHANNELS, H, W)
+        valid_mask = torch.ones(R, 1, H, W)
+        feat = critic.encode_map(map_tensor, valid_mask)
+        scalars = torch.randn(R, GLOBAL_SCALAR_DIM)
+        round_idx = torch.tensor([0, 1, 1, 2, 0, 2, 1], dtype=torch.long)
+        unit_xy = torch.randint(0, 10, (round_idx.shape[0], 2))
+        unit_ctx = torch.randn(round_idx.shape[0], UNIT_CONTEXT_DIM)
+        actor_latent = torch.randn(round_idx.shape[0], ACTOR_LATENT_DIM)
+
+        values_a, logits_a = critic.unit_value_logits(
+            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
+        )
+
+        perm = torch.tensor([4, 2, 6, 0, 5, 1, 3], dtype=torch.long)
+        values_b, logits_b = critic.unit_value_logits(
+            feat,
+            scalars,
+            round_idx[perm],
+            unit_xy[perm],
+            unit_ctx[perm],
+            actor_latent[perm],
+        )
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(perm.numel())
+
+        assert torch.allclose(values_a, values_b[inv_perm], atol=1e-5)
+        assert torch.allclose(logits_a, logits_b[inv_perm], atol=1e-5)
 
 
 # =====================================================================

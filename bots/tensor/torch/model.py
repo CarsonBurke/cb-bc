@@ -17,6 +17,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.init import trunc_normal_
 
 try:
     from pretrain.gpu import (
@@ -112,11 +113,14 @@ TERMINAL_LOSS_REWARD = -10.0
 GAMMA = 0.995 # GAE
 LAMBDA = 0.95 # GAE
 
-# ---- Dreamer4-style symexp two-hot value prediction ----
+# ---- Gaussian Histogram Loss (GHL) value prediction with symlog/symexp ----
 NUM_BUCKETS = 255
-# symlog range — covers symexp(-9)≈±8103, tight around zero
-BUCKET_LOW = -9
-BUCKET_HIGH = 9
+# symlog range — covers symexp(±9) ≈ ±8103
+BUCKET_LOW = -9.0
+BUCKET_HIGH = 9.0
+# GHL sigma: 2× bin width (Imani et al. default, confirmed in fig 6 of Farebrother et al.)
+_GHL_SIGMA_RATIO = 2.0
+_SQRT2 = math.sqrt(2.0)
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -127,55 +131,61 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
     return x.sign() * torch.expm1(x.abs())
 
 
-def _make_bucket_centers() -> torch.Tensor:
-    """Dreamer4-style symexp-spaced bins in original value space.
+def _make_bucket_support() -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Uniform support in symlog space for GHL.
 
-    Builds 255 bins via symexp(linspace(-20, 0, 128)) mirrored around 0.
-    Dense near zero, sparse at extremes.
+    Returns:
+        centers: (NUM_BUCKETS,) bin centers in symlog space.
+        support: (NUM_BUCKETS+1,) bin edges in symlog space.
+        sigma: Gaussian kernel width.
     """
-    n_half = (NUM_BUCKETS - 1) // 2 + 1  # 128
-    half = torch.linspace(BUCKET_LOW, 0.0, n_half, dtype=torch.float32)
-    half = symexp(half)
-    return torch.cat([half, -half[:-1].flip(0)])
+    support = torch.linspace(BUCKET_LOW, BUCKET_HIGH, NUM_BUCKETS + 1, dtype=torch.float32)
+    centers = (support[:-1] + support[1:]) / 2
+    bin_width = (BUCKET_HIGH - BUCKET_LOW) / NUM_BUCKETS
+    sigma = _GHL_SIGMA_RATIO * bin_width
+    return centers, support, sigma
 
 
-def twohot_encode(targets: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
-    """Encode scalar targets as twohot distributions over bins.
+def _make_bucket_centers() -> torch.Tensor:
+    """Return bin centers in symlog space (for backward compat with buffer registration)."""
+    centers, _, _ = _make_bucket_support()
+    return centers
 
-    Bins are symexp-spaced in original value space. Targets are raw
-    returns (NOT symlog'd) — same space as bins.
+
+def _ghl_target_probs(
+    targets: torch.Tensor,
+    support: torch.Tensor,
+    sigma: float,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """Gaussian histogram soft targets (Imani et al. 2018).
+
+    Targets are in original value space; symlog is applied internally.
+    Support edges are in symlog space.
 
     Args:
         targets: (...,) scalar targets in original value space.
-        bins: (NUM_BUCKETS,) bin centers in original value space.
+        support: (NUM_BUCKETS+1,) bin edges in symlog space.
+        sigma: Gaussian kernel width in symlog space.
 
     Returns:
-        (..., NUM_BUCKETS) twohot probability vectors.
+        (..., NUM_BUCKETS) soft probability vectors.
     """
-    targets = targets.clamp(bins[0], bins[-1])
-    below = torch.bucketize(targets, bins) - 1
-    below = below.clamp(0, len(bins) - 2)
-    above = below + 1
-    dist_to_below = (targets - bins[below]).abs()
-    dist_to_above = (bins[above] - targets).abs()
-    total = (dist_to_below + dist_to_above).clamp(min=1e-8)
-    weight_below = dist_to_above / total
-    weight_above = dist_to_below / total
-    result = torch.zeros(*targets.shape, len(bins), device=targets.device, dtype=targets.dtype)
-    result.scatter_(-1, below.unsqueeze(-1), weight_below.unsqueeze(-1))
-    result.scatter_(-1, above.unsqueeze(-1), weight_above.unsqueeze(-1))
-    return result
+    t = symlog(targets)
+    # CDF at each bin edge: erf((edge - target) / (sigma * sqrt(2)))
+    cdf = torch.special.erf((support - t.unsqueeze(-1)) / (sigma * _SQRT2))
+    # Bin probs = CDF differences, normalized
+    bin_probs = cdf[..., 1:] - cdf[..., :-1]
+    z = (cdf[..., -1] - cdf[..., 0]).clamp(min=eps)
+    return bin_probs / z.unsqueeze(-1)
 
 
 def win_probability(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
     """Win confidence from critic logits via linear rescale of decoded value.
 
-    The critic predicts discounted returns in [-10, +10] (terminal reward range).
-    We decode to a scalar and rescale: -10 → 0%, +10 → 100%.
-
     Args:
         logits: (..., NUM_BUCKETS) raw critic logits.
-        bins: (NUM_BUCKETS,) bin centers in original value space.
+        bins: (NUM_BUCKETS,) bin centers in symlog space.
 
     Returns:
         (...,) win probability in [0, 1].
@@ -185,44 +195,37 @@ def win_probability(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
 
 
 def decode_value(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
-    """Decode categorical logits to scalar values via symmetric summation.
+    """Decode categorical logits to scalar values.
 
-    Bins are already in original value space (symexp-spaced), so the
-    weighted average is the predicted value directly — no symexp needed.
-    Symmetric sum ensures uniform logits decode to exactly 0.
+    Bins are in symlog space; weighted average gives symlog-space prediction,
+    then symexp maps back to original value space.
 
     Args:
         logits: (..., NUM_BUCKETS) raw logits.
-        bins: (NUM_BUCKETS,) bin centers in original value space.
+        bins: (NUM_BUCKETS,) bin centers in symlog space.
 
     Returns:
         (...,) predicted values in original value space.
     """
-    n = bins.shape[0]
-    m = (n - 1) // 2  # 127 — center index
     probs = torch.softmax(logits, dim=-1)
-    # Symmetric sum: pair bins equidistant from center to cancel float error.
-    # p_left * bins_left (reversed) + p_right * bins_right cancel perfectly
-    # when probs are uniform over symmetric bins.
-    left = probs[..., :m] * bins[:m]          # (*, 127) — negative side
-    center = probs[..., m:m+1] * bins[m]      # (*, 1) — center bin (=0)
-    right = probs[..., m+1:] * bins[m+1:]     # (*, 127) — positive side
-    wavg = center.sum(dim=-1) + (left.flip(-1) + right).sum(dim=-1)
-    return wavg
+    symlog_value = (probs * bins).sum(dim=-1)
+    return symexp(symlog_value)
 
 
 def value_target_probs(
     targets: torch.Tensor,
     bins: torch.Tensor,
 ) -> torch.Tensor:
-    """Encode scalar values as Dreamer4-style exact two-hot targets.
+    """Encode scalar values as GHL soft targets.
 
-    Targets and bins live in the same original-value space, so this matches the
-    decode path exactly: expectation over the same symexp-spaced bin centers.
+    Args:
+        targets: (...,) in original value space.
+        bins: (NUM_BUCKETS,) bin centers in symlog space (unused, kept for API compat;
+              support is rebuilt from global constants).
     """
-    if bins.device != targets.device or bins.dtype != targets.dtype:
-        bins = bins.to(device=targets.device, dtype=targets.dtype)
-    return twohot_encode(targets, bins)
+    _, support, sigma = _make_bucket_support()
+    support = support.to(device=targets.device, dtype=targets.dtype)
+    return _ghl_target_probs(targets, support, sigma)
 
 
 def soft_cross_entropy_from_logits(
@@ -233,43 +236,27 @@ def soft_cross_entropy_from_logits(
     return -(target_probs * F.log_softmax(logits, dim=-1)).sum(dim=-1)
 
 
-def soft_cross_entropy_from_probs(
-    pred_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Cross-entropy for soft targets against normalized probabilities."""
-    return -(target_probs * pred_probs.clamp_min(eps).log()).sum(dim=-1)
-
 
 def distributional_value_loss(
     logits: torch.Tensor,
-    values: torch.Tensor,
     returns: torch.Tensor,
     bins: torch.Tensor,
-    *,
-    old_values: torch.Tensor | None = None,
-    clip_vloss: bool = True,
-    value_clip: float = 0.4,
 ) -> torch.Tensor:
-    """PPO-style clipped value loss for a distributional critic.
-
-    Mirrors Dreamer4's value clipping rule: score the current logits against the
-    true return two-hot target, also score the clipped decoded scalar value as a
-    synthetic categorical input against that same target, and take the
-    pessimistic branch elementwise.
-    """
+    """GHL value loss: cross-entropy between logits and Gaussian soft targets."""
     return_target = value_target_probs(returns, bins).detach()
-    value_loss_1 = soft_cross_entropy_from_logits(logits, return_target)
+    return soft_cross_entropy_from_logits(logits, return_target)
 
-    if not clip_vloss or old_values is None:
-        return value_loss_1
 
-    clipped_values = old_values + (values - old_values).clamp(-value_clip, value_clip)
-    clipped_value_bins = value_target_probs(clipped_values, bins)
-    value_loss_2 = soft_cross_entropy_from_logits(clipped_value_bins, return_target)
-
-    return torch.maximum(value_loss_1, value_loss_2)
+def _require_finite(name: str, x: torch.Tensor) -> None:
+    """Fail fast on non-finite tensors so training errors are not hidden."""
+    if torch.isfinite(x).all():
+        return
+    bad = (~torch.isfinite(x)).nonzero(as_tuple=False)
+    first_idx = tuple(int(i) for i in bad[0].tolist())
+    first_val = x[first_idx].detach().float().cpu().item()
+    raise RuntimeError(
+        f"non-finite {name}: count={int(bad.shape[0])} first_index={first_idx} first_value={first_val!r}"
+    )
 
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 LOG_PATH = PROJECT_ROOT / "bots" / "tensor" / "train_log.jsonl"
@@ -502,245 +489,854 @@ CRITIC_STAGE_B_DIM = 96
 CRITIC_STAGE_B_HEADS = 6
 
 
-class RMSNorm2d(nn.Module):
-    """RMSNorm for 2D spatial feature maps (B, C, H, W).
 
-    Uses F.rms_norm (fused CUDA kernel) via NHWC permutation for faster
-    forward+backward.  Falls back to manual implementation on CPU.
-    """
 
-    def __init__(self, num_channels: int, eps: float = 1e-6):
+# ---- Transformer Critic Modules ----
+
+class RotaryEmbedding2D(nn.Module):
+    """2D axial rotary position embeddings for spatial grids."""
+
+    def __init__(self, head_dim: int, max_size: int = 25):
         super().__init__()
-        self.num_channels = num_channels
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(num_channels))
+        half = head_dim // 2
+        freqs = 1.0 / (10000.0 ** (torch.arange(0, half, 2, dtype=torch.float32)[: half // 2] / half))
+        self.register_buffer("freqs", freqs)  # (half//2,)
+        # Precompute cos/sin for grid up to max_size × max_size
+        pos = torch.arange(max_size, dtype=torch.float32)
+        angles = pos.unsqueeze(-1) * freqs.unsqueeze(0)  # (max_size, half//2)
+        self.register_buffer("_cos_cache", angles.cos())  # (max_size, half//2)
+        self.register_buffer("_sin_cache", angles.sin())
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W) — normalize over C dimension per spatial position
-        if x.is_cuda:
-            # F.rms_norm needs C as the last dim.  When x is channels_last the
-            # permute is a free stride relabel; for contiguous NCHW it copies.
-            xp = x.permute(0, 2, 3, 1)  # (B, H, W, C)
-            weight = self.weight if self.weight.dtype == xp.dtype else self.weight.to(dtype=xp.dtype)
-            return F.rms_norm(xp, (self.num_channels,), weight, self.eps).permute(0, 3, 1, 2)
-        return x * torch.rsqrt(x.square().mean(1, keepdim=True) + self.eps) * self.weight.view(1, -1, 1, 1)
+    def forward(
+        self, h_coords: torch.Tensor, w_coords: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (cos, sin) each of shape (N, head_dim//2)."""
+        h_cos = self._cos_cache[h_coords]  # (N, half//2)
+        h_sin = self._sin_cache[h_coords]
+        w_cos = self._cos_cache[w_coords]
+        w_sin = self._sin_cache[w_coords]
+        return (
+            torch.cat([h_cos, w_cos], dim=-1),
+            torch.cat([h_sin, w_sin], dim=-1),
+        )
 
 
-class CriticBottleneckBlock(nn.Module):
-    """Full-resolution residual bottleneck for symbolic map reasoning.
+def apply_rotary_2d(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply 2D rotary embeddings. x: (B, n_heads, N, head_dim), cos/sin: (N, head_dim//2)."""
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    cos = cos.unsqueeze(1)  # (B|1, 1, N, hd//2)
+    sin = sin.unsqueeze(1)
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
-    The block keeps the post-conv latent compact while briefly widening into a
-    richer hidden state for spatial mixing. On our training GPU this style
-    outperformed a literal MobileNet depthwise port at the critic's small width.
-    """
+
+class CriticAttentionBlock(nn.Module):
+    """Transformer block with GQA, QK-norm, layer scale, and optional RoPE."""
 
     def __init__(
         self,
-        dim: int,
-        *,
-        hidden_dim: int,
-        kernel_size: int,
-        dilation: int,
+        dim: int = 48,
+        n_heads: int = 4,
+        n_kv_heads: int = 2,
+        mlp_ratio: int = 4,
+        layer_scale_init: float = 1e-4,
     ):
         super().__init__()
-        pad = dilation * (kernel_size // 2)
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = dim // n_heads
+        self.kv_group_size = n_heads // n_kv_heads
+        kv_dim = n_kv_heads * self.head_dim
 
-        self.expand = nn.Conv2d(dim, hidden_dim, 1)
-        self.expand_norm = RMSNorm2d(hidden_dim)
-        self.spatial = nn.Conv2d(
-            hidden_dim,
-            hidden_dim,
-            kernel_size,
-            padding=pad,
-            dilation=dilation,
-        )
-        self.spatial_norm = RMSNorm2d(hidden_dim)
-        self.project = nn.Conv2d(hidden_dim, dim, 1)
+        self.norm1 = RMSNorm(dim)
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, kv_dim, bias=False)
+        self.v_proj = nn.Linear(dim, kv_dim, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.expand(x)
-        y = F.silu(self.expand_norm(y))
-        y = self.spatial(y)
-        y = F.silu(self.spatial_norm(y))
-        y = self.project(y)
-        return x + y
+        self.norm2 = RMSNorm(dim)
+        mlp_hidden = dim * mlp_ratio
+        self.mlp_fc1 = nn.Linear(dim, mlp_hidden, bias=False)
+        self.mlp_fc2 = nn.Linear(mlp_hidden, dim, bias=False)
 
-
-class CentralizedCritic(nn.Module):
-    """Centralized per-unit critic over full replay-derived map state.
-
-    Takes full map state (omniscient, from replay) and produces per-unit
-    value estimates. Only used during training.
-
-    Architecture:
-      1. Per-tile 1×1 conv encodes sparse 19-channel indicators into dense
-         embeddings (preserves directional info for supply line analysis).
-      2. Full-resolution 3×3 convs with dilations for spatial context.
-         No striding — preserves per-tile directional precision needed
-         for supply line connectivity analysis.
-      3. Per-unit indexing + MLP produces value estimates.
-    """
-
-    def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS, conv_dim: int = 48):
-        super().__init__()
-        self.conv_dim = conv_dim
-
-        self.conv = nn.Sequential(
-            # Per-tile encode: sparse binary channels → dense embedding.
-            # 1×1 kernel = shared MLP per tile, no spatial mixing yet.
-            nn.Conv2d(map_channels, conv_dim, 1),
-            RMSNorm2d(conv_dim),
-            nn.SiLU(),
-            # Stage local symbolic decoding first, then grow map context with
-            # wider kernels and dilations while keeping the readout latent compact.
-            CriticBottleneckBlock(conv_dim, hidden_dim=64, kernel_size=5, dilation=1),
-            CriticBottleneckBlock(conv_dim, hidden_dim=64, kernel_size=3, dilation=2),
-            CriticBottleneckBlock(conv_dim, hidden_dim=64, kernel_size=3, dilation=4),
-            RMSNorm2d(conv_dim),
-            nn.SiLU(),
-        )
-
-        # Per-unit value head from tile features + replay/global context.
-        # Outputs NUM_BUCKETS logits for Dreamer4-style symexp two-hot prediction.
-        unit_in = conv_dim + UNIT_CONTEXT_DIM + GLOBAL_SCALAR_DIM + ACTOR_LATENT_DIM
-        self.unit_head = nn.Sequential(
-            nn.Linear(unit_in, unit_in),
-            RMSNorm(unit_in),
-            nn.SiLU(),
-            nn.Linear(unit_in, unit_in),
-            RMSNorm(unit_in),
-            nn.SiLU(),
-            nn.Linear(unit_in, NUM_BUCKETS),
-        )
-
-        # Dreamer4-style symexp-spaced bins in original value space.
-        bucket_centers = _make_bucket_centers()
-        self.register_buffer("bucket_centers", bucket_centers)
-        # Kept for checkpoint compatibility with older critic state dicts.
-        self.register_buffer("bucket_symlog", symlog(bucket_centers))
+        self.ls1 = nn.Parameter(layer_scale_init * torch.ones(dim))
+        self.ls2 = nn.Parameter(layer_scale_init * torch.ones(dim))
 
         self._init_weights()
-        # Conv weights stay fp32 (master copy). Forward uses autocast for bf16
-        # speed; backward accumulates gradients into fp32 to avoid bf16 overflow.
+
+    def _init_weights(self):
+        for m in [self.q_proj, self.k_proj, self.v_proj, self.out_proj,
+                   self.mlp_fc1, self.mlp_fc2]:
+            trunc_normal_(m.weight, std=0.02)
+
+    def project_qkv(
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project normalized tokens into Q/K/V, applying RoPE when requested."""
+        B, N, _ = x.shape
+        h = self.norm1(x)
+        q = self.q_proj(h).reshape(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).reshape(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).reshape(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if rope_cos is not None:
+            q = apply_rotary_2d(q, rope_cos, rope_sin)
+            k = apply_rotary_2d(k, rope_cos, rope_sin)
+        return q, k, v
+
+    def attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run SDPA on projected heads and return token-major outputs."""
+        B, _, N_q, _ = q.shape
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            enable_gqa=self.kv_group_size > 1,
+        )
+        return attn_out.transpose(1, 2).reshape(B, N_q, self.n_heads * self.head_dim)
+
+    def project_attn_residual(self, attn_out: torch.Tensor) -> torch.Tensor:
+        """Project attention outputs and scale them for the residual update."""
+        projected = self.out_proj(attn_out)
+        return self.ls1.to(dtype=projected.dtype) * projected
+
+    def apply_mlp_residual(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the post-attention MLP residual block."""
+        h = self.norm2(x)
+        mlp_out = self.mlp_fc2(F.silu(self.mlp_fc1(h)))
+        ls2 = self.ls2.to(dtype=mlp_out.dtype)
+        return x + ls2 * mlp_out
+
+    def apply_residual_mlp(
+        self,
+        x: torch.Tensor,
+        attn_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply output projection, residual update, and MLP block."""
+        x = x + self.project_attn_residual(attn_out)
+        return self.apply_mlp_residual(x)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        q, k, v = self.project_qkv(x, rope_cos=rope_cos, rope_sin=rope_sin)
+        attn_out = self.attend(q, k, v, attn_mask=attn_mask)
+        return self.apply_residual_mlp(x, attn_out)
+
+
+def critic_window_partition(
+    x: torch.Tensor, window_size: int,
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Partition (B, H, W, C) into non-overlapping windows. Returns (B*nw, ws*ws, C)."""
+    B, H, W, C = x.shape
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+    Hp, Wp = H + pad_h, W + pad_w
+    x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_size * window_size, C)
+    return windows, (Hp, Wp)
+
+
+def critic_window_unpartition(
+    windows: torch.Tensor, window_size: int,
+    pad_hw: tuple[int, int], hw: tuple[int, int], batch_size: int,
+) -> torch.Tensor:
+    """Reverse window partition. Returns (B, H, W, C)."""
+    Hp, Wp = pad_hw
+    H, W = hw
+    C = windows.shape[-1]
+    x = windows.reshape(
+        batch_size, Hp // window_size, Wp // window_size, window_size, window_size, C,
+    )
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(batch_size, Hp, Wp, C)
+    if Hp > H or Wp > W:
+        x = x[:, :H, :W, :]
+    return x
+
+
+
+# ---- Transformer Critic High-Level Modules ----
+
+from collections import namedtuple
+
+CriticMapState = namedtuple("CriticMapState", ["patches", "pH", "pW", "global_cls"])
+
+
+@dataclass(slots=True)
+class CriticGlobalLayout:
+    n_rounds: int
+    unit_start: int
+    total_tokens: int
+    perm: torch.Tensor
+    sorted_round_idx: torch.Tensor
+    local_pos: torch.Tensor
+    valid_unit_mask: torch.Tensor
+    unit_attn_mask: torch.Tensor | None
+    shared_rope_cos: torch.Tensor
+    shared_rope_sin: torch.Tensor
+    unit_rope_cos: torch.Tensor | None
+    unit_rope_sin: torch.Tensor | None
+
+
+class CriticTileEmbed(nn.Module):
+    """Per-tile two-layer MLP encoder."""
+
+    def __init__(self, in_channels: int = GLOBAL_MAP_CHANNELS, embed_dim: int = 12):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_channels, embed_dim, bias=False),
+            RMSNorm(embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim, bias=False),
+            RMSNorm(embed_dim),
+            nn.SiLU(),
+        )
+        self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (R, C, H, W) → (R, embed_dim, H, W)."""
+        R, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(R * H * W, C)
+        x = self.net(x)
+        return x.reshape(R, H, W, self.embed_dim).permute(0, 3, 1, 2)
+
+
+class CriticWindowedSA(nn.Module):
+    """Windowed self-attention with local 2D RoPE."""
+
+    def __init__(
+        self,
+        dim: int = 48,
+        n_heads: int = 4,
+        n_kv_heads: int = 2,
+        window_size: int = 5,
+        mlp_ratio: int = 4,
+        layer_scale_init: float = 1e-4,
+    ):
+        super().__init__()
+        self.window_size = window_size
+        self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio, layer_scale_init)
+        self.rope = RotaryEmbedding2D(dim // n_heads, max_size=window_size)
+        ws = window_size
+        h_coords = torch.arange(ws).unsqueeze(1).expand(ws, ws).reshape(-1)
+        w_coords = torch.arange(ws).unsqueeze(0).expand(ws, ws).reshape(-1)
+        self.register_buffer("_local_h", h_coords)
+        self.register_buffer("_local_w", w_coords)
+        local_rope_cos, local_rope_sin = self.rope(h_coords, w_coords)
+        self.register_buffer("_local_rope_cos", local_rope_cos)
+        self.register_buffer("_local_rope_sin", local_rope_sin)
+
+    _MAX_WINDOWS = 16384  # SDPA batch dim limit on some GPUs
+
+    def forward(self, patches: torch.Tensor, pH: int, pW: int) -> torch.Tensor:
+        """patches: (R, N, dim) where N = pH * pW. Returns same shape."""
+        R, N, C = patches.shape
+        x = patches.reshape(R, pH, pW, C)
+        windows, pad_hw = critic_window_partition(x, self.window_size)
+        rope_cos = self._local_rope_cos
+        rope_sin = self._local_rope_sin
+        if rope_cos.dtype != windows.dtype:
+            rope_cos = rope_cos.to(dtype=windows.dtype)
+            rope_sin = rope_sin.to(dtype=windows.dtype)
+        # Chunk to stay within SDPA batch limits
+        n_win = windows.shape[0]
+        if n_win > self._MAX_WINDOWS:
+            chunks = []
+            for i in range(0, n_win, self._MAX_WINDOWS):
+                chunks.append(self.attn(
+                    windows[i:i + self._MAX_WINDOWS],
+                    rope_cos=rope_cos, rope_sin=rope_sin,
+                ))
+            windows = torch.cat(chunks, dim=0)
+        else:
+            windows = self.attn(windows, rope_cos=rope_cos, rope_sin=rope_sin)
+        x = critic_window_unpartition(windows, self.window_size, pad_hw, (pH, pW), R)
+        return x.reshape(R, N, C)
+
+
+class CriticGlobalSA(nn.Module):
+    """Global self-attention over patches + special tokens with masked attention."""
+
+    def __init__(
+        self,
+        dim: int = 48,
+        n_heads: int = 4,
+        n_kv_heads: int = 2,
+        n_global_cls: int = 8,
+        mlp_ratio: int = 4,
+        layer_scale_init: float = 1e-4,
+        max_grid_size: int = 25,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.n_global_cls = n_global_cls
+        self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio, layer_scale_init)
+        self.rope = RotaryEmbedding2D(dim // n_heads, max_size=max_grid_size)
+        head_dim_half = self.rope.freqs.shape[0] * 2
+        self.register_buffer("_special_token_cos", torch.ones(1 + n_global_cls, head_dim_half))
+        self.register_buffer("_special_token_sin", torch.zeros(1 + n_global_cls, head_dim_half))
+        self._base_mask_cache: dict[tuple[int, int, tuple[str, int | None]], torch.Tensor] = {}
+        self._patch_rope_cache: dict[
+            tuple[int, int, int, torch.dtype, tuple[str, int | None]],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
+
+    @staticmethod
+    def _device_key(device: torch.device) -> tuple[str, int | None]:
+        return (device.type, device.index)
+
+    def _get_base_mask(
+        self,
+        n_patches: int,
+        max_units: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return cached token-type attention mask for a given shape.
+
+        The returned boolean mask follows SDPA semantics: ``True`` means the
+        key is visible to the query position.
+        """
+        cache_key = (n_patches, max_units, self._device_key(device))
+        cached = self._base_mask_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        n_scalar = 1
+        total = n_patches + n_scalar + self.n_global_cls + max_units
+        mask = torch.zeros(total, total, dtype=torch.bool, device=device)
+
+        p_end = n_patches
+        s_end = p_end + n_scalar
+        g_end = s_end + self.n_global_cls
+        u_end = g_end + max_units
+
+        mask[:p_end, :p_end] = True
+        mask[:p_end, p_end:s_end] = True
+        mask[:p_end, s_end:g_end] = True
+        mask[s_end:g_end, :p_end] = True
+        mask[s_end:g_end, p_end:s_end] = True
+        mask[g_end:u_end, :p_end] = True
+        mask[g_end:u_end, p_end:s_end] = True
+        mask[g_end:u_end, s_end:g_end] = True
+        mask[g_end:u_end, g_end:u_end] = True
+
+        self._base_mask_cache[cache_key] = mask
+        return mask
+
+    def _get_patch_rope(
+        self,
+        n_patches: int,
+        pH: int,
+        pW: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached RoPE for patch tokens shared by all rounds."""
+        cache_key = (n_patches, pH, pW, dtype, self._device_key(device))
+        cached = self._patch_rope_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        ph = torch.arange(pH, device=device)
+        pw = torch.arange(pW, device=device)
+        grid_h = ph.unsqueeze(1).expand(pH, pW).reshape(-1)[:n_patches]
+        grid_w = pw.unsqueeze(0).expand(pH, pW).reshape(-1)[:n_patches]
+        rope_cos, rope_sin = self.rope(grid_h, grid_w)
+        if rope_cos.dtype != dtype:
+            rope_cos = rope_cos.to(dtype=dtype)
+            rope_sin = rope_sin.to(dtype=dtype)
+        self._patch_rope_cache[cache_key] = (rope_cos, rope_sin)
+        return rope_cos, rope_sin
+
+    def prepare_layout(
+        self,
+        n_patches: int,
+        pH: int,
+        pW: int,
+        unit_cls: torch.Tensor,
+        unit_xy: torch.Tensor,
+        unit_round_idx: torch.Tensor,
+        n_rounds: int,
+    ) -> CriticGlobalLayout:
+        """Build all static layout tensors once and reuse them across layers."""
+        device = unit_cls.device
+        dtype = unit_cls.dtype
+        unit_start = n_patches + 1 + self.n_global_cls
+        total_units = unit_cls.shape[0]
+
+        patch_rope_cos, patch_rope_sin = self._get_patch_rope(n_patches, pH, pW, dtype, device)
+        special_cos = self._special_token_cos.to(device=device, dtype=dtype)
+        special_sin = self._special_token_sin.to(device=device, dtype=dtype)
+
+        if total_units == 0:
+            total_tokens = unit_start
+            shared_rope_cos = torch.empty((total_tokens, patch_rope_cos.shape[-1]), device=device, dtype=dtype)
+            shared_rope_sin = torch.empty_like(shared_rope_cos)
+            shared_rope_cos[:n_patches] = patch_rope_cos
+            shared_rope_sin[:n_patches] = patch_rope_sin
+            shared_rope_cos[n_patches:unit_start] = special_cos
+            shared_rope_sin[n_patches:unit_start] = special_sin
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            empty_mask = torch.zeros((n_rounds, 0), dtype=torch.bool, device=device)
+            return CriticGlobalLayout(
+                n_rounds=n_rounds,
+                unit_start=unit_start,
+                total_tokens=total_tokens,
+                perm=empty,
+                sorted_round_idx=empty,
+                local_pos=empty,
+                valid_unit_mask=empty_mask,
+                unit_attn_mask=None,
+                shared_rope_cos=shared_rope_cos,
+                shared_rope_sin=shared_rope_sin,
+                unit_rope_cos=None,
+                unit_rope_sin=None,
+            )
+
+        counts = torch.bincount(unit_round_idx, minlength=n_rounds)
+        max_units = int(counts.max().item())
+        perm = unit_round_idx.argsort(stable=True)
+        sorted_round_idx = unit_round_idx[perm]
+        starts = torch.zeros_like(counts)
+        starts[1:] = counts.cumsum(0)[:-1]
+        local_pos = torch.arange(total_units, device=device) - starts[sorted_round_idx]
+
+        total_tokens = unit_start + max_units
+        valid_unit_mask = torch.zeros((n_rounds, max_units), dtype=torch.bool, device=device)
+        valid_unit_mask[sorted_round_idx, local_pos] = True
+        unit_attn_mask = torch.ones(
+            (n_rounds, 1, max_units, total_tokens),
+            dtype=torch.bool,
+            device=device,
+        )
+        unit_attn_mask[..., :unit_start] = True
+        unit_attn_mask[..., unit_start:] = valid_unit_mask.unsqueeze(1).unsqueeze(2)
+
+        shared_rope_cos = torch.empty((unit_start, patch_rope_cos.shape[-1]), device=device, dtype=dtype)
+        shared_rope_sin = torch.empty_like(shared_rope_cos)
+        shared_rope_cos[:n_patches] = patch_rope_cos
+        shared_rope_sin[:n_patches] = patch_rope_sin
+        shared_rope_cos[n_patches:unit_start] = special_cos
+        shared_rope_sin[n_patches:unit_start] = special_sin
+        unit_rope_cos = torch.ones((n_rounds, max_units, patch_rope_cos.shape[-1]), device=device, dtype=dtype)
+        unit_rope_sin = torch.zeros_like(unit_rope_cos)
+        sorted_xy = unit_xy[perm]
+        u_h = (sorted_xy[:, 1] // 2).clamp(0, pH - 1)
+        u_w = (sorted_xy[:, 0] // 2).clamp(0, pW - 1)
+        u_cos, u_sin = self.rope(u_h, u_w)
+        if u_cos.dtype != dtype:
+            u_cos = u_cos.to(dtype=dtype)
+            u_sin = u_sin.to(dtype=dtype)
+        unit_rope_cos[sorted_round_idx, local_pos] = u_cos
+        unit_rope_sin[sorted_round_idx, local_pos] = u_sin
+
+        return CriticGlobalLayout(
+            n_rounds=n_rounds,
+            unit_start=unit_start,
+            total_tokens=total_tokens,
+            perm=perm,
+            sorted_round_idx=sorted_round_idx,
+            local_pos=local_pos,
+            valid_unit_mask=valid_unit_mask,
+            unit_attn_mask=unit_attn_mask,
+            shared_rope_cos=shared_rope_cos,
+            shared_rope_sin=shared_rope_sin,
+            unit_rope_cos=unit_rope_cos,
+            unit_rope_sin=unit_rope_sin,
+        )
+
+    def forward(
+        self,
+        patches: torch.Tensor,        # (R, N_patches, dim)
+        global_cls: torch.Tensor,      # (R, n_global_cls, dim)
+        scalar_tok: torch.Tensor,      # (R, 1, dim)
+        unit_cls: torch.Tensor,        # (B_total, dim)
+        layout: CriticGlobalLayout,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns updated (patches, global_cls, unit_cls).
+
+        Unit tokens remain permutation-equivariant: no token index is encoded,
+        and padded slots are masked only as keys, so reordering units only
+        reorders the corresponding outputs.
+        """
+        R = layout.n_rounds
+        N = patches.shape[1]
+        all_tokens = patches.new_zeros((R, layout.total_tokens, patches.shape[-1]))
+        all_tokens[:, :N] = patches
+        all_tokens[:, N:N + 1] = scalar_tok
+        all_tokens[:, N + 1:layout.unit_start] = global_cls
+        if layout.perm.numel() > 0:
+            all_tokens[layout.sorted_round_idx, layout.unit_start + layout.local_pos] = unit_cls[layout.perm]
+
+        q, k, v = self.attn.project_qkv(all_tokens)
+
+        prefix_end = layout.unit_start
+        q[:, :, :prefix_end] = apply_rotary_2d(
+            q[:, :, :prefix_end], layout.shared_rope_cos, layout.shared_rope_sin,
+        )
+        k[:, :, :prefix_end] = apply_rotary_2d(
+            k[:, :, :prefix_end], layout.shared_rope_cos, layout.shared_rope_sin,
+        )
+        if layout.unit_rope_cos is not None:
+            q[:, :, prefix_end:] = apply_rotary_2d(
+                q[:, :, prefix_end:], layout.unit_rope_cos, layout.unit_rope_sin,
+            )
+            k[:, :, prefix_end:] = apply_rotary_2d(
+                k[:, :, prefix_end:], layout.unit_rope_cos, layout.unit_rope_sin,
+            )
+
+        patch_end = N
+        scalar_end = N + 1
+        shared_end = layout.unit_start
+
+        patch_tokens = all_tokens[:, :patch_end]
+        scalar_tokens = all_tokens[:, patch_end:scalar_end]
+        global_tokens = all_tokens[:, scalar_end:shared_end]
+        unit_tokens = all_tokens[:, shared_end:]
+
+        patch_tokens = patch_tokens + self.attn.project_attn_residual(
+            self.attn.attend(
+                q[:, :, :patch_end],
+                k[:, :, :shared_end],
+                v[:, :, :shared_end],
+            )
+        )
+        global_tokens = global_tokens + self.attn.project_attn_residual(
+            self.attn.attend(
+                q[:, :, scalar_end:shared_end],
+                k[:, :, :scalar_end],
+                v[:, :, :scalar_end],
+            )
+        )
+        if layout.unit_attn_mask is not None:
+            unit_attn_out = self.attn.attend(
+                q[:, :, shared_end:],
+                k,
+                v,
+                attn_mask=layout.unit_attn_mask,
+            )
+            unit_attn_out *= layout.valid_unit_mask.unsqueeze(-1).to(dtype=unit_attn_out.dtype)
+            unit_tokens = unit_tokens + self.attn.project_attn_residual(unit_attn_out)
+
+        all_tokens = torch.cat([patch_tokens, scalar_tokens, global_tokens, unit_tokens], dim=1)
+        all_tokens = self.attn.apply_mlp_residual(all_tokens)
+        out_patches = all_tokens[:, :N].to(dtype=patches.dtype)
+        out_global_cls = all_tokens[:, N + 1:layout.unit_start].to(dtype=global_cls.dtype)
+        out_unit_cls = torch.zeros_like(unit_cls)
+        if layout.perm.numel() > 0:
+            out_unit_cls[layout.perm] = all_tokens[
+                layout.sorted_round_idx,
+                layout.unit_start + layout.local_pos,
+            ].to(dtype=unit_cls.dtype)
+        return out_patches, out_global_cls, out_unit_cls
+
+
+class CriticUnitCLSBuilder(nn.Module):
+    """Construct unit CLS tokens: content (actor latent) + position (sine embed)."""
+
+    def __init__(
+        self,
+        actor_latent_dim: int = ACTOR_LATENT_DIM,
+        context_dim: int = UNIT_CONTEXT_DIM,
+        out_dim: int = 48,
+        n_freqs: int = 16,
+    ):
+        super().__init__()
+        self.content_proj = nn.Sequential(
+            nn.Linear(actor_latent_dim, out_dim, bias=False),
+            RMSNorm(out_dim),
+            nn.SiLU(),
+        )
+        sine_dim = context_dim * n_freqs * 2
+        self.pos_proj = nn.Linear(sine_dim, out_dim, bias=False)
+        freq_bands = torch.arange(1, n_freqs + 1, dtype=torch.float32) * math.pi
+        self.register_buffer("freq_bands", freq_bands)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=0.02)
+
+    def forward(self, actor_latent: torch.Tensor, unit_context: torch.Tensor) -> torch.Tensor:
+        """actor_latent: (B, 64), unit_context: (B, 7) → (B, out_dim)."""
+        content = self.content_proj(actor_latent)
+        angles = unit_context.unsqueeze(-1) * self.freq_bands  # (B, 7, n_freqs)
+        sine_embed = torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(1)  # (B, 224)
+        position = self.pos_proj(sine_embed)
+        return content + position
+
+
+class CriticValueHead(nn.Module):
+    """Per-unit value prediction from CLS tokens + actor latent."""
+
+    def __init__(
+        self,
+        dim: int = 48,
+        actor_latent_dim: int = ACTOR_LATENT_DIM,
+        n_global_cls: int = 8,
+        n_buckets: int = NUM_BUCKETS,
+    ):
+        super().__init__()
+        self.cls_weights = nn.Parameter(torch.zeros(n_global_cls))
+        total_in = dim + dim + actor_latent_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(total_in, total_in, bias=False),
+            nn.SiLU(),
+            nn.Linear(total_in, total_in, bias=False),
+            RMSNorm(total_in),
+            nn.Linear(total_in, n_buckets),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        # Dreamer4's create_mlp leaves the value head MLP on nn.Linear defaults.
-        for layer in (self.unit_head[0], self.unit_head[3], self.unit_head[6]):
-            layer.reset_parameters()
+        nn.init.zeros_(self.mlp[-1].weight)
+
+    def forward(
+        self,
+        unit_cls: torch.Tensor,
+        global_cls: torch.Tensor,
+        unit_round_idx: torch.Tensor,
+        actor_latent: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns logits (B, n_buckets)."""
+        weights = F.softmax(self.cls_weights, dim=0)
+        pooled = (global_cls * weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (R, dim)
+        pooled_per_unit = pooled[unit_round_idx]  # (B, dim)
+        x = torch.cat([unit_cls, pooled_per_unit, actor_latent], dim=-1)
+        return self.mlp(x)
+
+
+class CentralizedCritic(nn.Module):
+    """Transformer-based centralized per-unit critic over full replay map state.
+
+    Architecture:
+      1. Per-tile MLP encodes 23-channel symbolic features → 12-dim embeddings.
+      2. 2×2 reshape packs tiles into patches (dim=48).
+      3. Alternating windowed SA (local, translation-equivariant) and global SA
+         (full map + special tokens) repeated 3 times.
+      4. Per-unit value from unit CLS tokens + global CLS pooling + actor latent.
+    """
+
+    _TILE_DIM = 12
+    _PATCH_DIM = 48  # 4 tiles × 12 dims
+    _N_HEADS = 4
+    _N_KV_HEADS = 2
+    _WINDOW_SIZE = 5
+    _MLP_RATIO = 4
+    _LAYER_SCALE_INIT = 1e-4
+    _N_GLOBAL_CLS = 8
+    _N_BLOCKS = 3
+
+    def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS):
+        super().__init__()
+        dim = self._PATCH_DIM
+
+        self.tile_embed = CriticTileEmbed(map_channels, self._TILE_DIM)
+
+        # 3 blocks, each with 2 windowed SA + 1 global SA
+        self.windowed_sa = nn.ModuleList([
+            CriticWindowedSA(dim, self._N_HEADS, self._N_KV_HEADS,
+                             self._WINDOW_SIZE, self._MLP_RATIO, self._LAYER_SCALE_INIT)
+            for _ in range(self._N_BLOCKS * 2)
+        ])
+        self.global_sa = nn.ModuleList([
+            CriticGlobalSA(dim, self._N_HEADS, self._N_KV_HEADS,
+                           self._N_GLOBAL_CLS, self._MLP_RATIO, self._LAYER_SCALE_INIT)
+            for _ in range(self._N_BLOCKS)
+        ])
+
+        # Scalar token projection
+        self.scalar_proj = nn.Sequential(
+            nn.Linear(GLOBAL_SCALAR_DIM, dim, bias=False),
+            RMSNorm(dim),
+            nn.SiLU(),
+        )
+        trunc_normal_(self.scalar_proj[0].weight, std=0.02)
+
+        # Learned global CLS tokens
+        self.global_cls = nn.Parameter(torch.zeros(self._N_GLOBAL_CLS, dim))
+        trunc_normal_(self.global_cls, std=0.02)
+
+        # Unit CLS builder and value head
+        self.unit_cls_builder = CriticUnitCLSBuilder(
+            ACTOR_LATENT_DIM, UNIT_CONTEXT_DIM, dim,
+        )
+        self.value_head = CriticValueHead(dim, ACTOR_LATENT_DIM, self._N_GLOBAL_CLS)
+
+        # GHL bin centers (uniform in symlog space).
+        bucket_centers = _make_bucket_centers()
+        self.register_buffer("bucket_centers", bucket_centers)
+
+    def _patchify(
+        self, tiles: torch.Tensor, valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, int, int]:
+        """Convert tile features to patch tokens via 2×2 reshape.
+
+        Args:
+            tiles: (R, tile_dim, H, W)
+            valid_mask: (R, 1, H, W)
+        Returns:
+            patches: (R, N_patches, patch_dim), pH, pW
+        """
+        R, D, H, W = tiles.shape
+        # Pad to even dimensions
+        pad_h = H % 2
+        pad_w = W % 2
+        if pad_h or pad_w:
+            tiles = F.pad(tiles, (0, pad_w, 0, pad_h))
+            valid_mask = F.pad(valid_mask, (0, pad_w, 0, pad_h))
+        Hp, Wp = H + pad_h, W + pad_w
+        pH, pW = Hp // 2, Wp // 2
+
+        # Zero out invalid tiles
+        tiles = tiles * valid_mask.to(tiles.dtype)
+
+        # Reshape 2×2 → patch: (R, D, Hp, Wp) → (R, pH, 2, pW, 2, D) → (R, pH*pW, 4*D)
+        tiles = tiles.permute(0, 2, 3, 1)  # (R, Hp, Wp, D)
+        patches = tiles.reshape(R, pH, 2, pW, 2, D).permute(0, 1, 3, 2, 4, 5)
+        patches = patches.reshape(R, pH * pW, 4 * D)  # (R, N, patch_dim)
+        return patches, pH, pW
 
     def encode_map(
         self,
         map_tensor: torch.Tensor,    # (R, C, H, W) — R unique rounds
         valid_mask: torch.Tensor,     # (R, 1, H, W)
-    ) -> torch.Tensor:
-        """Run CNN once per unique round and return spatial feature maps.
-
-        Forward runs in bf16 via autocast; backward accumulates fp32 grads.
-        valid_mask applied so padded area contributes no signal.
-        """
+    ) -> CriticMapState:
+        """Run tile embed + patchify + windowed SA layers. Returns cached state."""
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
-            feat = self.conv(map_tensor)
-        if feat.dtype != valid_mask.dtype:
-            valid_mask = valid_mask.to(feat.dtype)
-        return feat * valid_mask
+            tiles = self.tile_embed(map_tensor)  # (R, tile_dim, H, W)
+            patches, pH, pW = self._patchify(tiles, valid_mask)
+            for i in range(self._N_BLOCKS):
+                patches = self.windowed_sa[i * 2](patches, pH, pW)
+                patches = self.windowed_sa[i * 2 + 1](patches, pH, pW)
+
+        R = map_tensor.shape[0]
+        global_cls = self.global_cls.unsqueeze(0).expand(R, -1, -1)
+        return CriticMapState(patches=patches, pH=pH, pW=pW, global_cls=global_cls)
+
+    def _run_global_sa(
+        self,
+        state: CriticMapState,
+        round_scalars: torch.Tensor,
+        round_idx: torch.Tensor,
+        unit_xy: torch.Tensor,
+        unit_cls: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run global SA layers over cached patches + special tokens.
+
+        Returns:
+            (global_cls, unit_cls) after refinement through all global SA layers.
+        """
+        R = state.patches.shape[0]
+
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
+            patches = state.patches
+            token_dtype = patches.dtype
+            scalar_tok = self.scalar_proj(round_scalars).unsqueeze(1).to(dtype=token_dtype)
+            global_cls = state.global_cls.to(dtype=token_dtype)
+            unit_cls = unit_cls.to(dtype=token_dtype)
+
+            # Remap round_idx to local 0..R-1
+            ri = round_idx.long()
+            layout = self.global_sa[0].prepare_layout(
+                patches.shape[1], state.pH, state.pW,
+                unit_cls, unit_xy.long(), ri, R,
+            )
+            for layer in self.global_sa:
+                patches, global_cls, unit_cls = layer(
+                    patches,
+                    global_cls,
+                    scalar_tok,
+                    unit_cls,
+                    layout,
+                )
+
+        return global_cls, unit_cls
 
     def unit_values(
         self,
-        feat: torch.Tensor,          # (R, conv_dim, H', W') — cached from encode_map
+        feat: CriticMapState,
         round_scalars: torch.Tensor,  # (R, GLOBAL_SCALAR_DIM)
-        round_idx: torch.Tensor,      # (B,) — maps each unit-step to its round index
-        unit_xy: torch.Tensor,        # (B, 2) — x, y positions in ORIGINAL map coords
+        round_idx: torch.Tensor,      # (B,)
+        unit_xy: torch.Tensor,        # (B, 2)
         unit_context: torch.Tensor,   # (B, UNIT_CONTEXT_DIM)
-        actor_latent: torch.Tensor,   # (B, ACTOR_LATENT_DIM) — detached rollout latent
+        actor_latent: torch.Tensor,   # (B, ACTOR_LATENT_DIM)
     ) -> torch.Tensor:
-        """Compute per-unit marginal values by indexing cached feature maps.
-
-        Returns:
-            v_unit: (B,) — per-unit marginal value
-        """
-        fH, fW = feat.shape[2], feat.shape[3]
-        if unit_xy.dtype == torch.long:
-            ux = unit_xy[:, 0]
-            uy = unit_xy[:, 1]
-        else:
-            ux = unit_xy[:, 0].round().to(torch.long)
-            uy = unit_xy[:, 1].round().to(torch.long)
-        if round_idx.dtype == torch.long:
-            ri = round_idx
-        else:
-            ri = round_idx.to(torch.long)
-        ux = ux.clamp(0, fW - 1)
-        uy = uy.clamp(0, fH - 1)
-
-        # Index into cached feature maps: (B, conv_dim)
-        # feat may be bf16 from conv stack; cast to fp32 for the value MLP
-        unit_tile_feat = feat[ri, :, uy, ux].float()
-        unit_round_scalars = round_scalars[ri]
-
-        # Per-unit categorical value prediction over symexp-spaced bins.
-        unit_in = torch.cat(
-            [unit_tile_feat, unit_round_scalars, unit_context, actor_latent],
-            dim=-1,
-        )
-        logits = self.unit_head(unit_in)  # (B, NUM_BUCKETS)
-        return decode_value(logits, self.bucket_centers)  # (B,)
+        """Compute per-unit marginal values. Returns (B,)."""
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
+            unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float())
+            global_cls, unit_cls = self._run_global_sa(
+                feat, round_scalars, round_idx, unit_xy, unit_cls,
+            )
+        logits = self.value_head(unit_cls.float(), global_cls.float(),
+                                 round_idx.long(), actor_latent.float())
+        return decode_value(logits, self.bucket_centers)
 
     def unit_value_logits(
         self,
-        feat: torch.Tensor,
+        feat: CriticMapState,
         round_scalars: torch.Tensor,
         round_idx: torch.Tensor,
         unit_xy: torch.Tensor,
         unit_context: torch.Tensor,
         actor_latent: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Like unit_values but also returns raw logits for training loss.
-
-        Returns:
-            (decoded_values (B,), logits (B, NUM_BUCKETS))
-        """
-        fH, fW = feat.shape[2], feat.shape[3]
-        if unit_xy.dtype == torch.long:
-            ux = unit_xy[:, 0]
-            uy = unit_xy[:, 1]
-        else:
-            ux = unit_xy[:, 0].round().to(torch.long)
-            uy = unit_xy[:, 1].round().to(torch.long)
-        if round_idx.dtype == torch.long:
-            ri = round_idx
-        else:
-            ri = round_idx.to(torch.long)
-        ux = ux.clamp(0, fW - 1)
-        uy = uy.clamp(0, fH - 1)
-
-        unit_tile_feat = feat[ri, :, uy, ux].float()
-        unit_round_scalars = round_scalars[ri]
-
-        unit_in = torch.cat(
-            [unit_tile_feat, unit_round_scalars, unit_context, actor_latent],
-            dim=-1,
-        )
-        logits = self.unit_head(unit_in)  # (B, NUM_BUCKETS)
-        values = decode_value(logits, self.bucket_centers)  # (B,)
+        """Like unit_values but also returns raw logits for training loss."""
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
+            unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float())
+            global_cls, unit_cls = self._run_global_sa(
+                feat, round_scalars, round_idx, unit_xy, unit_cls,
+            )
+        logits = self.value_head(unit_cls.float(), global_cls.float(),
+                                 round_idx.long(), actor_latent.float())
+        values = decode_value(logits, self.bucket_centers)
         return values, logits
 
     def forward(
         self,
-        map_tensor: torch.Tensor,    # (B, C, H, W)
-        valid_mask: torch.Tensor,     # (B, 1, H, W)
-        round_scalars: torch.Tensor,  # (B, GLOBAL_SCALAR_DIM)
-        unit_xy: torch.Tensor,        # (B, 2) — x, y positions (long)
-        unit_context: torch.Tensor,   # (B, UNIT_CONTEXT_DIM)
-        actor_latent: torch.Tensor,   # (B, ACTOR_LATENT_DIM)
+        map_tensor: torch.Tensor,
+        valid_mask: torch.Tensor,
+        round_scalars: torch.Tensor,
+        unit_xy: torch.Tensor,
+        unit_context: torch.Tensor,
+        actor_latent: torch.Tensor,
     ) -> torch.Tensor:
         """Full forward pass (non-cached path). Returns per-unit value."""
         feat = self.encode_map(map_tensor, valid_mask)
@@ -790,30 +1386,24 @@ class CriticPpoLossStep(nn.Module):
         unit_context: torch.Tensor,
         actor_latent: torch.Tensor,
         returns: torch.Tensor,
-        old_values: torch.Tensor,
-        clip_mask: torch.Tensor,
-        value_clip: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feat = self.critic.encode_map(states, masks)
         values, logits = self.critic.unit_value_logits(
             feat, scalars, round_idx, unit_xy, unit_context, actor_latent,
         )
         return_target = value_target_probs(returns, self.critic.bucket_centers).detach()
-        value_loss_1 = soft_cross_entropy_from_logits(logits, return_target)
-        clipped_values = old_values + (values - old_values).clamp(-value_clip, value_clip)
-        clipped_value_bins = value_target_probs(clipped_values, self.critic.bucket_centers)
-        value_loss_2 = soft_cross_entropy_from_logits(clipped_value_bins, return_target)
-        v_loss_elems = torch.where(clip_mask, torch.maximum(value_loss_1, value_loss_2), value_loss_1)
+        v_loss_elems = soft_cross_entropy_from_logits(logits, return_target)
         loss_sum = v_loss_elems.sum()
         return loss_sum, loss_sum.detach(), values.detach()
 
 
 def _materialize_critic_inputs(centralized_data: dict) -> None:
-    """Pre-materialize all round tensors on GPU as bf16.
+    """Materialize critic inputs into canonical CPU slabs for batched staging.
 
-    Replaces the per-chunk CPU→GPU copy in _load_critic_round_batch with a
-    single bulk transfer. Stores results in centralized_data so subsequent
-    calls just index into the pre-built tensors.
+    Round tensors are packed once into contiguous CPU buffers. GPU copies happen
+    lazily per round batch in ``_load_critic_round_batch`` using reusable
+    staging buffers, so end-to-end VRAM scales with the current critic batch
+    instead of all deduped rounds in the episode.
     """
     global_states = centralized_data["global_states"]
     sizes = centralized_data["global_sizes"]
@@ -823,13 +1413,12 @@ def _materialize_critic_inputs(centralized_data: dict) -> None:
 
     max_w = int(sizes[:, 0].max().item())
     max_h = int(sizes[:, 1].max().item())
-    gpu_dtype = torch.bfloat16 if _USE_BF16 else torch.float32
 
     cuda_cfg = _get_critic_cuda_config()
     use_pinned = DEVICE.type == "cuda"
     memory_format = torch.channels_last if cuda_cfg.channels_last else torch.contiguous_format
 
-    # Stage on pinned CPU memory, then copy directly into final-layout device buffers.
+    # Pack once into final-layout CPU slabs so per-batch staging is just slicing.
     obs_cpu = torch.empty(
         (R, GLOBAL_MAP_CHANNELS, max_h, max_w),
         dtype=torch.float32,
@@ -838,7 +1427,7 @@ def _materialize_critic_inputs(centralized_data: dict) -> None:
     )
     mask_cpu = torch.empty(
         (R, 1, max_h, max_w),
-        dtype=torch.float32,
+        dtype=torch.bool,
         pin_memory=use_pinned,
         memory_format=memory_format,
     )
@@ -857,42 +1446,29 @@ def _materialize_critic_inputs(centralized_data: dict) -> None:
                     buf, dtype=torch.float32,
                 ).reshape(GLOBAL_MAP_CHANNELS, mh, mw)
                 obs_cpu[i, :, :mh, :mw].copy_(state_view)
-            mask_cpu[i, 0, :mh, :mw] = 1.0
-
-    gpu_obs = torch.empty(
-        (R, GLOBAL_MAP_CHANNELS, max_h, max_w),
-        dtype=gpu_dtype,
-        device=DEVICE,
-        memory_format=memory_format,
-    )
-    gpu_mask = torch.empty(
-        (R, 1, max_h, max_w),
-        dtype=gpu_dtype,
-        device=DEVICE,
-        memory_format=memory_format,
-    )
-    gpu_obs.copy_(obs_cpu, non_blocking=use_pinned)
-    gpu_mask.copy_(mask_cpu, non_blocking=use_pinned)
+            mask_cpu[i, 0, :mh, :mw] = True
 
     global_scalars = centralized_data["global_scalars"]
     if use_pinned and not global_scalars.is_pinned():
         global_scalars = global_scalars.pin_memory()
         centralized_data["global_scalars"] = global_scalars
-    gpu_scalars = torch.empty_like(global_scalars, device=DEVICE)
-    gpu_scalars.copy_(global_scalars, non_blocking=use_pinned)
 
-    centralized_data["gpu_obs"] = gpu_obs
-    centralized_data["gpu_mask"] = gpu_mask
-    centralized_data["gpu_scalars"] = gpu_scalars
+    centralized_data["critic_obs_cpu"] = obs_cpu
+    centralized_data["critic_mask_cpu"] = mask_cpu
+    centralized_data["critic_input_staging"] = None
 
     # Free CPU-side bytearrays — no longer needed
     centralized_data["global_states"] = None
 
-    vram_mb = (centralized_data["gpu_obs"].nbytes
-               + centralized_data["gpu_mask"].nbytes
-               + centralized_data["gpu_scalars"].nbytes) / (1024 * 1024)
-    print(f"  Critic inputs materialized on GPU: {R} rounds, "
-          f"{max_h}x{max_w} maps, {gpu_dtype}, {vram_mb:.0f} MB")
+    cpu_mb = (
+        obs_cpu.nbytes
+        + mask_cpu.nbytes
+        + global_scalars.nbytes
+    ) / (1024 * 1024)
+    print(
+        f"  Critic inputs staged on CPU: {R} rounds, "
+        f"{max_h}x{max_w} maps, {cpu_mb:.0f} MB"
+    )
 
 
 def _coerce_replay_buffer(buf):
@@ -904,12 +1480,99 @@ def _load_critic_round_batch(
     centralized_data: dict,
     round_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fetch a round batch from pre-materialized GPU tensors."""
+    """Fetch one round batch, staging from CPU to GPU only as needed."""
     ids = round_ids.long()
+    if "gpu_obs" in centralized_data:
+        return (
+            centralized_data["gpu_obs"][ids],
+            centralized_data["gpu_mask"][ids],
+            centralized_data["gpu_scalars"][ids],
+        )
+
+    obs_cpu = centralized_data["critic_obs_cpu"]
+    mask_cpu = centralized_data["critic_mask_cpu"]
+    scalars_cpu = centralized_data["global_scalars"]
+
+    if DEVICE.type != "cuda":
+        ids_cpu = ids.cpu()
+        return (
+            obs_cpu.index_select(0, ids_cpu),
+            mask_cpu.index_select(0, ids_cpu),
+            scalars_cpu.index_select(0, ids_cpu),
+        )
+
+    ids_cpu = ids.cpu()
+    sizes = centralized_data["global_sizes"].index_select(0, ids_cpu)
+    batch_w = int(sizes[:, 0].max().item())
+    batch_h = int(sizes[:, 1].max().item())
+    n_rounds = int(ids_cpu.numel())
+
+    def _contiguous_range(sel: torch.Tensor) -> tuple[int, int] | None:
+        if sel.numel() == 0:
+            return 0, 0
+        start = int(sel[0].item())
+        end = start + sel.numel()
+        if int(sel[-1].item()) == end - 1 and torch.equal(
+            sel, torch.arange(start, end, dtype=sel.dtype),
+        ):
+            return start, end
+        return None
+
+    contiguous = _contiguous_range(ids_cpu)
+    if contiguous is not None:
+        start, end = contiguous
+        obs_src = obs_cpu[start:end, :, :batch_h, :batch_w]
+        mask_src = mask_cpu[start:end, :, :batch_h, :batch_w]
+        scalars_src = scalars_cpu[start:end]
+    else:
+        obs_src = obs_cpu[:, :, :batch_h, :batch_w].index_select(0, ids_cpu)
+        mask_src = mask_cpu[:, :, :batch_h, :batch_w].index_select(0, ids_cpu)
+        scalars_src = scalars_cpu.index_select(0, ids_cpu)
+
+    gpu_dtype = torch.bfloat16 if _USE_BF16 else torch.float32
+    staging = centralized_data.get("critic_input_staging")
+    if (
+        staging is None
+        or staging.capacity_rounds < n_rounds
+        or staging.capacity_h < batch_h
+        or staging.capacity_w < batch_w
+    ):
+        cuda_cfg = _get_critic_cuda_config()
+        memory_format = torch.channels_last if cuda_cfg.channels_last else torch.contiguous_format
+        staging = CriticInputStaging(
+            obs=torch.empty(
+                (n_rounds, GLOBAL_MAP_CHANNELS, batch_h, batch_w),
+                dtype=gpu_dtype,
+                device=DEVICE,
+                memory_format=memory_format,
+            ),
+            mask=torch.empty(
+                (n_rounds, 1, batch_h, batch_w),
+                dtype=torch.bool,
+                device=DEVICE,
+                memory_format=memory_format,
+            ),
+            scalars=torch.empty(
+                (n_rounds, scalars_cpu.shape[1]),
+                dtype=scalars_cpu.dtype,
+                device=DEVICE,
+            ),
+            capacity_rounds=n_rounds,
+            capacity_h=batch_h,
+            capacity_w=batch_w,
+        )
+        centralized_data["critic_input_staging"] = staging
+
+    obs_dst = staging.obs[:n_rounds, :, :batch_h, :batch_w]
+    mask_dst = staging.mask[:n_rounds, :, :batch_h, :batch_w]
+    scalars_dst = staging.scalars[:n_rounds]
+    obs_dst.copy_(obs_src, non_blocking=True)
+    mask_dst.copy_(mask_src, non_blocking=True)
+    scalars_dst.copy_(scalars_src, non_blocking=True)
     return (
-        centralized_data["gpu_obs"][ids],
-        centralized_data["gpu_mask"][ids],
-        centralized_data["gpu_scalars"][ids],
+        obs_dst,
+        mask_dst,
+        scalars_dst,
     )
 
 
@@ -989,6 +1652,16 @@ class CriticEpochPlan:
     packed_returns_values: torch.Tensor
 
 
+@dataclass(slots=True)
+class CriticInputStaging:
+    obs: torch.Tensor
+    mask: torch.Tensor
+    scalars: torch.Tensor
+    capacity_rounds: int
+    capacity_h: int
+    capacity_w: int
+
+
 def _pack_round_major_tensors(
     step_round_idx: torch.Tensor,
     *tensors: torch.Tensor,
@@ -1062,7 +1735,7 @@ def _resolve_critic_minibatch_size(
     if critic_minibatch_size is not None and critic_minibatch_size > 0:
         return critic_minibatch_size
     target_batches = max(1, int(critic_batches_per_epoch))
-    return max((n_steps + target_batches - 1) // target_batches, DEFAULT_CRITIC_MINIBATCH_SIZE)
+    return (n_steps + target_batches - 1) // target_batches
 
 
 def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
@@ -1572,6 +2245,9 @@ class BuilderMLP(nn.Module):
             prev = h
         self.actor_trunk = nn.Sequential(*actor_layers)
 
+        # RMSNorm before all policy heads (Dreamer-style pre-head norm)
+        self.head_norm = RMSNorm(head_dim)
+
         # Policy heads: small std for near-uniform initial policy
         self.head_build_type = _ortho_init(nn.Linear(head_dim, N_BUILD), std=0.01)
         self.head_build_dir = _ortho_init(nn.Linear(head_dim, N_DIR), std=0.01)
@@ -1657,6 +2333,7 @@ class BuilderMLP(nn.Module):
         h: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project latent to policy heads and per-head learned eps."""
+        h = self.head_norm(h)
         # Fuse head matmuls into one kernel launch
         # Cache fused weights in eval mode (inference hot path)
         if self.training:
@@ -1753,7 +2430,7 @@ class BuilderMLP(nn.Module):
         compress_modules = [m for m in self.tile_compress if isinstance(m, (nn.Linear, RMSNorm))]
         enc_modules = [m for m in self.encoder if isinstance(m, (nn.Linear, RMSNorm))]
         actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
-        return tile_modules + compress_modules + enc_modules + actor_modules + [
+        return tile_modules + compress_modules + enc_modules + actor_modules + [self.head_norm] + [
             self.head_build_type, self.head_build_dir, self.head_conv_dir,
             self.head_bridge_target, self.head_move_dir,
             self.head_logit_scale,
@@ -2296,8 +2973,6 @@ def ppo_update(
     entropy_coeff: float = 0.001,
     max_grad_norm: float = 0.5,
     target_kl: float | None = None,
-    clip_vloss: bool = False,
-    value_clip: float = 0.4,
     profile: dict[str, float] | None = None,
     trace=None,
     bptt_chunks: list[tuple[int, int]] | None = None,
@@ -2494,8 +3169,6 @@ def ppo_update(
             critic_minibatch_size,
             critic_batches_per_epoch,
         )
-        clip_mask = torch.tensor(bool(clip_vloss and old_values is not None), device=obs.device, dtype=torch.bool)
-        value_clip_t = torch.tensor(float(value_clip), device=obs.device, dtype=returns.dtype)
 
         step_round_idx = centralized_data["step_round_idx"]
 
@@ -2545,7 +3218,6 @@ def ppo_update(
                     u_ctx = mb_uf[:, :_ctx_dim]
                     u_latent = mb_uf[:, _ctx_dim:]
                     mb_returns = mb_rv[:, 0]
-                    mb_old_values = mb_rv[:, 1]
                     with autocast_context(critic_cuda_cfg):
                         loss_sum, vf_loss_sum, new_values = critic_loss_step(
                             g_obs,
@@ -2556,9 +3228,6 @@ def ppo_update(
                             u_ctx,
                             u_latent,
                             mb_returns,
-                            mb_old_values,
-                            clip_mask,
-                            value_clip_t,
                         )
                     (vf_coeff * loss_sum / vf_denom).backward()
 
@@ -2571,7 +3240,7 @@ def ppo_update(
                     with torch.no_grad():
                         _critic_acc[0] += vf_loss_sum / vf_denom
                         _critic_acc[1] += critic_gn
-                        _critic_acc[2] += (new_values - mb_old_values).abs().mean()
+                        _critic_acc[2] += new_values.abs().mean()
                     n_critic_updates += 1
 
                     if profile is not None:
@@ -2586,12 +3255,13 @@ def ppo_update(
 
     # Single GPU→CPU sync for all accumulated scalars
     with torch.no_grad():
-        bucket_lo = bucket_centers[0]
-        bucket_hi = bucket_centers[-1]
+        # bucket_centers are in symlog space; map to original value space for diagnostics
+        bucket_lo_orig = symexp(bucket_centers[0:1])[0]
+        bucket_hi_orig = symexp(bucket_centers[-1:])[-1]
         _diag = torch.stack([
             returns.min(), returns.max(), returns.mean(),
-            ((returns <= bucket_lo) | (returns >= bucket_hi)).float().mean(),
-            bucket_lo.float(), bucket_hi.float(),
+            ((returns <= bucket_lo_orig) | (returns >= bucket_hi_orig)).float().mean(),
+            bucket_lo_orig.float(), bucket_hi_orig.float(),
         ])
         # Batch all .item() calls into one contiguous CPU transfer
         _all_scalars = torch.cat([_actor_acc, _critic_acc, _diag, mean_eps, std_eps]).cpu()
@@ -3092,16 +3762,13 @@ def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.o
     cuda_cfg = _ensure_critic_cuda_runtime()
     if _centralized_critic is None:
         _centralized_critic = CentralizedCritic().to(DEVICE)
-        if cuda_cfg.channels_last:
-            _centralized_critic = _centralized_critic.to(memory_format=torch.channels_last)
         _centralized_optimizer = torch.optim.Adam(
             _centralized_critic.parameters(), lr=lr,
         )
         n_params = sum(p.numel() for p in _centralized_critic.parameters())
         print(
             f"  CentralizedCritic: {n_params:,} params on {DEVICE} "
-            f"(compile={'on' if cuda_cfg.compile_model else 'off'}, "
-            f"channels_last={'on' if cuda_cfg.channels_last else 'off'})"
+            f"(compile={'on' if cuda_cfg.compile_model else 'off'})"
         )
     return _centralized_critic, _centralized_optimizer
 
@@ -3111,12 +3778,8 @@ def get_centralized_critic_step() -> nn.Module:
     global _centralized_critic_step
     critic, _ = get_centralized_critic()
     if _centralized_critic_step is None:
-        step = CriticPpoStep(critic)
-        _centralized_critic_step = maybe_compile(
-            step,
-            _get_critic_cuda_config(),
-            label="critic PPO",
-        )
+        # Transformer critic has dynamic per-round loops; skip torch.compile.
+        _centralized_critic_step = CriticPpoStep(critic)
     _centralized_critic_step.train()
     return _centralized_critic_step
 
@@ -3126,12 +3789,8 @@ def get_centralized_critic_loss_step() -> nn.Module:
     global _centralized_critic_loss_step
     critic, _ = get_centralized_critic()
     if _centralized_critic_loss_step is None:
-        step = CriticPpoLossStep(critic)
-        _centralized_critic_loss_step = maybe_compile(
-            step,
-            _get_critic_cuda_config(),
-            label="critic PPO loss",
-        )
+        # Transformer critic has dynamic per-round loops; skip torch.compile.
+        _centralized_critic_loss_step = CriticPpoLossStep(critic)
     _centralized_critic_loss_step.train()
     return _centralized_critic_loss_step
 
@@ -3192,7 +3851,6 @@ def _compute_all_values(
     unit_xy = data["step_unit_xy"]        # (N, 2) long
     unit_ctx = data["step_unit_ctx"]      # (N, UNIT_CONTEXT_DIM)
     actor_latent = data["step_actor_latent"]  # (N, ACTOR_LATENT_DIM)
-    R = data["gpu_obs"].shape[0] if "gpu_obs" in data else len(data["global_states"])
     N = data["n_steps"]
 
     values = torch.zeros(N, device=DEVICE)
@@ -3212,9 +3870,7 @@ def _compute_all_values(
         if step_lo == step_hi:
             continue
         c_rounds = packed.round_ids[round_start:round_end]
-        g_obs = data["gpu_obs"][c_rounds]
-        g_mask = data["gpu_mask"][c_rounds]
-        g_scalars = data["gpu_scalars"][c_rounds]
+        g_obs, g_mask, g_scalars = _load_critic_round_batch(data, c_rounds)
         feat = critic.encode_map(g_obs, g_mask)
 
         # Compute per-unit values for these steps (all at once — unit_head is small)
@@ -3227,7 +3883,7 @@ def _compute_all_values(
             torch.arange(round_end - round_start, device=step_indices.device),
             chunk_round_counts,
         )
-        values[step_indices] = critic.unit_values(
+        batch_values = critic.unit_values(
             feat,
             g_scalars,
             local_ri,
@@ -3235,6 +3891,25 @@ def _compute_all_values(
             packed_ctx[step_lo:step_hi],
             packed_latent[step_lo:step_hi],
         )
+        if not torch.isfinite(batch_values).all():
+            bad = (~torch.isfinite(batch_values)).nonzero(as_tuple=False)
+            b = int(bad[0, 0].item())
+            local_round = int(local_ri[b].item())
+            round_id = int(c_rounds[local_round].item())
+            step_index = int(step_indices[b].item())
+            raise RuntimeError(
+                "non-finite critic batch value: "
+                f"step_index={step_index} "
+                f"round_id={round_id} "
+                f"local_round={local_round} "
+                f"unit_xy={packed_xy[step_lo + b].detach().cpu().tolist()} "
+                f"unit_ctx_finite={bool(torch.isfinite(packed_ctx[step_lo:step_hi]).all().item())} "
+                f"actor_latent_finite={bool(torch.isfinite(packed_latent[step_lo:step_hi]).all().item())} "
+                f"round_scalars_finite={bool(torch.isfinite(g_scalars).all().item())} "
+                f"patches_finite={bool(torch.isfinite(feat.patches).all().item())} "
+                f"global_template_finite={bool(torch.isfinite(feat.global_cls).all().item())}"
+            )
+        values[step_indices] = batch_values
 
     return values
 
@@ -3300,6 +3975,7 @@ def train_on_trajectories(
     critic.eval()
     with trace_scope(trace, "train.compute_values"), torch.no_grad():
         values = _compute_all_values(critic, data)
+    _require_finite("critic values", values)
     if profile is not None:
         profile["value_forward_s"] = time.perf_counter() - t_phase
 
@@ -3308,6 +3984,8 @@ def train_on_trajectories(
         advantages, returns = _compute_gae(
             data["rewards"], values, data["ep_boundaries"], gamma, gae_lambda,
         )
+    _require_finite("advantages", advantages)
+    _require_finite("returns", returns)
     if profile is not None:
         profile["gae_s"] = time.perf_counter() - t_phase
 

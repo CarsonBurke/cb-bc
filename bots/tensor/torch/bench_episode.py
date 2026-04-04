@@ -109,7 +109,7 @@ def _benchmark_batched(args) -> dict:
 
     # --- Collection (identical call to train_batched) ---
     collection_profile: dict[str, float] = {}
-    all_trajs, all_winners, per_opp_winners, all_global_states, traj_game_map, _game_origin, _game_delivery_totals = collect_games_batched(
+    all_trajs, all_winners, per_opp_winners, all_global_states, traj_game_map, _game_origin, _game_delivery_totals, _game_specs = collect_games_batched(
         model, all_opp_paths, all_opp_ids, maps,
         1, replay_dir,
         opp_hidden=hidden,

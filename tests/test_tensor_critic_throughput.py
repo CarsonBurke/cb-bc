@@ -7,6 +7,7 @@ import struct
 import sys
 import warnings
 
+import pytest
 import torch
 
 
@@ -90,6 +91,124 @@ def test_compute_all_values_batches_only_sparse_unique_rounds():
     assert fake_critic.map_batch_sizes == [2]
     assert len(fake_critic.round_idx_calls) == 1
     assert fake_critic.round_idx_calls[0].tolist() == [0, 1]
+
+
+def test_compute_all_values_reports_nonfinite_batch_value_context(monkeypatch):
+    device = model_mod.DEVICE
+
+    class FakeFeat:
+        def __init__(self, device: torch.device):
+            self.patches = torch.zeros(1, 1, 1, 1, device=device)
+            self.global_cls = torch.zeros(1, 1, device=device)
+
+    class FakeCritic:
+        def encode_map(self, map_tensor: torch.Tensor, valid_mask: torch.Tensor) -> FakeFeat:
+            del map_tensor, valid_mask
+            return FakeFeat(device)
+
+        def unit_values(
+            self,
+            feat: FakeFeat,
+            round_scalars: torch.Tensor,
+            round_idx: torch.Tensor,
+            unit_xy: torch.Tensor,
+            unit_ctx: torch.Tensor,
+            actor_latent: torch.Tensor,
+        ) -> torch.Tensor:
+            del feat, round_scalars, round_idx, unit_xy, unit_ctx, actor_latent
+            return torch.tensor([float("nan")], device=device)
+
+    monkeypatch.setattr(
+        model_mod,
+        "_load_critic_round_batch",
+        lambda data, c_rounds: (
+            torch.zeros(c_rounds.shape[0], model_mod.GLOBAL_MAP_CHANNELS, 1, 1, device=device),
+            torch.ones(c_rounds.shape[0], 1, 1, 1, device=device),
+            torch.zeros(c_rounds.shape[0], model_mod.GLOBAL_SCALAR_DIM, device=device),
+        ),
+    )
+
+    data = {
+        "step_round_idx": torch.tensor([1], dtype=torch.long, device=device),
+        "step_unit_xy": torch.tensor([[3, 4]], dtype=torch.long, device=device),
+        "step_unit_ctx": torch.zeros(1, model_mod.UNIT_CONTEXT_DIM, device=device),
+        "step_actor_latent": torch.zeros(1, model_mod.ACTOR_LATENT_DIM, device=device),
+        "n_steps": 1,
+    }
+
+    with pytest.raises(RuntimeError, match=r"step_index=0 .*round_id=1 .*local_round=0 .*unit_xy=\[3, 4\]"):
+        model_mod._compute_all_values(FakeCritic(), data, cnn_chunk_size=4096)
+
+
+def test_critic_global_layout_keeps_padded_unit_queries_nonempty():
+    device = torch.device("cpu")
+    layer = model_mod.CriticGlobalSA().to(device)
+    unit_cls = torch.zeros(3, layer.dim, device=device)
+    unit_xy = torch.tensor([[0, 0], [1, 1], [2, 2]], dtype=torch.long, device=device)
+    unit_round_idx = torch.tensor([0, 0, 1], dtype=torch.long, device=device)
+
+    layout = layer.prepare_layout(
+        n_patches=4,
+        pH=2,
+        pW=2,
+        unit_cls=unit_cls,
+        unit_xy=unit_xy,
+        unit_round_idx=unit_round_idx,
+        n_rounds=2,
+    )
+
+    assert layout.unit_attn_mask is not None
+    invalid_queries = ~layout.valid_unit_mask
+    assert invalid_queries.any()
+    invalid_query_rows = layout.unit_attn_mask.squeeze(1)[invalid_queries]
+    assert invalid_query_rows.any(dim=-1).all()
+
+
+def test_critic_global_layout_initializes_padded_unit_rope_to_identity():
+    device = torch.device("cpu")
+    layer = model_mod.CriticGlobalSA().to(device)
+    unit_cls = torch.zeros(3, layer.dim, device=device)
+    unit_xy = torch.tensor([[0, 0], [1, 1], [2, 2]], dtype=torch.long, device=device)
+    unit_round_idx = torch.tensor([0, 0, 1], dtype=torch.long, device=device)
+
+    layout = layer.prepare_layout(
+        n_patches=4,
+        pH=2,
+        pW=2,
+        unit_cls=unit_cls,
+        unit_xy=unit_xy,
+        unit_round_idx=unit_round_idx,
+        n_rounds=2,
+    )
+
+    invalid_queries = ~layout.valid_unit_mask
+    assert layout.unit_rope_cos is not None
+    assert layout.unit_rope_sin is not None
+    unit_rope_cos = layout.unit_rope_cos
+    unit_rope_sin = layout.unit_rope_sin
+    assert torch.equal(unit_rope_cos[invalid_queries], torch.ones_like(unit_rope_cos[invalid_queries]))
+    assert torch.equal(unit_rope_sin[invalid_queries], torch.zeros_like(unit_rope_sin[invalid_queries]))
+
+
+def test_critic_global_layout_keeps_shared_rope_prefix_round_independent():
+    device = torch.device("cpu")
+    layer = model_mod.CriticGlobalSA().to(device)
+    unit_cls = torch.zeros(3, layer.dim, device=device)
+    unit_xy = torch.tensor([[0, 0], [1, 1], [2, 2]], dtype=torch.long, device=device)
+    unit_round_idx = torch.tensor([0, 0, 1], dtype=torch.long, device=device)
+
+    layout = layer.prepare_layout(
+        n_patches=4,
+        pH=2,
+        pW=2,
+        unit_cls=unit_cls,
+        unit_xy=unit_xy,
+        unit_round_idx=unit_round_idx,
+        n_rounds=2,
+    )
+
+    assert layout.shared_rope_cos.shape[0] == layout.unit_start
+    assert layout.shared_rope_sin.shape == layout.shared_rope_cos.shape
 
 
 def test_critic_round_batch_plan_respects_step_target_and_round_cap(monkeypatch):
@@ -265,7 +384,7 @@ def test_sample_actions_from_policy_heads_returns_finite_behavior_log_prob():
     assert out_h.shape == h_next.shape
 
 
-def test_materialize_critic_inputs_uses_final_layout_device_buffers(monkeypatch):
+def test_materialize_critic_inputs_packs_cpu_slabs_for_staged_round_loading(monkeypatch):
     monkeypatch.setattr(model_mod, "DEVICE", torch.device("cpu"))
     monkeypatch.setattr(
         model_mod,
@@ -289,25 +408,29 @@ def test_materialize_critic_inputs_uses_final_layout_device_buffers(monkeypatch)
     }
 
     model_mod._materialize_critic_inputs(data)
+    g_obs, g_mask, g_scalars = model_mod._load_critic_round_batch(
+        data, torch.tensor([0, 1], dtype=torch.long),
+    )
 
     assert data["global_states"] is None
-    assert data["gpu_obs"].shape == (2, model_mod.GLOBAL_MAP_CHANNELS, 2, 3)
-    assert data["gpu_mask"].shape == (2, 1, 2, 3)
-    assert data["gpu_obs"].is_contiguous(memory_format=torch.channels_last)
-    assert data["gpu_mask"].is_contiguous(memory_format=torch.channels_last)
-    assert torch.allclose(data["gpu_obs"][0], round0.to(dtype=data["gpu_obs"].dtype))
+    assert data["critic_input_staging"] is None
+    assert data["critic_obs_cpu"].shape == (2, model_mod.GLOBAL_MAP_CHANNELS, 2, 3)
+    assert data["critic_mask_cpu"].shape == (2, 1, 2, 3)
+    assert data["critic_obs_cpu"].is_contiguous(memory_format=torch.channels_last)
+    assert data["critic_mask_cpu"].is_contiguous(memory_format=torch.channels_last)
+    assert torch.allclose(g_obs[0], round0.to(dtype=g_obs.dtype))
     assert torch.allclose(
-        data["gpu_obs"][1, :, 0, 0],
-        torch.full((model_mod.GLOBAL_MAP_CHANNELS,), 7.0, dtype=data["gpu_obs"].dtype),
+        g_obs[1, :, 0, 0],
+        torch.full((model_mod.GLOBAL_MAP_CHANNELS,), 7.0, dtype=g_obs.dtype),
     )
-    assert torch.count_nonzero(data["gpu_obs"][1, :, 0, 1:]) == 0
-    assert torch.count_nonzero(data["gpu_obs"][1, :, 1:, :]) == 0
-    assert torch.equal(data["gpu_mask"][0, 0], torch.ones(2, 3, dtype=data["gpu_mask"].dtype))
+    assert torch.count_nonzero(g_obs[1, :, 0, 1:]) == 0
+    assert torch.count_nonzero(g_obs[1, :, 1:, :]) == 0
+    assert torch.equal(g_mask[0, 0], torch.ones(2, 3, dtype=g_mask.dtype))
     assert torch.equal(
-        data["gpu_mask"][1, 0],
-        torch.tensor([[1, 0, 0], [0, 0, 0]], dtype=data["gpu_mask"].dtype),
+        g_mask[1, 0],
+        torch.tensor([[1, 0, 0], [0, 0, 0]], dtype=g_mask.dtype),
     )
-    assert torch.allclose(data["gpu_scalars"], global_scalars)
+    assert torch.allclose(g_scalars, global_scalars)
 
 
 def test_resolve_critic_minibatch_size_uses_configured_epoch_batch_target():

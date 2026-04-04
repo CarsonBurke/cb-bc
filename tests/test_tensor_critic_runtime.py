@@ -15,27 +15,30 @@ if str(TORCH_DIR) not in sys.path:
 import model as model_mod
 
 
-def test_resolve_critic_minibatch_size_prefers_gpu_sized_auto_batch():
-    auto_cuda = model_mod._resolve_critic_minibatch_size(
-        actor_minibatch_size=2048,
+def test_resolve_critic_minibatch_size_is_n_over_batches():
+    # Auto: n_steps / critic_batches_per_epoch (pure ratio, no floor)
+    auto = model_mod._resolve_critic_minibatch_size(
+        n_steps=16000,
         critic_minibatch_size=None,
-        device=model_mod.torch.device("cuda"),
+        critic_batches_per_epoch=8,
     )
-    assert auto_cuda == model_mod.DEFAULT_CRITIC_MINIBATCH_SIZE
+    assert auto == 2000
 
+    # Explicit override wins
     explicit = model_mod._resolve_critic_minibatch_size(
-        actor_minibatch_size=2048,
+        n_steps=16000,
         critic_minibatch_size=4096,
-        device=model_mod.torch.device("cuda"),
+        critic_batches_per_epoch=8,
     )
     assert explicit == 4096
 
-    cpu_auto = model_mod._resolve_critic_minibatch_size(
-        actor_minibatch_size=2048,
+    # Small dataset: no floor, just n/8
+    small = model_mod._resolve_critic_minibatch_size(
+        n_steps=100,
         critic_minibatch_size=None,
-        device=model_mod.torch.device("cpu"),
+        critic_batches_per_epoch=8,
     )
-    assert cpu_auto == 2048
+    assert small == 13  # ceil(100/8)
 
 
 def test_configure_centralized_critic_runtime_forwards_compile_flag(monkeypatch):
