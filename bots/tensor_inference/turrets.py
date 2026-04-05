@@ -33,9 +33,16 @@ def run_turret(ct: Controller, etype: EntityType) -> None:
         target_pos = ct.get_gunner_target()
         if target_pos is None:
             return
+        # Find entity at target — tile queries miss units (turrets/cores),
+        # so fall back to scanning nearby entities by position.
         eid = ct.get_tile_building_id(target_pos)
         if eid is None:
             eid = ct.get_tile_builder_bot_id(target_pos)
+        if eid is None:
+            for candidate in ct.get_nearby_entities():
+                if ct.get_position(candidate) == target_pos:
+                    eid = candidate
+                    break
         if eid is None:
             return
         if ct.get_team(eid) == my_team:
@@ -49,7 +56,9 @@ def run_turret(ct: Controller, etype: EntityType) -> None:
     # Sentinel / Breach: scan nearby entities for best target.
     best_pos = None
     best_pri = max_pri + 1
-    nearby = ct.get_nearby_entities()
+    # Breach splash can hit friendlies adjacent to target but outside vision r²=10.
+    # Use wider radius (18) to catch them: (sqrt(5) + sqrt(2))² ≈ 13.4.
+    nearby = ct.get_nearby_entities(18 if etype == EntityType.BREACH else None)
 
     for eid in nearby:
         if ct.get_team(eid) == my_team:
