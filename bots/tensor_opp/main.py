@@ -80,7 +80,7 @@ def _get_shared_model(path: str):
             "conv_dir": 4,
             "bridge_target": len(BRIDGE_OFFSETS),
             "move_dir": 9,
-            "logit_scale": 5,
+            "temperature": 5,
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },

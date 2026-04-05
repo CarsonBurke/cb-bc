@@ -199,7 +199,7 @@ def _build_model() -> ActorModel:
             "conv_dir": 4,
             "bridge_target": N_BRIDGE_TARGETS,
             "move_dir": 9,
-            "logit_scale": 5,
+            "temperature": 5,
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },

@@ -61,6 +61,18 @@ def _softmax(scores: list[float]) -> list[float]:
     return [x / z for x in exps]
 
 
+def _linear(vec: list[float], rows: list[list[float]], bias: list[float] | None) -> list[float]:
+    out = [_DOT(vec, rows[j]) for j in range(len(rows))]
+    if bias is not None:
+        for j in range(len(rows)):
+            out[j] += bias[j]
+    return out
+
+
+def _silu_vec(values: list[float]) -> list[float]:
+    return [_silu_scalar(v) for v in values]
+
+
 def _rmsnorm(vec: list[float], gamma: list[float], eps: float) -> list[float]:
     inv_rms = 1.0 / (sum(x * x for x in vec) / len(vec) + eps) ** 0.5
     return [vec[i] * inv_rms * gamma[i] for i in range(len(vec))]
@@ -117,12 +129,15 @@ class ActorModel:
     """Stdlib-only actor matching the PyTorch CLS-attention actor."""
 
     def __init__(self, output_heads: dict[str, int]):
+        self._output_heads = dict(output_heads)
         self.tile_linear = Linear(TILE_INPUT_DIM, TILE_EMBED_DIM)
         self.context_proj = Linear(GLOBAL_FEATURES, ACTOR_CONTEXT_DIM)
         self.context_k_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
         self.context_v_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
+        self.tile_sa_q_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
         self.tile_sa_k_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
         self.tile_sa_v_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
+        self.cls_ca_q_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
         self.cls_ca_k_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
         self.cls_ca_v_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
 
@@ -130,16 +145,22 @@ class ActorModel:
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
         self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_norm = RMSNorm(ACTOR_LATENT_DIM)
+        self.latent_ffn_norm = RMSNorm(ACTOR_LATENT_DIM)
 
         self.cls_tokens = Tensor.zeros((ACTOR_CLS_TOKENS, TILE_EMBED_DIM))
         self.context_tau = Tensor.zeros((ACTOR_CLS_TOKENS,))
+        self.tile_sa_tau = Tensor.zeros((1,))
+        self.cls_ca_tau = Tensor.zeros((1,))
+
+        self.latent_ffn_up = Linear(ACTOR_LATENT_DIM, ACTOR_LATENT_DIM * 2)
+        self.latent_ffn_down = Linear(ACTOR_LATENT_DIM * 2, ACTOR_LATENT_DIM)
 
         self.head_build_type = Linear(ACTOR_LATENT_DIM, output_heads["build_type"])
         self.head_build_dir = Linear(ACTOR_LATENT_DIM, output_heads["build_dir"])
         self.head_conv_dir = Linear(ACTOR_LATENT_DIM, output_heads["conv_dir"])
         self.head_bridge_target = Linear(ACTOR_LATENT_DIM, output_heads["bridge_target"])
         self.head_move_dir = Linear(ACTOR_LATENT_DIM, output_heads["move_dir"])
-        self.head_logit_scale = Linear(ACTOR_LATENT_DIM, output_heads["logit_scale"])
+        self.head_temperature = Linear(ACTOR_LATENT_DIM, output_heads["temperature"])
         self.head_h_gate = Linear(ACTOR_GRU_INPUT_DIM, output_heads["h_gate"])
         self.head_h_cand = Linear(ACTOR_GRU_INPUT_DIM, output_heads["h_cand"])
 
@@ -150,6 +171,21 @@ class ActorModel:
         ]
         self._rope_cos, self._rope_sin = _build_rope_cache()
         self._infer_cache: dict | None = None
+
+        self._init_identity_linear(self.tile_sa_q_proj)
+        self._init_identity_linear(self.cls_ca_q_proj)
+        self.latent_ffn_down.weight.data[:] = [0.0] * len(self.latent_ffn_down.weight.data)
+        self.latent_ffn_down.bias.data[:] = [0.0] * len(self.latent_ffn_down.bias.data)
+
+    @staticmethod
+    def _init_identity_linear(layer: Linear) -> None:
+        data = layer.weight.data
+        for i in range(layer.in_features):
+            row_base = i * layer.out_features
+            for j in range(layer.out_features):
+                data[row_base + j] = 1.0 if i == j else 0.0
+        if layer.bias is not None:
+            layer.bias.data[:] = [0.0] * len(layer.bias.data)
 
     def parameters(self) -> list[Tensor]:
         params: list[Tensor] = []
@@ -176,11 +212,18 @@ class ActorModel:
             self.head_conv_dir,
             self.head_bridge_target,
             self.head_move_dir,
-            self.head_logit_scale,
+            self.head_temperature,
             self.head_h_gate,
             self.head_h_cand,
         ):
             params.extend(layer.parameters())
+        params.extend(self.tile_sa_q_proj.parameters())
+        params.extend(self.cls_ca_q_proj.parameters())
+        params.append(self.tile_sa_tau)
+        params.append(self.cls_ca_tau)
+        params.extend(self.latent_ffn_norm.parameters())
+        params.extend(self.latent_ffn_up.parameters())
+        params.extend(self.latent_ffn_down.parameters())
         return params
 
     def train(self, mode: bool = True) -> None:
@@ -202,7 +245,7 @@ class ActorModel:
             ("conv_dir", self.head_conv_dir),
             ("bridge_target", self.head_bridge_target),
             ("move_dir", self.head_move_dir),
-            ("logit_scale", self.head_logit_scale),
+            ("temperature", self.head_temperature),
         )
         action_names: list[str] = []
         action_slices: list[tuple[int, int]] = []
@@ -233,16 +276,23 @@ class ActorModel:
             "context_proj": _linear_rows(self.context_proj),
             "context_k_proj": _linear_rows(self.context_k_proj),
             "context_v_proj": _linear_rows(self.context_v_proj),
+            "tile_sa_q_proj": _linear_rows(self.tile_sa_q_proj),
             "tile_sa_k_proj": _linear_rows(self.tile_sa_k_proj),
             "tile_sa_v_proj": _linear_rows(self.tile_sa_v_proj),
+            "cls_ca_q_proj": _linear_rows(self.cls_ca_q_proj),
             "cls_ca_k_proj": _linear_rows(self.cls_ca_k_proj),
             "cls_ca_v_proj": _linear_rows(self.cls_ca_v_proj),
             "context_ca_norm": (list(self.context_ca_norm.gamma.data), self.context_ca_norm.eps),
             "tile_sa_norm": (list(self.tile_sa_norm.gamma.data), self.tile_sa_norm.eps),
             "cls_ca_norm": (list(self.cls_ca_norm.gamma.data), self.cls_ca_norm.eps),
             "latent_norm": (list(self.latent_norm.gamma.data), self.latent_norm.eps),
+            "latent_ffn_norm": (list(self.latent_ffn_norm.gamma.data), self.latent_ffn_norm.eps),
             "cls_tokens": _reshape_tokens(list(self.cls_tokens.data), ACTOR_CLS_TOKENS, TILE_EMBED_DIM),
             "context_tau": list(self.context_tau.data),
+            "tile_sa_tau": list(self.tile_sa_tau.data),
+            "cls_ca_tau": list(self.cls_ca_tau.data),
+            "latent_ffn_up": _linear_rows(self.latent_ffn_up),
+            "latent_ffn_down": _linear_rows(self.latent_ffn_down),
             "action_heads": (action_names, action_slices, action_rows, action_bias),
             "head_h_gate": (head_h_gate_rows, head_h_gate_bias),
             "head_h_cand": (head_h_cand_rows, head_h_cand_bias),
@@ -258,16 +308,23 @@ class ActorModel:
         context_rows, context_bias = cache["context_proj"]
         ctx_k_rows, ctx_k_bias = cache["context_k_proj"]
         ctx_v_rows, ctx_v_bias = cache["context_v_proj"]
+        tile_q_rows, tile_q_bias = cache["tile_sa_q_proj"]
         tile_k_rows, tile_k_bias = cache["tile_sa_k_proj"]
         tile_v_rows, tile_v_bias = cache["tile_sa_v_proj"]
+        cls_q_rows, cls_q_bias = cache["cls_ca_q_proj"]
         cls_k_rows, cls_k_bias = cache["cls_ca_k_proj"]
         cls_v_rows, cls_v_bias = cache["cls_ca_v_proj"]
         context_norm_gamma, context_norm_eps = cache["context_ca_norm"]
         tile_norm_gamma, tile_norm_eps = cache["tile_sa_norm"]
         cls_norm_gamma, cls_norm_eps = cache["cls_ca_norm"]
         latent_norm_gamma, latent_norm_eps = cache["latent_norm"]
+        latent_ffn_norm_gamma, latent_ffn_norm_eps = cache["latent_ffn_norm"]
         cls_tokens = cache["cls_tokens"]
         context_tau = cache["context_tau"]
+        tile_sa_tau = cache["tile_sa_tau"][0]
+        cls_ca_tau = cache["cls_ca_tau"][0]
+        latent_ffn_up_rows, latent_ffn_up_bias = cache["latent_ffn_up"]
+        latent_ffn_down_rows, latent_ffn_down_bias = cache["latent_ffn_down"]
 
         tile_obs_end = TILE_GRID_N * TILE_FEATURES
         globals_end = tile_obs_end + GLOBAL_FEATURES
@@ -333,25 +390,29 @@ class ActorModel:
         tile_k: list[list[float]] = []
         tile_v: list[list[float]] = []
         for idx, token in enumerate(encoded_tokens):
-            q_rot = _apply_rotary(token, self._rope_cos[idx], self._rope_sin[idx])
+            q_tok = [0.0] * TILE_EMBED_DIM
             k_tok = [0.0] * TILE_EMBED_DIM
             v_tok = [0.0] * TILE_EMBED_DIM
             for j in range(TILE_EMBED_DIM):
+                q_val = _DOT(token, tile_q_rows[j])
                 k_val = _DOT(token, tile_k_rows[j])
                 v_val = _DOT(token, tile_v_rows[j])
+                if tile_q_bias is not None:
+                    q_val += tile_q_bias[j]
                 if tile_k_bias is not None:
                     k_val += tile_k_bias[j]
                 if tile_v_bias is not None:
                     v_val += tile_v_bias[j]
+                q_tok[j] = q_val
                 k_tok[j] = k_val
                 v_tok[j] = v_val
-            tile_q.append(q_rot)
-            tile_k.append(_apply_rotary(k_tok, self._rope_cos[idx], self._rope_sin[idx]))
+            tile_q.append(_l2_normalize(_apply_rotary(q_tok, self._rope_cos[idx], self._rope_sin[idx])))
+            tile_k.append(_l2_normalize(_apply_rotary(k_tok, self._rope_cos[idx], self._rope_sin[idx])))
             tile_v.append(v_tok)
 
         enriched_tiles: list[list[float]] = []
         for i, token in enumerate(encoded_tokens):
-            scores = [_DOT(tile_q[i], tile_k[j]) / _SQRT_TILE_DIM for j in range(TILE_GRID_N)]
+            scores = [_EXP(tile_sa_tau) * _DOT(tile_q[i], tile_k[j]) for j in range(TILE_GRID_N)]
             weights = _softmax(scores)
             update = [0.0] * TILE_EMBED_DIM
             for w, value in zip(weights, tile_v):
@@ -364,6 +425,7 @@ class ActorModel:
             )])
 
         cls_k: list[list[float]] = []
+        cls_k_norm: list[list[float]] = []
         cls_v: list[list[float]] = []
         for token in enriched_tiles:
             k_tok = [0.0] * TILE_EMBED_DIM
@@ -378,10 +440,18 @@ class ActorModel:
                 k_tok[j] = k_val
                 v_tok[j] = v_val
             cls_k.append(k_tok)
+            cls_k_norm.append(_l2_normalize(k_tok))
             cls_v.append(v_tok)
 
         for i, token in enumerate(cls_state):
-            scores = [_DOT(token, cls_k[j]) / _SQRT_TILE_DIM for j in range(TILE_GRID_N)]
+            q_tok = [0.0] * TILE_EMBED_DIM
+            for j in range(TILE_EMBED_DIM):
+                q_val = _DOT(token, cls_q_rows[j])
+                if cls_q_bias is not None:
+                    q_val += cls_q_bias[j]
+                q_tok[j] = q_val
+            q_tok = _l2_normalize(q_tok)
+            scores = [_EXP(cls_ca_tau) * _DOT(q_tok, cls_k_norm[j]) for j in range(TILE_GRID_N)]
             weights = _softmax(scores)
             update = [0.0] * TILE_EMBED_DIM
             for w, value in zip(weights, cls_v):
@@ -394,6 +464,9 @@ class ActorModel:
             )]
 
         latent = _rmsnorm(_flatten_tokens(cls_state), latent_norm_gamma, latent_norm_eps)
+        latent_hidden = _silu_vec(_linear(_rmsnorm(latent, latent_ffn_norm_gamma, latent_ffn_norm_eps), latent_ffn_up_rows, latent_ffn_up_bias))
+        latent_delta = _linear(latent_hidden, latent_ffn_down_rows, latent_ffn_down_bias)
+        latent = [latent[i] + latent_delta[i] for i in range(ACTOR_LATENT_DIM)]
 
         action_names, action_slices, action_rows, action_bias = cache["action_heads"]
         fused_action = [_DOT(latent, action_rows[j]) + action_bias[j] for j in range(len(action_rows))]
@@ -408,7 +481,7 @@ class ActorModel:
         h_cand = [math.tanh(_DOT(gru_in, cand_rows[j]) + cand_bias[j]) for j in range(H_DIM)]
         outputs["h_gate"] = h_gate
         outputs["h_cand"] = h_cand
-        outputs.pop("logit_scale", None)
+        outputs.pop("temperature", None)
         return outputs
 
     def save(self) -> list[list[float]]:
@@ -416,8 +489,14 @@ class ActorModel:
 
     def load(self, state: list[list[float]]) -> None:
         params = self.parameters()
-        if len(state) != len(params):
-            raise AssertionError(f"State has {len(state)} entries, expected {len(params)}")
+        legacy_expected = len(params) - 11
+        if len(state) not in (len(params), legacy_expected):
+            raise AssertionError(
+                f"State has {len(state)} entries, expected {len(params)} or legacy {legacy_expected}"
+            )
+        if len(state) == legacy_expected:
+            default_state = ActorModel(self._output_heads).save()
+            state = list(state) + default_state[len(state):]
         for p, s in zip(params, state):
             if len(p.data) != len(s):
                 raise AssertionError(f"Param size mismatch: {len(p.data)} vs {len(s)}")
