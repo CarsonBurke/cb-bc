@@ -726,10 +726,10 @@ class CriticTileEmbed(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.net = nn.Sequential(
-            nn.Linear(in_channels, in_channels, bias=False),
+            nn.Linear(in_channels, in_channels, bias=True),
             RMSNorm(in_channels),
             nn.SiLU(),
-            nn.Linear(in_channels, embed_dim, bias=False),
+            nn.Linear(in_channels, embed_dim, bias=True),
         )
         self._init_weights()
 
@@ -1428,7 +1428,7 @@ class CriticPpoLossStep(nn.Module):
                 self.critic.bucket_centers,
                 values=values,
                 old_values=old_values,
-                clip_vloss=True,
+                clip_vloss=False,
             )
         loss_sum = v_loss_elems.sum()
         return loss_sum, loss_sum.detach(), values.detach()
