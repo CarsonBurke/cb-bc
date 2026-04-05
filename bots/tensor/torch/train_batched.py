@@ -65,6 +65,7 @@ import torch
 import torch.nn.functional as F
 
 try:
+    from hidden_state_bank import HiddenStateBank
     from replay_buffers import preload_replay_buffers
     from shared_collector import (
         COLLECTOR_RING_SLOTS_DEFAULT,
@@ -85,6 +86,7 @@ try:
         validate_worker_game_result,
     )
 except ImportError:
+    from bots.tensor.torch.hidden_state_bank import HiddenStateBank
     from bots.tensor.torch.replay_buffers import preload_replay_buffers
     from bots.tensor.shared_collector import (
         COLLECTOR_RING_SLOTS_DEFAULT,
@@ -645,8 +647,6 @@ def collect_games_batched(
     selector = selectors.DefaultSelector()
     results: list[WorkerGameResult | None] = [None] * n_games
     actor_trajectories: dict[int, dict[int, list[TrajectoryStep]]] = {}
-    actor_hidden_states: dict[tuple[int, int], torch.Tensor] = {}
-    opponent_hidden_states: dict[tuple[int, int], torch.Tensor] = {}
     processes = {}
     launch_order = sorted(range(n_games), key=lambda i: (opp_weight_paths[i], i))
     pending_indices = launch_order[:]
@@ -667,14 +667,6 @@ def collect_games_batched(
         except OSError:
             pass
 
-    def _prune_hidden_state_for_game(game_idx: int) -> None:
-        actor_keys = [key for key in actor_hidden_states if key[0] == game_idx]
-        for key in actor_keys:
-            actor_hidden_states.pop(key, None)
-        opp_keys = [key for key in opponent_hidden_states if key[0] == game_idx]
-        for key in opp_keys:
-            opponent_hidden_states.pop(key, None)
-
     def _close_game_collector(game_idx: int) -> None:
         collector = active_collectors.pop(game_idx, None)
         if collector is None:
@@ -691,7 +683,8 @@ def collect_games_batched(
             side_view.close()
         collector.collector_mm.close()
         os.close(collector.collector_fd)
-        _prune_hidden_state_for_game(game_idx)
+        actor_hidden_bank.release_game(game_idx)
+        opponent_hidden_bank.release_game(game_idx)
 
     def _launch_game(i: int) -> None:
         collector_fd = _create_collector_fd(tmpdir, i, collector_ring_slots)
@@ -790,11 +783,23 @@ def collect_games_batched(
     _use_pinned = DEVICE.type == "cuda"
     # Pre-allocate pinned staging buffers for H2D/D2H to enable non_blocking transfers.
     # Sized for max batch; reused each iteration to avoid repeated allocation.
+    _hidden_bank_capacity = max(4096, n_games * 512)
+    actor_hidden_bank = HiddenStateBank(
+        hidden_dim=H_DIM,
+        device=DEVICE,
+        initial_capacity=_hidden_bank_capacity,
+        growth_capacity=4096,
+    )
+    opponent_hidden_bank = HiddenStateBank(
+        hidden_dim=H_DIM,
+        device=DEVICE,
+        initial_capacity=_hidden_bank_capacity,
+        growth_capacity=4096,
+    )
     if _use_pinned:
-        _pin_h2d = torch.empty(_max_a_batch, _OBS_FLOATS, dtype=torch.float32, pin_memory=True)
+        _pin_obs = torch.empty(_max_a_batch, OBS_SIZE, dtype=torch.float32, pin_memory=True)
         _pin_results = torch.empty(5, _max_a_batch, dtype=torch.float32, pin_memory=True)
         _pin_h_prev = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32, pin_memory=True)
-        _pin_h_out = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32, pin_memory=True)
         _pin_actor_bt_l = torch.empty(_max_a_batch, N_BUILD, dtype=torch.float32, pin_memory=True)
         _pin_actor_bd_l = torch.empty(_max_a_batch, N_DIR, dtype=torch.float32, pin_memory=True)
         _pin_actor_cd_l = torch.empty(_max_a_batch, N_CONV_DIR, dtype=torch.float32, pin_memory=True)
@@ -802,10 +807,11 @@ def collect_games_batched(
         _pin_actor_md_l = torch.empty(_max_a_batch, N_DIR, dtype=torch.float32, pin_memory=True)
         _pin_actor_eps = torch.empty(_max_a_batch, N_LOGIT_SCALE, dtype=torch.float32, pin_memory=True)
     else:
-        _pin_h2d = torch.empty(_max_a_batch, _OBS_FLOATS, dtype=torch.float32)
+        _pin_obs = torch.empty(_max_a_batch, OBS_SIZE, dtype=torch.float32)
         _pin_results = torch.empty(5, _max_a_batch, dtype=torch.float32)
         _pin_h_prev = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32)
-        _pin_h_out = torch.empty(_max_a_batch, H_DIM, dtype=torch.float32)
+    _actor_trunk = torch.empty(_max_a_batch, OBS_SIZE + H_DIM, dtype=torch.float32, device=DEVICE)
+    _opponent_trunk = torch.empty(_max_a_batch, OBS_SIZE + H_DIM, dtype=torch.float32, device=DEVICE)
 
     while pending_indices and len(processes) < max_workers:
         _launch_game(pending_indices.pop(0))
@@ -877,37 +883,32 @@ def collect_games_batched(
             batch_a_items += n_a
             batch_a_max = max(batch_a_max, n_a)
             t_phase = time.perf_counter() if profile is not None else 0.0
-            batch_cpu = _pin_h2d[:n_a]
-            batch_h_prev = _pin_h_prev[:n_a]
+            batch_obs = _pin_obs[:n_a]
             for row, (game_idx, request) in enumerate(pending_a):
-                unit_id = request.unit_id
                 collector = active_collectors[game_idx]
-                batch_cpu[row, :OBS_SIZE].copy_(collector.obs_tensors[("a", request.slot_index)])
-                h_prev = actor_hidden_states.get((game_idx, unit_id))
-                if h_prev is None:
-                    batch_h_prev[row].zero_()
-                else:
-                    batch_h_prev[row].copy_(h_prev)
-            batch_cpu[:, OBS_SIZE:].copy_(batch_h_prev)
+                batch_obs[row].copy_(collector.obs_tensors[("a", request.slot_index)])
+            actor_keys = [(game_idx, request.unit_id) for game_idx, request in pending_a]
             if profile is not None:
                 profile["batch_pack_a_s"] = profile.get("batch_pack_a_s", 0.0) + (time.perf_counter() - t_phase)
 
             with trace_scope(trace, "collect.actor_batch"), torch.no_grad():
+                actor_all_t = _actor_trunk[:n_a]
                 t_phase = time.perf_counter() if profile is not None else 0.0
                 with trace_scope(trace, "collect.actor_h2d"):
-                    if _use_pinned:
-                        all_t = batch_cpu.to(DEVICE, non_blocking=True)
-                    else:
-                        all_t = batch_cpu.to(DEVICE)
+                    actor_all_t[:, :OBS_SIZE].copy_(batch_obs, non_blocking=_use_pinned)
+                    actor_row_index = actor_hidden_bank.gather_into(
+                        actor_keys,
+                        actor_all_t[:, OBS_SIZE:],
+                    )
                 if profile is not None:
                     dt = time.perf_counter() - t_phase
                     profile["h2d_a_s"] = profile.get("h2d_a_s", 0.0) + dt
 
-                obs_cpu = batch_cpu[:, :OBS_SIZE]
+                obs_cpu = batch_obs
                 t_infer = time.perf_counter() if profile is not None else 0.0
                 while True:
                     bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = graphed_a.policy_heads(
-                        all_t,
+                        actor_all_t,
                         trace=trace,
                         scope_prefix="collect.actor",
                     )
@@ -923,7 +924,7 @@ def collect_games_batched(
                             _pin_actor_brt_l[:n_a].copy_(brt_l, non_blocking=True)
                             _pin_actor_md_l[:n_a].copy_(md_l, non_blocking=True)
                             _pin_actor_eps[:n_a].copy_(eps, non_blocking=True)
-                            _pin_h_out[:n_a].copy_(h_next, non_blocking=True)
+                            _pin_h_prev[:n_a].copy_(actor_all_t[:, OBS_SIZE:], non_blocking=True)
                             torch.cuda.synchronize()
                             bt_l_cpu = _pin_actor_bt_l[:n_a]
                             bd_l_cpu = _pin_actor_bd_l[:n_a]
@@ -931,7 +932,7 @@ def collect_games_batched(
                             brt_l_cpu = _pin_actor_brt_l[:n_a]
                             md_l_cpu = _pin_actor_md_l[:n_a]
                             eps_cpu = _pin_actor_eps[:n_a]
-                            h_cpu = _pin_h_out[:n_a]
+                            h_prev_cpu = _pin_h_prev[:n_a]
                         else:
                             bt_l_cpu = bt_l.float().cpu()
                             bd_l_cpu = bd_l.float().cpu()
@@ -939,13 +940,13 @@ def collect_games_batched(
                             brt_l_cpu = brt_l.float().cpu()
                             md_l_cpu = md_l.float().cpu()
                             eps_cpu = eps.float().cpu()
-                            h_cpu = h_next.cpu().contiguous()
+                            h_prev_cpu = actor_all_t[:, OBS_SIZE:].cpu().contiguous()
                     if profile is not None:
                         profile["d2h_a_s"] = profile.get("d2h_a_s", 0.0) + (time.perf_counter() - t_phase)
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     with trace_scope(trace, "collect.actor.sample"):
-                        bt_act, bd_act, cd_act, brt_act, md_act, lp, h_cpu = _sample_actions_from_policy_heads(
+                        bt_act, bd_act, cd_act, brt_act, md_act, lp, _ = _sample_actions_from_policy_heads(
                             obs_cpu,
                             bt_l_cpu,
                             bd_l_cpu,
@@ -953,7 +954,7 @@ def collect_games_batched(
                             brt_l_cpu,
                             md_l_cpu,
                             eps_cpu,
-                            h_cpu,
+                            h_prev_cpu,
                             temperature=1.0,
                             return_log_prob=True,
                         )
@@ -972,10 +973,11 @@ def collect_games_batched(
                     graphed_a.disable_graph()
                     actor_graph_disabled = True
                     t_infer = time.perf_counter() if profile is not None else 0.0
+                actor_hidden_bank.update(actor_row_index, h_next)
 
             t_phase = time.perf_counter() if profile is not None else 0.0
             with trace_scope(trace, "collect.actor_fanout"):
-                h_prev_view = _tensor_byte_view(batch_h_prev)
+                h_prev_view = _tensor_byte_view(h_prev_cpu)
                 for i, (game_idx, request) in enumerate(pending_a):
                     unit_id = request.unit_id
                     round_idx = request.round_idx
@@ -1026,7 +1028,6 @@ def collect_games_batched(
                             conv_prox_paid=0,
                         )
                     )
-                    actor_hidden_states[(game_idx, unit_id)] = h_cpu[i].clone()
                     collector = active_collectors.get(game_idx)
                     if collector is None:
                         continue
@@ -1057,24 +1058,16 @@ def collect_games_batched(
                 batch_b_items += n_b
                 batch_b_max = max(batch_b_max, n_b)
                 t_phase = time.perf_counter() if profile is not None else 0.0
-                batch_cpu = _pin_h2d[:n_b]
-                batch_h_prev = _pin_h_prev[:n_b]
+                batch_obs = _pin_obs[:n_b]
                 for row, (game_idx, request) in enumerate(items):
-                    unit_id = request.unit_id
                     collector = active_collectors[game_idx]
-                    batch_cpu[row, :OBS_SIZE].copy_(collector.obs_tensors[("b", request.slot_index)])
-                    h_prev = opponent_hidden_states.get((game_idx, unit_id))
-                    if h_prev is None:
-                        batch_h_prev[row].zero_()
-                    else:
-                        batch_h_prev[row].copy_(h_prev)
-                batch_cpu[:, OBS_SIZE:].copy_(batch_h_prev)
+                    batch_obs[row].copy_(collector.obs_tensors[("b", request.slot_index)])
                 if profile is not None:
                     profile["batch_pack_b_s"] = profile.get("batch_pack_b_s", 0.0) + (time.perf_counter() - t_phase)
 
                 if wp == DUMMY_OPP_PATH:
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    obs_t = batch_cpu[:, :OBS_SIZE]
+                    obs_t = batch_obs
                     bt_act, bd_act, cd_act, md_act = _dummy_policy(obs_t)
                     brt_act = torch.zeros_like(bt_act)
                     if profile is not None:
@@ -1101,13 +1094,16 @@ def collect_games_batched(
                     continue
 
                 opp_m = opp_models[wp]
-                opp_g = _get_cached_opponent_graph(opp_model_keys[wp], opp_m, n_b, _OPP_GRAPH_TEMP)
+                opp_keys = [(game_idx, request.unit_id) for game_idx, request in items]
+                opp_g = None
                 with trace_scope(trace, "collect.opponent_batch"), torch.no_grad():
+                    opp_all_t = _opponent_trunk[:n_b]
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    if _use_pinned and n_b <= _max_a_batch:
-                        all_t = batch_cpu.to(DEVICE, non_blocking=True)
-                    else:
-                        all_t = batch_cpu.to(DEVICE)
+                    opp_all_t[:, :OBS_SIZE].copy_(batch_obs, non_blocking=_use_pinned and n_b <= _max_a_batch)
+                    opp_row_index = opponent_hidden_bank.gather_into(
+                        opp_keys,
+                        opp_all_t[:, OBS_SIZE:],
+                    )
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
                         profile["h2d_b_s"] = profile.get("h2d_b_s", 0.0) + dt
@@ -1116,53 +1112,46 @@ def collect_games_batched(
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     if opp_g is not None and n_b <= opp_g.max_batch:
                         # CUDA-graphed path: forward + mask + sample in one graph replay
-                        bt_act, bd_act, cd_act, brt_act, md_act, _, h_next = opp_g(all_t)
+                        bt_act, bd_act, cd_act, brt_act, md_act, _, h_next = opp_g(opp_all_t)
                         if _use_pinned and n_b <= _max_a_batch:
                             _pin_results[:5, :n_b].copy_(torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]), non_blocking=True)
-                            _pin_h_out[:n_b].copy_(h_next, non_blocking=True)
                             torch.cuda.synchronize()
                             acts_cpu = _pin_results[:5, :n_b]
-                            h_cpu = _pin_h_out[:n_b]
                         else:
                             acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
-                            h_cpu = h_next.cpu().contiguous()
                     else:
                         # Fallback: ungraphed inference
-                        obs_t = all_t[:, :OBS_SIZE]
-                        bt_l, bd_l, cd_l, _brt_l, md_l, _eps, h_next = opp_m.infer_packed(all_t)
+                        bt_l, bd_l, cd_l, _brt_l, md_l, _eps, h_next = opp_m.infer_packed(opp_all_t)
                         if profile is not None:
                             dt = time.perf_counter() - t_phase
                             profile["forward_b_s"] = profile.get("forward_b_s", 0.0) + dt
                             profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
                         t_phase = time.perf_counter() if profile is not None else 0.0
-                        bt_m, bd_m = compute_action_masks(obs_t)
-                        cd_m = conveyor_dir_mask(obs_t.device, obs_t.shape[0])
-                        bt_l.masked_fill_(~bt_m, -1e9)
-                        cd_l.masked_fill_(~cd_m, -1e9)
-                        bt_act, _ = sample_logits_gumbel(bt_l, _OPP_GRAPH_TEMP, mask=bt_m, return_log_prob=False)
-                        bd_l.masked_fill_(~bd_m, -1e9)
-                        bd_act, _ = sample_logits_gumbel(bd_l, _OPP_GRAPH_TEMP, mask=bd_m, return_log_prob=False)
-                        cd_act, _ = sample_logits_gumbel(cd_l, _OPP_GRAPH_TEMP, mask=cd_m, return_log_prob=False)
-                        brt_act, _ = sample_logits_gumbel(_brt_l, _OPP_GRAPH_TEMP, return_log_prob=False)
-                        md_act, _ = sample_logits_gumbel(md_l, _OPP_GRAPH_TEMP, return_log_prob=False)
-                        if _use_pinned and n_b <= _max_a_batch:
-                            _pin_results[:5, :n_b].copy_(torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]), non_blocking=True)
-                            _pin_h_out[:n_b].copy_(h_next, non_blocking=True)
-                            torch.cuda.synchronize()
-                            acts_cpu = _pin_results[:5, :n_b]
-                            h_cpu = _pin_h_out[:n_b]
-                        else:
-                            acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
-                            h_cpu = h_next.cpu().contiguous()
+                        obs_t_cpu = batch_obs
+                        bt_l_cpu = bt_l.float().cpu()
+                        bd_l_cpu = bd_l.float().cpu()
+                        cd_l_cpu = cd_l.float().cpu()
+                        brt_l_cpu = _brt_l.float().cpu()
+                        md_l_cpu = md_l.float().cpu()
+                        bt_m, bd_m = compute_action_masks(obs_t_cpu)
+                        cd_m = conveyor_dir_mask(obs_t_cpu.device, obs_t_cpu.shape[0])
+                        bt_l_cpu.masked_fill_(~bt_m, -1e9)
+                        cd_l_cpu.masked_fill_(~cd_m, -1e9)
+                        bt_act, _ = sample_logits_gumbel(bt_l_cpu, _OPP_GRAPH_TEMP, mask=bt_m, return_log_prob=False)
+                        bd_l_cpu.masked_fill_(~bd_m, -1e9)
+                        bd_act, _ = sample_logits_gumbel(bd_l_cpu, _OPP_GRAPH_TEMP, mask=bd_m, return_log_prob=False)
+                        cd_act, _ = sample_logits_gumbel(cd_l_cpu, _OPP_GRAPH_TEMP, mask=cd_m, return_log_prob=False)
+                        brt_act, _ = sample_logits_gumbel(brt_l_cpu, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        md_act, _ = sample_logits_gumbel(md_l_cpu, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act])
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
+                opponent_hidden_bank.update(opp_row_index, h_next)
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
                 for i, (game_idx, request) in enumerate(items):
-                    unit_id = request.unit_id
-                    opponent_hidden_states[(game_idx, unit_id)] = h_cpu[i].clone()
                     collector = active_collectors.get(game_idx)
                     if collector is None:
                         continue

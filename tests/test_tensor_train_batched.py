@@ -24,6 +24,7 @@ if str(TENSOR_DIR) not in sys.path:
     sys.path.insert(0, str(TENSOR_DIR))
 
 import train_batched as train_batched_mod
+from hidden_state_bank import HiddenStateBank
 from shared_collector import (
     COLLECTOR_RING_SLOTS_DEFAULT,
     CollectorClient,
@@ -208,3 +209,64 @@ def test_build_game_launch_specs_uses_requested_benchmark_maps(tmp_path):
     )
 
     assert [Path(spec.map_path).name for spec in specs] == ["beta.map26", "beta.map26"]
+
+
+def test_hidden_state_bank_reuses_updated_rows_without_aliasing():
+    bank = HiddenStateBank(hidden_dim=4, device=torch.device("cpu"), initial_capacity=2, growth_capacity=2)
+
+    first = bank.batch([(1, 10), (1, 11), (2, 10)])
+    assert torch.equal(first.h_prev, torch.zeros(3, 4))
+
+    updated = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+        ],
+        dtype=torch.float32,
+    )
+    bank.update(first.row_index, updated)
+
+    second = bank.batch([(1, 11), (2, 10), (1, 10)])
+    assert torch.equal(second.h_prev, updated[[1, 2, 0]])
+
+
+def test_hidden_state_bank_release_game_zeroes_reused_rows():
+    bank = HiddenStateBank(hidden_dim=2, device=torch.device("cpu"), initial_capacity=1, growth_capacity=1)
+
+    first = bank.batch([(5, 99)])
+    bank.update(first.row_index, torch.tensor([[3.0, 4.0]], dtype=torch.float32))
+    bank.release_game(5)
+
+    second = bank.batch([(6, 99)])
+    assert torch.equal(second.h_prev, torch.zeros(1, 2))
+
+
+def test_hidden_state_bank_gather_into_fills_preallocated_buffer():
+    bank = HiddenStateBank(hidden_dim=3, device=torch.device("cpu"), initial_capacity=2, growth_capacity=2)
+    first = bank.batch([(1, 10), (1, 11)])
+    bank.update(
+        first.row_index,
+        torch.tensor(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+
+    out = torch.empty(2, 3, dtype=torch.float32)
+    row_index = bank.gather_into([(1, 11), (1, 10)], out)
+
+    assert torch.equal(row_index, torch.tensor([1, 0], dtype=torch.long))
+    assert torch.equal(
+        out,
+        torch.tensor(
+            [
+                [4.0, 5.0, 6.0],
+                [1.0, 2.0, 3.0],
+            ],
+            dtype=torch.float32,
+        ),
+    )
