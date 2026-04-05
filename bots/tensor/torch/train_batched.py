@@ -704,7 +704,10 @@ def collect_games_batched(
         for side_view in collector.sides.values():
             side_view.close()
         collector.collector_mm.close()
-        os.close(collector.collector_fd)
+        try:
+            os.close(collector.collector_fd)
+        except OSError:
+            pass
         actor_hidden_bank.release_game(game_idx)
         opponent_hidden_bank.release_game(game_idx)
 
@@ -722,6 +725,10 @@ def collect_games_batched(
         result_path = os.path.join(tmpdir, f"result_{i}.pkl")
         worker_env = os.environ.copy()
         worker_env["CUDA_VISIBLE_DEVICES"] = ""
+        if max_training_turns is None:
+            worker_env.pop("TENSOR_TRAIN_MAX_TURNS", None)
+        else:
+            worker_env["TENSOR_TRAIN_MAX_TURNS"] = str(int(max_training_turns))
         worker_fds = tuple(fd for fd in (collector_fd, req_w_a, resp_r_a, req_w_b, resp_r_b) if fd >= 0)
         worker_python = WORKER_PYTHON if os.path.exists(WORKER_PYTHON) else sys.executable
         proc = subprocess.Popen(

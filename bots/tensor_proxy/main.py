@@ -18,7 +18,7 @@ from shared import (
     _CONV_DIR_MASK,
     GameState,
     discover_ore, scan_enemy_core_dmg, scan_own_core_dmg,
-    encode_state_into,
+    compute_masks_from_obs, encode_state_into,
     execute_build, execute_move,
 )
 from shared_collector import CollectorClient
@@ -27,6 +27,58 @@ from cambc import Controller, Direction, EntityType, Environment, Position
 
 _collector = None
 _unit_id_counter = 1
+_FALLBACK_BUILD_DIR_ORDER = (1, 5, 7, 3, 2, 8, 6, 0)
+_FALLBACK_MOVE_DIR_ORDER = (1, 5, 7, 3, 2, 8, 6, 0)
+
+
+def _training_turn_cap() -> int | None:
+    raw = os.environ.get("TENSOR_TRAIN_MAX_TURNS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid TENSOR_TRAIN_MAX_TURNS: {raw!r}") from exc
+    if value <= 0:
+        raise RuntimeError(f"TENSOR_TRAIN_MAX_TURNS must be > 0, got {value}")
+    return value
+
+
+def _rotate_order(order: tuple[int, ...], offset: int) -> tuple[int, ...]:
+    if not order:
+        return ()
+    shift = offset % len(order)
+    if shift == 0:
+        return order
+    return order[shift:] + order[:shift]
+
+
+def _dir_tile_index(dir_idx: int) -> int:
+    dx, dy = DIR_DXY[DIR_MAP_9[dir_idx]]
+    return (GRID_HALF + int(dy)) * GRID_SIZE + (GRID_HALF + int(dx))
+
+
+def _dir_has_ore(obs, dir_idx: int) -> bool:
+    ts = _dir_tile_index(dir_idx) * TILE_FEATURES
+    return obs[ts + 1] > 0.5 or obs[ts + 2] > 0.5
+
+
+def _scripted_fallback_actions(obs, *, unit_id: int, round_idx: int) -> tuple[int, int, int, int, int]:
+    bt_mask, bd_mask = compute_masks_from_obs(obs)
+    build_order = _rotate_order(_FALLBACK_BUILD_DIR_ORDER, unit_id)
+    move_order = _rotate_order(_FALLBACK_MOVE_DIR_ORDER, unit_id + round_idx)
+
+    if bt_mask[1]:
+        for dir_idx in build_order:
+            if bd_mask[dir_idx] and _dir_has_ore(obs, dir_idx):
+                return 1, dir_idx, 0, 0, move_order[0]
+
+    if bt_mask[3]:
+        for dir_idx in build_order:
+            if bd_mask[dir_idx]:
+                return 3, dir_idx, 0, 0, move_order[0]
+
+    return 0, 4, 0, 0, move_order[0]
 
 
 def _get_collector():
@@ -57,6 +109,9 @@ class Player:
         self._spawn_round: int = -1
         self._unit_id = _next_unit_id()
         self._dbg_flags: int = 0  # packed dbg from previous action
+        self._training_turn_cap = _training_turn_cap()
+        self._has_collected_step = False
+        self._post_horizon_flushed = False
 
     def run(self, ct):
         etype = ct.get_entity_type()
@@ -91,6 +146,10 @@ class Player:
             self.my_team = ct.get_team()
         if self.core_center is None:
             self._find_core(ct)
+        round_idx = ct.get_current_round()
+        if self._training_turn_cap is not None and round_idx >= self._training_turn_cap:
+            self._run_builder_fallback(ct, round_idx)
+            return
 
         discover_ore(ct)
         scan_enemy_core_dmg(ct)
@@ -101,10 +160,10 @@ class Player:
         collector = _get_collector()
         if collector is None:
             raise RuntimeError("tensor_proxy missing actor collector transport")
-        round_idx = ct.get_current_round()
         result = collector.request(self._unit_id, round_idx, obs, self._dbg_flags)
         if result is None:
             raise RuntimeError("tensor_proxy actor collector transport closed")
+        self._has_collected_step = True
         build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx = result
 
         build_action = BUILD_ACTIONS[build_type_idx]
@@ -118,6 +177,43 @@ class Player:
 
         move_dir = DIR_MAP_9[move_dir_idx]
         execute_move(ct, move_dir)
+
+    def _run_builder_fallback(self, ct, round_idx: int) -> None:
+        obs = self._encode_state_buf(ct)
+        if (
+            self._training_turn_cap is not None
+            and round_idx == self._training_turn_cap
+            and self._has_collected_step
+            and not self._post_horizon_flushed
+        ):
+            collector = _get_collector()
+            if collector is None:
+                raise RuntimeError("tensor_proxy missing actor collector transport")
+            result = collector.request(self._unit_id, round_idx, obs, self._dbg_flags)
+            if result is None:
+                raise RuntimeError("tensor_proxy actor collector transport closed")
+            self._post_horizon_flushed = True
+        build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx = _scripted_fallback_actions(
+            obs,
+            unit_id=self._unit_id,
+            round_idx=round_idx,
+        )
+        build_action = BUILD_ACTIONS[build_type_idx]
+        build_dir = DIR_MAP_9[build_dir_idx]
+        conv_dir = CONV_DIR_4[conv_dir_idx]
+        _harv_aux, _conv_aux, dbg = execute_build(
+            ct,
+            build_action,
+            build_dir,
+            conv_dir,
+            self.my_team,
+            bridge_target_idx,
+        )
+        self._dbg_flags = (
+            dbg[0] | (dbg[1] << 1) | (dbg[2] << 2) | (dbg[3] << 3)
+            | (dbg[4] << 4) | (dbg[5] << 5) | (dbg[6] << 6) | (dbg[7] << 7)
+        )
+        execute_move(ct, DIR_MAP_9[move_dir_idx])
 
     def _find_core(self, ct):
         if self.my_team is None:

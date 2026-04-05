@@ -26,36 +26,56 @@ except ImportError:
     from bots.tensor.trajectory_schema import WorkerGameResult
 
 
-def _write_bytes(path: Path, data: bytes | bytearray) -> str | None:
+def _write_bytes(path: Path, data: bytes | bytearray | memoryview) -> str | None:
     if not data:
         return None
     path.write_bytes(data)
     return str(path)
 
 
-def _run_game_proxy(args, result_path: str):
-    bot_a, bot_b, map_path, engine_root, replay_path, seed = args
-    from cambc.cambc_engine import run_game
+def _training_turn_cap() -> int | None:
+    raw = os.environ.get("TENSOR_TRAIN_MAX_TURNS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid TENSOR_TRAIN_MAX_TURNS: {raw!r}") from exc
+    if value <= 0:
+        raise RuntimeError(f"TENSOR_TRAIN_MAX_TURNS must be > 0, got {value}")
+    return value
 
-    run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
-    rd = ReplayData.from_file(replay_path, team=0)
-    working = rd.working_harvesters_dict()
-    winner = rd.winner_str
+
+def _turn_prefix(data: bytes | bytearray | None, *, per_turn_bytes: int, n_turns: int) -> bytes | bytearray:
+    if not data or per_turn_bytes <= 0:
+        return b""
+    return memoryview(data)[: max(0, int(n_turns)) * per_turn_bytes]
+
+
+def _build_global_states(rd: ReplayData, result_path: str, *, max_turns: int | None) -> dict:
+    kept_turns = rd.n_turns if max_turns is None else min(rd.n_turns, int(max_turns))
     base = Path(result_path)
-    state_path = _write_bytes(base.with_suffix(".states.bin"), rd.states_bytes)
-    scalars_path = _write_bytes(base.with_suffix(".scalars.bin"), rd.scalars_bytes)
+    state_path = _write_bytes(
+        base.with_suffix(".states.bin"),
+        _turn_prefix(rd.states_bytes, per_turn_bytes=rd.state_stride * 4, n_turns=kept_turns),
+    )
+    scalars_path = _write_bytes(
+        base.with_suffix(".scalars.bin"),
+        _turn_prefix(rd.scalars_bytes, per_turn_bytes=rd.n_scalars * 4, n_turns=kept_turns),
+    )
     transfers_path = _write_bytes(
         base.with_suffix(".transfers.bin"),
-        rd.resource_transfers_bytes,
+        _turn_prefix(rd.resource_transfers_bytes, per_turn_bytes=8, n_turns=kept_turns),
     )
     ti_delivered_path = _write_bytes(
         base.with_suffix(".ti_delivered.bin"),
-        rd.titanium_delivered_bytes,
+        _turn_prefix(rd.titanium_delivered_bytes, per_turn_bytes=8, n_turns=kept_turns),
     )
     ax_delivered_path = _write_bytes(
         base.with_suffix(".ax_delivered.bin"),
-        rd.axionite_delivered_bytes,
+        _turn_prefix(rd.axionite_delivered_bytes, per_turn_bytes=8, n_turns=kept_turns),
     )
+
     core_x, core_y = 0, 0
     map_h, map_w = rd.map_h, rd.map_w
     turn0_bytes = rd.state_bytes_for_turn(0)
@@ -74,7 +94,7 @@ def _run_game_proxy(args, result_path: str):
             continue
         break
 
-    global_states = {
+    return {
         "states_path": state_path,
         "scalars_path": scalars_path,
         "transfer_events_path": transfers_path,
@@ -83,12 +103,23 @@ def _run_game_proxy(args, result_path: str):
         "state_stride": rd.state_stride,
         "map_w": rd.map_w,
         "map_h": rd.map_h,
-        "n_turns": rd.n_turns,
+        "n_turns": kept_turns,
         "n_channels": rd.n_channels,
         "n_scalars": rd.n_scalars,
         "core_x": core_x,
         "core_y": core_y,
     }
+
+
+def _run_game_proxy(args, result_path: str):
+    bot_a, bot_b, map_path, engine_root, replay_path, seed = args
+    from cambc.cambc_engine import run_game
+
+    run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
+    rd = ReplayData.from_file(replay_path, team=0)
+    working = rd.working_harvesters_dict()
+    winner = rd.winner_str
+    global_states = _build_global_states(rd, result_path, max_turns=_training_turn_cap())
     return WorkerGameResult(working=working, winner=winner, global_states=global_states)
 
 
