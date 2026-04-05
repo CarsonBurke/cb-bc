@@ -8,13 +8,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INFER_DIR = PROJECT_ROOT / "bots" / "tensor_inference"
 TORCH_DIR = PROJECT_ROOT / "bots" / "tensor" / "torch"
 
-for path in (INFER_DIR, TORCH_DIR):
+for path in (PROJECT_ROOT, INFER_DIR, TORCH_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
 from tensor_lib import ActorModel
 from tensor_lib.nn import MLP
 from model import BuilderMLP, OBS_SIZE, H_DIM
+import main as infer_main
+from bench_obs import FakeController
 
 
 def test_infer_applies_tanh_to_h_cand_only():
@@ -130,3 +132,50 @@ def test_actor_load_accepts_legacy_state_prefix():
     assert infer_out["conv_dir"] == pytest.approx(cd_l[0].tolist(), rel=1e-5, abs=1e-5)
     assert infer_out["bridge_target"] == pytest.approx(brt_l[0].tolist(), rel=1e-5, abs=1e-5)
     assert infer_out["move_dir"] == pytest.approx(md_l[0].tolist(), rel=1e-5, abs=1e-5)
+
+
+def test_actor_model_matches_exported_torch_actor_on_symbolic_obs():
+    torch_model = BuilderMLP().eval()
+    state = torch_model.export_weights()
+    infer_model = ActorModel(
+        output_heads={
+            "build_type": 13,
+            "build_dir": 9,
+            "conv_dir": 4,
+            "bridge_target": 28,
+            "move_dir": 9,
+            "temperature": 5,
+            "h_gate": H_DIM,
+            "h_cand": H_DIM,
+        },
+        assume_symbolic_tiles=True,
+    )
+    infer_model.load(state)
+
+    ct = FakeController()
+    player = infer_main.Player()
+    player.my_team = ct.get_team()
+    player.core_center = infer_main.Position(18, 20)
+    player.enemy_core = infer_main.Position(25, 22)
+    player._spawn_round = 100
+    player._prev_resources = (160.0, 35.0)
+
+    obs = player._encode_state(ct, ct.nearby_tiles, ct.nearby_entities)
+    h_prev = [0.0] * H_DIM
+    packed = torch.tensor([obs + h_prev], dtype=torch.float32)
+
+    with torch.no_grad():
+        bt_l, bd_l, cd_l, brt_l, md_l, _head_temperature, _h_next = torch_model.infer_packed(packed)
+        latent = torch_model.actor_latent(packed[:, :OBS_SIZE], packed[:, OBS_SIZE:])
+        recurrent_in = torch.cat([latent, packed[:, OBS_SIZE:]], dim=-1)
+        gate = torch_model.head_h_gate(recurrent_in)
+        cand = torch.tanh(torch_model.head_h_cand(recurrent_in))
+    infer_out = infer_model.infer(obs + h_prev)
+
+    assert infer_out["build_type"] == pytest.approx(bt_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["build_dir"] == pytest.approx(bd_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["conv_dir"] == pytest.approx(cd_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["bridge_target"] == pytest.approx(brt_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["move_dir"] == pytest.approx(md_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["h_gate"] == pytest.approx(gate[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["h_cand"] == pytest.approx(cand[0].tolist(), rel=1e-5, abs=1e-5)
