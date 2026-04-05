@@ -31,6 +31,7 @@ BOT_DIR = _resolve_bot_dir()
 if BOT_DIR not in sys.path:
     sys.path.insert(0, BOT_DIR)
 from tensor_lib import MLP
+from turrets import run_turret, run_launcher
 from model_constants import (
     GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES,
     H_DIM, HIDDEN_SIZES, COMPRESS_DIM, RMSNORM_LAYERS,
@@ -271,6 +272,10 @@ class Player:
             self._run_core(ct)
         elif etype == EntityType.BUILDER_BOT:
             self._run_builder(ct)
+        elif etype in (EntityType.GUNNER, EntityType.SENTINEL, EntityType.BREACH):
+            run_turret(ct, etype)
+        elif etype == EntityType.LAUNCHER:
+            run_launcher(ct)
 
     # ---- Core: spawn builders ----
 
