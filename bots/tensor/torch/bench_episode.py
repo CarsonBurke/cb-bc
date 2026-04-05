@@ -47,6 +47,7 @@ def _benchmark_batched(args) -> dict:
         League,
         PROJECT_ROOT,
         TEACHER_HIDDEN,
+        TRAIN_MAX_TURNS,
         WEIGHT_PATH,
         _default_session_name,
         _init_session,
@@ -114,6 +115,7 @@ def _benchmark_batched(args) -> dict:
         1, replay_dir,
         opp_hidden=hidden,
         coalesce_ms=args.coalesce_ms,
+        max_training_turns=TRAIN_MAX_TURNS,
         profile=collection_profile,
     )
     if not all_trajs:

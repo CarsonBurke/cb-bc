@@ -66,7 +66,15 @@ import torch.nn.functional as F
 
 try:
     from hidden_state_bank import HiddenStateBank
-    from replay_buffers import preload_replay_buffers
+    from replay_buffers import (
+        AX_DELIVERED_BUFFER,
+        SCALAR_BUFFER,
+        STATE_BUFFER,
+        TI_DELIVERED_BUFFER,
+        TRANSFER_EVENTS_BUFFER,
+        load_replay_buffer,
+        preload_replay_buffers,
+    )
     from shared_collector import (
         COLLECTOR_RING_SLOTS_DEFAULT,
         CollectorServerSide,
@@ -87,7 +95,15 @@ try:
     )
 except ImportError:
     from bots.tensor.torch.hidden_state_bank import HiddenStateBank
-    from bots.tensor.torch.replay_buffers import preload_replay_buffers
+    from bots.tensor.torch.replay_buffers import (
+        AX_DELIVERED_BUFFER,
+        SCALAR_BUFFER,
+        STATE_BUFFER,
+        TI_DELIVERED_BUFFER,
+        TRANSFER_EVENTS_BUFFER,
+        load_replay_buffer,
+        preload_replay_buffers,
+    )
     from bots.tensor.shared_collector import (
         COLLECTOR_RING_SLOTS_DEFAULT,
         CollectorServerSide,
@@ -169,6 +185,7 @@ import ctypes as _ctypes
 WORKER_LAUNCH_STAGGER_S = 0.005
 DUMMY_OPP_PATH = "__dummy__"
 DUMMY_OPP_ID = "dummy"
+TRAIN_MAX_TURNS = 200
 _DUMMY_DIR_TILES = (6, 7, 8, 11, 12, 13, 16, 17, 18)
 _dummy_idx_cache = {}
 _OPP_GRAPH_TEMP = 0.5
@@ -593,17 +610,22 @@ def collect_games_batched(
     benchmark_seed: int | None = None,
     benchmark_maps: list[str] | None = None,
     collector_ring_slots: int = COLLECTOR_RING_SLOTS_DEFAULT,
+    max_training_turns: int | None = None,
     profile: dict[str, float] | None = None,
     trace=None,
 ) -> tuple[list[list[TrajectoryStep]], list[str | None], dict[str, list[str | None]], list[dict | None], list[int], list[int], dict[int, float], list[GameLaunchSpec]]:
     """Run all games with batched GPU inference via shared-memory rings."""
+    if max_training_turns is not None and max_training_turns < 2000 and REWARD_MODE == RewardMode.OUTCOME:
+        raise ValueError("max_training_turns requires dense per-turn rewards; outcome-only reward mode is unsupported")
     t_total = time.perf_counter() if profile is not None else 0.0
     bot_a = str(PROJECT_ROOT / "bots" / "tensor_proxy" / "main.py")
     bot_b_proxy = str(PROJECT_ROOT / "bots" / "tensor_proxy_opp" / "main.py")
     bot_b_dummy = str(PROJECT_ROOT / "bots" / "tensor_dummy" / "main.py")
     engine_root = str(PROJECT_ROOT)
     replay_dir.mkdir(parents=True, exist_ok=True)
-    tmpdir = tempfile.mkdtemp(prefix="batched_")
+    temp_root = PROJECT_ROOT / ".tmp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="batched_", dir=str(temp_root))
     if collector_ring_slots <= 0:
         raise ValueError(f"collector_ring_slots must be > 0, got {collector_ring_slots}")
     n_games = len(opp_weight_paths)
@@ -1239,7 +1261,12 @@ def collect_games_batched(
             game_trajs = augment_trajectories_with_flow_rewards(game_trajs, rewards)
             # Track delivery totals separately for logging
             delivery_rewards = compute_dense_delivery_rewards(gstates)
+            if max_training_turns is not None:
+                delivery_rewards = _truncate_reward_dict(delivery_rewards, max_training_turns)
             game_delivery_totals[game_counter] = sum(delivery_rewards.values())
+        if max_training_turns is not None:
+            game_trajs = _truncate_trajectories_to_turn_limit(game_trajs, max_training_turns)
+            gstates = _truncate_global_states_to_turn_limit(gstates, max_training_turns)
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -1292,6 +1319,80 @@ def _shared_flow_reward_total(game_trajs: list[list[TrajectoryStep]]) -> float:
             if reward > round_rewards.get(rnd, 0.0):
                 round_rewards[rnd] = reward
     return sum(round_rewards.values())
+
+
+def _truncate_trajectories_to_turn_limit(
+    trajectories: list[list[TrajectoryStep]],
+    max_turns: int,
+) -> list[list[TrajectoryStep]]:
+    """Keep only non-empty trajectories with steps strictly before ``max_turns``."""
+    if max_turns <= 0:
+        return []
+    truncated = [
+        [step for step in traj if _step_round_index(step) < max_turns]
+        for traj in trajectories
+    ]
+    return [traj for traj in truncated if traj]
+
+
+def _truncate_reward_dict(rewards: dict[int, float], max_turns: int) -> dict[int, float]:
+    if max_turns <= 0:
+        return {}
+    return {rnd: reward for rnd, reward in rewards.items() if rnd < max_turns}
+
+
+def _truncate_global_states_to_turn_limit(
+    global_states: dict | None,
+    max_turns: int,
+) -> dict | None:
+    """Slice replay-backed per-turn buffers so training only sees early turns."""
+    if global_states is None:
+        return None
+    n_turns = int(global_states.get("n_turns", 0))
+    if n_turns <= max_turns:
+        return global_states
+
+    capped_turns = max(0, int(max_turns))
+    state_stride = int(global_states.get("state_stride", 0))
+    n_scalars = int(global_states.get("n_scalars", 0))
+    bytes_per_turn = {
+        STATE_BUFFER: state_stride * 4,
+        SCALAR_BUFFER: n_scalars * 4,
+        TRANSFER_EVENTS_BUFFER: 8,
+        TI_DELIVERED_BUFFER: 8,
+        AX_DELIVERED_BUFFER: 8,
+    }
+
+    for spec, per_turn in bytes_per_turn.items():
+        limit = capped_turns * per_turn
+        required = spec in (STATE_BUFFER, SCALAR_BUFFER)
+        if per_turn <= 0:
+            global_states[spec.buf_key] = None
+            global_states[spec.path_key] = None
+            continue
+        path = global_states.get(spec.path_key)
+        if path:
+            try:
+                with Path(path).open("rb") as f:
+                    global_states[spec.buf_key] = bytearray(f.read(limit))
+                global_states[spec.path_key] = None
+                continue
+            except OSError:
+                pass
+        buf = global_states.get(spec.buf_key)
+        if buf is None:
+            if required:
+                raise RuntimeError(
+                    f"missing required replay buffer during truncation: {spec.path_key}"
+                )
+            global_states[spec.buf_key] = None
+            global_states[spec.path_key] = None
+            continue
+        global_states[spec.buf_key] = bytearray(memoryview(buf)[:limit])
+        global_states[spec.path_key] = None
+
+    global_states["n_turns"] = capped_turns
+    return global_states
 
 
 def main():
@@ -1416,6 +1517,7 @@ def main():
     print(f"Device: {DEVICE} | {n_params:,} params")
     print(f"Self-play: {args.episodes} episodes, {args.opponents}x{args.games_per_opp} games")
     print(f"Collector ring slots: {args.collector_ring_slots}")
+    print(f"Training turn cap: first {TRAIN_MAX_TURNS} turns per match")
     if args.benchmark_seed is not None or args.benchmark_maps:
         print(
             "Benchmark workload:"
@@ -1499,6 +1601,7 @@ def main():
                 benchmark_seed=args.benchmark_seed,
                 benchmark_maps=benchmark_maps if (args.benchmark_seed is not None or args.benchmark_maps) else None,
                 collector_ring_slots=args.collector_ring_slots,
+                max_training_turns=TRAIN_MAX_TURNS,
                 profile=episode_profile,
                 trace=episode_trace,
             )

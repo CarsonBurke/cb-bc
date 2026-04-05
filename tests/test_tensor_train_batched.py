@@ -270,3 +270,132 @@ def test_hidden_state_bank_gather_into_fills_preallocated_buffer():
             dtype=torch.float32,
         ),
     )
+
+
+def _test_step(round_idx: int, reward: float = 0.0):
+    obs = array("f", [0.0] * train_batched_mod.OBS_SIZE)
+    h_prev = array("f", [0.0] * train_batched_mod.H_DIM)
+    return make_trajectory_step(
+        obs=obs,
+        h_prev=h_prev,
+        obs_bytes_len=train_batched_mod.OBS_SIZE * 4,
+        h_bytes_len=train_batched_mod.H_DIM * 4,
+        round_idx=round_idx,
+        bt=0,
+        bd=0,
+        cd=0,
+        brt=0,
+        md=0,
+        reward=reward,
+        old_log_prob=0.0,
+        enemy_core_dmg=0.0,
+        own_core_dmg=0.0,
+        harv_attempt=0,
+        harv_fail=0,
+        harv_prox_gate=0,
+        harv_prox_paid=0,
+        conv_attempt=0,
+        conv_fail=0,
+        conv_prox_gate=0,
+        conv_prox_paid=0,
+    )
+
+
+def test_truncate_trajectories_to_turn_limit_filters_late_steps():
+    trajectories = [
+        [_test_step(0), _test_step(199), _test_step(200)],
+        [_test_step(150), _test_step(201)],
+        [_test_step(250)],
+    ]
+
+    truncated = train_batched_mod._truncate_trajectories_to_turn_limit(trajectories, 200)
+
+    assert [[step.round_idx for step in traj] for traj in truncated] == [[0, 199], [150]]
+
+
+def test_truncate_global_states_to_turn_limit_slices_replay_buffers():
+    states = array("f", [float(i) for i in range(3 * 2)])
+    scalars = array("f", [float(i) for i in range(3)])
+    transfers = array("f", [float(i) for i in range(3 * 2)])
+    delivered = array("i", [int(i) for i in range(3 * 2)])
+    global_states = {
+        "states_buf": states.tobytes(),
+        "scalars_buf": scalars.tobytes(),
+        "transfer_events_buf": transfers.tobytes(),
+        "ti_delivered_buf": delivered.tobytes(),
+        "ax_delivered_buf": delivered.tobytes(),
+        "states_path": "/tmp/full.states.bin",
+        "scalars_path": "/tmp/full.scalars.bin",
+        "transfer_events_path": "/tmp/full.transfers.bin",
+        "ti_delivered_path": "/tmp/full.ti.bin",
+        "ax_delivered_path": "/tmp/full.ax.bin",
+        "state_stride": 2,
+        "n_scalars": 1,
+        "n_turns": 3,
+    }
+
+    truncated = train_batched_mod._truncate_global_states_to_turn_limit(global_states, 2)
+
+    assert truncated["n_turns"] == 2
+    assert bytes(truncated["states_buf"]) == states.tobytes()[: 2 * 2 * 4]
+    assert bytes(truncated["scalars_buf"]) == scalars.tobytes()[: 2 * 4]
+    assert bytes(truncated["transfer_events_buf"]) == transfers.tobytes()[: 2 * 8]
+    assert bytes(truncated["ti_delivered_buf"]) == delivered.tobytes()[: 2 * 8]
+    assert bytes(truncated["ax_delivered_buf"]) == delivered.tobytes()[: 2 * 8]
+    assert truncated["states_path"] is None
+    assert truncated["scalars_path"] is None
+    assert truncated["transfer_events_path"] is None
+    assert truncated["ti_delivered_path"] is None
+    assert truncated["ax_delivered_path"] is None
+
+
+def test_truncate_global_states_to_turn_limit_reads_path_backed_prefix(tmp_path):
+    state_path = tmp_path / "states.bin"
+    scalar_path = tmp_path / "scalars.bin"
+    states = array("f", [float(i) for i in range(4 * 2)])
+    scalars = array("f", [float(i) for i in range(4)])
+    state_path.write_bytes(states.tobytes())
+    scalar_path.write_bytes(scalars.tobytes())
+    global_states = {
+        "states_path": str(state_path),
+        "scalars_path": str(scalar_path),
+        "state_stride": 2,
+        "n_scalars": 1,
+        "n_turns": 4,
+    }
+
+    truncated = train_batched_mod._truncate_global_states_to_turn_limit(global_states, 2)
+
+    assert truncated is global_states
+    assert truncated["n_turns"] == 2
+    assert bytes(truncated["states_buf"]) == states.tobytes()[: 2 * 2 * 4]
+    assert bytes(truncated["scalars_buf"]) == scalars.tobytes()[: 2 * 4]
+    assert truncated["states_path"] is None
+    assert truncated["scalars_path"] is None
+
+
+def test_truncate_global_states_to_turn_limit_is_noop_when_under_cap():
+    global_states = {
+        "states_buf": b"abcd",
+        "n_turns": 2,
+        "state_stride": 1,
+        "n_scalars": 0,
+    }
+
+    truncated = train_batched_mod._truncate_global_states_to_turn_limit(global_states, 3)
+
+    assert truncated is global_states
+    assert truncated["states_buf"] == b"abcd"
+    assert truncated["n_turns"] == 2
+
+
+def test_truncate_global_states_to_turn_limit_requires_state_buffer():
+    global_states = {
+        "states_path": "/tmp/does-not-exist.states.bin",
+        "n_turns": 3,
+        "state_stride": 1,
+        "n_scalars": 0,
+    }
+
+    with pytest.raises(RuntimeError, match="missing required replay buffer"):
+        train_batched_mod._truncate_global_states_to_turn_limit(global_states, 2)
