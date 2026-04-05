@@ -440,6 +440,56 @@ def test_resolve_critic_minibatch_size_uses_configured_epoch_batch_target():
     assert model_mod._resolve_critic_minibatch_size(13) == 2
 
 
+def test_build_critic_turn_minibatches_preserves_coverage_and_target_steps():
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            model_mod.torch,
+            "randperm",
+            lambda n, device=None: torch.arange(n, device=device),
+        )
+        step_round_idx = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.long)
+        positive_mask = torch.tensor([False, False, False, False, True, True, True, True], dtype=torch.bool)
+        batches = model_mod._build_critic_turn_minibatches(
+            step_round_idx,
+            target_steps=4,
+            positive_mask=positive_mask,
+        )
+    finally:
+        monkeypatch.undo()
+
+    flattened = torch.cat(batches)
+    assert flattened.numel() == step_round_idx.numel()
+    assert torch.equal(flattened.sort().values, torch.arange(step_round_idx.numel()))
+    assert all(batch.numel() <= 4 for batch in batches)
+    assert all(positive_mask[batch].any().item() for batch in batches)
+
+
+def test_build_critic_turn_minibatches_handles_insufficient_positive_turns_without_duplication():
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            model_mod.torch,
+            "randperm",
+            lambda n, device=None: torch.arange(n, device=device),
+        )
+        step_round_idx = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.long)
+        positive_mask = torch.tensor([False, False, False, False, False, False, True, True], dtype=torch.bool)
+        batches = model_mod._build_critic_turn_minibatches(
+            step_round_idx,
+            target_steps=4,
+            positive_mask=positive_mask,
+        )
+    finally:
+        monkeypatch.undo()
+
+    flattened = torch.cat(batches)
+    assert flattened.numel() == step_round_idx.numel()
+    assert torch.equal(flattened.sort().values, torch.arange(step_round_idx.numel()))
+    assert all(batch.numel() <= 4 for batch in batches)
+    assert sum(positive_mask[batch].any().item() for batch in batches) == 1
+
+
 def test_freeze_critic_skips_critic_singleton_and_compile(monkeypatch):
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("critic singleton should not be constructed when frozen")

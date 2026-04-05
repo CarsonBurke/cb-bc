@@ -125,8 +125,8 @@ NUM_BUCKETS = 255
 # symlog range — covers symexp(±9) ≈ ±8103
 BUCKET_LOW = -9.0
 BUCKET_HIGH = 9.0
-# GHL sigma: 2× bin width (Imani et al. default, confirmed in fig 6 of Farebrother et al.)
-_GHL_SIGMA_RATIO = 2.0
+# GHL sigma in symlog space, expressed as a multiple of bin width.
+_GHL_SIGMA_RATIO = 0.5
 _SQRT2 = math.sqrt(2.0)
 
 
@@ -726,12 +726,10 @@ class CriticTileEmbed(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.net = nn.Sequential(
+            nn.Linear(in_channels, in_channels, bias=False),
+            RMSNorm(in_channels),
+            nn.SiLU(),
             nn.Linear(in_channels, embed_dim, bias=False),
-            RMSNorm(embed_dim),
-            nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim, bias=False),
-            RMSNorm(embed_dim),
-            nn.SiLU(),
         )
         self._init_weights()
 
@@ -1700,6 +1698,111 @@ class CriticInputStaging:
     capacity_rounds: int
     capacity_h: int
     capacity_w: int
+
+
+def _build_critic_turn_minibatches(
+    step_round_idx: torch.Tensor,
+    target_steps: int,
+    positive_mask: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
+    """Build shuffled critic turn minibatches without splitting turns.
+
+    Critic updates are not recurrent, but the centralized critic is keyed by
+    turn-level map state. We therefore shuffle turns, keep all unit-steps from
+    a turn together, and spread positive-reward turns across batches when
+    available while preserving exact epoch coverage.
+    """
+    n_steps = int(step_round_idx.numel())
+    if n_steps <= 0:
+        return []
+
+    dev = step_round_idx.device
+    target_steps = max(1, int(target_steps))
+    packed = _pack_round_major_tensors(step_round_idx)
+    round_counts = packed.round_offsets[1:] - packed.round_offsets[:-1]
+    n_rounds = int(packed.round_ids.shape[0])
+    total_steps = int(round_counts.sum().item())
+    target_batches = max(1, math.ceil(total_steps / target_steps))
+
+    if positive_mask is not None:
+        round_positive_counts = torch.zeros(n_rounds, dtype=torch.int32, device=dev)
+        round_inverse = torch.bucketize(step_round_idx[packed.perm], packed.round_ids)
+        round_positive_counts.index_add_(
+            0,
+            round_inverse,
+            positive_mask[packed.perm].to(dtype=torch.int32),
+        )
+        positive_rounds = torch.nonzero(round_positive_counts > 0, as_tuple=False).flatten()
+        negative_rounds = torch.nonzero(round_positive_counts == 0, as_tuple=False).flatten()
+        if positive_rounds.numel() > 0:
+            positive_rounds = positive_rounds[
+                torch.randperm(positive_rounds.numel(), device=dev)
+            ]
+        if negative_rounds.numel() > 0:
+            negative_rounds = negative_rounds[
+                torch.randperm(negative_rounds.numel(), device=dev)
+            ]
+    else:
+        positive_rounds = torch.empty(0, dtype=torch.long, device=dev)
+        negative_rounds = torch.randperm(n_rounds, device=dev)
+
+    seed_count = min(target_batches, int(positive_rounds.numel()))
+    round_batches = [
+        [int(positive_rounds[i].item())]
+        for i in range(seed_count)
+    ]
+    batch_steps = [
+        int(round_counts[positive_rounds[i]].item())
+        for i in range(seed_count)
+    ]
+
+    if not round_batches:
+        round_batches = [[]]
+        batch_steps = [0]
+
+    remaining_parts: list[torch.Tensor] = []
+    if positive_rounds.numel() > seed_count:
+        remaining_parts.append(positive_rounds[seed_count:])
+    if negative_rounds.numel() > 0:
+        remaining_parts.append(negative_rounds)
+    if remaining_parts:
+        remaining_rounds = torch.cat(remaining_parts)
+        if remaining_rounds.numel() > 1:
+            remaining_rounds = remaining_rounds[
+                torch.randperm(remaining_rounds.numel(), device=dev)
+            ]
+    else:
+        remaining_rounds = torch.empty(0, dtype=torch.long, device=dev)
+
+    for round_pos in remaining_rounds:
+        round_idx = int(round_pos.item())
+        count = int(round_counts[round_idx].item())
+        best_batch = -1
+        best_steps = -1
+        for i, steps in enumerate(batch_steps):
+            next_steps = steps + count
+            if steps > 0 and next_steps > target_steps:
+                continue
+            if steps > best_steps:
+                best_batch = i
+                best_steps = steps
+        if best_batch < 0:
+            round_batches.append([round_idx])
+            batch_steps.append(count)
+        else:
+            round_batches[best_batch].append(round_idx)
+            batch_steps[best_batch] += count
+
+    offsets_cpu = packed.round_offsets_cpu
+    step_batches: list[torch.Tensor] = []
+    for batch_rounds in round_batches:
+        batch = torch.tensor(batch_rounds, dtype=torch.long, device=dev)
+        parts = [
+            packed.perm[offsets_cpu[int(round_pos.item())]:offsets_cpu[int(round_pos.item()) + 1]]
+            for round_pos in batch
+        ]
+        step_batches.append(torch.cat(parts) if len(parts) > 1 else parts[0])
+    return step_batches
 
 
 def _pack_round_major_tensors(
@@ -3190,24 +3293,21 @@ def ppo_update(
             centralized_data["step_unit_ctx"],
             centralized_data["step_actor_latent"],
         ], dim=1)
+        positive_reward_mask = centralized_data["rewards"] > 0
         _ctx_dim = centralized_data["step_unit_ctx"].shape[1]
         old_values_safe = old_values if old_values is not None else returns
         step_rv = torch.stack([returns, old_values_safe], dim=1)
 
         for epoch in range(critic_epochs):
             with trace_scope(trace, "ppo.critic_epoch_plan"):
-                epoch_plan = _build_critic_epoch_plan(
+                step_batches = _build_critic_turn_minibatches(
                     step_round_idx,
-                    step_unit_xy,
-                    step_unit_float,
-                    step_rv,
-                    target_steps=critic_minibatch_size,
+                    critic_minibatch_size,
+                    positive_mask=positive_reward_mask,
                 )
 
-            for batch_idx, (round_start, round_end) in enumerate(epoch_plan.batch_ranges):
+            for batch_idx, step_indices in enumerate(step_batches):
                 with trace_scope(trace, "ppo.critic_minibatch"):
-                    step_lo = epoch_plan.round_offsets_cpu[round_start]
-                    step_hi = epoch_plan.round_offsets_cpu[round_end]
                     t_value = time.perf_counter() if profile is not None else 0.0
                     critic_opt.zero_grad(set_to_none=True)
                     capture_this_batch = (
@@ -3220,12 +3320,21 @@ def ppo_update(
                         torch.cuda.synchronize()
                         torch.cuda.profiler.start()
 
-                    mb_xy = epoch_plan.packed_xy[step_lo:step_hi]
-                    mb_uf = epoch_plan.packed_unit_float[step_lo:step_hi]
-                    mb_rv = epoch_plan.packed_returns_values[step_lo:step_hi]
+                    batch_round_idx = step_round_idx[step_indices]
+                    packed = _pack_round_major_tensors(
+                        batch_round_idx,
+                        step_unit_xy[step_indices],
+                        step_unit_float[step_indices],
+                        step_rv[step_indices],
+                    )
+                    mb_xy, mb_uf, mb_rv = packed.tensors
                     vf_denom = max(mb_xy.shape[0], 1)
-                    c_rounds = epoch_plan.round_ids[round_start:round_end]
+                    c_rounds = packed.round_ids
                     g_obs, g_mask, g_scalars = _load_critic_round_batch(centralized_data, c_rounds)
+                    local_round_idx = torch.repeat_interleave(
+                        torch.arange(c_rounds.shape[0], device=step_indices.device),
+                        packed.round_offsets[1:] - packed.round_offsets[:-1],
+                    )
                     u_ctx = mb_uf[:, :_ctx_dim]
                     u_latent = mb_uf[:, _ctx_dim:]
                     mb_returns = mb_rv[:, 0]
@@ -3235,7 +3344,7 @@ def ppo_update(
                             g_obs,
                             g_mask,
                             g_scalars,
-                            epoch_plan.local_round_idx_by_batch[batch_idx],
+                            local_round_idx,
                             mb_xy,
                             u_ctx,
                             u_latent,
