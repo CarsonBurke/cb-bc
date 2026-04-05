@@ -561,13 +561,8 @@ def _actor_bc_optimizer(
     lr: float,
     weight_decay: float = 1e-4,
 ) -> torch.optim.Optimizer:
-    """Actor-BC optimizer excluding exploration parameters."""
-    excluded = {
-        id(model.head_logit_scale.weight),
-        id(model.head_logit_scale.bias),
-    }
-    params = [param for param in model.parameters() if id(param) not in excluded]
-    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    """Actor-BC optimizer."""
+    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 
 def _run_eval_games(

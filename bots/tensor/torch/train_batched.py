@@ -157,10 +157,9 @@ from model import (
     N_CONV_DIR,
     N_BRIDGE_TARGETS,
     N_DIR,
-    N_LOGIT_SCALE,
+    N_ACTION_TEMPERATURES,
     bd_has_ore,
     _sample_actions_from_policy_heads,
-    _unimix_logits,
     _OBS_GLOBAL_START,
 )
 
@@ -835,7 +834,7 @@ def collect_games_batched(
         _pin_actor_cd_l = torch.empty(_max_a_batch, N_CONV_DIR, dtype=torch.float32, pin_memory=True)
         _pin_actor_brt_l = torch.empty(_max_a_batch, N_BRIDGE_TARGETS, dtype=torch.float32, pin_memory=True)
         _pin_actor_md_l = torch.empty(_max_a_batch, N_DIR, dtype=torch.float32, pin_memory=True)
-        _pin_actor_eps = torch.empty(_max_a_batch, N_LOGIT_SCALE, dtype=torch.float32, pin_memory=True)
+        _pin_actor_temperature = torch.empty(_max_a_batch, N_ACTION_TEMPERATURES, dtype=torch.float32, pin_memory=True)
     else:
         _pin_obs = torch.empty(_max_a_batch, OBS_SIZE, dtype=torch.float32)
         _pin_results = torch.empty(5, _max_a_batch, dtype=torch.float32)
@@ -937,7 +936,7 @@ def collect_games_batched(
                 obs_cpu = batch_obs
                 t_infer = time.perf_counter() if profile is not None else 0.0
                 while True:
-                    bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = graphed_a.policy_heads(
+                    bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_next = graphed_a.policy_heads(
                         actor_all_t,
                         trace=trace,
                         scope_prefix="collect.actor",
@@ -953,7 +952,7 @@ def collect_games_batched(
                             _pin_actor_cd_l[:n_a].copy_(cd_l, non_blocking=True)
                             _pin_actor_brt_l[:n_a].copy_(brt_l, non_blocking=True)
                             _pin_actor_md_l[:n_a].copy_(md_l, non_blocking=True)
-                            _pin_actor_eps[:n_a].copy_(eps, non_blocking=True)
+                            _pin_actor_temperature[:n_a].copy_(head_temperature, non_blocking=True)
                             _pin_h_prev[:n_a].copy_(actor_all_t[:, OBS_SIZE:], non_blocking=True)
                             torch.cuda.synchronize()
                             bt_l_cpu = _pin_actor_bt_l[:n_a]
@@ -961,7 +960,7 @@ def collect_games_batched(
                             cd_l_cpu = _pin_actor_cd_l[:n_a]
                             brt_l_cpu = _pin_actor_brt_l[:n_a]
                             md_l_cpu = _pin_actor_md_l[:n_a]
-                            eps_cpu = _pin_actor_eps[:n_a]
+                            temperature_cpu = _pin_actor_temperature[:n_a]
                             h_prev_cpu = _pin_h_prev[:n_a]
                         else:
                             bt_l_cpu = bt_l.float().cpu()
@@ -969,7 +968,7 @@ def collect_games_batched(
                             cd_l_cpu = cd_l.float().cpu()
                             brt_l_cpu = brt_l.float().cpu()
                             md_l_cpu = md_l.float().cpu()
-                            eps_cpu = eps.float().cpu()
+                            temperature_cpu = head_temperature.float().cpu()
                             h_prev_cpu = actor_all_t[:, OBS_SIZE:].cpu().contiguous()
                     if profile is not None:
                         profile["d2h_a_s"] = profile.get("d2h_a_s", 0.0) + (time.perf_counter() - t_phase)
@@ -983,7 +982,7 @@ def collect_games_batched(
                             cd_l_cpu,
                             brt_l_cpu,
                             md_l_cpu,
-                            eps_cpu,
+                            temperature_cpu,
                             h_prev_cpu,
                             temperature=1.0,
                             return_log_prob=True,
@@ -1151,7 +1150,7 @@ def collect_games_batched(
                             acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
                     else:
                         # Fallback: ungraphed inference
-                        bt_l, bd_l, cd_l, _brt_l, md_l, _eps, h_next = opp_m.infer_packed(opp_all_t)
+                        bt_l, bd_l, cd_l, _brt_l, md_l, head_temperature, h_next = opp_m.infer_packed(opp_all_t)
                         if profile is not None:
                             dt = time.perf_counter() - t_phase
                             profile["forward_b_s"] = profile.get("forward_b_s", 0.0) + dt
@@ -1164,16 +1163,40 @@ def collect_games_batched(
                         cd_l_cpu = cd_l.float().cpu()
                         brt_l_cpu = _brt_l.float().cpu()
                         md_l_cpu = md_l.float().cpu()
+                        head_temperature_cpu = head_temperature.float().cpu()
                         bt_m, bd_m = compute_action_masks(obs_t_cpu)
                         cd_m = conveyor_dir_mask(obs_t_cpu.device, obs_t_cpu.shape[0])
                         bt_l_cpu.masked_fill_(~bt_m, -1e9)
                         cd_l_cpu.masked_fill_(~cd_m, -1e9)
-                        bt_act, _ = sample_logits_gumbel(bt_l_cpu, _OPP_GRAPH_TEMP, mask=bt_m, return_log_prob=False)
+                        bt_act, _ = sample_logits_gumbel(
+                            bt_l_cpu,
+                            temperature=head_temperature_cpu[:, 0] * _OPP_GRAPH_TEMP,
+                            mask=bt_m,
+                            return_log_prob=False,
+                        )
                         bd_l_cpu.masked_fill_(~bd_m, -1e9)
-                        bd_act, _ = sample_logits_gumbel(bd_l_cpu, _OPP_GRAPH_TEMP, mask=bd_m, return_log_prob=False)
-                        cd_act, _ = sample_logits_gumbel(cd_l_cpu, _OPP_GRAPH_TEMP, mask=cd_m, return_log_prob=False)
-                        brt_act, _ = sample_logits_gumbel(brt_l_cpu, _OPP_GRAPH_TEMP, return_log_prob=False)
-                        md_act, _ = sample_logits_gumbel(md_l_cpu, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        bd_act, _ = sample_logits_gumbel(
+                            bd_l_cpu,
+                            temperature=head_temperature_cpu[:, 1] * _OPP_GRAPH_TEMP,
+                            mask=bd_m,
+                            return_log_prob=False,
+                        )
+                        cd_act, _ = sample_logits_gumbel(
+                            cd_l_cpu,
+                            temperature=head_temperature_cpu[:, 2] * _OPP_GRAPH_TEMP,
+                            mask=cd_m,
+                            return_log_prob=False,
+                        )
+                        brt_act, _ = sample_logits_gumbel(
+                            brt_l_cpu,
+                            temperature=head_temperature_cpu[:, 3] * _OPP_GRAPH_TEMP,
+                            return_log_prob=False,
+                        )
+                        md_act, _ = sample_logits_gumbel(
+                            md_l_cpu,
+                            temperature=head_temperature_cpu[:, 4] * _OPP_GRAPH_TEMP,
+                            return_log_prob=False,
+                        )
                         acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act])
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
@@ -1772,14 +1795,16 @@ def main():
             "ret_max": stats.get("ret_max", 0),
             "ret_mean": stats.get("ret_mean", 0),
             "ret_oob_frac": stats.get("ret_oob_frac", 0),
-            "ls_bt_mean": round(stats.get("ls_bt_mean", 0), 4),
-            "ls_bd_mean": round(stats.get("ls_bd_mean", 0), 4),
-            "ls_cd_mean": round(stats.get("ls_cd_mean", 0), 4),
-            "ls_md_mean": round(stats.get("ls_md_mean", 0), 4),
-            "ls_bt_std": round(stats.get("ls_bt_std", 0), 4),
-            "ls_bd_std": round(stats.get("ls_bd_std", 0), 4),
-            "ls_cd_std": round(stats.get("ls_cd_std", 0), 4),
-            "ls_md_std": round(stats.get("ls_md_std", 0), 4),
+            "temp_bt_mean": round(stats.get("temp_bt_mean", 0), 4),
+            "temp_bd_mean": round(stats.get("temp_bd_mean", 0), 4),
+            "temp_cd_mean": round(stats.get("temp_cd_mean", 0), 4),
+            "temp_brt_mean": round(stats.get("temp_brt_mean", 0), 4),
+            "temp_md_mean": round(stats.get("temp_md_mean", 0), 4),
+            "temp_bt_std": round(stats.get("temp_bt_std", 0), 4),
+            "temp_bd_std": round(stats.get("temp_bd_std", 0), 4),
+            "temp_cd_std": round(stats.get("temp_cd_std", 0), 4),
+            "temp_brt_std": round(stats.get("temp_brt_std", 0), 4),
+            "temp_md_std": round(stats.get("temp_md_std", 0), 4),
             "reward_raw_std": round(stats.get("reward_raw_std", 0), 4),
             "sps": stats["n_steps"], "elapsed": round(elapsed, 1),
             "winrate": round(total_wins / max(total_games, 1), 3),
