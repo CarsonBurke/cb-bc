@@ -72,9 +72,21 @@ def _benchmark_batched(args) -> dict:
     setup_start = time.perf_counter()
     hidden = TEACHER_HIDDEN if args.teacher else None
     model = BuilderMLP(hidden=hidden).to(DEVICE)
-    model.load_weights(WEIGHT_PATH)
+    session_weight_path = Path(sess["weight_path"])
+    if args.teacher:
+        if not session_weight_path.exists():
+            raise RuntimeError(
+                "Teacher benchmark requires an existing session checkpoint at "
+                f"{session_weight_path}; deploy weights at {WEIGHT_PATH} are student-format."
+            )
+        actor_source_path = session_weight_path
+    else:
+        actor_source_path = session_weight_path if session_weight_path.exists() else Path(WEIGHT_PATH)
+    if not model.load_weights(actor_source_path):
+        raise RuntimeError(f"Could not load benchmark weights from {actor_source_path}")
     reset_centralized_critic()
-    load_centralized_critic_checkpoint(WEIGHT_PATH, lr=args.lr)
+    critic_source_path = session_weight_path if session_weight_path.exists() else actor_source_path
+    load_centralized_critic_checkpoint(critic_source_path, lr=args.lr)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()

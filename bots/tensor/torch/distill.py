@@ -65,7 +65,7 @@ def main():
     print(f"Device: {DEVICE}")
 
     # Load league for opponents
-    league = League(sess["league_dir"], sess["league_json"])
+    league = League(sess["league_dir"])
     opponents = league.sample_opponents(min(3, len(league.models)))
     if not opponents:
         print("No opponents in league")
@@ -82,8 +82,9 @@ def main():
             opp_ids.append(opp["id"])
 
     t0 = time.time()
-    trajs, _, _ = collect_games_batched(
-        teacher, opp_paths, opp_ids, maps, args.workers, 0, replay_dir,
+    trajs, _all_winners, _per_opp_winners, _all_global_states, _traj_game_map, _game_origin, _game_delivery_totals, _game_specs = collect_games_batched(
+        teacher, opp_paths, opp_ids, maps, 0, replay_dir,
+        opp_hidden=TEACHER_HIDDEN,
     )
     t_collect = time.time() - t0
     print(f"Collected {len(trajs)} trajectories in {t_collect:.1f}s")

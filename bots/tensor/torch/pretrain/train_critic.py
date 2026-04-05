@@ -34,7 +34,7 @@ from model import (
     BuilderMLP,
     CentralizedCritic,
     DEVICE, GLOBAL_MAP_CHANNELS, GLOBAL_MAP_MAX_W, GLOBAL_MAP_MAX_H,
-    GLOBAL_SCALAR_DIM, H_DIM, UNIT_CONTEXT_DIM,
+    GLOBAL_SCALAR_DIM, H_DIM, OBS_PREFIX_SIZE, UNIT_CONTEXT_DIM,
     soft_cross_entropy_from_logits,
     value_target_probs,
     _make_bucket_centers, _normalize_actor_latent_dim,
@@ -254,11 +254,13 @@ def _compute_actor_latents_for_replay(
     actor: BuilderMLP,
     obs_pre_bt: torch.Tensor,
     bot_ids_bt: torch.Tensor,
-    device: torch.device,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """Replay actor latents in bot-major recurrent order. Runs on `device`."""
     if obs_pre_bt.shape[0] == 0:
         return torch.zeros(0, ACTOR_LATENT_DIM, dtype=torch.float16)
+    if device is None:
+        device = DEVICE
 
     with torch.no_grad():
         obs_pre = obs_pre_bt.to(device=device, dtype=torch.float32)
@@ -273,10 +275,6 @@ def _compute_actor_latents_for_replay(
 
         h_live = torch.zeros(seg_starts.shape[0], H_DIM, device=device)
         actor_latent = torch.empty(obs_pre.shape[0], ACTOR_LATENT_DIM, device=device)
-        w_gate = actor.head_h_gate.weight
-        b_gate = actor.head_h_gate.bias
-        w_cand = actor.head_h_cand.weight
-        b_cand = actor.head_h_cand.bias
 
         for t in range(max_len):
             active = seg_lens > t
@@ -285,8 +283,7 @@ def _compute_actor_latents_for_replay(
             h_prev = h_live[active_ids]
             raw_latent = actor._latent_from_obs_pre(obs_pre[step_idx], h_prev)
             actor_latent[step_idx] = _normalize_actor_latent_dim(raw_latent)
-            h_gate = F.linear(raw_latent, w_gate, b_gate)
-            h_cand = torch.tanh(F.linear(raw_latent, w_cand, b_cand))
+            h_gate, h_cand = actor._project_recurrent_heads(raw_latent, h_prev)
             z = torch.sigmoid(h_gate)
             h_live.index_copy_(0, active_ids, ((1.0 - z) * h_prev + z * h_cand).float())
 
@@ -296,15 +293,17 @@ def _compute_actor_latents_for_replay(
 def _compute_actor_obs_pre(
     actor: BuilderMLP,
     obs_bt_cpu: torch.Tensor,
-    device: torch.device,
+    device: torch.device | None = None,
     chunk_size: int = DEFAULT_PRETRAIN_CHUNK_SIZE,
 ) -> torch.Tensor:
     """Project replay observations through the actor's obs-only encoder in chunks."""
     if obs_bt_cpu.shape[0] == 0:
-        enc_dim = actor.encoder[0].out_features
+        enc_dim = OBS_PREFIX_SIZE
         return torch.zeros(0, enc_dim, dtype=torch.float16)
+    if device is None:
+        device = DEVICE
 
-    enc_dim = actor.encoder[0].out_features
+    enc_dim = OBS_PREFIX_SIZE
     obs_pre_cpu = torch.empty(obs_bt_cpu.shape[0], enc_dim, dtype=torch.float16)
 
     with torch.no_grad():
@@ -315,6 +314,49 @@ def _compute_actor_obs_pre(
             obs_pre_cpu[start:end] = obs_pre.to(dtype=torch.float16).cpu()
 
     return obs_pre_cpu
+
+
+def _compute_actor_obs_pre_for_replay(
+    actor: BuilderMLP,
+    obs_bt_cpu: torch.Tensor,
+    chunk_size: int = DEFAULT_PRETRAIN_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Compatibility wrapper for replay staging tests and one-off materialization."""
+    return _compute_actor_obs_pre(actor, obs_bt_cpu, chunk_size=chunk_size)
+
+
+def _ensure_step_actor_latents(
+    bufs: dict,
+    actor: BuilderMLP,
+) -> torch.Tensor:
+    """Materialize per-step actor latents from replay staging tensors if needed."""
+    step_actor_latent = bufs.get("step_actor_latent")
+    if step_actor_latent is not None:
+        return step_actor_latent
+
+    actor_obs_pre = bufs.get("actor_obs_pre")
+    if actor_obs_pre is None:
+        actor_obs = bufs.get("actor_obs")
+        if actor_obs is None:
+            raise KeyError("missing actor_obs staging tensor")
+        actor_obs_pre = _compute_actor_obs_pre_for_replay(actor, actor_obs)
+        bufs["actor_obs_pre"] = actor_obs_pre
+
+    actor_bot_ids = bufs.get("actor_bot_ids")
+    if actor_bot_ids is None:
+        raise KeyError("missing actor_bot_ids staging tensor")
+    actor_step_order = bufs.get("actor_step_order")
+    if actor_step_order is None:
+        raise KeyError("missing actor_step_order staging tensor")
+
+    actor_latent_bt = _compute_actor_latents_for_replay(actor, actor_obs_pre, actor_bot_ids)
+    step_actor_latent = actor_latent_bt.index_select(0, actor_step_order.to(torch.long))
+    bufs["step_actor_latent"] = step_actor_latent
+    bufs.pop("actor_obs_pre", None)
+    bufs.pop("actor_obs", None)
+    bufs.pop("actor_bot_ids", None)
+    bufs.pop("actor_step_order", None)
+    return step_actor_latent
 
 
 def precompute_all_actor_latents(

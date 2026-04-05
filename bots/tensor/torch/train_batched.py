@@ -332,7 +332,8 @@ def _get_cached_opponent_model(weight_path: str, hidden: list[int] | None) -> Bu
         return cached
 
     model = BuilderMLP(hidden=hidden).to(DEVICE)
-    model.load_weights(weight_path)
+    if not model.load_weights(weight_path):
+        raise RuntimeError(f"Could not load opponent weights from {weight_path}")
     model.eval()
     _cache_put(_opp_model_cache, key, model, _OPP_MODEL_CACHE_MAX)
     return model
@@ -1487,7 +1488,8 @@ def main():
     reset_centralized_critic()
     _critic_lr = args.critic_lr if args.critic_lr > 0 else args.lr
     if args.resume:
-        model.load_weights(weight_path)
+        if not model.load_weights(weight_path):
+            raise SystemExit(f"Could not load actor weights from {weight_path}")
         _load_resume_critic_checkpoint(weight_path, lr=_critic_lr)
     elif args.init_weights:
         if not model.load_weights(args.init_weights):

@@ -493,8 +493,6 @@ def _fused_actor_head_params(model) -> tuple[torch.Tensor, torch.Tensor]:
         model.head_conv_dir.weight,
         model.head_bridge_target.weight,
         model.head_move_dir.weight,
-        model.head_h_gate.weight,
-        model.head_h_cand.weight,
     ], dim=0)
     combined_b = torch.cat([
         model.head_build_type.bias,
@@ -502,8 +500,6 @@ def _fused_actor_head_params(model) -> tuple[torch.Tensor, torch.Tensor]:
         model.head_conv_dir.bias,
         model.head_bridge_target.bias,
         model.head_move_dir.bias,
-        model.head_h_gate.bias,
-        model.head_h_cand.bias,
     ])
     return combined_w, combined_b
 
@@ -531,12 +527,14 @@ def _forward_from_obs_pre_step_fused(
     """Recurrent actor step with a cached fused head projection."""
     h = model._latent_from_obs_pre(obs_pre, h_prev)
     combined = F.linear(h, combined_w, combined_b)
-    bt_l, bd_l, cd_l, brt_l, md_l, h_gate, h_cand = combined.split(
-        [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, H_DIM, H_DIM],
+    bt_l, bd_l, cd_l, brt_l, md_l = combined.split(
+        [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR],
         dim=-1,
     )
+    recurrent_in = torch.cat([h, h_prev], dim=-1)
+    h_gate = model.head_h_gate(recurrent_in)
+    h_cand = torch.tanh(model.head_h_cand(recurrent_in))
     z = torch.sigmoid(h_gate)
-    h_cand = torch.tanh(h_cand)
     h_next = (1.0 - z) * h_prev + z * h_cand
     return bt_l, bd_l, cd_l, brt_l, md_l, h_next
 
@@ -550,7 +548,8 @@ def _hidden_update_from_obs_pre_step_fused(
 ) -> torch.Tensor:
     """Recurrent hidden-state update without projecting policy heads."""
     h = model._latent_from_obs_pre(obs_pre, h_prev)
-    h_gate, h_cand = F.linear(h, combined_w, combined_b).split([H_DIM, H_DIM], dim=-1)
+    recurrent_in = torch.cat([h, h_prev], dim=-1)
+    h_gate, h_cand = F.linear(recurrent_in, combined_w, combined_b).split([H_DIM, H_DIM], dim=-1)
     z = torch.sigmoid(h_gate)
     h_cand = torch.tanh(h_cand)
     return (1.0 - z) * h_prev + z * h_cand
