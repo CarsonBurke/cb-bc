@@ -20,6 +20,7 @@ import TileLayout from './TileLayout'
 import { useCardSettings } from './CardSettingsContext'
 
 const TrainEpisodesCtx = createContext([])
+const DownsampledCtx = createContext([])
 const TrainConfigCtx = createContext({})
 const TrainLoadingCtx = createContext(true)
 const TrainLeagueCtx = createContext([])
@@ -45,6 +46,10 @@ function useTrainLeagueModels() {
 
 function useTrainGameLog() {
   return useContext(TrainGameLogCtx)
+}
+
+function useDownsampled() {
+  return useContext(DownsampledCtx)
 }
 
 function TrainingDataProvider({ session, children }) {
@@ -79,28 +84,23 @@ const MAX_CHART_POINTS = 200
 
 function downsample(arr, max = MAX_CHART_POINTS) {
   if (arr.length <= max) return arr
-  // Use fixed-width buckets so existing buckets stay stable as data grows.
-  // Bucket width is ceil(length/max) — only the last bucket changes size.
   const bucketSize = Math.ceil(arr.length / max)
   const result = []
   for (let i = 0; i < arr.length; i += bucketSize) {
     const end = Math.min(i + bucketSize, arr.length)
-    // Average numeric fields, keep structure from the midpoint element
     const mid = arr[Math.floor((i + end - 1) / 2)]
-    const bucket = arr.slice(i, end)
     const averaged = { ...mid }
     for (const key of Object.keys(mid)) {
       if (typeof mid[key] === 'number') {
         let sum = 0, count = 0
-        for (let j = 0; j < bucket.length; j++) {
-          const v = bucket[j][key]
+        for (let j = i; j < end; j++) {
+          const v = arr[j][key]
           if (v != null) { sum += v; count++ }
         }
         averaged[key] = count > 0 ? sum / count : mid[key]
       }
     }
-    // Preserve episode number from the last element in the bucket for x-axis
-    averaged.episode = bucket[bucket.length - 1].episode
+    averaged.episode = arr[end - 1].episode
     result.push(averaged)
   }
   return result
@@ -159,10 +159,17 @@ function chartBase(yViewport = null) {
   return {
     responsive: true,
     maintainAspectRatio: false,
+    animation: false,
     interaction: { mode: 'index', intersect: false },
     scales,
     plugins: { legend: { display: false } },
   }
+}
+
+function DownsampledProvider({ children }) {
+  const episodes = useRangedEpisodes()
+  const ds = useMemo(() => downsample(episodes), [episodes])
+  return <DownsampledCtx.Provider value={ds}>{children}</DownsampledCtx.Provider>
 }
 
 // ---- Card content components ----
@@ -202,10 +209,9 @@ function StatusPanel() {
 }
 
 const RewardChart = memo(function RewardChart() {
-  const episodes = useRangedEpisodes()
+  const ds = useDownsampled()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
-  if (episodes.length <= 1) return <NoData />
-  const ds = downsample(episodes)
+  if (ds.length <= 1) return <NoData />
   const raw = ds.map(e => e.reward)
   const yViewport = bandsOn ? percentileViewport(raw) : null
   const datasets = [{
@@ -225,10 +231,9 @@ const RewardChart = memo(function RewardChart() {
 })
 
 const RewardBreakdownChart = memo(function RewardBreakdownChart() {
-  const episodes = useRangedEpisodes()
+  const ds = useDownsampled()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
-  if (episodes.length <= 1) return <NoData />
-  const ds = downsample(episodes)
+  if (ds.length <= 1) return <NoData />
   const dim = emaOn
   const series = [
     { key: 'r_flow', altKey: 'r_work', label: 'Flow', color: '#f9e2af' },
@@ -265,10 +270,9 @@ const RewardBreakdownChart = memo(function RewardBreakdownChart() {
 })
 
 const HarvesterDebugChart = memo(function HarvesterDebugChart() {
-  const episodes = useRangedEpisodes()
+  const ds = useDownsampled()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
-  if (episodes.length <= 1) return <NoData />
-  const ds = downsample(episodes)
+  if (ds.length <= 1) return <NoData />
   const dim = emaOn
   const series = [
     { key: 'harv_attempts', label: 'Attempts', color: '#89b4fa' },
@@ -305,10 +309,9 @@ const HarvesterDebugChart = memo(function HarvesterDebugChart() {
 })
 
 const ConveyorDebugChart = memo(function ConveyorDebugChart() {
-  const episodes = useRangedEpisodes()
+  const ds = useDownsampled()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
-  if (episodes.length <= 1) return <NoData />
-  const ds = downsample(episodes)
+  if (ds.length <= 1) return <NoData />
   const dim = emaOn
   const series = [
     { key: 'conv_attempts', label: 'Attempts', color: '#89b4fa' },
@@ -347,10 +350,9 @@ const ConveyorDebugChart = memo(function ConveyorDebugChart() {
 function makeSimpleChart(label, dataKey, color, opts = {}) {
   return memo(function SimpleChart() {
     "use no memo"
-    const episodes = useRangedEpisodes()
+    const ds = useDownsampled()
     const { ema: emaOn, bands: bandsOn } = useCardSettings()
-    if (episodes.length <= 1) return <NoData />
-    const ds = downsample(episodes)
+    if (ds.length <= 1) return <NoData />
     const raw = ds.map(e => e[dataKey] ?? e[opts.altKey] ?? null)
     const yViewport = bandsOn ? percentileViewport(raw) : null
     const dim = emaOn
@@ -386,10 +388,9 @@ const RetOobFracChart = makeSimpleChart('Return OOB Frac', 'ret_oob_frac', '#f38
 const ActorLrChart = makeSimpleChart('Actor LR', 'actor_lr', '#89dceb')
 
 const LogitScaleChart = memo(function LogitScaleChart({ series }) {
-  const episodes = useRangedEpisodes()
+  const ds = useDownsampled()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
-  if (episodes.length <= 1) return <NoData />
-  const ds = downsample(episodes)
+  if (ds.length <= 1) return <NoData />
   const dim = emaOn
   const datasets = series.flatMap(({ key, label, color }) => {
     const raw = ds.map(e => e[key])
@@ -446,11 +447,10 @@ const LogitScaleStdChart = memo(function LogitScaleStdChart() {
 })
 
 const LossChart = memo(function LossChart() {
-  const episodes = useRangedEpisodes()
+  const ds = useDownsampled()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
-  if (episodes.length <= 1) return <NoData />
+  if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const ds = downsample(episodes)
   const series = [
     { key: 'pi_loss', label: 'Policy Loss', color: '#f38ba8' },
     { key: 'vf_loss', label: 'Value Loss', color: '#f9e2af' },
@@ -909,11 +909,10 @@ function EpisodeSelector() {
 }
 
 const ReturnRangeChart = memo(function ReturnRangeChart() {
-  const episodes = useRangedEpisodes()
+  const ds = useDownsampled()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
-  if (episodes.length <= 1) return <NoData />
+  if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const ds = downsample(episodes)
   const series = [
     { key: 'ret_min', label: 'Min', color: '#f38ba8' },
     { key: 'ret_mean', label: 'Mean', color: '#a6e3a1' },
@@ -953,11 +952,10 @@ const BCLossChart = makeSimpleChart('Loss', 'loss', '#f38ba8')
 const BCGradNormChart = makeSimpleChart('Grad Norm', 'grad_norm', '#94e2d5')
 
 const BCHeadLossChart = memo(function BCHeadLossChart() {
-  const episodes = useRangedEpisodes()
+  const ds = useDownsampled()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
-  if (episodes.length <= 1) return <NoData />
+  if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const ds = downsample(episodes)
   const series = [
     { key: 'loss_bt', label: 'Build Type', color: '#89b4fa' },
     { key: 'loss_bd', label: 'Build Dir', color: '#a6e3a1' },
@@ -1082,11 +1080,13 @@ export default function TrainingView() {
     <TrainingDataProvider session={session}>
       <SelectedEpisodeCtx.Provider value={ctx}>
         <EpisodeSelector />
-        <TileLayout
-          cards={TRAINING_CARDS}
-          storageKey="training-tiles"
-          defaultLayout={DEFAULT_LAYOUT}
-        />
+        <DownsampledProvider>
+          <TileLayout
+            cards={TRAINING_CARDS}
+            storageKey="training-tiles"
+            defaultLayout={DEFAULT_LAYOUT}
+          />
+        </DownsampledProvider>
       </SelectedEpisodeCtx.Provider>
     </TrainingDataProvider>
   )
