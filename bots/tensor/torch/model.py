@@ -67,10 +67,12 @@ from model_constants import (
     H_DIM, HIDDEN_SIZES, COMPRESS_DIM, RMSNORM_LAYERS,
     TILE_EMBED_DIM, TILE_INPUT_DIM, TILE_GRID_N,
     INPUT_SIZE, OBS_SIZE, TRUNK_INPUT_SIZE, OBS_PREFIX_SIZE,
+    ACTOR_CLS_TOKENS, ACTOR_CONTEXT_CHUNKS, ACTOR_CONTEXT_DIM,
+    ACTOR_LATENT_DIM as MODEL_ACTOR_LATENT_DIM, ACTOR_GRU_INPUT_DIM,
 )
 HIDDEN = HIDDEN_SIZES
 TEACHER_HIDDEN = [128, 128, 128, 64]
-ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
+ACTOR_LATENT_DIM = MODEL_ACTOR_LATENT_DIM
 N_BUILD = 13
 N_DIR = 9
 N_CONV_DIR = 4  # cardinal only: N, W, E, S (indices 1, 3, 5, 7 in DIR_MAP_9)
@@ -399,6 +401,31 @@ def bd_has_ore(obs: torch.Tensor, bd_act: torch.Tensor) -> torch.Tensor:
     chosen_ax = ore_ax_idx[bd_act.long()]   # (B,)
     return (obs.gather(1, chosen_ti.unsqueeze(1)).squeeze(1) == 1.0) | \
            (obs.gather(1, chosen_ax.unsqueeze(1)).squeeze(1) == 1.0)
+
+
+def compute_harvester_build_dir_mask(
+    obs: torch.Tensor,
+    bd_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Restrict build directions to ore-bearing tiles for harvester actions."""
+    ore_ti_idx, ore_ax_idx = _harv_mask_indices(obs.device)
+    ore_present = (obs[:, ore_ti_idx] == 1.0) | (obs[:, ore_ax_idx] == 1.0)
+    return bd_mask & ore_present
+
+
+def compute_build_dir_mask_for_type(
+    obs: torch.Tensor,
+    bt_act: torch.Tensor,
+    bd_mask: torch.Tensor,
+    harv_bd_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return the build-dir mask conditioned on the chosen build type."""
+    del obs
+    return torch.where(
+        (bt_act == HARVESTER_BUILD_TYPE).unsqueeze(1),
+        harv_bd_mask,
+        bd_mask,
+    )
 
 
 _conv_dir_mask_cache: dict = {}
@@ -2316,205 +2343,210 @@ class GraphedInference:
 
 
 class BuilderMLP(nn.Module):
-    """MLP actor with shared encoder and separate policy heads.
+    """CLS-attention actor with a dedicated recurrent update path.
 
-    Value estimation is handled by CentralizedCritic (not part of this model).
-
-    Args:
-        hidden: Hidden layer sizes. Defaults to HIDDEN (production).
-                Use TEACHER_HIDDEN for larger teacher model.
+    The optional ``hidden`` argument is retained for API compatibility with the
+    previous trunked actor, but the architecture now has a fixed 32-dim actor
+    latent exported directly to the critic.
     """
 
     def __init__(self, hidden: list[int] | None = None):
         super().__init__()
-        hidden = hidden or HIDDEN
-        self._hidden = hidden
-        head_dim = hidden[-1]
+        self._hidden = hidden or HIDDEN
+        if hidden is None or hidden == HIDDEN:
+            self._actor_cls_tokens = ACTOR_CLS_TOKENS
+            self._actor_latent_dim = ACTOR_LATENT_DIM
+        else:
+            requested_latent = max(TILE_EMBED_DIM, hidden[-1])
+            self._actor_cls_tokens = max(
+                ACTOR_CLS_TOKENS,
+                math.ceil(requested_latent / TILE_EMBED_DIM),
+            )
+            self._actor_latent_dim = self._actor_cls_tokens * TILE_EMBED_DIM
+        self._recurrent_input_dim = self._actor_latent_dim + H_DIM
 
-        # Per-tile linear encoder
         self.tile_linear = _ortho_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM))
-        # Depthwise 3x3 conv for spatial mixing between adjacent tiles
-        self.tile_conv = nn.Conv2d(
-            TILE_EMBED_DIM, TILE_EMBED_DIM, 3, padding=1,
-            groups=TILE_EMBED_DIM, bias=True,
-        )
-        # Pointwise 1x1 conv mixes channels after depthwise spatial aggregation.
-        self.tile_pointwise = nn.Conv2d(
-            TILE_EMBED_DIM, TILE_EMBED_DIM, 1, bias=True,
-        )
-        nn.init.orthogonal_(self.tile_conv.weight, gain=0.1)
-        nn.init.zeros_(self.tile_conv.bias)
-        nn.init.orthogonal_(self.tile_pointwise.weight, gain=1.0)
-        nn.init.zeros_(self.tile_pointwise.bias)
-        self.tile_rms = RMSNorm(TILE_EMBED_DIM)
-        self.tile_act = nn.SiLU()
-        # Compress 25×8=200 spatially-mixed tile features → 80-dim summary
-        self.tile_compress = nn.Sequential(
-            _ortho_init(nn.Linear(TILE_GRID_N * TILE_EMBED_DIM, COMPRESS_DIM)),
-            RMSNorm(COMPRESS_DIM),
-            nn.SiLU(),
-        )
-        self.register_buffer('_tile_dxdy', _TILE_DXDY.clone())
+        self.context_proj = _ortho_init(nn.Linear(GLOBAL_FEATURES, ACTOR_CONTEXT_DIM))
+        self.context_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.context_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
 
-        # Shared encoder: first hidden layer only
-        enc_dim = hidden[0]
-        self.encoder = nn.Sequential(
-            _ortho_init(nn.Linear(TRUNK_INPUT_SIZE, enc_dim)),
-            RMSNorm(enc_dim),
-            nn.SiLU(),
-        )
+        self.context_ca_norm = RMSNorm(TILE_EMBED_DIM)
+        self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
+        self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
+        self.latent_norm = RMSNorm(self._actor_latent_dim)
 
-        # Actor trunk: remaining hidden layers
-        actor_layers: list[nn.Module] = []
-        prev = enc_dim
-        for i, h in enumerate(hidden[1:], start=1):
-            actor_layers.append(_ortho_init(nn.Linear(prev, h)))
-            if ACTOR_RMSNORM_LAYERS[i]:
-                actor_layers.append(RMSNorm(h))
-            actor_layers.append(nn.SiLU())
-            prev = h
-        self.actor_trunk = nn.Sequential(*actor_layers)
+        self.actor_cls = nn.Parameter(torch.zeros(self._actor_cls_tokens, TILE_EMBED_DIM))
+        self.context_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))
 
-        # RMSNorm before all policy heads (Dreamer-style pre-head norm)
-        self.head_norm = RMSNorm(head_dim)
+        self.head_build_type = _ortho_init(nn.Linear(self._actor_latent_dim, N_BUILD), std=0.01)
+        self.head_build_dir = _ortho_init(nn.Linear(self._actor_latent_dim, N_DIR), std=0.01)
+        self.head_conv_dir = _ortho_init(nn.Linear(self._actor_latent_dim, N_CONV_DIR), std=0.01)
+        self.head_bridge_target = _ortho_init(nn.Linear(self._actor_latent_dim, N_BRIDGE_TARGETS), std=0.01)
+        self.head_move_dir = _ortho_init(nn.Linear(self._actor_latent_dim, N_DIR), std=0.01)
+        self.head_logit_scale = _ortho_init(nn.Linear(self._actor_latent_dim, N_LOGIT_SCALE), std=0.01)
+        self.head_h_gate = _ortho_init(nn.Linear(self._recurrent_input_dim, H_DIM), std=0.01)
+        self.head_h_cand = _ortho_init(nn.Linear(self._recurrent_input_dim, H_DIM), std=0.01)
 
-        # Policy heads: small std for near-uniform initial policy
-        self.head_build_type = _ortho_init(nn.Linear(head_dim, N_BUILD), std=0.01)
-        self.head_build_dir = _ortho_init(nn.Linear(head_dim, N_DIR), std=0.01)
-        self.head_conv_dir = _ortho_init(nn.Linear(head_dim, N_CONV_DIR), std=0.01)
-        self.head_bridge_target = _ortho_init(nn.Linear(head_dim, N_BRIDGE_TARGETS), std=0.01)
-        self.head_move_dir = _ortho_init(nn.Linear(head_dim, N_DIR), std=0.01)
-        self.head_logit_scale = _ortho_init(nn.Linear(head_dim, N_LOGIT_SCALE), std=0.01)
-        self.head_h_gate = _ortho_init(nn.Linear(head_dim, H_DIM), std=0.01)  # Wz: update gate
-        self.head_h_cand = _ortho_init(nn.Linear(head_dim, H_DIM), std=0.01)  # Wh: candidate
+        self.register_buffer("_tile_dxdy", _TILE_DXDY.clone())
+        tile_coords = torch.arange(TILE_GRID_N, dtype=torch.long)
+        rope = RotaryEmbedding2D(TILE_EMBED_DIM, max_size=GRID_SIZE)
+        rope_cos, rope_sin = rope(tile_coords // GRID_SIZE, tile_coords % GRID_SIZE)
+        self.register_buffer("_tile_rope_cos", rope_cos)
+        self.register_buffer("_tile_rope_sin", rope_sin)
 
-        # Init eps head bias so sigmoid(raw) ≈ EPS_MIN at start.
         with torch.no_grad():
+            trunc_normal_(self.actor_cls, std=0.02)
             self.head_logit_scale.bias.fill_(_EPS_INIT_BIAS)
-
-        # Give new policies a structured exploration prior toward economy actions.
-        with torch.no_grad():
             self.head_build_type.bias.copy_(
                 torch.tensor(INITIAL_BUILD_TYPE_BIAS, dtype=torch.float32),
             )
 
     def train(self, mode=True):
-        # Invalidate fused head cache when entering train mode
-        if mode and hasattr(self, '_cached_head_w'):
-            del self._cached_head_w
-            del self._cached_head_b
+        if mode:
+            for attr in ("_cached_action_head_w", "_cached_action_head_b"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
         return super().train(mode)
 
+    def _apply_tile_rope(self, x: torch.Tensor) -> torch.Tensor:
+        rope_cos = self._tile_rope_cos
+        rope_sin = self._tile_rope_sin
+        if rope_cos.dtype != x.dtype:
+            rope_cos = rope_cos.to(dtype=x.dtype)
+            rope_sin = rope_sin.to(dtype=x.dtype)
+        return apply_rotary_2d(x.unsqueeze(1), rope_cos, rope_sin).squeeze(1)
+
+    def _context_cross_attention(
+        self,
+        cls: torch.Tensor,
+        context_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        q = F.normalize(cls, dim=-1, eps=1e-6)
+        k = F.normalize(self.context_k_proj(context_tokens), dim=-1, eps=1e-6)
+        v = self.context_v_proj(context_tokens)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.context_tau.exp().view(1, -1, 1)
+        attn = scores.softmax(dim=-1)
+        cls = self.context_ca_norm(cls + torch.matmul(attn, v))
+        return F.silu(cls)
+
+    def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
+        q = self._apply_tile_rope(tiles)
+        k = self._apply_tile_rope(self.tile_sa_k_proj(tiles))
+        v = self.tile_sa_v_proj(tiles)
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(TILE_EMBED_DIM)
+        attn = scores.softmax(dim=-1)
+        tiles = self.tile_sa_norm(tiles + torch.matmul(attn, v))
+        return F.silu(tiles)
+
+    def _cls_cross_attention(self, cls: torch.Tensor, tiles: torch.Tensor) -> torch.Tensor:
+        k = self.cls_ca_k_proj(tiles)
+        v = self.cls_ca_v_proj(tiles)
+        scores = torch.matmul(cls, k.transpose(-1, -2)) / math.sqrt(TILE_EMBED_DIM)
+        attn = scores.softmax(dim=-1)
+        cls = self.cls_ca_norm(cls + torch.matmul(attn, v))
+        return F.silu(cls)
+
     def _encode_tiles(self, obs: torch.Tensor) -> torch.Tensor:
-        """Extract tiles, encode per-tile, spatial conv, compress to summary."""
         B = obs.shape[0]
         tile_flat = obs[:, :TILE_GRID_N * TILE_FEATURES]
         tiles = tile_flat.reshape(B, TILE_GRID_N, TILE_FEATURES)
         dxdy = self._tile_dxdy.unsqueeze(0).expand(B, -1, -1)
-        tile_in = torch.cat([dxdy, tiles], dim=-1)          # (B, 25, 21)
-        h = F.silu(self.tile_linear(tile_in))               # (B, 25, 8)
-        # Depthwise 3x3 + pointwise 1x1 + residual + SiLU
-        h_grid = h.reshape(B, 5, 5, TILE_EMBED_DIM).permute(0, 3, 1, 2)
-        conv_out = self.tile_pointwise(self.tile_conv(h_grid))  # (B, 8, 5, 5)
-        conv_out = conv_out.permute(0, 2, 3, 1).reshape(B, TILE_GRID_N, TILE_EMBED_DIM)
-        h = self.tile_rms(h + conv_out)
-        h = self.tile_act(h)                                # (B, 25, 8)
-        # Compress to fixed-size tile summary
-        h_flat = h.reshape(B, TILE_GRID_N * TILE_EMBED_DIM) # (B, 200)
-        return self.tile_compress(h_flat)                    # (B, 80)
-
-    def _build_trunk_input(self, obs: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        """Build trunk input: compressed tiles + globals + h_prev."""
-        obs_prefix = self._build_obs_prefix(obs)
-        return torch.cat([obs_prefix, h_prev], dim=-1)  # (B, 103)
-
-    def _build_obs_prefix(self, obs: torch.Tensor) -> torch.Tensor:
-        """Build the observation-only trunk prefix."""
-        tile_summary = self._encode_tiles(obs)  # (B, 64)
-        globals_pos = obs[:, TILE_GRID_N * TILE_FEATURES:]  # (B, 19) globals
-        return torch.cat([tile_summary, globals_pos], dim=-1)  # (B, 87)
+        tile_in = torch.cat([dxdy, tiles], dim=-1)
+        return F.silu(self.tile_linear(tile_in))
 
     def _obs_encoder_pre(self, obs: torch.Tensor) -> torch.Tensor:
-        """Precompute the obs-only contribution to the first encoder linear."""
-        obs_prefix = self._build_obs_prefix(obs)
-        enc_linear = self.encoder[0]
-        return F.linear(obs_prefix, enc_linear.weight[:, :OBS_PREFIX_SIZE], enc_linear.bias)
+        tiles = self._encode_tiles(obs).reshape(obs.shape[0], TILE_GRID_N * TILE_EMBED_DIM)
+        globals_obs = obs[:, TILE_GRID_N * TILE_FEATURES:]
+        global_ctx = self.context_proj(globals_obs)
+        return torch.cat([tiles, global_ctx], dim=-1)
+
+    def _split_obs_pre(self, obs_pre: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        tiles_flat, global_ctx = obs_pre.split([TILE_GRID_N * TILE_EMBED_DIM, ACTOR_CONTEXT_DIM], dim=-1)
+        tiles = tiles_flat.reshape(obs_pre.shape[0], TILE_GRID_N, TILE_EMBED_DIM)
+        return tiles, global_ctx.reshape(obs_pre.shape[0], ACTOR_CONTEXT_CHUNKS, TILE_EMBED_DIM)
 
     def _latent_from_obs_pre(self, obs_pre: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        """Run the recurrent actor from a precomputed obs-side encoder term."""
-        enc_linear = self.encoder[0]
-        h_pre = F.linear(h_prev, enc_linear.weight[:, OBS_PREFIX_SIZE:], None)
-        enc = self.encoder[1](obs_pre + h_pre)
-        enc = self.encoder[2](enc)
-        return self.actor_trunk(enc)
-
-    def _forward_from_obs_pre(self, obs_pre: torch.Tensor, h_prev: torch.Tensor):
-        """Forward pass from precomputed obs-side encoder activations."""
-        h = self._latent_from_obs_pre(obs_pre, h_prev)
-        return self._forward_from_hidden(h)
+        tiles, global_ctx = self._split_obs_pre(obs_pre)
+        cls = self.actor_cls.unsqueeze(0).expand(obs_pre.shape[0], -1, -1)
+        recurrent_ctx = h_prev.reshape(obs_pre.shape[0], ACTOR_CONTEXT_CHUNKS, TILE_EMBED_DIM)
+        cls = self._context_cross_attention(cls, torch.cat([global_ctx, recurrent_ctx], dim=1))
+        tiles = self._tile_self_attention(tiles)
+        cls = self._cls_cross_attention(cls, tiles)
+        return self.latent_norm(cls.reshape(obs_pre.shape[0], self._actor_latent_dim))
 
     def actor_latent(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        """Return the actor trunk latent used for policy logits."""
         obs_pre = self._obs_encoder_pre(x)
         return self._latent_from_obs_pre(obs_pre, h_prev)
 
-    def _project_actor_heads(
+    def _project_policy_heads(
         self,
-        h: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project latent to policy heads and per-head learned eps."""
-        h = self.head_norm(h)
-        # Fuse head matmuls into one kernel launch
-        # Cache fused weights in eval mode (inference hot path)
+        latent: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.training:
             combined_w = torch.cat([
-                self.head_build_type.weight, self.head_build_dir.weight,
-                self.head_conv_dir.weight, self.head_bridge_target.weight,
-                self.head_move_dir.weight, self.head_logit_scale.weight,
-                self.head_h_gate.weight, self.head_h_cand.weight,
+                self.head_build_type.weight,
+                self.head_build_dir.weight,
+                self.head_conv_dir.weight,
+                self.head_bridge_target.weight,
+                self.head_move_dir.weight,
+                self.head_logit_scale.weight,
             ], dim=0)
             combined_b = torch.cat([
-                self.head_build_type.bias, self.head_build_dir.bias,
-                self.head_conv_dir.bias, self.head_bridge_target.bias,
-                self.head_move_dir.bias, self.head_logit_scale.bias,
-                self.head_h_gate.bias, self.head_h_cand.bias,
+                self.head_build_type.bias,
+                self.head_build_dir.bias,
+                self.head_conv_dir.bias,
+                self.head_bridge_target.bias,
+                self.head_move_dir.bias,
+                self.head_logit_scale.bias,
             ])
         else:
-            if not hasattr(self, '_cached_head_w') or self._cached_head_w is None:
-                self._cached_head_w = torch.cat([
-                    self.head_build_type.weight, self.head_build_dir.weight,
-                    self.head_conv_dir.weight, self.head_bridge_target.weight,
-                    self.head_move_dir.weight, self.head_logit_scale.weight,
-                    self.head_h_gate.weight, self.head_h_cand.weight,
+            if not hasattr(self, "_cached_action_head_w"):
+                self._cached_action_head_w = torch.cat([
+                    self.head_build_type.weight,
+                    self.head_build_dir.weight,
+                    self.head_conv_dir.weight,
+                    self.head_bridge_target.weight,
+                    self.head_move_dir.weight,
+                    self.head_logit_scale.weight,
                 ], dim=0)
-                self._cached_head_b = torch.cat([
-                    self.head_build_type.bias, self.head_build_dir.bias,
-                    self.head_conv_dir.bias, self.head_bridge_target.bias,
-                    self.head_move_dir.bias, self.head_logit_scale.bias,
-                    self.head_h_gate.bias, self.head_h_cand.bias,
+                self._cached_action_head_b = torch.cat([
+                    self.head_build_type.bias,
+                    self.head_build_dir.bias,
+                    self.head_conv_dir.bias,
+                    self.head_bridge_target.bias,
+                    self.head_move_dir.bias,
+                    self.head_logit_scale.bias,
                 ])
-            combined_w = self._cached_head_w
-            combined_b = self._cached_head_b
+            combined_w = self._cached_action_head_w
+            combined_b = self._cached_action_head_b
 
-        combined = F.linear(h, combined_w, combined_b)
-        bt_l, bd_l, cd_l, brt_l, md_l, eps_raw, h_gate, h_cand = combined.split(
-            [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, N_LOGIT_SCALE, H_DIM, H_DIM],
+        combined = F.linear(latent, combined_w, combined_b)
+        bt_l, bd_l, cd_l, brt_l, md_l, eps_raw = combined.split(
+            [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, N_LOGIT_SCALE],
             dim=-1,
         )
-        # Per-head learned eps: sigmoid → [EPS_MIN, EPS_MAX]
-        # eps_raw is (B, 5) — one per head: bt, bd, cd, brt, md
         eps = torch.sigmoid(eps_raw) * (EPS_MAX - EPS_MIN) + EPS_MIN
-        h_cand = torch.tanh(h_cand)
+        return bt_l, bd_l, cd_l, brt_l, md_l, eps
+
+    def _project_recurrent_heads(
+        self,
+        latent: torch.Tensor,
+        h_prev: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        recurrent_in = torch.cat([latent, h_prev], dim=-1)
+        h_gate = self.head_h_gate(recurrent_in)
+        h_cand = torch.tanh(self.head_h_cand(recurrent_in))
+        return h_gate, h_cand
+
+    def _forward_from_obs_pre(self, obs_pre: torch.Tensor, h_prev: torch.Tensor):
+        latent = self._latent_from_obs_pre(obs_pre, h_prev)
+        bt_l, bd_l, cd_l, brt_l, md_l, eps = self._project_policy_heads(latent)
+        h_gate, h_cand = self._project_recurrent_heads(latent, h_prev)
         return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand
-
-    def _forward_from_hidden(self, h: torch.Tensor):
-        """Project actor latent to policy heads."""
-        return self._project_actor_heads(h)
-
-    def _forward_from_trunk_in(self, trunk_in: torch.Tensor):
-        enc = self.encoder(trunk_in)
-        h = self.actor_trunk(enc)
-        return self._forward_from_hidden(h)
 
     def forward(self, x, h_prev):
         obs_pre = self._obs_encoder_pre(x)
@@ -2554,145 +2586,72 @@ class BuilderMLP(nn.Module):
         h_next = (1.0 - z) * h_prev + z * h_cand
         return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next
 
-    def _policy_state_modules(self) -> list[nn.Module]:
-        """Policy modules only in tensor_lib serialization order (critic excluded)."""
-        tile_modules = [self.tile_linear, self.tile_conv, self.tile_pointwise, self.tile_rms]
-        compress_modules = [m for m in self.tile_compress if isinstance(m, (nn.Linear, RMSNorm))]
-        enc_modules = [m for m in self.encoder if isinstance(m, (nn.Linear, RMSNorm))]
-        actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
-        return tile_modules + compress_modules + enc_modules + actor_modules + [self.head_norm] + [
-            self.head_build_type, self.head_build_dir, self.head_conv_dir,
-            self.head_bridge_target, self.head_move_dir,
-            self.head_logit_scale,
-            self.head_h_gate, self.head_h_cand,
+    def _policy_state_entries(self) -> list[tuple[str, object]]:
+        return [
+            ("linear", self.tile_linear),
+            ("linear", self.context_proj),
+            ("linear", self.context_k_proj),
+            ("linear", self.context_v_proj),
+            ("linear", self.tile_sa_k_proj),
+            ("linear", self.tile_sa_v_proj),
+            ("linear", self.cls_ca_k_proj),
+            ("linear", self.cls_ca_v_proj),
+            ("param", self.actor_cls),
+            ("param", self.context_tau),
+            ("norm", self.context_ca_norm),
+            ("norm", self.tile_sa_norm),
+            ("norm", self.cls_ca_norm),
+            ("norm", self.latent_norm),
+            ("linear", self.head_build_type),
+            ("linear", self.head_build_dir),
+            ("linear", self.head_conv_dir),
+            ("linear", self.head_bridge_target),
+            ("linear", self.head_move_dir),
+            ("linear", self.head_logit_scale),
+            ("linear", self.head_h_gate),
+            ("linear", self.head_h_cand),
         ]
 
     def export_weights(self) -> list[list[float]]:
-        """Export weights as JSON list. Transposes Linear to match tensor_lib (in, out) format."""
+        """Export weights as JSON list. Transposes Linear to match tensor_lib."""
         state: list[list[float]] = []
-        for layer in self._policy_state_modules():
-            if isinstance(layer, nn.Linear):
+        for kind, obj in self._policy_state_entries():
+            if kind == "linear":
+                layer = obj
                 state.append(layer.weight.T.contiguous().view(-1).tolist())
                 state.append(layer.bias.view(-1).tolist())
-            elif isinstance(layer, nn.Conv2d):
-                w = layer.weight
-                if w.shape[2:] == (1, 1) and layer.groups == 1:
-                    # 1x1 pointwise: (C_out, C_in, 1, 1) → transpose to (C_in, C_out)
-                    state.append(w.squeeze(-1).squeeze(-1).T.contiguous().view(-1).tolist())
-                else:
-                    # Depthwise / spatial kernels: flatten as-is
-                    state.append(w.view(-1).tolist())
-                if layer.bias is not None:
-                    state.append(layer.bias.view(-1).tolist())
-            else:
+            elif kind == "norm":
+                layer = obj
                 state.append(layer.weight.view(-1).tolist())
+            else:
+                param = obj
+                state.append(param.view(-1).tolist())
         return state
 
     def import_weights(self, state: list[list[float]]) -> None:
         """Load weights from tensor_lib JSON format."""
-        modules = self._policy_state_modules()
-        full_entries = sum(
-            (2 if isinstance(m, (nn.Linear, nn.Conv2d)) else 1)
-            for m in modules
-        )
-        # Also support loading without conv_dir head (2 fewer entries)
-        full_no_conv_dir = full_entries - 2
-        # Legacy exports before the learned logit-scale head existed.
-        full_no_logit_scale = full_entries - 2
-        full_no_conv_dir_no_logit_scale = full_no_conv_dir - 2
-        # Legacy exports before the tile RMSNorm existed (and before logit scale).
-        full_no_tile_rms = full_entries - 3
-        full_no_tile_rms_no_conv_dir = full_no_conv_dir - 3
-        # Legacy exports before the pointwise 1x1 conv existed (also no tile RMS/logit scale).
-        full_no_pointwise = full_entries - 5
-        full_no_pointwise_no_conv_dir = full_no_conv_dir - 5
-        pointwise_weight_size = self.tile_pointwise.weight.numel()
-        tile_rms_size = self.tile_rms.weight.numel()
-        move_dir_weight_size = self.head_move_dir.weight.numel()
-        load_pointwise = True
-        load_tile_rms = True
-        load_logit_scale = True
-
-        if len(state) == full_entries:
-            load_conv_dir = True
-        elif len(state) == full_no_conv_dir:
-            if len(state[20]) == move_dir_weight_size:
-                load_conv_dir = False
-            else:
-                load_conv_dir = True
-                load_logit_scale = False
-        elif (
-            len(state) == full_no_tile_rms
-            and len(state[4]) == pointwise_weight_size
-            and len(state[6]) != tile_rms_size
-        ):
-            load_conv_dir = True
-            load_tile_rms = False
-            load_logit_scale = False
-        elif (
-            len(state) == full_no_tile_rms_no_conv_dir
-            and len(state[4]) == pointwise_weight_size
-            and len(state[6]) != tile_rms_size
-        ):
-            load_conv_dir = False
-            load_tile_rms = False
-            load_logit_scale = False
-        elif len(state) == full_no_conv_dir_no_logit_scale:
-            load_conv_dir = False
-            load_logit_scale = False
-        elif len(state) == full_no_pointwise:
-            load_conv_dir = True
-            load_pointwise = False
-            load_tile_rms = False
-            load_logit_scale = False
-        elif len(state) == full_no_pointwise_no_conv_dir:
-            load_conv_dir = False
-            load_pointwise = False
-            load_tile_rms = False
-            load_logit_scale = False
-        elif len(state) == full_no_logit_scale:
-            load_conv_dir = True
-            load_logit_scale = False
-        else:
-            raise AssertionError(
-                f"State has {len(state)} entries, expected {full_entries} "
-                f"(or {full_no_conv_dir} without conv_dir head)"
-            )
-
+        entries = self._policy_state_entries()
+        expected = sum(2 if kind == "linear" else 1 for kind, _ in entries)
+        if len(state) != expected:
+            raise AssertionError(f"State has {len(state)} entries, expected {expected}")
         idx = 0
         dev = next(self.parameters()).device
-        for layer in modules:
-            if layer is self.head_conv_dir and not load_conv_dir:
-                continue
-            if layer is self.tile_pointwise and not load_pointwise:
-                continue
-            if layer is self.tile_rms and not load_tile_rms:
-                continue
-            if layer is self.head_logit_scale and not load_logit_scale:
-                continue
-            if isinstance(layer, nn.Linear):
+        for kind, obj in entries:
+            if kind == "linear":
+                layer = obj
                 w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
                 in_f, out_f = layer.in_features, layer.out_features
                 layer.weight.data = w_flat.view(in_f, out_f).T.contiguous()
                 idx += 1
                 layer.bias.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
                 idx += 1
-            elif isinstance(layer, nn.Conv2d):
-                w_flat = torch.tensor(state[idx], dtype=torch.float32, device=dev)
-                w = layer.weight
-                if w.shape[2:] == (1, 1) and layer.groups == 1:
-                    # Reverse 1x1 transpose: (C_in, C_out) → (C_out, C_in, 1, 1)
-                    c_out, c_in = w.shape[0], w.shape[1]
-                    layer.weight.data = w_flat.view(c_in, c_out).T.contiguous().view(c_out, c_in, 1, 1)
-                else:
-                    layer.weight.data = w_flat.view(w.shape)
-                idx += 1
-                if layer.bias is not None:
-                    layer.bias.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
-                    idx += 1
-            else:
-                # RMSNorm
+            elif kind == "norm":
+                layer = obj
                 layer.weight.data = torch.tensor(state[idx], dtype=torch.float32, device=dev)
+                idx += 1
+            else:
+                param = obj
+                param.data = torch.tensor(state[idx], dtype=torch.float32, device=dev).view_as(param)
                 idx += 1
 
     def save_weights(self, path: str | Path = WEIGHT_PATH) -> None:
@@ -2873,12 +2832,13 @@ def _recurrent_logprob_pass(
     cd_mask = conveyor_dir_mask(dev, B)
 
     step_fn = _get_logprob_step_fn()
-    for t in range(K_max):
-        log_probs[:, t], h_t = step_fn(
-            model, obs_pre[:, t], h_t,
-            bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
-            bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
-        )
+    with autocast_context(_get_actor_cuda_config()):
+        for t in range(K_max):
+            log_probs[:, t], h_t = step_fn(
+                model, obs_pre[:, t], h_t,
+                bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
+                bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
+            )
 
     return log_probs
 
@@ -2976,12 +2936,13 @@ def _recurrent_actor_pass(
     cd_mask = conveyor_dir_mask(dev, B)
 
     step_fn = _get_actor_step_fn()
-    for t in range(K_max):
-        new_lps[:, t], entropies[:, t], all_eps[:, t], h_t = step_fn(
-            model, obs_pre[:, t], h_t,
-            bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
-            bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
-        )
+    with autocast_context(_get_actor_cuda_config()):
+        for t in range(K_max):
+            new_lps[:, t], entropies[:, t], all_eps[:, t], h_t = step_fn(
+                model, obs_pre[:, t], h_t,
+                bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
+                bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
+            )
 
     return new_lps, entropies, all_eps
 
