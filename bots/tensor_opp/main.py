@@ -19,7 +19,7 @@ sys.path.insert(0, _TENSOR_DIR)
 from shared import (
     INPUT_SIZE, HIDDEN_SIZES, H_DIM, RMSNORM_LAYERS, COMPRESS_DIM,
     DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4,
-    encode_state_into, argmax,
+    encode_state_into, select_greedy_actions_from_outputs,
     execute_build,
     N_BLD_TYPES, BRIDGE_OFFSETS,
     TILE_FEATURES, GRID_SIZE,
@@ -182,11 +182,9 @@ class Player:
             h_new[i] = (1.0 - z) * h_in[i] + z * h_cand[i]
         self.h_prev = h_new
 
-        build_type_idx = argmax(outputs["build_type"])
-        build_dir_idx = argmax(outputs["build_dir"])
-        conv_dir_idx = argmax(outputs["conv_dir"])
-        bridge_target_idx = argmax(outputs["bridge_target"])
-        move_dir_idx = argmax(outputs["move_dir"])
+        build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx = (
+            select_greedy_actions_from_outputs(obs, outputs)
+        )
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]

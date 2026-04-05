@@ -474,6 +474,26 @@ def compute_harvester_build_dir_mask(obs: list[float], bd_mask: list[bool]) -> l
     return harv_mask
 
 
+def select_greedy_actions_from_outputs(
+    obs: list[float],
+    outputs: dict[str, list[float]],
+) -> tuple[int, int, int, int, int]:
+    """Match deploy/training greedy action selection for factorized actor heads."""
+    bt_mask, bd_mask = compute_masks_from_obs(obs)
+    build_dir_idx = argmax(outputs["build_dir"], bd_mask)
+
+    # Harvester legality depends on the chosen build direction.
+    ts = _BUILD_DIR_TILE_INDICES[build_dir_idx] * TILE_FEATURES
+    if not (obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0):
+        bt_mask[_HARVESTER_BUILD_TYPE] = False
+
+    build_type_idx = argmax(outputs["build_type"], bt_mask)
+    conv_dir_idx = argmax(outputs["conv_dir"])
+    bridge_target_idx = argmax(outputs["bridge_target"])
+    move_dir_idx = argmax(outputs["move_dir"])
+    return build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx
+
+
 # ---------------------------------------------------------------------------
 # Reward functions
 # ---------------------------------------------------------------------------

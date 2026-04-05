@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +22,11 @@ def _load_module(name: str, rel_path: str):
 
 
 tensor_main = _load_module("tensor_inference_main_for_action_tests", "bots/tensor_inference/main.py")
+shared_mod = _load_module("tensor_shared_for_action_tests", "bots/tensor/shared.py")
+INFER_DIR = ROOT / "bots" / "tensor_inference"
+if str(INFER_DIR) not in sys.path:
+    sys.path.insert(0, str(INFER_DIR))
+from tensor_lib.actor import _l2_normalize
 
 
 Direction = tensor_main.Direction
@@ -237,3 +245,68 @@ def test_execute_move_builds_roads_and_uses_fallback():
 
     assert ct.build_calls == [("road", primary), ("road", fallback)]
     assert ct.move_calls == [Direction.NORTHEAST]
+
+
+def _empty_obs():
+    obs = [0.0] * shared_mod.INPUT_SIZE
+    g = shared_mod.GRID_SIZE * shared_mod.GRID_SIZE * shared_mod.TILE_FEATURES
+    obs[g + 3] = 10.0  # titanium
+    obs[g + 4] = 10.0  # axionite
+    obs[g + 5] = 0.2   # 100% build scale
+    for dir_idx in range(9):
+        ts = shared_mod._BUILD_DIR_TILE_INDICES[dir_idx] * shared_mod.TILE_FEATURES
+        obs[ts + 4] = 1.0
+    return obs
+
+
+def test_select_greedy_actions_masks_harvester_when_chosen_tile_has_no_ore():
+    obs = _empty_obs()
+    ore_dir_idx = 3  # west
+    ore_ts = shared_mod._BUILD_DIR_TILE_INDICES[ore_dir_idx] * shared_mod.TILE_FEATURES
+    obs[ore_ts + 1] = 1.0
+
+    outputs = {
+        "build_type": [0.0] * len(shared_mod.BUILD_ACTIONS),
+        "build_dir": [0.0] * 9,
+        "conv_dir": [0.0] * 4,
+        "bridge_target": [0.0] * len(shared_mod.BRIDGE_OFFSETS),
+        "move_dir": [0.0] * 9,
+    }
+    outputs["build_type"][1] = 10.0  # harvester
+    outputs["build_type"][3] = 5.0   # road fallback
+    outputs["build_dir"][1] = 20.0   # north, no ore
+
+    build_type_idx, build_dir_idx, *_ = shared_mod.select_greedy_actions_from_outputs(obs, outputs)
+
+    assert build_dir_idx == 1
+    assert build_type_idx == 3
+
+
+def test_select_greedy_actions_keeps_harvester_when_chosen_tile_has_ore():
+    obs = _empty_obs()
+    ore_dir_idx = 1  # north
+    ore_ts = shared_mod._BUILD_DIR_TILE_INDICES[ore_dir_idx] * shared_mod.TILE_FEATURES
+    obs[ore_ts + 1] = 1.0
+
+    outputs = {
+        "build_type": [0.0] * len(shared_mod.BUILD_ACTIONS),
+        "build_dir": [0.0] * 9,
+        "conv_dir": [0.0] * 4,
+        "bridge_target": [0.0] * len(shared_mod.BRIDGE_OFFSETS),
+        "move_dir": [0.0] * 9,
+    }
+    outputs["build_type"][1] = 10.0
+    outputs["build_type"][3] = 5.0
+    outputs["build_dir"][ore_dir_idx] = 20.0
+
+    build_type_idx, build_dir_idx, *_ = shared_mod.select_greedy_actions_from_outputs(obs, outputs)
+
+    assert build_dir_idx == ore_dir_idx
+    assert build_type_idx == 1
+
+
+def test_actor_l2_normalize_matches_torch_clamped_norm_behavior():
+    normalized = _l2_normalize([1e-8, 0.0], eps=1e-6)
+
+    assert normalized[0] == pytest.approx(1e-2)
+    assert normalized[1] == pytest.approx(0.0)
