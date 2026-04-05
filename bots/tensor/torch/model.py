@@ -77,16 +77,14 @@ N_BUILD = 13
 N_DIR = 9
 N_CONV_DIR = 4  # cardinal only: N, W, E, S (indices 1, 3, 5, 7 in DIR_MAP_9)
 N_BRIDGE_TARGETS = 28  # offsets (dx,dy) with 0 < dx²+dy² ≤ 9
-N_LOGIT_SCALE = 5  # per-head eps: bt, bd, cd, brt, md
+N_ACTION_TEMPERATURES = 5  # per-head temperatures: bt, bd, cd, brt, md
 ACTOR_RMSNORM_LAYERS = tuple(RMSNORM_LAYERS)
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
 BRIDGE_BUILD_TYPE = 12
 CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
-EPS_MIN = 0.01   # unimix floor (DreamerV3-style safety net)
-EPS_MAX = 0.50   # max exploration ratio per head
-# Init raw eps so sigmoid(raw) ≈ EPS_MIN at start.
-_EPS_INIT_BIAS = -4.6
+TEMP_MIN = 0.5
+TEMP_MAX = 2.0
 INITIAL_BUILD_TYPE_BIAS = [
     -2.0,  # none
     1.1,   # harvester
@@ -1910,60 +1908,42 @@ def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float =
     return layer
 
 
-def _unimix_logits(
+def _temperature_scaled_log_probs(
     logits: torch.Tensor,
     mask: torch.Tensor | None = None,
-    eps: torch.Tensor | float = EPS_MIN,
+    temperature: torch.Tensor | float = 1.0,
 ) -> torch.Tensor:
-    """Blend softmax probs with uniform floor (DreamerV3-style).
-
-    eps:  (B,) or scalar — per-sample unimix ratio (learned or fixed).
-    mask: (B, K) boolean — True = valid action. Uniform probability is
-          distributed only over valid actions.
-    """
-    eps_t = torch.as_tensor(eps, dtype=logits.dtype, device=logits.device)
-    # eps may be (B,) — unsqueeze for broadcasting with (B, K)
-    if eps_t.dim() == 1:
-        eps_t = eps_t.unsqueeze(-1)
+    """Return masked log-probs after dividing logits by a per-sample temperature."""
+    temperature_t = torch.as_tensor(temperature, dtype=logits.dtype, device=logits.device)
+    if temperature_t.dim() == 1:
+        temperature_t = temperature_t.unsqueeze(-1)
+    temperature_t = temperature_t.clamp_min(1e-4)
+    scaled_logits = logits / temperature_t
 
     if mask is not None:
-        K_valid = mask.float().sum(dim=-1, keepdim=True).clamp(min=1)
+        masked_logits = scaled_logits.masked_fill(~mask, float("-inf"))
         any_valid = mask.any(dim=-1, keepdim=True)
-        masked_logits = logits.masked_fill(~mask, float("-inf"))
-        # Avoid log_softmax(all -inf) on degenerate rows; they become all -inf below.
         masked_logits = torch.where(any_valid, masked_logits, torch.zeros_like(masked_logits))
         log_probs = torch.log_softmax(masked_logits, dim=-1)
-        log_uniform = -K_valid.log()
-        mixed_log = torch.logaddexp(
-            torch.log1p(-eps_t) + log_probs,
-            eps_t.log() + log_uniform,
-        )
-        return mixed_log.masked_fill(~mask, float("-inf"))
+        return log_probs.masked_fill(~mask, float("-inf"))
 
-    log_probs = torch.log_softmax(logits, dim=-1)
-    log_uniform = logits.new_full(log_probs.shape, -math.log(logits.shape[-1]))
-    return torch.logaddexp(
-        torch.log1p(-eps_t) + log_probs,
-        eps_t.log() + log_uniform,
-    )
+    return torch.log_softmax(scaled_logits, dim=-1)
 
 
 def sample_logits_gumbel(
     logits: torch.Tensor,
-    temperature: float = 1.0,
+    temperature: torch.Tensor | float = 1.0,
     *,
     mask: torch.Tensor | None = None,
-    eps: torch.Tensor | float = EPS_MIN,
     return_log_prob: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Sample from unimix(softmax(logits / temperature)) via Gumbel-max."""
-    scaled = logits if temperature == 1.0 else logits / temperature
-    scaled = _unimix_logits(scaled, mask, eps)
-    gumbel = -torch.empty_like(scaled).exponential_().log()
-    actions = (scaled + gumbel).argmax(dim=-1)
+    """Sample from a masked temperature-scaled categorical via Gumbel-max."""
+    log_probs = _temperature_scaled_log_probs(logits, mask, temperature)
+    gumbel = -torch.empty_like(log_probs).exponential_().log()
+    actions = (log_probs + gumbel).argmax(dim=-1)
     if not return_log_prob:
         return actions, None
-    chosen = scaled.gather(1, actions.unsqueeze(1)).squeeze(1)
+    chosen = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
     return actions, chosen
 
 
@@ -1971,10 +1951,10 @@ def action_log_prob_and_entropy(
     logits: torch.Tensor,
     actions: torch.Tensor,
     mask: torch.Tensor | None = None,
-    eps: torch.Tensor | float = EPS_MIN,
+    temperature: torch.Tensor | float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return chosen-action log_probs and categorical entropy from logits."""
-    log_probs = _unimix_logits(logits, mask, eps)
+    log_probs = _temperature_scaled_log_probs(logits, mask, temperature)
     chosen = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
     # nan_to_num handles 0 * -inf from masked actions.
     probs = log_probs.exp()
@@ -2010,7 +1990,7 @@ def _sample_actions_from_policy_heads(
     cd_l: torch.Tensor,
     brt_l: torch.Tensor,
     md_l: torch.Tensor,
-    eps: torch.Tensor,
+    head_temperature: torch.Tensor,
     h_next: torch.Tensor,
     *,
     temperature: float,
@@ -2023,37 +2003,32 @@ def _sample_actions_from_policy_heads(
     # Sample direction first so we can condition build-type on the target tile.
     bd_act, bd_lp = sample_logits_gumbel(
         bd_l,
-        temperature,
         mask=bd_m,
-        eps=eps[:, 1],
+        temperature=head_temperature[:, 1] * temperature,
         return_log_prob=return_log_prob,
     )
     # Harvester only legal when chosen direction points at ore.
     bt_m[:, HARVESTER_BUILD_TYPE] &= bd_has_ore(obs, bd_act)
     bt_act, bt_lp = sample_logits_gumbel(
         bt_l,
-        temperature,
         mask=bt_m,
-        eps=eps[:, 0],
+        temperature=head_temperature[:, 0] * temperature,
         return_log_prob=return_log_prob,
     )
     cd_act, cd_lp = sample_logits_gumbel(
         cd_l,
-        temperature,
         mask=cd_m,
-        eps=eps[:, 2],
+        temperature=head_temperature[:, 2] * temperature,
         return_log_prob=return_log_prob,
     )
     brt_act, brt_lp = sample_logits_gumbel(
         brt_l,
-        temperature,
-        eps=eps[:, 3],
+        temperature=head_temperature[:, 3] * temperature,
         return_log_prob=return_log_prob,
     )
     md_act, md_lp = sample_logits_gumbel(
         md_l,
-        temperature,
-        eps=eps[:, 4],
+        temperature=head_temperature[:, 4] * temperature,
         return_log_prob=return_log_prob,
     )
 
@@ -2118,7 +2093,7 @@ class GraphedInference:
         # Output references (point into graph memory)
         self._s_bt_act = self._s_bd_act = self._s_cd_act = self._s_md_act = None
         self._s_lp = self._s_h = None
-        self._s_bt_l = self._s_bd_l = self._s_cd_l = self._s_brt_l = self._s_md_l = self._s_eps = None
+        self._s_bt_l = self._s_bd_l = self._s_cd_l = self._s_brt_l = self._s_md_l = self._s_head_temperature = None
 
     def capture(self) -> None:
         """Capture the CUDA graph. Call once after model is on device."""
@@ -2135,7 +2110,7 @@ class GraphedInference:
             self._graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self._graph):
                 with torch.no_grad():
-                    self._s_bt_l, self._s_bd_l, self._s_cd_l, self._s_brt_l, self._s_md_l, self._s_eps, self._s_h = self._model.infer_packed(self._static_input)
+                    self._s_bt_l, self._s_bd_l, self._s_cd_l, self._s_brt_l, self._s_md_l, self._s_head_temperature, self._s_h = self._model.infer_packed(self._static_input)
             return
 
         costs_ti, costs_ax, wall_idx, nobld_idx, unit_idx, friendly_idx, core_idx = _mask_indices(DEVICE)
@@ -2155,7 +2130,7 @@ class GraphedInference:
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
             with torch.no_grad():
-                bt_l, bd_l, cd_l, brt_l, md_l, eps, s_h = self._model.infer_packed(self._static_input)
+                bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, s_h = self._model.infer_packed(self._static_input)
                 obs = self._static_input[:, :OBS_SIZE]
 
                 ti = obs[:, _OBS_TI] * 500.0
@@ -2175,14 +2150,16 @@ class GraphedInference:
                 bd_m |= force_none.unsqueeze(1)
 
                 # Sample direction first, then condition build-type on ore.
-                _T = self._temperature
-
                 bd_l.masked_fill_(~bd_m, -1e9)
-                if _T != 1.0:
-                    bd_l = bd_l / _T
-                    md_l = md_l / _T
-                bd_l = _unimix_logits(bd_l, bd_m, eps[:, 1])
-                md_l = _unimix_logits(md_l, eps=eps[:, 4])
+                bd_l = _temperature_scaled_log_probs(
+                    bd_l,
+                    bd_m,
+                    head_temperature[:, 1] * self._temperature,
+                )
+                md_l = _temperature_scaled_log_probs(
+                    md_l,
+                    temperature=head_temperature[:, 4] * self._temperature,
+                )
 
                 static_g_bd.exponential_()
                 s_bd_act = (bd_l - static_g_bd.log_()).argmax(dim=-1)
@@ -2192,13 +2169,20 @@ class GraphedInference:
 
                 bt_l.masked_fill_(~bt_m, -1e9)
                 cd_l.masked_fill_(~cd_mask, -1e9)
-                if _T != 1.0:
-                    bt_l = bt_l / _T
-                    cd_l = cd_l / _T
-
-                bt_l = _unimix_logits(bt_l, bt_m, eps[:, 0])
-                cd_l = _unimix_logits(cd_l, cd_mask, eps[:, 2])
-                brt_l = _unimix_logits(brt_l, eps=eps[:, 3])
+                bt_l = _temperature_scaled_log_probs(
+                    bt_l,
+                    bt_m,
+                    head_temperature[:, 0] * self._temperature,
+                )
+                cd_l = _temperature_scaled_log_probs(
+                    cd_l,
+                    cd_mask,
+                    head_temperature[:, 2] * self._temperature,
+                )
+                brt_l = _temperature_scaled_log_probs(
+                    brt_l,
+                    temperature=head_temperature[:, 3] * self._temperature,
+                )
 
                 static_g_bt.exponential_()
                 s_bt_act = (bt_l - static_g_bt.log_()).argmax(dim=-1)
@@ -2212,7 +2196,7 @@ class GraphedInference:
 
                 s_lp = None
                 if self._return_log_prob:
-                    # bt_l etc. are already log-probs from _unimix_logits — just gather.
+                    # bt_l etc. are already masked log-probs — just gather.
                     s_bt_lp = bt_l.gather(1, s_bt_act.unsqueeze(1)).squeeze(1)
                     s_bd_lp = bd_l.gather(1, s_bd_act.unsqueeze(1)).squeeze(1)
                     s_cd_lp = cd_l.gather(1, s_cd_act.unsqueeze(1)).squeeze(1)
@@ -2265,7 +2249,7 @@ class GraphedInference:
                 self._s_cd_l[:B].clone(),
                 self._s_brt_l[:B].clone(),
                 self._s_md_l[:B].clone(),
-                self._s_eps[:B].clone(),
+                self._s_head_temperature[:B].clone(),
                 self._s_h[:B].clone(),
             )
         with trace_scope(trace, f"{scope_prefix}.forward"):
@@ -2293,7 +2277,7 @@ class GraphedInference:
                 cd_l = self._s_cd_l[:B].clone()
                 brt_l = self._s_brt_l[:B].clone()
                 md_l = self._s_md_l[:B].clone()
-                eps = self._s_eps[:B].clone()
+                head_temperature = self._s_head_temperature[:B].clone()
                 h_next = self._s_h[:B].clone()
                 with trace_scope(trace, f"{scope_prefix}.sample"):
                     return _sample_actions_from_policy_heads(
@@ -2303,7 +2287,7 @@ class GraphedInference:
                         cd_l,
                         brt_l,
                         md_l,
-                        eps,
+                        head_temperature,
                         h_next,
                         temperature=self._temperature,
                         return_log_prob=self._return_log_prob,
@@ -2315,7 +2299,7 @@ class GraphedInference:
                 self._s_h[:B],
             )
         obs = trunk_in[:, :OBS_SIZE]
-        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = self.policy_heads(
+        bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_next = self.policy_heads(
             trunk_in,
             trace=trace,
             scope_prefix=scope_prefix,
@@ -2328,7 +2312,7 @@ class GraphedInference:
                 cd_l,
                 brt_l,
                 md_l,
-                eps,
+                head_temperature,
                 h_next,
                 temperature=self._temperature,
                 return_log_prob=self._return_log_prob,
@@ -2369,8 +2353,10 @@ class BuilderMLP(nn.Module):
         self.context_proj = _ortho_init(nn.Linear(GLOBAL_FEATURES, ACTOR_CONTEXT_DIM))
         self.context_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
         self.context_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_q_proj = nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
         self.tile_sa_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
         self.tile_sa_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_q_proj = nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
         self.cls_ca_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
         self.cls_ca_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
 
@@ -2381,13 +2367,20 @@ class BuilderMLP(nn.Module):
 
         self.actor_cls = nn.Parameter(torch.zeros(self._actor_cls_tokens, TILE_EMBED_DIM))
         self.context_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))
+        self.tile_sa_tau = nn.Parameter(torch.zeros(1))
+        self.cls_ca_tau = nn.Parameter(torch.zeros(1))
+
+        latent_ffn_hidden = self._actor_latent_dim * 2
+        self.latent_ffn_norm = RMSNorm(self._actor_latent_dim)
+        self.latent_ffn_up = _ortho_init(nn.Linear(self._actor_latent_dim, latent_ffn_hidden))
+        self.latent_ffn_down = nn.Linear(latent_ffn_hidden, self._actor_latent_dim)
 
         self.head_build_type = _ortho_init(nn.Linear(self._actor_latent_dim, N_BUILD), std=0.01)
         self.head_build_dir = _ortho_init(nn.Linear(self._actor_latent_dim, N_DIR), std=0.01)
         self.head_conv_dir = _ortho_init(nn.Linear(self._actor_latent_dim, N_CONV_DIR), std=0.01)
         self.head_bridge_target = _ortho_init(nn.Linear(self._actor_latent_dim, N_BRIDGE_TARGETS), std=0.01)
         self.head_move_dir = _ortho_init(nn.Linear(self._actor_latent_dim, N_DIR), std=0.01)
-        self.head_logit_scale = _ortho_init(nn.Linear(self._actor_latent_dim, N_LOGIT_SCALE), std=0.01)
+        self.head_temperature = _ortho_init(nn.Linear(self._actor_latent_dim, N_ACTION_TEMPERATURES), std=0.01)
         self.head_h_gate = _ortho_init(nn.Linear(self._recurrent_input_dim, H_DIM), std=0.01)
         self.head_h_cand = _ortho_init(nn.Linear(self._recurrent_input_dim, H_DIM), std=0.01)
 
@@ -2400,7 +2393,12 @@ class BuilderMLP(nn.Module):
 
         with torch.no_grad():
             trunc_normal_(self.actor_cls, std=0.02)
-            self.head_logit_scale.bias.fill_(_EPS_INIT_BIAS)
+            nn.init.eye_(self.tile_sa_q_proj.weight)
+            self.tile_sa_q_proj.bias.zero_()
+            nn.init.eye_(self.cls_ca_q_proj.weight)
+            self.cls_ca_q_proj.bias.zero_()
+            self.latent_ffn_down.weight.zero_()
+            self.latent_ffn_down.bias.zero_()
             self.head_build_type.bias.copy_(
                 torch.tensor(INITIAL_BUILD_TYPE_BIAS, dtype=torch.float32),
             )
@@ -2434,21 +2432,27 @@ class BuilderMLP(nn.Module):
         return F.silu(cls)
 
     def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
-        q = self._apply_tile_rope(tiles)
+        q = F.normalize(self._apply_tile_rope(self.tile_sa_q_proj(tiles)), dim=-1, eps=1e-6)
         k = self._apply_tile_rope(self.tile_sa_k_proj(tiles))
+        k = F.normalize(k, dim=-1, eps=1e-6)
         v = self.tile_sa_v_proj(tiles)
-        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(TILE_EMBED_DIM)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.tile_sa_tau.exp()
         attn = scores.softmax(dim=-1)
         tiles = self.tile_sa_norm(tiles + torch.matmul(attn, v))
         return F.silu(tiles)
 
     def _cls_cross_attention(self, cls: torch.Tensor, tiles: torch.Tensor) -> torch.Tensor:
-        k = self.cls_ca_k_proj(tiles)
+        q = F.normalize(self.cls_ca_q_proj(cls), dim=-1, eps=1e-6)
+        k = F.normalize(self.cls_ca_k_proj(tiles), dim=-1, eps=1e-6)
         v = self.cls_ca_v_proj(tiles)
-        scores = torch.matmul(cls, k.transpose(-1, -2)) / math.sqrt(TILE_EMBED_DIM)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.cls_ca_tau.exp()
         attn = scores.softmax(dim=-1)
         cls = self.cls_ca_norm(cls + torch.matmul(attn, v))
         return F.silu(cls)
+
+    def _latent_ffn(self, latent: torch.Tensor) -> torch.Tensor:
+        hidden = F.silu(self.latent_ffn_up(self.latent_ffn_norm(latent)))
+        return latent + self.latent_ffn_down(hidden)
 
     def _encode_tiles(self, obs: torch.Tensor) -> torch.Tensor:
         B = obs.shape[0]
@@ -2476,7 +2480,8 @@ class BuilderMLP(nn.Module):
         cls = self._context_cross_attention(cls, torch.cat([global_ctx, recurrent_ctx], dim=1))
         tiles = self._tile_self_attention(tiles)
         cls = self._cls_cross_attention(cls, tiles)
-        return self.latent_norm(cls.reshape(obs_pre.shape[0], self._actor_latent_dim))
+        latent = self.latent_norm(cls.reshape(obs_pre.shape[0], self._actor_latent_dim))
+        return self._latent_ffn(latent)
 
     def actor_latent(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         obs_pre = self._obs_encoder_pre(x)
@@ -2493,7 +2498,7 @@ class BuilderMLP(nn.Module):
                 self.head_conv_dir.weight,
                 self.head_bridge_target.weight,
                 self.head_move_dir.weight,
-                self.head_logit_scale.weight,
+                self.head_temperature.weight,
             ], dim=0)
             combined_b = torch.cat([
                 self.head_build_type.bias,
@@ -2501,7 +2506,7 @@ class BuilderMLP(nn.Module):
                 self.head_conv_dir.bias,
                 self.head_bridge_target.bias,
                 self.head_move_dir.bias,
-                self.head_logit_scale.bias,
+                self.head_temperature.bias,
             ])
         else:
             if not hasattr(self, "_cached_action_head_w"):
@@ -2511,7 +2516,7 @@ class BuilderMLP(nn.Module):
                     self.head_conv_dir.weight,
                     self.head_bridge_target.weight,
                     self.head_move_dir.weight,
-                    self.head_logit_scale.weight,
+                    self.head_temperature.weight,
                 ], dim=0)
                 self._cached_action_head_b = torch.cat([
                     self.head_build_type.bias,
@@ -2519,18 +2524,19 @@ class BuilderMLP(nn.Module):
                     self.head_conv_dir.bias,
                     self.head_bridge_target.bias,
                     self.head_move_dir.bias,
-                    self.head_logit_scale.bias,
+                    self.head_temperature.bias,
                 ])
             combined_w = self._cached_action_head_w
             combined_b = self._cached_action_head_b
 
         combined = F.linear(latent, combined_w, combined_b)
-        bt_l, bd_l, cd_l, brt_l, md_l, eps_raw = combined.split(
-            [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, N_LOGIT_SCALE],
+        bt_l, bd_l, cd_l, brt_l, md_l, temp_raw = combined.split(
+            [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, N_ACTION_TEMPERATURES],
             dim=-1,
         )
-        eps = torch.sigmoid(eps_raw) * (EPS_MAX - EPS_MIN) + EPS_MIN
-        return bt_l, bd_l, cd_l, brt_l, md_l, eps
+        log_temp = torch.sigmoid(temp_raw) * (math.log(TEMP_MAX) - math.log(TEMP_MIN)) + math.log(TEMP_MIN)
+        head_temperature = log_temp.exp()
+        return bt_l, bd_l, cd_l, brt_l, md_l, head_temperature
 
     def _project_recurrent_heads(
         self,
@@ -2544,16 +2550,16 @@ class BuilderMLP(nn.Module):
 
     def _forward_from_obs_pre(self, obs_pre: torch.Tensor, h_prev: torch.Tensor):
         latent = self._latent_from_obs_pre(obs_pre, h_prev)
-        bt_l, bd_l, cd_l, brt_l, md_l, eps = self._project_policy_heads(latent)
+        bt_l, bd_l, cd_l, brt_l, md_l, head_temperature = self._project_policy_heads(latent)
         h_gate, h_cand = self._project_recurrent_heads(latent, h_prev)
-        return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand
+        return bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_gate, h_cand
 
     def forward(self, x, h_prev):
         obs_pre = self._obs_encoder_pre(x)
-        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
+        bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
         z = torch.sigmoid(h_gate)
         h_next = (1.0 - z) * h_prev + z * h_cand
-        return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next
+        return bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_next
 
     @torch.no_grad()
     def mu_center_policy_heads(self) -> None:
@@ -2581,10 +2587,10 @@ class BuilderMLP(nn.Module):
         obs = packed[:, :OBS_SIZE]
         h_prev = packed[:, OBS_SIZE:]
         obs_pre = self._obs_encoder_pre(obs)
-        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
+        bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
         z = torch.sigmoid(h_gate)
         h_next = (1.0 - z) * h_prev + z * h_cand
-        return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next
+        return bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_next
 
     def _policy_state_entries(self) -> list[tuple[str, object]]:
         return [
@@ -2607,9 +2613,16 @@ class BuilderMLP(nn.Module):
             ("linear", self.head_conv_dir),
             ("linear", self.head_bridge_target),
             ("linear", self.head_move_dir),
-            ("linear", self.head_logit_scale),
+            ("linear", self.head_temperature),
             ("linear", self.head_h_gate),
             ("linear", self.head_h_cand),
+            ("linear", self.tile_sa_q_proj),
+            ("linear", self.cls_ca_q_proj),
+            ("param", self.tile_sa_tau),
+            ("param", self.cls_ca_tau),
+            ("norm", self.latent_ffn_norm),
+            ("linear", self.latent_ffn_up),
+            ("linear", self.latent_ffn_down),
         ]
 
     def export_weights(self) -> list[list[float]]:
@@ -2631,11 +2644,19 @@ class BuilderMLP(nn.Module):
     def import_weights(self, state: list[list[float]]) -> None:
         """Load weights from tensor_lib JSON format."""
         entries = self._policy_state_entries()
+        new_item_count = 11
         expected = sum(2 if kind == "linear" else 1 for kind, _ in entries)
-        if len(state) != expected:
-            raise AssertionError(f"State has {len(state)} entries, expected {expected}")
-        idx = 0
+        legacy_expected = expected - new_item_count
+        if len(state) not in (expected, legacy_expected):
+            raise AssertionError(
+                f"State has {len(state)} entries, expected {expected} or legacy {legacy_expected}"
+            )
         dev = next(self.parameters()).device
+        if len(state) == legacy_expected:
+            fresh = type(self)(hidden=list(self._hidden)).to(device=dev)
+            default_state = fresh.export_weights()
+            state = list(state) + default_state[len(state):]
+        idx = 0
         for kind, obj in entries:
             if kind == "linear":
                 layer = obj
@@ -2770,7 +2791,7 @@ def _logprob_recurrent_step(
     cd_causal_t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One recurrent timestep: forward → GRU update → log-prob (no entropy)."""
-    bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre_t, h_t)
+    bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_gate, h_cand = model._forward_from_obs_pre(obs_pre_t, h_t)
     z = torch.sigmoid(h_gate)
     h_new = (1.0 - z) * h_t + z * h_cand
 
@@ -2778,11 +2799,11 @@ def _logprob_recurrent_step(
     bd_l = bd_l.masked_fill(~bd_mask_t, -1e9)
     cd_l = cd_l.masked_fill(~cd_mask, -1e9)
 
-    bt_lp = _unimix_logits(bt_l, bt_mask_t, eps[:, 0]).gather(1, bt_act_t.unsqueeze(1)).squeeze(1)
-    bd_lp = _unimix_logits(bd_l, bd_mask_t, eps[:, 1]).gather(1, bd_act_t.unsqueeze(1)).squeeze(1)
-    cd_lp = _unimix_logits(cd_l, cd_mask, eps[:, 2]).gather(1, cd_act_t.unsqueeze(1)).squeeze(1)
-    brt_lp = _unimix_logits(brt_l, eps=eps[:, 3]).gather(1, brt_act_t.unsqueeze(1)).squeeze(1)
-    md_lp = _unimix_logits(md_l, eps=eps[:, 4]).gather(1, md_act_t.unsqueeze(1)).squeeze(1)
+    bt_lp = _temperature_scaled_log_probs(bt_l, bt_mask_t, head_temperature[:, 0]).gather(1, bt_act_t.unsqueeze(1)).squeeze(1)
+    bd_lp = _temperature_scaled_log_probs(bd_l, bd_mask_t, head_temperature[:, 1]).gather(1, bd_act_t.unsqueeze(1)).squeeze(1)
+    cd_lp = _temperature_scaled_log_probs(cd_l, cd_mask, head_temperature[:, 2]).gather(1, cd_act_t.unsqueeze(1)).squeeze(1)
+    brt_lp = _temperature_scaled_log_probs(brt_l, temperature=head_temperature[:, 3]).gather(1, brt_act_t.unsqueeze(1)).squeeze(1)
+    md_lp = _temperature_scaled_log_probs(md_l, temperature=head_temperature[:, 4]).gather(1, md_act_t.unsqueeze(1)).squeeze(1)
     brt_causal = bt_act_t == BRIDGE_BUILD_TYPE
     lp = _compose_action_log_prob(
         bt_lp,
@@ -2858,7 +2879,7 @@ def _actor_recurrent_step(
     cd_causal_t: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One recurrent timestep: forward → GRU update → log-probs + entropy."""
-    bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre_t, h_t)
+    bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_gate, h_cand = model._forward_from_obs_pre(obs_pre_t, h_t)
     z = torch.sigmoid(h_gate)
     h_new = (1.0 - z) * h_t + z * h_cand
 
@@ -2866,11 +2887,11 @@ def _actor_recurrent_step(
     bd_l = bd_l.masked_fill(~bd_mask_t, -1e9)
     cd_l = cd_l.masked_fill(~cd_mask, -1e9)
 
-    bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask_t, eps[:, 0])
-    bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask_t, eps[:, 1])
-    cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, eps[:, 2])
-    brt_lp, brt_ent = action_log_prob_and_entropy(brt_l, brt_act_t, eps=eps[:, 3])
-    md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act_t, eps=eps[:, 4])
+    bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask_t, head_temperature[:, 0])
+    bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask_t, head_temperature[:, 1])
+    cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, head_temperature[:, 2])
+    brt_lp, brt_ent = action_log_prob_and_entropy(brt_l, brt_act_t, temperature=head_temperature[:, 3])
+    md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act_t, temperature=head_temperature[:, 4])
     brt_causal = bt_act_t == BRIDGE_BUILD_TYPE
 
     new_lp = _compose_action_log_prob(
@@ -2883,7 +2904,7 @@ def _actor_recurrent_step(
         brt_causal=brt_causal,
     )
     ent = bt_ent + bd_ent + cd_ent * cd_causal_t + brt_ent * brt_causal + md_ent
-    return new_lp, ent, eps, h_new
+    return new_lp, ent, head_temperature, h_new
 
 
 _compiled_actor_step: Callable | None = None
@@ -2926,25 +2947,25 @@ def _recurrent_actor_pass(
     bd_mask: torch.Tensor,
     cd_causal: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sequential recurrent pass that returns log-probs, entropies, and per-head eps."""
+    """Sequential recurrent pass that returns log-probs, entropies, and per-head temperatures."""
     B, K_max, _ = obs_pre.shape
     dev = obs_pre.device
     h_t = h0
     new_lps = torch.empty(B, K_max, device=dev)
     entropies = torch.empty(B, K_max, device=dev)
-    all_eps = torch.empty(B, K_max, N_LOGIT_SCALE, device=dev)
+    all_temperatures = torch.empty(B, K_max, N_ACTION_TEMPERATURES, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
     step_fn = _get_actor_step_fn()
     with autocast_context(_get_actor_cuda_config()):
         for t in range(K_max):
-            new_lps[:, t], entropies[:, t], all_eps[:, t], h_t = step_fn(
+            new_lps[:, t], entropies[:, t], all_temperatures[:, t], h_t = step_fn(
                 model, obs_pre[:, t], h_t,
                 bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
                 bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
             )
 
-    return new_lps, entropies, all_eps
+    return new_lps, entropies, all_temperatures
 
 
 def _sequential_logprobs(
@@ -3069,9 +3090,9 @@ def ppo_update(
     # Layout: [pi_loss, ent_loss, actor_gn, kl, clip_frac]
     _actor_acc = torch.zeros(5, device=dev)
     _critic_acc = torch.zeros(3, device=dev)  # [vf_loss, critic_gn, critic_delta]
-    sum_eps = torch.zeros(N_LOGIT_SCALE, device=dev)
-    sum_eps_sq = torch.zeros(N_LOGIT_SCALE, device=dev)
-    n_eps = 0
+    sum_temperature = torch.zeros(N_ACTION_TEMPERATURES, device=dev)
+    sum_temperature_sq = torch.zeros(N_ACTION_TEMPERATURES, device=dev)
+    n_temperature = 0
     n_updates = 0
 
     bucket_centers = _make_bucket_centers().to(device=obs.device)
@@ -3127,7 +3148,7 @@ def ppo_update(
             tail_perm = tail_perm[all_chunk_lens[tail_perm].argsort(descending=True, stable=True)]
 
         def _run_actor_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
-            nonlocal _epoch_kl_acc, n_mb, n_updates, sum_eps, sum_eps_sq, n_eps
+            nonlocal _epoch_kl_acc, n_mb, n_updates, sum_temperature, sum_temperature_sq, n_temperature
             for cb_start in range(0, chunk_ids.shape[0], B_chunk):
                 with trace_scope(trace, "ppo.actor_minibatch"):
                     batch_ids = chunk_ids[cb_start:cb_start + B_chunk]
@@ -3155,7 +3176,7 @@ def ppo_update(
                     all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    new_lps, entropies, batch_eps = _recurrent_actor_pass(
+                    new_lps, entropies, batch_temperature = _recurrent_actor_pass(
                         model,
                         all_obs_pre,
                         h[chunk_starts].detach(),
@@ -3218,12 +3239,12 @@ def ppo_update(
 
                     with torch.no_grad():
                         if full_length:
-                            flat_eps = batch_eps.reshape(-1, N_LOGIT_SCALE)
+                            flat_temperature = batch_temperature.reshape(-1, N_ACTION_TEMPERATURES)
                         else:
-                            flat_eps = batch_eps[valid_mask]
-                        sum_eps += flat_eps.sum(dim=0)
-                        sum_eps_sq += flat_eps.square().sum(dim=0)
-                        n_eps += flat_eps.shape[0]
+                            flat_temperature = batch_temperature[valid_mask]
+                        sum_temperature += flat_temperature.sum(dim=0)
+                        sum_temperature_sq += flat_temperature.square().sum(dim=0)
+                        n_temperature += flat_temperature.shape[0]
 
         if full_perm.numel() > 0:
             _run_actor_group(full_perm, full_length=True)
@@ -3329,12 +3350,12 @@ def ppo_update(
                     if profile is not None:
                         profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_value)
 
-    if n_eps > 0:
-        mean_eps = sum_eps / n_eps
-        std_eps = (sum_eps_sq / n_eps - mean_eps.square()).clamp_min(0.0).sqrt()
+    if n_temperature > 0:
+        mean_temperature = sum_temperature / n_temperature
+        std_temperature = (sum_temperature_sq / n_temperature - mean_temperature.square()).clamp_min(0.0).sqrt()
     else:
-        mean_eps = torch.full((N_LOGIT_SCALE,), EPS_MIN, device=obs.device)
-        std_eps = torch.zeros(N_LOGIT_SCALE, device=obs.device)
+        mean_temperature = torch.ones(N_ACTION_TEMPERATURES, device=obs.device)
+        std_temperature = torch.zeros(N_ACTION_TEMPERATURES, device=obs.device)
 
     # Single GPU→CPU sync for all accumulated scalars
     with torch.no_grad():
@@ -3351,7 +3372,7 @@ def ppo_update(
             oob_frac, bucket_lo_orig.float(), bucket_hi_orig.float(),
         ])
         # Batch all .item() calls into one contiguous CPU transfer
-        _all_scalars = torch.cat([_actor_acc, _critic_acc, _diag, mean_eps, std_eps]).cpu()
+        _all_scalars = torch.cat([_actor_acc, _critic_acc, _diag, mean_temperature, std_temperature]).cpu()
     # Unpack after single sync
     _a = _all_scalars
     _na = max(n_updates, 1)
@@ -3371,14 +3392,16 @@ def ppo_update(
         "ret_mean": round(_a[10].item(), 3),
         "ret_oob_frac": round(_a[11].item(), 4),
         "n_updates": n_updates,
-        "ls_bt_mean": _a[14].item(),
-        "ls_bd_mean": _a[15].item(),
-        "ls_cd_mean": _a[16].item(),
-        "ls_md_mean": _a[17].item(),
-        "ls_bt_std": _a[18].item(),
-        "ls_bd_std": _a[19].item(),
-        "ls_cd_std": _a[20].item(),
-        "ls_md_std": _a[21].item(),
+        "temp_bt_mean": _a[14].item(),
+        "temp_bd_mean": _a[15].item(),
+        "temp_cd_mean": _a[16].item(),
+        "temp_brt_mean": _a[17].item(),
+        "temp_md_mean": _a[18].item(),
+        "temp_bt_std": _a[19].item(),
+        "temp_bd_std": _a[20].item(),
+        "temp_cd_std": _a[21].item(),
+        "temp_brt_std": _a[22].item(),
+        "temp_md_std": _a[23].item(),
     }
 
 
@@ -4117,7 +4140,7 @@ def distill(
     with torch.no_grad():
         for i in range(0, N, 4096):
             packed = torch.cat([obs[i:i + 4096], h[i:i + 4096]], dim=-1)
-            bt_l, bd_l, cd_l, _brt_l, md_l, _eps, _ = teacher.infer_packed(packed)
+            bt_l, bd_l, cd_l, _brt_l, md_l, _head_temperature, _ = teacher.infer_packed(packed)
             t_bt.append(bt_l)
             t_bd.append(bd_l)
             t_cd.append(cd_l)
@@ -4135,7 +4158,7 @@ def distill(
         perm = torch.randperm(N, device=DEVICE)
         for start in range(0, N, minibatch_size):
             idx = perm[start:start + minibatch_size]
-            s_bt, s_bd, s_cd, s_md, _eps, _ = student(obs[idx], h[idx])
+            s_bt, s_bd, s_cd, _s_brt, s_md, _head_temperature, _ = student(obs[idx], h[idx])
 
             # KL(teacher || student) on softened logits
             loss = (
