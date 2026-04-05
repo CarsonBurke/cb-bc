@@ -125,6 +125,54 @@ def _build_rope_cache() -> tuple[list[list[float]], list[list[float]]]:
     return cos_cache, sin_cache
 
 
+def _attention_update(
+    q: list[float],
+    keys: list[list[float]],
+    values: list[list[float]],
+    scale: float,
+) -> list[float]:
+    n_keys = len(keys)
+    scores = [0.0] * n_keys
+    best = float("-inf")
+    for i in range(n_keys):
+        score = scale * _DOT(q, keys[i])
+        scores[i] = score
+        if score > best:
+            best = score
+
+    out = [0.0] * len(values[0])
+    z = 0.0
+    for i in range(n_keys):
+        weight = _EXP(scores[i] - best)
+        z += weight
+        value = values[i]
+        for j in range(len(out)):
+            out[j] += weight * value[j]
+
+    inv_z = 1.0 / z
+    for j in range(len(out)):
+        out[j] *= inv_z
+    return out
+
+
+def _residual_rmsnorm_silu(
+    base: list[float],
+    update: list[float],
+    gamma: list[float],
+    eps: float,
+) -> list[float]:
+    out = [0.0] * len(base)
+    mean_sq = 0.0
+    for i in range(len(base)):
+        x = base[i] + update[i]
+        out[i] = x
+        mean_sq += x * x
+    inv_rms = 1.0 / (mean_sq / len(base) + eps) ** 0.5
+    for i in range(len(base)):
+        out[i] = _silu_scalar(out[i] * inv_rms * gamma[i])
+    return out
+
+
 class ActorModel:
     """Stdlib-only actor matching the PyTorch CLS-attention actor."""
 
@@ -373,18 +421,13 @@ class ActorModel:
         cls_state = [list(token) for token in cls_tokens]
         for i, token in enumerate(cls_state):
             q = _l2_normalize(token)
-            scale = _EXP(context_tau[i])
-            scores = [scale * _DOT(q, projected_ctx_k[j]) for j in range(len(projected_ctx_k))]
-            weights = _softmax(scores)
-            update = [0.0] * TILE_EMBED_DIM
-            for w, value in zip(weights, projected_ctx_v):
-                for j in range(TILE_EMBED_DIM):
-                    update[j] += w * value[j]
-            cls_state[i] = [_silu_scalar(x) for x in _rmsnorm(
-                [token[j] + update[j] for j in range(TILE_EMBED_DIM)],
+            update = _attention_update(q, projected_ctx_k, projected_ctx_v, _EXP(context_tau[i]))
+            cls_state[i] = _residual_rmsnorm_silu(
+                token,
+                update,
                 context_norm_gamma,
                 context_norm_eps,
-            )]
+            )
 
         tile_q: list[list[float]] = []
         tile_k: list[list[float]] = []
@@ -410,19 +453,16 @@ class ActorModel:
             tile_k.append(_l2_normalize(_apply_rotary(k_tok, self._rope_cos[idx], self._rope_sin[idx])))
             tile_v.append(v_tok)
 
+        tile_sa_scale = _EXP(tile_sa_tau)
         enriched_tiles: list[list[float]] = []
         for i, token in enumerate(encoded_tokens):
-            scores = [_EXP(tile_sa_tau) * _DOT(tile_q[i], tile_k[j]) for j in range(TILE_GRID_N)]
-            weights = _softmax(scores)
-            update = [0.0] * TILE_EMBED_DIM
-            for w, value in zip(weights, tile_v):
-                for j in range(TILE_EMBED_DIM):
-                    update[j] += w * value[j]
-            enriched_tiles.append([_silu_scalar(x) for x in _rmsnorm(
-                [token[j] + update[j] for j in range(TILE_EMBED_DIM)],
+            update = _attention_update(tile_q[i], tile_k, tile_v, tile_sa_scale)
+            enriched_tiles.append(_residual_rmsnorm_silu(
+                token,
+                update,
                 tile_norm_gamma,
                 tile_norm_eps,
-            )])
+            ))
 
         cls_k: list[list[float]] = []
         cls_k_norm: list[list[float]] = []
@@ -443,6 +483,7 @@ class ActorModel:
             cls_k_norm.append(_l2_normalize(k_tok))
             cls_v.append(v_tok)
 
+        cls_ca_scale = _EXP(cls_ca_tau)
         for i, token in enumerate(cls_state):
             q_tok = [0.0] * TILE_EMBED_DIM
             for j in range(TILE_EMBED_DIM):
@@ -451,17 +492,13 @@ class ActorModel:
                     q_val += cls_q_bias[j]
                 q_tok[j] = q_val
             q_tok = _l2_normalize(q_tok)
-            scores = [_EXP(cls_ca_tau) * _DOT(q_tok, cls_k_norm[j]) for j in range(TILE_GRID_N)]
-            weights = _softmax(scores)
-            update = [0.0] * TILE_EMBED_DIM
-            for w, value in zip(weights, cls_v):
-                for j in range(TILE_EMBED_DIM):
-                    update[j] += w * value[j]
-            cls_state[i] = [_silu_scalar(x) for x in _rmsnorm(
-                [token[j] + update[j] for j in range(TILE_EMBED_DIM)],
+            update = _attention_update(q_tok, cls_k_norm, cls_v, cls_ca_scale)
+            cls_state[i] = _residual_rmsnorm_silu(
+                token,
+                update,
                 cls_norm_gamma,
                 cls_norm_eps,
-            )]
+            )
 
         latent = _rmsnorm(_flatten_tokens(cls_state), latent_norm_gamma, latent_norm_eps)
         latent_hidden = _silu_vec(_linear(_rmsnorm(latent, latent_ffn_norm_gamma, latent_ffn_norm_eps), latent_ffn_up_rows, latent_ffn_up_bias))
