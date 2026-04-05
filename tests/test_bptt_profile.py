@@ -75,7 +75,7 @@ def test_bptt_profile():
     # --- (b) Per-step residual: recurrent path from cached obs_pre ---
     def single_step_residual():
         lat = model._latent_from_obs_pre(single_obs_pre, h_prev)
-        bt_l, bd_l, cd_l, brt_l, md_l, eps = model._project_policy_heads(lat)
+        bt_l, bd_l, cd_l, brt_l, md_l, head_temperature = model._project_policy_heads(lat)
         h_gate, h_cand = model._project_recurrent_heads(lat, h_prev)
         z = torch.sigmoid(h_gate)
         h_new = (1.0 - z) * h_prev + z * h_cand
@@ -88,7 +88,7 @@ def test_bptt_profile():
         h_t = h_prev
         for t in range(K):
             lat = model._latent_from_obs_pre(obs_pre_seq[:, t], h_t)
-            bt_l, bd_l, cd_l, brt_l, md_l, eps = model._project_policy_heads(lat)
+            bt_l, bd_l, cd_l, brt_l, md_l, head_temperature = model._project_policy_heads(lat)
             h_gate, h_cand = model._project_recurrent_heads(lat, h_t)
             z = torch.sigmoid(h_gate)
             h_t = (1.0 - z) * h_t + z * h_cand
@@ -104,7 +104,7 @@ def test_bptt_profile():
         for t in range(K):
             obs_pre_t = model._obs_encoder_pre(obs_seq[:, t])
             lat = model._latent_from_obs_pre(obs_pre_t, h_t)
-            bt_l, bd_l, cd_l, brt_l, md_l, eps = model._project_policy_heads(lat)
+            bt_l, bd_l, cd_l, brt_l, md_l, head_temperature = model._project_policy_heads(lat)
             h_gate, h_cand = model._project_recurrent_heads(lat, h_t)
             z = torch.sigmoid(h_gate)
             h_t = (1.0 - z) * h_t + z * h_cand

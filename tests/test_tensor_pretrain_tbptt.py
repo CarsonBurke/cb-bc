@@ -211,9 +211,9 @@ def test_forward_from_obs_pre_step_fused_matches_model_path():
     obs_pre = model._obs_encoder_pre(obs)
     combined_w, combined_b = train_bc._fused_actor_head_params(model)
 
-    # Reference: use model's own forward (returns 8 values: 5 logits + eps + h_gate + h_cand)
+    # Reference: use model's own forward (returns 8 values: 5 logits + temperature + h_gate + h_cand)
     bt_e, bd_e, cd_e, brt_e, md_e, _eps, _hg, _hc = model._forward_from_obs_pre(obs_pre, h_prev)
-    # Fused BC path (returns 6 values: 5 logits + h_next, no eps)
+    # Fused BC path (returns 6 values: 5 logits + h_next, no temperature)
     bt_a, bd_a, cd_a, brt_a, md_a, _h_a = train_bc._forward_from_obs_pre_step_fused(
         model, obs_pre, h_prev, combined_w, combined_b,
     )
@@ -222,7 +222,7 @@ def test_forward_from_obs_pre_step_fused_matches_model_path():
         assert torch.allclose(lhs, rhs, atol=1e-5, rtol=1e-5)
 
 
-def test_fused_actor_bc_path_ignores_head_logit_scale():
+def test_fused_actor_bc_path_ignores_head_temperature():
     model = BuilderMLP()
     obs = torch.randn(3, OBS_SIZE, dtype=torch.float32)
     h_prev = torch.randn(3, train_bc.H_DIM, dtype=torch.float32)
@@ -232,8 +232,8 @@ def test_fused_actor_bc_path_ignores_head_logit_scale():
     actual_a = train_bc._forward_from_obs_pre_step_fused(model, obs_pre, h_prev, combined_w_a, combined_b_a)
 
     with torch.no_grad():
-        model.head_logit_scale.weight.normal_(mean=0.0, std=50.0)
-        model.head_logit_scale.bias.normal_(mean=0.0, std=50.0)
+        model.head_temperature.weight.normal_(mean=0.0, std=50.0)
+        model.head_temperature.bias.normal_(mean=0.0, std=50.0)
 
     combined_w_b, combined_b_b = train_bc._fused_actor_head_params(model)
     actual_b = train_bc._forward_from_obs_pre_step_fused(model, obs_pre, h_prev, combined_w_b, combined_b_b)
@@ -246,7 +246,7 @@ def test_fused_actor_bc_path_ignores_head_logit_scale():
     assert torch.allclose(actual_a[5], actual_b[5], atol=1e-5, rtol=1e-5)
 
 
-def test_actor_bc_optimizer_excludes_head_logit_scale():
+def test_actor_bc_optimizer_includes_head_temperature():
     model = BuilderMLP()
     optimizer = train_bc._actor_bc_optimizer(model, lr=3e-4)
     opt_param_ids = {
@@ -255,8 +255,8 @@ def test_actor_bc_optimizer_excludes_head_logit_scale():
         for param in group["params"]
     }
 
-    assert id(model.head_logit_scale.weight) not in opt_param_ids
-    assert id(model.head_logit_scale.bias) not in opt_param_ids
+    assert id(model.head_temperature.weight) in opt_param_ids
+    assert id(model.head_temperature.bias) in opt_param_ids
     assert id(model.head_build_type.weight) in opt_param_ids
     assert id(model.head_move_dir.bias) in opt_param_ids
 

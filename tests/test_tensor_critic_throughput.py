@@ -358,7 +358,7 @@ def test_sample_actions_from_policy_heads_returns_finite_behavior_log_prob():
     cd_l = torch.zeros(2, model_mod.N_CONV_DIR)
     brt_l = torch.zeros(2, model_mod.N_BRIDGE_TARGETS)
     md_l = torch.zeros(2, model_mod.N_DIR)
-    eps = torch.full((2, model_mod.N_LOGIT_SCALE), model_mod.EPS_MIN)
+    head_temperature = torch.ones((2, model_mod.N_ACTION_TEMPERATURES))
     h_next = torch.zeros(2, model_mod.H_DIM)
 
     torch.manual_seed(0)
@@ -369,7 +369,7 @@ def test_sample_actions_from_policy_heads_returns_finite_behavior_log_prob():
         cd_l,
         brt_l,
         md_l,
-        eps,
+        head_temperature,
         h_next,
         temperature=1.0,
         return_log_prob=True,
@@ -561,8 +561,8 @@ def test_ppo_update_reuses_cached_obs_pre_for_actor_minibatches(monkeypatch):
         captured_obs_pre.append(obs_pre.detach().cpu())
         new_lps = obs_pre[..., 0] * model.scale
         entropies = torch.zeros_like(new_lps)
-        eps = torch.zeros(*new_lps.shape, model_mod.N_LOGIT_SCALE, device=new_lps.device)
-        return new_lps, entropies, eps
+        head_temperature = torch.ones(*new_lps.shape, model_mod.N_ACTION_TEMPERATURES, device=new_lps.device)
+        return new_lps, entropies, head_temperature
 
     monkeypatch.setattr(model_mod, "_recurrent_actor_pass", fake_recurrent_actor_pass)
 

@@ -64,7 +64,7 @@ def test_actor_model_matches_exported_torch_actor():
             "conv_dir": 4,
             "bridge_target": 28,
             "move_dir": 9,
-            "logit_scale": 5,
+            "temperature": 5,
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },
@@ -76,7 +76,7 @@ def test_actor_model_matches_exported_torch_actor():
     packed = torch.cat([obs, h_prev], dim=-1)
 
     with torch.no_grad():
-        bt_l, bd_l, cd_l, brt_l, md_l, _eps, h_next = torch_model.infer_packed(packed)
+        bt_l, bd_l, cd_l, brt_l, md_l, _head_temperature, h_next = torch_model.infer_packed(packed)
         latent = torch_model.actor_latent(obs, h_prev)
         recurrent_in = torch.cat([latent, h_prev], dim=-1)
         gate = torch_model.head_h_gate(recurrent_in)
@@ -90,3 +90,43 @@ def test_actor_model_matches_exported_torch_actor():
     assert infer_out["move_dir"] == pytest.approx(md_l[0].tolist(), rel=1e-5, abs=1e-5)
     assert infer_out["h_gate"] == pytest.approx(gate[0].tolist(), rel=1e-5, abs=1e-5)
     assert infer_out["h_cand"] == pytest.approx(cand[0].tolist(), rel=1e-5, abs=1e-5)
+
+
+def test_actor_load_accepts_legacy_state_prefix():
+    torch_model = BuilderMLP().eval()
+    full_state = torch_model.export_weights()
+    legacy_state = full_state[:-11]
+
+    infer_model = ActorModel(
+        output_heads={
+            "build_type": 13,
+            "build_dir": 9,
+            "conv_dir": 4,
+            "bridge_target": 28,
+            "move_dir": 9,
+            "temperature": 5,
+            "h_gate": H_DIM,
+            "h_cand": H_DIM,
+        },
+    )
+    infer_model.load(full_state)
+    infer_model.load(legacy_state)
+
+    compat_model = BuilderMLP().eval()
+    compat_model.import_weights(full_state)
+    compat_model.import_weights(legacy_state)
+
+    obs = torch.randn(1, OBS_SIZE)
+    h_prev = torch.randn(1, H_DIM)
+    packed = torch.cat([obs, h_prev], dim=-1)
+
+    with torch.no_grad():
+        bt_l, bd_l, cd_l, brt_l, md_l, _head_temperature, _h_next = compat_model.infer_packed(packed)
+    infer_out = infer_model.infer(obs[0].tolist() + h_prev[0].tolist())
+
+    assert torch.isfinite(bt_l).all()
+    assert infer_out["build_type"] == pytest.approx(bt_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["build_dir"] == pytest.approx(bd_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["conv_dir"] == pytest.approx(cd_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["bridge_target"] == pytest.approx(brt_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["move_dir"] == pytest.approx(md_l[0].tolist(), rel=1e-5, abs=1e-5)

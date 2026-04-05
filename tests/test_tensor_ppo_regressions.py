@@ -25,9 +25,9 @@ from model import (
     GLOBAL_SCALAR_DIM,
     H_DIM,
     HARVESTER_BUILD_TYPE,
-    EPS_MIN,
     NUM_BUCKETS,
     OBS_SIZE,
+    TEMP_MIN,
     TILE_FEATURES,
     UNIT_CONTEXT_DIM,
     _MASK_BD_TILES,
@@ -41,7 +41,7 @@ from model import (
     _precompute_policy_masks,
     _recurrent_actor_pass,
     _recurrent_logprob_pass,
-    _unimix_logits,
+    _temperature_scaled_log_probs,
     _sequential_logprobs,
     _split_chunk_ids,
     action_log_prob_and_entropy,
@@ -92,7 +92,7 @@ def _manual_rollout_episode(
     for local_step in range(length):
         step_idx = offset + local_step
         obs = _make_obs(step_idx).unsqueeze(0).to(device)
-        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = model(obs, h_prev)
+        bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_next = model(obs, h_prev)
 
         bt_mask, bd_mask = compute_action_masks(obs)
         cd_mask = conveyor_dir_mask(device, 1)
@@ -125,11 +125,11 @@ def _manual_rollout_episode(
         bd_l = bd_l.masked_fill(~bd_mask, -1e9)
         cd_l = cd_l.masked_fill(~cd_mask, -1e9)
 
-        bt_lp, _ = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask, eps[:, 0])
-        bd_lp, _ = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask, eps[:, 1])
-        cd_lp, _ = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, eps[:, 2])
-        brt_lp, _ = action_log_prob_and_entropy(brt_l, brt_act_t, eps=eps[:, 3])
-        md_lp, _ = action_log_prob_and_entropy(md_l, md_act_t, eps=eps[:, 4])
+        bt_lp, _ = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask, head_temperature[:, 0])
+        bd_lp, _ = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask, head_temperature[:, 1])
+        cd_lp, _ = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, head_temperature[:, 2])
+        brt_lp, _ = action_log_prob_and_entropy(brt_l, brt_act_t, temperature=head_temperature[:, 3])
+        md_lp, _ = action_log_prob_and_entropy(md_l, md_act_t, temperature=head_temperature[:, 4])
         cd_causal = 1.0 if bt_act in CONVEYOR_BUILD_TYPES else 0.0
         brt_causal = 1.0 if bt_act == BRIDGE_BUILD_TYPE else 0.0
         total_lp = bd_lp + bt_lp + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
@@ -301,26 +301,24 @@ class TestActionLogProbAndEntropy:
     """Verify log_prob and entropy computation against manual formulas."""
 
     def test_log_prob_matches_manual(self):
-        """Log prob should match manual softmax + unimix + gather."""
+        """Log prob should match manual temperature-scaled softmax + gather."""
         logits = torch.tensor([[2.0, 1.0, 0.5]])
         action = torch.tensor([1])
 
         lp, _ = action_log_prob_and_entropy(logits, action)
         probs = F.softmax(logits, dim=-1)
-        mixed = (1 - EPS_MIN) * probs + EPS_MIN / logits.shape[-1]
-        expected = mixed.log()[0, 1]
+        expected = probs.log()[0, 1]
         assert lp.item() == pytest.approx(expected.item(), abs=1e-6)
 
     def test_entropy_matches_manual(self):
-        """Entropy should match -sum(p * log(p)) over unimixed distribution."""
+        """Entropy should match -sum(p * log(p)) over the scaled distribution."""
         logits = torch.tensor([[2.0, 1.0, 0.5]])
         action = torch.tensor([0])
 
         _, ent = action_log_prob_and_entropy(logits, action)
         probs = F.softmax(logits, dim=-1)
-        mixed = (1 - EPS_MIN) * probs + EPS_MIN / logits.shape[-1]
-        log_mixed = mixed.log()
-        expected_ent = -(mixed * log_mixed).sum(dim=-1)
+        log_probs = probs.log()
+        expected_ent = -(probs * log_probs).sum(dim=-1)
         assert ent.item() == pytest.approx(expected_ent.item(), abs=1e-6)
 
     def test_uniform_logits_max_entropy(self):
@@ -333,14 +331,15 @@ class TestActionLogProbAndEntropy:
         max_ent = torch.log(torch.tensor(float(n)))
         assert ent.item() == pytest.approx(max_ent.item(), abs=1e-5)
 
-    def test_peaked_logits_has_entropy_floor(self):
-        """Peaked logits should still have nonzero entropy due to unimix."""
-        logits = torch.tensor([[-100.0, 100.0, -100.0]])
+    def test_higher_temperature_increases_entropy(self):
+        """A higher temperature should flatten the categorical distribution."""
+        logits = torch.tensor([[4.0, 1.0, -1.0]])
         action = torch.tensor([1])
 
-        lp, ent = action_log_prob_and_entropy(logits, action)
-        assert ent.item() > 0.0
-        assert lp.item() < 0.0
+        lp_cold, ent_cold = action_log_prob_and_entropy(logits, action, temperature=TEMP_MIN)
+        lp_hot, ent_hot = action_log_prob_and_entropy(logits, action, temperature=2.0)
+        assert ent_hot.item() > ent_cold.item()
+        assert lp_hot.item() > lp_cold.item()
 
     def test_log_prob_always_negative_or_zero(self):
         """Log probabilities must be <= 0."""
@@ -931,56 +930,54 @@ class TestAdvantageNormalization:
 
 
 # =====================================================================
-# Logit scaling
+# Temperature scaling
 # =====================================================================
 
-class TestUnimix:
-    """Verify fixed unimix mechanism."""
+class TestTemperatureScaledLogProbs:
+    """Verify masked temperature-scaled categorical helpers."""
 
-    def test_unimix_with_mask_zeros_invalid(self):
-        """Masked actions should get zero probability from unimix."""
+    def test_masked_temperature_scaled_log_probs_zero_invalid(self):
+        """Masked actions should get zero probability mass."""
         logits = torch.randn(2, 5)
         mask = torch.tensor([[True, True, False, False, False],
                              [True, True, True, True, True]])
         logits[~mask] = -1e9
-        log_probs = _unimix_logits(logits, mask)
+        log_probs = _temperature_scaled_log_probs(logits, mask)
         assert log_probs[0, 2].item() == float('-inf')
         assert log_probs[0, 3].item() == float('-inf')
         assert log_probs[0, 0].isfinite()
         assert log_probs[1, 4].isfinite()
 
-    def test_unimix_with_mask_matches_valid_support_mix(self):
-        """Masked unimix should match a valid-only Dreamer-style probability mix."""
+    def test_masked_temperature_matches_valid_support_softmax(self):
+        """Masked logits should normalize only over the valid support."""
         logits = torch.tensor([[3.0, -7.0, 1.0, -9.0]])
         mask = torch.tensor([[True, False, True, False]])
-        eps = 0.01
 
-        log_probs = _unimix_logits(logits, mask, eps=eps)
+        log_probs = _temperature_scaled_log_probs(logits, mask, temperature=1.0)
         probs = log_probs.exp()
 
         valid_logits = logits[0, mask[0]]
-        valid_probs = torch.softmax(valid_logits, dim=-1)
-        expected_valid = (1.0 - eps) * valid_probs + eps * (1.0 / valid_probs.numel())
+        expected_valid = torch.softmax(valid_logits, dim=-1)
 
         assert probs[0, 1].item() == pytest.approx(0.0, abs=1e-12)
         assert probs[0, 3].item() == pytest.approx(0.0, abs=1e-12)
         assert probs[0, mask[0]].tolist() == pytest.approx(expected_valid.tolist(), abs=1e-7)
 
-    def test_unimix_provides_entropy_floor(self):
-        """Even peaked logits should have nonzero entropy from unimix."""
-        logits = torch.tensor([[-100.0, 100.0, -100.0]])
-        log_probs = _unimix_logits(logits)
-        probs = log_probs.exp()
-        entropy = -(probs * log_probs).nan_to_num().sum(dim=-1)
-        assert entropy.item() > 0.0
+    def test_higher_temperature_flattens_distribution(self):
+        """Higher temperature should move mass away from the argmax action."""
+        logits = torch.tensor([[3.0, 1.0, -1.0]])
+        cold = _temperature_scaled_log_probs(logits, temperature=TEMP_MIN).exp()
+        hot = _temperature_scaled_log_probs(logits, temperature=2.0).exp()
+        assert hot[0, 0].item() < cold[0, 0].item()
+        assert hot[0, 2].item() > cold[0, 2].item()
 
-    def test_unimix_masked_logprob_backward_stays_finite(self):
+    def test_masked_temperature_logprob_backward_stays_finite(self):
         """Masked-out zero-prob actions must not create NaN gradients in backward."""
         logits = torch.tensor([[3.0, -1e9, 1.0, -1e9]], requires_grad=True)
         mask = torch.tensor([[True, False, True, False]])
         action = torch.tensor([0])
 
-        log_probs = _unimix_logits(logits, mask)
+        log_probs = _temperature_scaled_log_probs(logits, mask)
         loss = -log_probs.gather(1, action.unsqueeze(1)).mean()
         loss.backward()
 
