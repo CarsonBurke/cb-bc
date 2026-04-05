@@ -15,9 +15,9 @@ if str(TORCH_DIR) not in sys.path:
 import model as model_mod
 
 
-def test_resolve_critic_minibatch_size_is_fixed_n_over_twelve():
-    assert model_mod._resolve_critic_minibatch_size(n_steps=16000) == 1334
-    assert model_mod._resolve_critic_minibatch_size(n_steps=100) == 9
+def test_resolve_critic_minibatch_size_is_fixed_n_over_eight():
+    assert model_mod._resolve_critic_minibatch_size(n_steps=16000) == 2000
+    assert model_mod._resolve_critic_minibatch_size(n_steps=100) == 13
 
 
 def test_configure_centralized_critic_runtime_forwards_compile_flag(monkeypatch):
