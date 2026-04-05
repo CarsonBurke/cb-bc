@@ -388,7 +388,7 @@ def test_obs_encodes_expected_tiles_and_globals():
     assert globals_slice == ref[tensor_main._GLOBAL_OBS_START:]
 
 
-def test_symbolic_tile_actor_matches_generic_actor_on_valid_obs():
+def test_actor_model_round_trips_on_valid_obs():
     ct = FakeController()
     player = _make_player()
     obs = list(player._encode_state(ct, ct.nearby_tiles, ct.nearby_entities))
@@ -396,7 +396,7 @@ def test_symbolic_tile_actor_matches_generic_actor_on_valid_obs():
     h_prev = [random.uniform(-2.0, 2.0) for _ in range(tensor_main.H_DIM)]
     packed = obs + h_prev
 
-    generic = tensor_main.ActorModel(
+    model = tensor_main.ActorModel(
         output_heads={
             "build_type": len(tensor_main.BUILD_ACTIONS),
             "build_dir": 9,
@@ -408,26 +408,12 @@ def test_symbolic_tile_actor_matches_generic_actor_on_valid_obs():
             "h_cand": tensor_main.H_DIM,
         },
     )
-    state = generic.save()
-    generic.load(state)
+    state = model.save()
+    model.load(state)
 
-    symbolic = tensor_main.ActorModel(
-        output_heads={
-            "build_type": len(tensor_main.BUILD_ACTIONS),
-            "build_dir": 9,
-            "conv_dir": 4,
-            "bridge_target": tensor_main.N_BRIDGE_TARGETS,
-            "move_dir": 9,
-            "temperature": 5,
-            "h_gate": tensor_main.H_DIM,
-            "h_cand": tensor_main.H_DIM,
-        },
-        assume_symbolic_tiles=True,
-    )
-    symbolic.load(state)
+    before = model.infer(packed)
+    model.load(state)
+    after = model.infer(packed)
 
-    generic_out = generic.infer(packed)
-    symbolic_out = symbolic.infer(packed)
-
-    for key, expected in generic_out.items():
-        assert symbolic_out[key] == pytest.approx(expected, abs=1e-12)
+    for key, expected in before.items():
+        assert after[key] == pytest.approx(expected, abs=1e-12)

@@ -202,7 +202,6 @@ def _build_model() -> ActorModel:
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },
-        assume_symbolic_tiles=True,
     )
     model.eval()
     return model
