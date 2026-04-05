@@ -3,23 +3,32 @@
 # No tensor_lib dependency — stdlib only.
 
 import math
+import os
 import random
+import sys
 
 from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position, ResourceType
 
+# Keep actor architecture constants sourced from the deploy model constants.
+_INFERENCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor_inference")
+if _INFERENCE_DIR not in sys.path:
+    sys.path.insert(0, _INFERENCE_DIR)
+from model_constants import (
+    ACTOR_CLS_TOKENS,
+    ACTOR_CONTEXT_CHUNKS,
+    ACTOR_LATENT_DIM,
+    COMPRESS_DIM,
+    GLOBAL_FEATURES,
+    GRID_HALF,
+    GRID_SIZE,
+    HIDDEN_SIZES,
+    H_DIM,
+    INPUT_SIZE,
+    RMSNORM_LAYERS,
+    TILE_FEATURES,
+)
+
 # -- Layout constants --
-GRID_SIZE = 5
-GRID_HALF = GRID_SIZE // 2
-TILE_FEATURES = 21
-GLOBAL_FEATURES = 20
-INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES
-HIDDEN_SIZES = [64, 64]
-H_DIM = 24
-COMPRESS_DIM = 80
-RMSNORM_LAYERS = [True, False]
-ACTOR_CLS_TOKENS = 4
-ACTOR_CONTEXT_CHUNKS = 3
-ACTOR_LATENT_DIM = ACTOR_CLS_TOKENS * 8
 
 DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
 
