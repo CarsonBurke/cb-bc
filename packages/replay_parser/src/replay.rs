@@ -21,8 +21,11 @@ pub struct ReplayData {
     pub winner: Option<u8>,
 }
 
-/// BFS from all core tiles for one team, returning flow-field distance grid.
-/// Walls (env_grid == 1) are impassable. Unreachable tiles get i32::MAX.
+/// Cardinal BFS from all core tiles for one team, returning Manhattan
+/// flow-field distances. Tiles isolated by walls but reachable via diagonal
+/// unit movement get seeded by a second diagonal pass, then continue
+/// propagating cardinally. Walls (env_grid == 1) are impassable.
+/// Unreachable tiles get i32::MAX.
 pub fn compute_flow_distance(
     cores: &[(i32, u8, Pos)],
     team: u8,
@@ -42,6 +45,55 @@ pub fn compute_flow_distance(
             }
         }
     }
+    // Phase 1: cardinal BFS
+    cardinal_bfs(&mut dist, &mut queue, env_grid, map_w, map_h);
+
+    // Phase 2: seed unreachable tiles from diagonal neighbors, then
+    // continue cardinal BFS from each new seed.
+    loop {
+        let mut seeded = false;
+        for y in 0..map_h as i32 {
+            for x in 0..map_w as i32 {
+                let idx = y as usize * map_w + x as usize;
+                if dist[idx] != i32::MAX || env_grid[idx] == 1 {
+                    continue;
+                }
+                // Find best diagonal neighbor
+                let mut best = i32::MAX;
+                for (dx, dy) in [(-1i32, -1i32), (-1, 1), (1, -1), (1, 1)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx as usize >= map_w || ny as usize >= map_h {
+                        continue;
+                    }
+                    let nd = dist[ny as usize * map_w + nx as usize];
+                    if nd < best {
+                        best = nd;
+                    }
+                }
+                if best < i32::MAX {
+                    dist[idx] = best + 1;
+                    queue.push_back((x, y));
+                    seeded = true;
+                }
+            }
+        }
+        if !seeded {
+            break;
+        }
+        cardinal_bfs(&mut dist, &mut queue, env_grid, map_w, map_h);
+    }
+
+    dist
+}
+
+fn cardinal_bfs(
+    dist: &mut [i32],
+    queue: &mut VecDeque<(i32, i32)>,
+    env_grid: &[u8],
+    map_w: usize,
+    map_h: usize,
+) {
     while let Some((x, y)) = queue.pop_front() {
         let d = dist[y as usize * map_w + x as usize] + 1;
         for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
@@ -56,7 +108,6 @@ pub fn compute_flow_distance(
             queue.push_back((nx, ny));
         }
     }
-    dist
 }
 
 /// Shared helper: compute per-team core center from map cores.
