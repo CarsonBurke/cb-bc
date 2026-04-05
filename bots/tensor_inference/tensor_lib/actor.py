@@ -17,6 +17,7 @@ try:
         GLOBAL_FEATURES,
         GRID_SIZE,
         H_DIM,
+        N_BLD_TYPES,
         TILE_EMBED_DIM,
         TILE_FEATURES,
         TILE_GRID_N,
@@ -32,6 +33,7 @@ except ImportError:
         GLOBAL_FEATURES,
         GRID_SIZE,
         H_DIM,
+        N_BLD_TYPES,
         TILE_EMBED_DIM,
         TILE_FEATURES,
         TILE_GRID_N,
@@ -125,14 +127,15 @@ def _build_rope_cache() -> tuple[list[list[float]], list[list[float]]]:
     return cos_cache, sin_cache
 
 
-def _attention_update(
+def _attention_update_inplace(
     q: list[float],
     keys: list[list[float]],
     values: list[list[float]],
     scale: float,
+    scores: list[float],
+    out: list[float],
 ) -> list[float]:
     n_keys = len(keys)
-    scores = [0.0] * n_keys
     best = float("-inf")
     for i in range(n_keys):
         score = scale * _DOT(q, keys[i])
@@ -140,17 +143,19 @@ def _attention_update(
         if score > best:
             best = score
 
-    out = [0.0] * len(values[0])
+    out_dim = len(values[0])
+    for j in range(out_dim):
+        out[j] = 0.0
     z = 0.0
     for i in range(n_keys):
         weight = _EXP(scores[i] - best)
         z += weight
         value = values[i]
-        for j in range(len(out)):
+        for j in range(out_dim):
             out[j] += weight * value[j]
 
     inv_z = 1.0 / z
-    for j in range(len(out)):
+    for j in range(out_dim):
         out[j] *= inv_z
     return out
 
@@ -176,8 +181,9 @@ def _residual_rmsnorm_silu(
 class ActorModel:
     """Stdlib-only actor matching the PyTorch CLS-attention actor."""
 
-    def __init__(self, output_heads: dict[str, int]):
+    def __init__(self, output_heads: dict[str, int], *, assume_symbolic_tiles: bool = False):
         self._output_heads = dict(output_heads)
+        self._assume_symbolic_tiles = assume_symbolic_tiles
         self.tile_linear = Linear(TILE_INPUT_DIM, TILE_EMBED_DIM)
         self.context_proj = Linear(GLOBAL_FEATURES, ACTOR_CONTEXT_DIM)
         self.context_k_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
@@ -219,6 +225,8 @@ class ActorModel:
         ]
         self._rope_cos, self._rope_sin = _build_rope_cache()
         self._infer_cache: dict | None = None
+        self._attn_scores = [0.0] * TILE_GRID_N
+        self._attn_update = [0.0] * TILE_EMBED_DIM
 
         self._init_identity_linear(self.tile_sa_q_proj)
         self._init_identity_linear(self.cls_ca_q_proj)
@@ -318,9 +326,50 @@ class ActorModel:
         tile_dx_w = [row[0] for row in tile_rows_full]
         tile_dy_w = [row[1] for row in tile_rows_full]
         tile_rows = [row[2:] for row in tile_rows_full]
+        tile_linear_cache: dict[str, object] = {
+            "raw": (tile_rows, tile_bias, tile_dx_w, tile_dy_w),
+        }
+        if self._assume_symbolic_tiles:
+            base_pos = []
+            for dx, dy in self._tile_dxdy:
+                base_pos.append([
+                    tile_bias[j] + dx * tile_dx_w[j] + dy * tile_dy_w[j]
+                    for j in range(TILE_EMBED_DIM)
+                ])
+            env_lut = [[0.0] * TILE_EMBED_DIM for _ in range(4)]  # empty, wall, ti, ax
+            imp_lut = [[0.0] * TILE_EMBED_DIM for _ in range(2)]
+            build_lut = [[0.0] * TILE_EMBED_DIM for _ in range(N_BLD_TYPES)]
+            team_lut = [[0.0] * TILE_EMBED_DIM for _ in range(3)]  # -1, 0, +1
+            dir_lut = [[0.0] * TILE_EMBED_DIM for _ in range(9)]  # NW..SE
+            stored_lut = [[0.0] * TILE_EMBED_DIM for _ in range(3)]  # -1, 0, +1
+            unit_lut = [[0.0] * TILE_EMBED_DIM for _ in range(3)]  # none, friendly, enemy
+            cooldown_w = [0.0] * TILE_EMBED_DIM
+            for j, row in enumerate(tile_rows):
+                env_lut[1][j] = row[0]
+                env_lut[2][j] = row[1]
+                env_lut[3][j] = row[2]
+                imp_lut[1][j] = row[3]
+                for bidx in range(N_BLD_TYPES):
+                    build_lut[bidx][j] = row[4 + bidx]
+                team_lut[0][j] = -row[14]
+                team_lut[2][j] = row[14]
+                for dir_y in (-1, 0, 1):
+                    for dir_x in (-1, 0, 1):
+                        dir_lut[(dir_y + 1) * 3 + (dir_x + 1)][j] = (
+                            dir_x * row[15] + dir_y * row[16]
+                        )
+                cooldown_w[j] = row[17]
+                stored_lut[0][j] = -row[18]
+                stored_lut[2][j] = row[18]
+                unit_lut[1][j] = row[19] + row[20]
+                unit_lut[2][j] = row[19] - row[20]
+            tile_linear_cache["lookup"] = (
+                base_pos, env_lut, imp_lut, build_lut, team_lut,
+                dir_lut, cooldown_w, stored_lut, unit_lut,
+            )
 
         cache = {
-            "tile_linear": (tile_rows, tile_bias, tile_dx_w, tile_dy_w),
+            "tile_linear": tile_linear_cache,
             "context_proj": _linear_rows(self.context_proj),
             "context_k_proj": _linear_rows(self.context_k_proj),
             "context_v_proj": _linear_rows(self.context_v_proj),
@@ -335,7 +384,7 @@ class ActorModel:
             "cls_ca_norm": (list(self.cls_ca_norm.gamma.data), self.cls_ca_norm.eps),
             "latent_norm": (list(self.latent_norm.gamma.data), self.latent_norm.eps),
             "latent_ffn_norm": (list(self.latent_ffn_norm.gamma.data), self.latent_ffn_norm.eps),
-            "cls_tokens": _reshape_tokens(list(self.cls_tokens.data), ACTOR_CLS_TOKENS, TILE_EMBED_DIM),
+            "cls_tokens": list(self.cls_tokens.data),
             "context_tau": list(self.context_tau.data),
             "tile_sa_tau": list(self.tile_sa_tau.data),
             "cls_ca_tau": list(self.cls_ca_tau.data),
@@ -352,7 +401,9 @@ class ActorModel:
             self._infer_cache = self._build_infer_cache()
         cache = self._infer_cache
 
-        tile_rows, tile_bias, tile_dx_w, tile_dy_w = cache["tile_linear"]
+        tile_linear_cache = cache["tile_linear"]
+        tile_rows, tile_bias, tile_dx_w, tile_dy_w = tile_linear_cache["raw"]
+        tile_lookup = tile_linear_cache.get("lookup")
         context_rows, context_bias = cache["context_proj"]
         ctx_k_rows, ctx_k_bias = cache["context_k_proj"]
         ctx_v_rows, ctx_v_bias = cache["context_v_proj"]
@@ -367,12 +418,14 @@ class ActorModel:
         cls_norm_gamma, cls_norm_eps = cache["cls_ca_norm"]
         latent_norm_gamma, latent_norm_eps = cache["latent_norm"]
         latent_ffn_norm_gamma, latent_ffn_norm_eps = cache["latent_ffn_norm"]
-        cls_tokens = cache["cls_tokens"]
+        cls_tokens_flat = cache["cls_tokens"]
         context_tau = cache["context_tau"]
         tile_sa_tau = cache["tile_sa_tau"][0]
         cls_ca_tau = cache["cls_ca_tau"][0]
         latent_ffn_up_rows, latent_ffn_up_bias = cache["latent_ffn_up"]
         latent_ffn_down_rows, latent_ffn_down_bias = cache["latent_ffn_down"]
+        attn_scores = self._attn_scores
+        attn_update = self._attn_update
 
         tile_obs_end = TILE_GRID_N * TILE_FEATURES
         globals_end = tile_obs_end + GLOBAL_FEATURES
@@ -380,17 +433,69 @@ class ActorModel:
         h_prev = features[globals_end:globals_end + H_DIM]
 
         encoded_tokens: list[list[float]] = []
-        for t in range(TILE_GRID_N):
-            base = t * TILE_FEATURES
-            tile_raw = features[base:base + TILE_FEATURES]
-            dx, dy = self._tile_dxdy[t]
-            token = [0.0] * TILE_EMBED_DIM
-            for j in range(TILE_EMBED_DIM):
-                x = _DOT(tile_raw, tile_rows[j]) + dx * tile_dx_w[j] + dy * tile_dy_w[j]
-                if tile_bias is not None:
-                    x += tile_bias[j]
-                token[j] = _silu_scalar(x)
-            encoded_tokens.append(token)
+        if tile_lookup is None:
+            for t in range(TILE_GRID_N):
+                base = t * TILE_FEATURES
+                tile_raw = features[base:base + TILE_FEATURES]
+                dx, dy = self._tile_dxdy[t]
+                token = [0.0] * TILE_EMBED_DIM
+                for j in range(TILE_EMBED_DIM):
+                    x = _DOT(tile_raw, tile_rows[j]) + dx * tile_dx_w[j] + dy * tile_dy_w[j]
+                    if tile_bias is not None:
+                        x += tile_bias[j]
+                    token[j] = _silu_scalar(x)
+                encoded_tokens.append(token)
+        else:
+            (
+                base_pos, env_lut, imp_lut, build_lut, team_lut,
+                dir_lut, cooldown_w, stored_lut, unit_lut,
+            ) = tile_lookup
+            for t in range(TILE_GRID_N):
+                base = t * TILE_FEATURES
+                wall = features[base]
+                ore_ti = features[base + 1]
+                ore_ax = features[base + 2]
+                env_id = 1 if wall == 1.0 else 2 if ore_ti == 1.0 else 3 if ore_ax == 1.0 else 0
+                imp = int(features[base + 3])
+                build_idx = 0
+                for bidx in range(N_BLD_TYPES):
+                    if features[base + 4 + bidx] == 1.0:
+                        build_idx = bidx
+                        break
+                b_team = features[base + 14]
+                team_id = 0 if b_team < 0.0 else 2 if b_team > 0.0 else 1
+                dir_x = int(features[base + 15])
+                dir_y = int(features[base + 16])
+                dir_id = (dir_y + 1) * 3 + (dir_x + 1)
+                cooldown = features[base + 17]
+                stored = features[base + 18]
+                stored_id = 0 if stored < 0.0 else 2 if stored > 0.0 else 1
+                has_unit = features[base + 19]
+                unit_friendly = features[base + 20]
+                unit_id = 0 if has_unit == 0.0 else 1 if unit_friendly > 0.0 else 2
+                token = [0.0] * TILE_EMBED_DIM
+                pos_vec = base_pos[t]
+                env_vec = env_lut[env_id]
+                imp_vec = imp_lut[imp]
+                build_vec = build_lut[build_idx]
+                team_vec = team_lut[team_id]
+                dir_vec = dir_lut[dir_id]
+                stored_vec = stored_lut[stored_id]
+                unit_vec = unit_lut[unit_id]
+                for j in range(TILE_EMBED_DIM):
+                    x = (
+                        pos_vec[j]
+                        + env_vec[j]
+                        + imp_vec[j]
+                        + build_vec[j]
+                        + team_vec[j]
+                        + dir_vec[j]
+                        + cooldown * cooldown_w[j]
+                        + stored_vec[j]
+                        + unit_vec[j]
+                    )
+                    token[j] = _silu_scalar(x)
+                encoded_tokens.append(token)
 
         global_ctx = [0.0] * ACTOR_CONTEXT_DIM
         for j in range(ACTOR_CONTEXT_DIM):
@@ -398,12 +503,18 @@ class ActorModel:
             if context_bias is not None:
                 x += context_bias[j]
             global_ctx[j] = x
-        context_tokens = _reshape_tokens(global_ctx, ACTOR_CONTEXT_CHUNKS, TILE_EMBED_DIM)
-        context_tokens.extend(_reshape_tokens(h_prev, ACTOR_CONTEXT_CHUNKS, TILE_EMBED_DIM))
-
         projected_ctx_k: list[list[float]] = []
         projected_ctx_v: list[list[float]] = []
-        for token in context_tokens:
+        for chunk_idx in range(ACTOR_CONTEXT_CHUNKS * 2):
+            if chunk_idx < ACTOR_CONTEXT_CHUNKS:
+                token = global_ctx[
+                    chunk_idx * TILE_EMBED_DIM:(chunk_idx + 1) * TILE_EMBED_DIM
+                ]
+            else:
+                h_idx = chunk_idx - ACTOR_CONTEXT_CHUNKS
+                token = h_prev[
+                    h_idx * TILE_EMBED_DIM:(h_idx + 1) * TILE_EMBED_DIM
+                ]
             k_tok = [0.0] * TILE_EMBED_DIM
             v_tok = [0.0] * TILE_EMBED_DIM
             for j in range(TILE_EMBED_DIM):
@@ -418,10 +529,15 @@ class ActorModel:
             projected_ctx_k.append(_l2_normalize(k_tok))
             projected_ctx_v.append(v_tok)
 
-        cls_state = [list(token) for token in cls_tokens]
+        cls_state = [
+            cls_tokens_flat[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM]
+            for i in range(ACTOR_CLS_TOKENS)
+        ]
         for i, token in enumerate(cls_state):
             q = _l2_normalize(token)
-            update = _attention_update(q, projected_ctx_k, projected_ctx_v, _EXP(context_tau[i]))
+            update = _attention_update_inplace(
+                q, projected_ctx_k, projected_ctx_v, _EXP(context_tau[i]), attn_scores, attn_update
+            )
             cls_state[i] = _residual_rmsnorm_silu(
                 token,
                 update,
@@ -456,7 +572,9 @@ class ActorModel:
         tile_sa_scale = _EXP(tile_sa_tau)
         enriched_tiles: list[list[float]] = []
         for i, token in enumerate(encoded_tokens):
-            update = _attention_update(tile_q[i], tile_k, tile_v, tile_sa_scale)
+            update = _attention_update_inplace(
+                tile_q[i], tile_k, tile_v, tile_sa_scale, attn_scores, attn_update
+            )
             enriched_tiles.append(_residual_rmsnorm_silu(
                 token,
                 update,
@@ -492,7 +610,9 @@ class ActorModel:
                     q_val += cls_q_bias[j]
                 q_tok[j] = q_val
             q_tok = _l2_normalize(q_tok)
-            update = _attention_update(q_tok, cls_k_norm, cls_v, cls_ca_scale)
+            update = _attention_update_inplace(
+                q_tok, cls_k_norm, cls_v, cls_ca_scale, attn_scores, attn_update
+            )
             cls_state[i] = _residual_rmsnorm_silu(
                 token,
                 update,
@@ -500,18 +620,29 @@ class ActorModel:
                 cls_norm_eps,
             )
 
-        latent = _rmsnorm(_flatten_tokens(cls_state), latent_norm_gamma, latent_norm_eps)
+        latent_input = [0.0] * ACTOR_LATENT_DIM
+        for i, token in enumerate(cls_state):
+            base = i * TILE_EMBED_DIM
+            for j in range(TILE_EMBED_DIM):
+                latent_input[base + j] = token[j]
+        latent = _rmsnorm(latent_input, latent_norm_gamma, latent_norm_eps)
         latent_hidden = _silu_vec(_linear(_rmsnorm(latent, latent_ffn_norm_gamma, latent_ffn_norm_eps), latent_ffn_up_rows, latent_ffn_up_bias))
         latent_delta = _linear(latent_hidden, latent_ffn_down_rows, latent_ffn_down_bias)
         latent = [latent[i] + latent_delta[i] for i in range(ACTOR_LATENT_DIM)]
 
         action_names, action_slices, action_rows, action_bias = cache["action_heads"]
-        fused_action = [_DOT(latent, action_rows[j]) + action_bias[j] for j in range(len(action_rows))]
         outputs: dict[str, list[float]] = {}
         for name, (start, end) in zip(action_names, action_slices):
-            outputs[name] = fused_action[start:end]
+            head_out = [0.0] * (end - start)
+            for out_idx, row_idx in enumerate(range(start, end)):
+                head_out[out_idx] = _DOT(latent, action_rows[row_idx]) + action_bias[row_idx]
+            outputs[name] = head_out
 
-        gru_in = latent + h_prev
+        gru_in = [0.0] * ACTOR_GRU_INPUT_DIM
+        for i in range(ACTOR_LATENT_DIM):
+            gru_in[i] = latent[i]
+        for i in range(H_DIM):
+            gru_in[ACTOR_LATENT_DIM + i] = h_prev[i]
         gate_rows, gate_bias = cache["head_h_gate"]
         cand_rows, cand_bias = cache["head_h_cand"]
         h_gate = [_DOT(gru_in, gate_rows[j]) + gate_bias[j] for j in range(H_DIM)]

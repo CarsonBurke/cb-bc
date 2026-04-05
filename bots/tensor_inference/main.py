@@ -36,7 +36,7 @@ from model_constants import (
     GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES,
     H_DIM, HIDDEN_SIZES, COMPRESS_DIM, RMSNORM_LAYERS,
     TILE_EMBED_DIM, TILE_INPUT_DIM, TILE_GRID_N,
-    INPUT_SIZE, OBS_SIZE, TRUNK_INPUT_SIZE,
+    INPUT_SIZE, OBS_SIZE, TRUNK_INPUT_SIZE, N_BLD_TYPES,
 )
 
 DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
@@ -110,7 +110,6 @@ BLD_IDX = {
     EntityType.LAUNCHER: 8,
     EntityType.CORE: 9,
 }
-N_BLD_TYPES = 10
 
 # Direction -> (dx, dy) normalized offsets
 DIR_DXY = {
@@ -203,6 +202,7 @@ def _build_model() -> ActorModel:
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },
+        assume_symbolic_tiles=True,
     )
     model.eval()
     return model
