@@ -1,14 +1,20 @@
 from pathlib import Path
 import sys
 
+import pytest
+import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INFER_DIR = PROJECT_ROOT / "bots" / "tensor_inference"
+TORCH_DIR = PROJECT_ROOT / "bots" / "tensor" / "torch"
 
-if str(INFER_DIR) not in sys.path:
-    sys.path.insert(0, str(INFER_DIR))
+for path in (INFER_DIR, TORCH_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
+from tensor_lib import ActorModel
 from tensor_lib.nn import MLP
+from model import BuilderMLP, OBS_SIZE, H_DIM
 
 
 def test_infer_applies_tanh_to_h_cand_only():
@@ -25,8 +31,8 @@ def test_infer_applies_tanh_to_h_cand_only():
     out = model.infer([2.0])
 
     assert out["h_cand"][0] < 1.0
-    assert out["h_cand"][0] > 0.96
-    assert out["other"] == [2.0]
+    assert out["h_cand"][0] == pytest.approx(torch.tanh(torch.tensor(1.0)).item(), abs=1e-6)
+    assert out["other"] == pytest.approx([1.0], abs=1e-6)
 
 
 def test_head_projection_keeps_heads_narrower_than_trunk():
@@ -45,4 +51,42 @@ def test_head_projection_keeps_heads_narrower_than_trunk():
 
     out = model.infer([3.0])
 
-    assert out["out"] == [3.0]
+    assert out["out"] == pytest.approx([1.0], abs=1e-6)
+
+
+def test_actor_model_matches_exported_torch_actor():
+    torch_model = BuilderMLP().eval()
+    state = torch_model.export_weights()
+    infer_model = ActorModel(
+        output_heads={
+            "build_type": 13,
+            "build_dir": 9,
+            "conv_dir": 4,
+            "bridge_target": 28,
+            "move_dir": 9,
+            "logit_scale": 5,
+            "h_gate": H_DIM,
+            "h_cand": H_DIM,
+        },
+    )
+    infer_model.load(state)
+
+    obs = torch.randn(1, OBS_SIZE)
+    h_prev = torch.randn(1, H_DIM)
+    packed = torch.cat([obs, h_prev], dim=-1)
+
+    with torch.no_grad():
+        bt_l, bd_l, cd_l, brt_l, md_l, _eps, h_next = torch_model.infer_packed(packed)
+        latent = torch_model.actor_latent(obs, h_prev)
+        recurrent_in = torch.cat([latent, h_prev], dim=-1)
+        gate = torch_model.head_h_gate(recurrent_in)
+        cand = torch.tanh(torch_model.head_h_cand(recurrent_in))
+    infer_out = infer_model.infer(obs[0].tolist() + h_prev[0].tolist())
+
+    assert infer_out["build_type"] == pytest.approx(bt_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["build_dir"] == pytest.approx(bd_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["conv_dir"] == pytest.approx(cd_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["bridge_target"] == pytest.approx(brt_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["move_dir"] == pytest.approx(md_l[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["h_gate"] == pytest.approx(gate[0].tolist(), rel=1e-5, abs=1e-5)
+    assert infer_out["h_cand"] == pytest.approx(cand[0].tolist(), rel=1e-5, abs=1e-5)

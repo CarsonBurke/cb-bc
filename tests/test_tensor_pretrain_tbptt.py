@@ -19,7 +19,7 @@ if str(TORCH_DIR) not in sys.path:
 if str(PRETRAIN_DIR) not in sys.path:
     sys.path.insert(0, str(PRETRAIN_DIR))
 
-from model import BuilderMLP, OBS_SIZE, _OBS_AX, _OBS_SCALE, _OBS_TI
+from model import ACTOR_LATENT_DIM, BuilderMLP, OBS_SIZE, TEACHER_HIDDEN, _OBS_AX, _OBS_SCALE, _OBS_TI
 from pretrain import train_bc
 
 
@@ -294,13 +294,28 @@ def test_recurrent_candidate_is_tanh_bounded():
     assert torch.all(h_cand >= -1.0 - 1e-6)
 
 
-def test_default_actor_uses_wide_trunk_and_64d_heads():
+def test_default_actor_uses_32d_policy_latent():
     model = BuilderMLP()
-    trunk_linears = [layer for layer in model.actor_trunk if isinstance(layer, torch.nn.Linear)]
+    obs = torch.randn(2, OBS_SIZE, dtype=torch.float32)
+    h_prev = torch.randn(2, train_bc.H_DIM, dtype=torch.float32)
 
-    assert trunk_linears[-1].out_features == 64
-    assert model.head_build_type.in_features == 64
-    assert model.head_h_gate.in_features == 64
+    latent = model.actor_latent(obs, h_prev)
+
+    assert latent.shape[-1] == ACTOR_LATENT_DIM
+    assert model.head_build_type.in_features == ACTOR_LATENT_DIM
+    assert model.head_h_gate.in_features == ACTOR_LATENT_DIM + train_bc.H_DIM
+
+
+def test_teacher_hidden_widens_actor_latent():
+    model = BuilderMLP(hidden=TEACHER_HIDDEN)
+    obs = torch.randn(2, OBS_SIZE, dtype=torch.float32)
+    h_prev = torch.randn(2, train_bc.H_DIM, dtype=torch.float32)
+
+    latent = model.actor_latent(obs, h_prev)
+
+    assert latent.shape[-1] > ACTOR_LATENT_DIM
+    assert model.head_build_type.in_features == latent.shape[-1]
+    assert model.head_h_gate.in_features == latent.shape[-1] + train_bc.H_DIM
 
 
 def test_masked_cross_entropy_ignores_inactive_targets():

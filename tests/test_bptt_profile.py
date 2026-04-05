@@ -7,7 +7,6 @@ import sys
 import time
 
 import torch
-import torch.nn.functional as F
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -20,7 +19,7 @@ for d in (TORCH_DIR, TENSOR_DIR, PRETRAIN_DIR):
         sys.path.insert(0, str(d))
 
 import model as model_mod
-from model_constants import OBS_SIZE, H_DIM, OBS_PREFIX_SIZE
+from model_constants import OBS_SIZE, H_DIM
 
 BuilderMLP = model_mod.BuilderMLP
 BPTT_K = model_mod.BPTT_K
@@ -73,15 +72,11 @@ def test_bptt_profile():
 
     t_enc = _bench(batched_enc)
 
-    # --- (b) Per-step residual: h-dependent linear + remaining encoder + trunk + heads + GRU ---
-    enc_linear = model.encoder[0]
-
+    # --- (b) Per-step residual: recurrent path from cached obs_pre ---
     def single_step_residual():
-        h_pre = F.linear(h_prev, enc_linear.weight[:, OBS_PREFIX_SIZE:], None)
-        enc = model.encoder[1](single_obs_pre + h_pre)
-        enc = model.encoder[2](enc)
-        lat = model.actor_trunk(enc)
-        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._project_actor_heads(lat)
+        lat = model._latent_from_obs_pre(single_obs_pre, h_prev)
+        bt_l, bd_l, cd_l, brt_l, md_l, eps = model._project_policy_heads(lat)
+        h_gate, h_cand = model._project_recurrent_heads(lat, h_prev)
         z = torch.sigmoid(h_gate)
         h_new = (1.0 - z) * h_prev + z * h_cand
         return h_new
@@ -92,11 +87,9 @@ def test_bptt_profile():
     def residual_loop_32():
         h_t = h_prev
         for t in range(K):
-            h_pre = F.linear(h_t, enc_linear.weight[:, OBS_PREFIX_SIZE:], None)
-            enc = model.encoder[1](obs_pre_seq[:, t] + h_pre)
-            enc = model.encoder[2](enc)
-            lat = model.actor_trunk(enc)
-            bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._project_actor_heads(lat)
+            lat = model._latent_from_obs_pre(obs_pre_seq[:, t], h_t)
+            bt_l, bd_l, cd_l, brt_l, md_l, eps = model._project_policy_heads(lat)
+            h_gate, h_cand = model._project_recurrent_heads(lat, h_t)
             z = torch.sigmoid(h_gate)
             h_t = (1.0 - z) * h_t + z * h_cand
         return h_t
@@ -110,11 +103,9 @@ def test_bptt_profile():
         h_t = h_prev
         for t in range(K):
             obs_pre_t = model._obs_encoder_pre(obs_seq[:, t])
-            h_pre = F.linear(h_t, enc_linear.weight[:, OBS_PREFIX_SIZE:], None)
-            enc = model.encoder[1](obs_pre_t + h_pre)
-            enc = model.encoder[2](enc)
-            lat = model.actor_trunk(enc)
-            bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._project_actor_heads(lat)
+            lat = model._latent_from_obs_pre(obs_pre_t, h_t)
+            bt_l, bd_l, cd_l, brt_l, md_l, eps = model._project_policy_heads(lat)
+            h_gate, h_cand = model._project_recurrent_heads(lat, h_t)
             z = torch.sigmoid(h_gate)
             h_t = (1.0 - z) * h_t + z * h_cand
         return h_t
