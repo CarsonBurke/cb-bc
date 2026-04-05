@@ -5,18 +5,28 @@ from cambc import Controller, EntityType
 
 # Entities worth spending turret ammo on, by priority (lower = better).
 _TARGET_PRIORITY = {
-    EntityType.BUILDER_BOT: 0,
+    EntityType.GUNNER: 0,
+    EntityType.SENTINEL: 0,
+    EntityType.BREACH: 0,
+    EntityType.LAUNCHER: 0,
     EntityType.CORE: 1,
-    EntityType.HARVESTER: 2,
-    EntityType.FOUNDRY: 2,
-    EntityType.GUNNER: 3,
-    EntityType.SENTINEL: 3,
-    EntityType.BREACH: 3,
-    EntityType.LAUNCHER: 3,
+    EntityType.BUILDER_BOT: 2,
+    EntityType.HARVESTER: 3,
+    EntityType.FOUNDRY: 3,
+    # Junk: low-value but may block line of fire (especially for gunner).
+    EntityType.BARRIER: 4,
+    EntityType.CONVEYOR: 4,
+    EntityType.ARMOURED_CONVEYOR: 4,
+    EntityType.SPLITTER: 4,
+    EntityType.BRIDGE: 4,
+    EntityType.ROAD: 4,
 }
-# Breach uses refined axionite — only fire at high-value targets.
+# Breach uses refined axionite — only fire at high-value targets (turrets/core/bots).
 _BREACH_MAX_PRIORITY = 2
-_TURRET_MAX_PRIORITY = 3
+# Sentinel is expensive (10 Ti + 4-round CD) — skip junk.
+_SENTINEL_MAX_PRIORITY = 3
+# Gunner is cheap (2 Ti) — clear junk blocking line of fire.
+_GUNNER_MAX_PRIORITY = 4
 
 
 def run_turret(ct: Controller, etype: EntityType) -> None:
@@ -25,7 +35,12 @@ def run_turret(ct: Controller, etype: EntityType) -> None:
     if ct.get_ammo_amount() <= 0:
         return
 
-    max_pri = _BREACH_MAX_PRIORITY if etype == EntityType.BREACH else _TURRET_MAX_PRIORITY
+    if etype == EntityType.BREACH:
+        max_pri = _BREACH_MAX_PRIORITY
+    elif etype == EntityType.SENTINEL:
+        max_pri = _SENTINEL_MAX_PRIORITY
+    else:
+        max_pri = _GUNNER_MAX_PRIORITY
     my_team = ct.get_team()
 
     # Gunner fast path: built-in line-of-sight targeting.
@@ -113,7 +128,7 @@ def run_launcher(ct: Controller) -> None:
 
     # Find best enemy target we can launch a bot at.
     best_target = None
-    best_pri = _TURRET_MAX_PRIORITY + 1
+    best_pri = _SENTINEL_MAX_PRIORITY + 1
     for eid in nearby:
         if ct.get_team(eid) == my_team:
             continue
