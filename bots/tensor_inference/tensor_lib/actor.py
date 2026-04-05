@@ -67,7 +67,8 @@ def _rmsnorm(vec: list[float], gamma: list[float], eps: float) -> list[float]:
 
 
 def _l2_normalize(vec: list[float], eps: float = 1e-6) -> list[float]:
-    inv = 1.0 / max(sum(x * x for x in vec), eps) ** 0.5
+    norm = sum(x * x for x in vec) ** 0.5
+    inv = 1.0 / max(norm, eps)
     return [x * inv for x in vec]
 
 
