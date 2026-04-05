@@ -53,7 +53,7 @@ class SinusoidalPositionEmbedding:
 # Import MLP from tensor_inference's tensor_lib
 _INFERENCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor_inference")
 sys.path.insert(0, _INFERENCE_DIR)
-from tensor_lib import MLP
+from tensor_lib import ActorModel
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
@@ -73,11 +73,7 @@ def _get_shared_model(path: str):
     if cache_key is not None and cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
-    _tile_input_dim = TILE_FEATURES + 2  # 21
-    _tile_embed_dim = 8
-    model = MLP(
-        input_size=COMPRESS_DIM + POS_EMBED_DIM + 15 + H_DIM,  # 127
-        hidden_sizes=HIDDEN_SIZES,
+    model = ActorModel(
         output_heads={
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
@@ -88,12 +84,6 @@ def _get_shared_model(path: str):
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },
-        activation="silu",
-        rmsnorm_layers=RMSNORM_LAYERS,
-        tile_encoder_sizes=(_tile_input_dim, _tile_embed_dim),
-        tile_grid_n=GRID_SIZE * GRID_SIZE,
-        tile_conv=True,
-        tile_compress_size=COMPRESS_DIM,
     )
     model.eval()
 
@@ -107,8 +97,7 @@ def _get_shared_model(path: str):
                 with open(path) as f:
                     model.load(json.load(f))
         except Exception as e:
-            import sys
-            print(f"WARNING: tensor_opp failed to load weights from {path}: {e}", file=sys.stderr)
+            raise RuntimeError(f"tensor_opp failed to load weights from {path}: {e}") from e
 
     if cache_key is not None:
         _MODEL_CACHE[cache_key] = model

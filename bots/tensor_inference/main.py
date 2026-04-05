@@ -30,7 +30,7 @@ def _resolve_bot_dir() -> str:
 BOT_DIR = _resolve_bot_dir()
 if BOT_DIR not in sys.path:
     sys.path.insert(0, BOT_DIR)
-from tensor_lib import MLP
+from tensor_lib import ActorModel
 from turrets import run_turret, run_launcher
 from model_constants import (
     GRID_SIZE, GRID_HALF, TILE_FEATURES, GLOBAL_FEATURES,
@@ -191,10 +191,8 @@ _GLOBAL_OBS_START = TILE_GRID_N * TILE_FEATURES
 _ZERO_OBS = (0.0,) * OBS_SIZE
 
 
-def _build_model() -> MLP:
-    model = MLP(
-        input_size=COMPRESS_DIM + GLOBAL_FEATURES + H_DIM,
-        hidden_sizes=HIDDEN_SIZES,
+def _build_model() -> ActorModel:
+    model = ActorModel(
         output_heads={
             "build_type": len(BUILD_ACTIONS),
             "build_dir": 9,
@@ -205,18 +203,12 @@ def _build_model() -> MLP:
             "h_gate": H_DIM,
             "h_cand": H_DIM,
         },
-        activation="silu",
-        rmsnorm_layers=RMSNORM_LAYERS,
-        tile_encoder_sizes=(TILE_INPUT_DIM, TILE_EMBED_DIM),
-        tile_grid_n=GRID_SIZE * GRID_SIZE,
-        tile_conv=True,
-        tile_compress_size=COMPRESS_DIM,
     )
     model.eval()
     return model
 
 
-def _get_shared_model() -> MLP:
+def _get_shared_model() -> ActorModel:
     global _SHARED_MODEL, _SHARED_MODEL_KEY
 
     cache_key = _weight_cache_key(WEIGHT_PATH)
@@ -228,8 +220,8 @@ def _get_shared_model() -> MLP:
         try:
             with open(WEIGHT_PATH) as f:
                 model.load(json.load(f))
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(f"tensor_inference failed to load weights from {WEIGHT_PATH}: {e}") from e
 
     _SHARED_MODEL = model
     _SHARED_MODEL_KEY = cache_key
