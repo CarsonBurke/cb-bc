@@ -18,8 +18,9 @@ sys.path.insert(0, str(REPLAY_PARSER_PYTHON))
 from trajectory_schema import make_trajectory_step
 from flow_reward import (
     compute_dense_flow_rewards, compute_dense_delivery_rewards,
-    augment_trajectories_with_flow_rewards, AX_CONVERSION_RATE,
-    _TILE_FEATURES, _OBS_GLOBAL_START, REWARD_INCOME_SCALE, REWARD_FLOW_SCALE,
+    augment_trajectories_with_flow_rewards,
+    _TILE_FEATURES, _OBS_GLOBAL_START, _N_SCALARS, _RESOURCES_COLLECTED_IDX,
+    _RESOURCES_COLLECTED_NORM, REWARD_INCOME_SCALE, REWARD_FLOW_SCALE,
 )
 
 OBS_SIZE = 5 * 5 * _TILE_FEATURES + 17 + 8  # fallback
@@ -71,10 +72,19 @@ def _make_step(round_num: int, n_working: float = 0.0):
     )
 
 
-def _zero_delivery_bufs(n: int) -> dict:
-    """Helper: zero ti/ax delivered buffers for n turns."""
-    z = _pack_int_pairs([(0, 0)] * n)
-    return {"ti_delivered_buf": z, "ax_delivered_buf": z}
+def _pack_scalars(resources_collected_cumulative: list[float]) -> bytes:
+    """Build a scalars buffer with resources_collected at index 9."""
+    buf = b""
+    for rc in resources_collected_cumulative:
+        sc = [0.0] * _N_SCALARS
+        sc[_RESOURCES_COLLECTED_IDX] = rc / _RESOURCES_COLLECTED_NORM
+        buf += struct.pack(f"<{_N_SCALARS}f", *sc)
+    return buf
+
+
+def _zero_scalars(n: int) -> dict:
+    """Helper: zero-resource scalars buffer for n turns."""
+    return {"scalars_buf": _pack_scalars([0.0] * n)}
 
 
 class TestComputeDenseFlowRewards:
@@ -88,7 +98,7 @@ class TestComputeDenseFlowRewards:
         gs = {
             "transfer_events_buf": _pack_float_pairs([(0.0, 1.0), (2.5, 3.0), (0.0, 0.0)]),
             "n_turns": 3,
-            **_zero_delivery_bufs(3),
+            **_zero_scalars(3),
         }
         assert compute_dense_flow_rewards(gs) == {1: 2.5 * REWARD_FLOW_SCALE}
 
@@ -96,7 +106,7 @@ class TestComputeDenseFlowRewards:
         gs = {
             "transfer_events_buf": _pack_float_pairs([(0.0, 1.0), (2.5, 3.0), (0.0, 0.5)]),
             "n_turns": 3,
-            **_zero_delivery_bufs(3),
+            **_zero_scalars(3),
         }
         assert compute_dense_flow_rewards(gs, team=1) == {
             0: 1.0 * REWARD_FLOW_SCALE,
@@ -105,15 +115,15 @@ class TestComputeDenseFlowRewards:
         }
 
     def test_includes_core_deliveries(self):
-        """Core deliveries add weight 1.0 per resource unit (ti + ax*4)."""
+        """Core deliveries from resources_collected deltas."""
         gs = {
             "transfer_events_buf": _pack_float_pairs([(1.0, 0.0), (0.0, 0.0)]),
-            "ti_delivered_buf": _pack_int_pairs([(3, 0), (0, 0)]),
-            "ax_delivered_buf": _pack_int_pairs([(1, 0), (0, 0)]),
+            # cumulative resources_collected: 7 at turn 0, still 7 at turn 1
+            "scalars_buf": _pack_scalars([7.0, 7.0]),
             "n_turns": 2,
         }
         rewards = compute_dense_flow_rewards(gs, team=0)
-        # round 0: 1.0 * REWARD_FLOW_SCALE (flow) + (3 (ti) + 1*4 (ax)) * REWARD_INCOME_SCALE
+        # round 0: 1.0 * REWARD_FLOW_SCALE (flow) + 7 * REWARD_INCOME_SCALE
         assert rewards[0] == pytest.approx(1.0 * REWARD_FLOW_SCALE + 7.0 * REWARD_INCOME_SCALE)
         assert 1 not in rewards
 
@@ -121,27 +131,30 @@ class TestComputeDenseFlowRewards:
         """Rounds with zero flow but nonzero delivery still get reward."""
         gs = {
             "transfer_events_buf": _pack_float_pairs([(0.0, 0.0)]),
-            "ti_delivered_buf": _pack_int_pairs([(5, 0)]),
-            "ax_delivered_buf": _pack_int_pairs([(0, 0)]),
+            # 5 resources collected on turn 0
+            "scalars_buf": _pack_scalars([5.0]),
             "n_turns": 1,
         }
         rewards = compute_dense_flow_rewards(gs, team=0)
         assert rewards[0] == pytest.approx(5.0 * REWARD_INCOME_SCALE)
 
-    def test_no_delivery_bufs_flow_only(self):
-        """Missing delivery buffers → only flow signal, no error."""
+    def test_no_scalars_flow_only(self):
+        """Missing scalars buffer → raises (scalars required)."""
         gs = {
             "transfer_events_buf": _pack_float_pairs([(2.0, 0.0)]),
             "n_turns": 1,
         }
-        rewards = compute_dense_flow_rewards(gs, team=0)
-        assert rewards[0] == pytest.approx(2.0 * REWARD_FLOW_SCALE)
+        with pytest.raises(ValueError, match="scalars"):
+            compute_dense_flow_rewards(gs, team=0)
 
     def test_path_backed_buffers_load_without_writable_copy(self, tmp_path):
         transfer_path = tmp_path / "transfer.bin"
         transfer_path.write_bytes(_pack_float_pairs([(2.0, 0.0)]))
+        scalars_path = tmp_path / "scalars.bin"
+        scalars_path.write_bytes(_pack_scalars([0.0]))
         gs = {
             "transfer_events_path": str(transfer_path),
+            "scalars_path": str(scalars_path),
             "n_turns": 1,
         }
 
@@ -196,6 +209,23 @@ def replay_path():
     return str(candidates[0])
 
 
+class TestDeliveryRewards:
+    def test_empty(self):
+        assert compute_dense_delivery_rewards({}) == {}
+
+    def test_cumulative_deltas(self):
+        # cumulative: 0, 3, 3, 10 → deltas: 0, 3, 0, 7
+        gs = {
+            "scalars_buf": _pack_scalars([0.0, 3.0, 3.0, 10.0]),
+            "n_turns": 4,
+        }
+        rewards = compute_dense_delivery_rewards(gs)
+        assert 0 not in rewards
+        assert rewards[1] == pytest.approx(3.0)
+        assert 2 not in rewards
+        assert rewards[3] == pytest.approx(7.0)
+
+
 class TestIntegration:
     def test_replay_round_trip(self, replay_path):
         replay_parser = pytest.importorskip("replay_parser")
@@ -204,8 +234,7 @@ class TestIntegration:
         rd = ReplayData.from_file(replay_path, team=0)
         gs = {
             "transfer_events_buf": rd.resource_transfers_bytes,
-            "ti_delivered_buf": rd.titanium_delivered_bytes,
-            "ax_delivered_buf": rd.axionite_delivered_bytes,
+            "scalars_buf": rd.scalars_bytes,
             "n_turns": rd.n_turns,
         }
         rewards = compute_dense_flow_rewards(gs)

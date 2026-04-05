@@ -11,15 +11,13 @@ except ImportError:
     from bots.tensor.trajectory_schema import TrajectoryStep
 try:
     from replay_buffers import (
-        AX_DELIVERED_BUFFER,
-        TI_DELIVERED_BUFFER,
+        SCALAR_BUFFER,
         TRANSFER_EVENTS_BUFFER,
         load_replay_buffer,
     )
 except ImportError:
     from bots.tensor.torch.replay_buffers import (
-        AX_DELIVERED_BUFFER,
-        TI_DELIVERED_BUFFER,
+        SCALAR_BUFFER,
         TRANSFER_EVENTS_BUFFER,
         load_replay_buffer,
     )
@@ -29,39 +27,56 @@ _TILE_FEATURES = 21
 _OBS_GLOBAL_START = 5 * 5 * _TILE_FEATURES  # 525
 _OBS_ROUND_BYTE_OFFSET = _OBS_GLOBAL_START * 4  # byte offset for float32 obs
 
-AX_CONVERSION_RATE = 4  # GameConstants.AXIONITE_CONVERSION_TITANIUM_RATE
+# Scalar buffer layout (replay_parser replay.rs): 19 f32s per turn.
+# Index 9 = own resources_collected / 500.0
+_N_SCALARS = 19
+_RESOURCES_COLLECTED_IDX = 9
+_RESOURCES_COLLECTED_NORM = 500.0
 
 
 def _load_buf(global_states: dict, spec) -> bytes:
     return load_replay_buffer(global_states, spec) or b""
 
 
+def _resources_collected_deltas(global_states: dict) -> list[float]:
+    """Per-round resources_collected deltas from the scalars buffer.
+
+    The scalars buffer is team-relative (index 9 = own resources_collected),
+    so no team parameter is needed.  Returns unnormalized integer-scale deltas.
+    """
+    n_turns = global_states.get("n_turns", 0)
+    if n_turns == 0:
+        return []
+
+    sc_buf = _load_buf(global_states, SCALAR_BUFFER)
+    if not sc_buf:
+        raise ValueError("scalars data missing from global_states")
+
+    stride = _N_SCALARS * 4  # bytes per turn
+    deltas: list[float] = []
+    prev = 0.0
+    for rnd in range(n_turns):
+        (val_norm,) = struct.unpack_from("<f", sc_buf, rnd * stride + _RESOURCES_COLLECTED_IDX * 4)
+        val = val_norm * _RESOURCES_COLLECTED_NORM
+        deltas.append(val - prev)
+        prev = val
+    return deltas
+
+
 def compute_dense_delivery_rewards(
     global_states: dict,
     team: int = 0,
 ) -> dict[int, float]:
-    """Per-round reward from resources delivered to core (ti + ax * 4).
+    """Per-round reward from resources delivered to core.
 
-    Requires ti_delivered and ax_delivered buffers. Raises if missing.
+    Uses resources_collected deltas from the scalars buffer, which includes
+    both titanium deliveries and axionite refinement output.
     """
-    n_turns = global_states.get("n_turns", 0)
-    if n_turns == 0:
-        return {}
-
-    ti_buf = _load_buf(global_states, TI_DELIVERED_BUFFER)
-    ax_buf = _load_buf(global_states, AX_DELIVERED_BUFFER)
-    if not ti_buf:
-        raise ValueError("ti_delivered data missing from global_states")
-    if not ax_buf:
-        raise ValueError("ax_delivered data missing from global_states")
-
+    deltas = _resources_collected_deltas(global_states)
     rewards: dict[int, float] = {}
-    for rnd in range(n_turns):
-        ti_a, ti_b = struct.unpack_from("<ii", ti_buf, rnd * 8)
-        ax_a, ax_b = struct.unpack_from("<ii", ax_buf, rnd * 8)
-        delivered = (ti_a if team == 0 else ti_b) + (ax_a if team == 0 else ax_b) * AX_CONVERSION_RATE
-        if delivered > 0:
-            rewards[rnd] = float(delivered)
+    for rnd, d in enumerate(deltas):
+        if d > 0.5:  # threshold at 0.5 to absorb float rounding
+            rewards[rnd] = round(d)
     return rewards
 
 
@@ -72,9 +87,8 @@ def compute_dense_flow_rewards(
     """Per-round reward from weighted conveyor hops toward core + delivery.
 
     Conveyor hops use improvement/sqrt(src_dist) weighting with flow-field
-    distance. Axionite transfers are weighted 4x (AX_CONVERSION_RATE).
-    Core deliveries are added separately from the delivery buffers
-    (ti + ax * 4) so transfer hops exclude the final hop into core.
+    distance. Core deliveries are added from resources_collected deltas
+    so transfer hops exclude the final hop into core.
 
     Requires transfer_events buffer. Raises if missing.
     """
@@ -86,19 +100,14 @@ def compute_dense_flow_rewards(
     if not buf:
         raise ValueError("transfer_events data missing from global_states")
 
-    ti_buf = _load_buf(global_states, TI_DELIVERED_BUFFER)
-    ax_buf = _load_buf(global_states, AX_DELIVERED_BUFFER)
-    has_delivery = bool(ti_buf and ax_buf)
+    delivery_deltas = _resources_collected_deltas(global_states)
 
     rewards: dict[int, float] = {}
     for rnd in range(n_turns):
         a_val, b_val = struct.unpack_from("<ff", buf, rnd * 8)
         reward = (a_val if team == 0 else b_val) * REWARD_FLOW_SCALE
-        if has_delivery:
-            ti_a, ti_b = struct.unpack_from("<ii", ti_buf, rnd * 8)
-            ax_a, ax_b = struct.unpack_from("<ii", ax_buf, rnd * 8)
-            delivered = (ti_a if team == 0 else ti_b) + (ax_a if team == 0 else ax_b) * AX_CONVERSION_RATE
-            reward += float(delivered) * REWARD_INCOME_SCALE
+        if rnd < len(delivery_deltas) and delivery_deltas[rnd] > 0.5:
+            reward += round(delivery_deltas[rnd]) * REWARD_INCOME_SCALE
         if reward != 0.0:
             rewards[rnd] = float(reward)
     return rewards

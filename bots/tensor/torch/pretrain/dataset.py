@@ -26,7 +26,7 @@ from replay_parser import (
 
 _CACHE_DIR_NAME = ".pretrain_cache"
 _ACTOR_CACHE_VERSION = 12  # v12: GLOBAL_FEATURES 17→19 (map w/50, h/50), removed POS_EMBED_DIM
-_CRITIC_CACHE_VERSION = 14  # v14: income mode (no terminal reward)
+_CRITIC_CACHE_VERSION = 15  # v15: delivery reward from resources_collected (includes axionite refinement)
 from model import (
     GAMMA,
     REWARD_MODE,
@@ -137,25 +137,20 @@ def _critic_winloss_targets(
     *,
     base_value: float,
     gamma: float = GAMMA,
-    ti_delivered: torch.Tensor | None = None,
-    ax_delivered: torch.Tensor | None = None,
+    resources_collected_deltas: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Discounted returns for critic pretraining: resource income + terminal.
 
-    Per-round reward = (ti_delivered[t] + ax_delivered[t] * 4) * REWARD_BUILD_CREDIT,
+    Per-round reward = resources_collected_delta[t] * REWARD_INCOME_SCALE,
     plus terminal reward at the last step. Returns are computed via reverse-scan:
       R_t = r_t + γ * R_{t+1}
     """
-    AX_CONVERSION_RATE = 4  # GameConstants.AXIONITE_CONVERSION_TITANIUM_RATE
-
     if n_turns <= 0:
         return torch.zeros(0, dtype=torch.float32)
 
     rewards = torch.zeros(n_turns, dtype=torch.float32)
-    if REWARD_MODE == RewardMode.INCOME and ti_delivered is not None and ti_delivered.shape[0] >= n_turns:
-        rewards = ti_delivered[:n_turns].float() * REWARD_INCOME_SCALE
-        if ax_delivered is not None and ax_delivered.shape[0] >= n_turns:
-            rewards += ax_delivered[:n_turns].float() * AX_CONVERSION_RATE * REWARD_INCOME_SCALE
+    if REWARD_MODE == RewardMode.INCOME and resources_collected_deltas is not None and resources_collected_deltas.shape[0] >= n_turns:
+        rewards = resources_collected_deltas[:n_turns].float() * REWARD_INCOME_SCALE
     if REWARD_MODE == RewardMode.OUTCOME:
         rewards[-1] += float(base_value)
 
@@ -746,24 +741,20 @@ class CriticBCDataset:
                 core_x=core_x,
                 core_y=core_y,
             )
-            # Extract per-round titanium/axionite delivered for this team
-            ti_buf = data.get("titanium_delivered", b"")
-            ti_delivered = None
-            if ti_buf and len(ti_buf) >= full_turns * 8:
-                ti_raw = torch.frombuffer(bytearray(ti_buf), dtype=torch.int32).reshape(-1, 2)
-                ti_delivered = ti_raw[:full_turns, team].clone()
-
-            ax_buf = data.get("axionite_delivered", b"")
-            ax_delivered = None
-            if ax_buf and len(ax_buf) >= full_turns * 8:
-                ax_raw = torch.frombuffer(bytearray(ax_buf), dtype=torch.int32).reshape(-1, 2)
-                ax_delivered = ax_raw[:full_turns, team].clone()
+            # Extract per-round resources_collected deltas from scalars.
+            # Scalars index 9 = own resources_collected / 500.0 (already team-relative).
+            rc_deltas = None
+            if n_scalars > 9:
+                rc_norm = scalars[:full_turns, 9].float() * 500.0
+                rc_deltas = torch.zeros_like(rc_norm)
+                rc_deltas[1:] = rc_norm[1:] - rc_norm[:-1]
+                rc_deltas[0] = rc_norm[0]
+                rc_deltas = rc_deltas.round()
 
             round_targets = _critic_winloss_targets(
                 full_turns,
                 base_value=base_value,
-                ti_delivered=ti_delivered,
-                ax_delivered=ax_delivered,
+                resources_collected_deltas=rc_deltas,
             )
             step_targets = round_targets.index_select(0, step_rounds.to(torch.long))
             entry = {
