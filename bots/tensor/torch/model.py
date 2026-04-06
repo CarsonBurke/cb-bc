@@ -737,7 +737,7 @@ class CriticGlobalLayout:
     sorted_round_idx: torch.Tensor
     local_pos: torch.Tensor
     valid_unit_mask: torch.Tensor
-    unit_attn_mask: torch.Tensor | None
+    unit_attn_bias: torch.Tensor | None  # float additive mask for mem-efficient SDPA
     shared_rope_cos: torch.Tensor
     shared_rope_sin: torch.Tensor
     unit_rope_cos: torch.Tensor | None
@@ -845,7 +845,6 @@ class CriticGlobalSA(nn.Module):
         head_dim_half = self.rope.freqs.shape[0] * 2
         self.register_buffer("_special_token_cos", torch.ones(1 + n_global_cls, head_dim_half))
         self.register_buffer("_special_token_sin", torch.zeros(1 + n_global_cls, head_dim_half))
-        self._base_mask_cache: dict[tuple[int, int, tuple[str, int | None]], torch.Tensor] = {}
         self._patch_rope_cache: dict[
             tuple[int, int, int, torch.dtype, tuple[str, int | None]],
             tuple[torch.Tensor, torch.Tensor],
@@ -854,44 +853,6 @@ class CriticGlobalSA(nn.Module):
     @staticmethod
     def _device_key(device: torch.device) -> tuple[str, int | None]:
         return (device.type, device.index)
-
-    def _get_base_mask(
-        self,
-        n_patches: int,
-        max_units: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Return cached token-type attention mask for a given shape.
-
-        The returned boolean mask follows SDPA semantics: ``True`` means the
-        key is visible to the query position.
-        """
-        cache_key = (n_patches, max_units, self._device_key(device))
-        cached = self._base_mask_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        n_scalar = 1
-        total = n_patches + n_scalar + self.n_global_cls + max_units
-        mask = torch.zeros(total, total, dtype=torch.bool, device=device)
-
-        p_end = n_patches
-        s_end = p_end + n_scalar
-        g_end = s_end + self.n_global_cls
-        u_end = g_end + max_units
-
-        mask[:p_end, :p_end] = True
-        mask[:p_end, p_end:s_end] = True
-        mask[:p_end, s_end:g_end] = True
-        mask[s_end:g_end, :p_end] = True
-        mask[s_end:g_end, p_end:s_end] = True
-        mask[g_end:u_end, :p_end] = True
-        mask[g_end:u_end, p_end:s_end] = True
-        mask[g_end:u_end, s_end:g_end] = True
-        mask[g_end:u_end, g_end:u_end] = True
-
-        self._base_mask_cache[cache_key] = mask
-        return mask
 
     def _get_patch_rope(
         self,
@@ -956,7 +917,7 @@ class CriticGlobalSA(nn.Module):
                 sorted_round_idx=empty,
                 local_pos=empty,
                 valid_unit_mask=empty_mask,
-                unit_attn_mask=None,
+                unit_attn_bias=None,
                 shared_rope_cos=shared_rope_cos,
                 shared_rope_sin=shared_rope_sin,
                 unit_rope_cos=None,
@@ -974,13 +935,15 @@ class CriticGlobalSA(nn.Module):
         total_tokens = unit_start + max_units
         valid_unit_mask = torch.zeros((n_rounds, max_units), dtype=torch.bool, device=device)
         valid_unit_mask[sorted_round_idx, local_pos] = True
-        unit_attn_mask = torch.ones(
-            (n_rounds, 1, max_units, total_tokens),
-            dtype=torch.bool,
-            device=device,
+        # Float additive mask: 0 for visible keys, -inf for padded unit keys.
+        # Using float (not boolean) makes SDPA dispatch to the memory-efficient
+        # backend instead of the math backend.
+        unit_attn_bias = torch.zeros(
+            (n_rounds, 1, 1, total_tokens), dtype=dtype, device=device,
         )
-        unit_attn_mask[..., :unit_start] = True
-        unit_attn_mask[..., unit_start:] = valid_unit_mask.unsqueeze(1).unsqueeze(2)
+        unit_attn_bias[:, :, :, unit_start:].masked_fill_(
+            ~valid_unit_mask.unsqueeze(1).unsqueeze(2), float('-inf'),
+        )
 
         shared_rope_cos = torch.empty((unit_start, patch_rope_cos.shape[-1]), device=device, dtype=dtype)
         shared_rope_sin = torch.empty_like(shared_rope_cos)
@@ -1008,7 +971,7 @@ class CriticGlobalSA(nn.Module):
             sorted_round_idx=sorted_round_idx,
             local_pos=local_pos,
             valid_unit_mask=valid_unit_mask,
-            unit_attn_mask=unit_attn_mask,
+            unit_attn_bias=unit_attn_bias,
             shared_rope_cos=shared_rope_cos,
             shared_rope_sin=shared_rope_sin,
             unit_rope_cos=unit_rope_cos,
@@ -1078,12 +1041,10 @@ class CriticGlobalSA(nn.Module):
                 v[:, :, :scalar_end],
             )
         )
-        if layout.unit_attn_mask is not None:
+        if layout.unit_attn_bias is not None:
             unit_attn_out = self.attn.attend(
-                q[:, :, shared_end:],
-                k,
-                v,
-                attn_mask=layout.unit_attn_mask,
+                q[:, :, shared_end:], k, v,
+                attn_mask=layout.unit_attn_bias,
             )
             unit_attn_out *= layout.valid_unit_mask.unsqueeze(-1).to(dtype=unit_attn_out.dtype)
             unit_tokens = unit_tokens + self.attn.project_attn_residual(unit_attn_out)
@@ -2423,31 +2384,37 @@ class BuilderMLP(nn.Module):
         cls: torch.Tensor,
         context_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        q = F.normalize(cls, dim=-1, eps=1e-6)
+        # Fold per-token tau into q so SDPA uses scale=1.0 (CUDA-graph safe).
+        q = F.normalize(cls, dim=-1, eps=1e-6) * self.context_tau.exp().view(1, -1, 1)
         k = F.normalize(self.context_k_proj(context_tokens), dim=-1, eps=1e-6)
         v = self.context_v_proj(context_tokens)
-        scores = torch.matmul(q, k.transpose(-1, -2)) * self.context_tau.exp().view(1, -1, 1)
-        attn = scores.softmax(dim=-1)
-        cls = self.context_ca_norm(cls + torch.matmul(attn, v))
+        attn_out = F.scaled_dot_product_attention(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
+        ).squeeze(1)
+        cls = self.context_ca_norm(cls + attn_out)
         return F.silu(cls)
 
     def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
         q = F.normalize(self._apply_tile_rope(self.tile_sa_q_proj(tiles)), dim=-1, eps=1e-6)
+        q = q * self.tile_sa_tau.exp()
         k = self._apply_tile_rope(self.tile_sa_k_proj(tiles))
         k = F.normalize(k, dim=-1, eps=1e-6)
         v = self.tile_sa_v_proj(tiles)
-        scores = torch.matmul(q, k.transpose(-1, -2)) * self.tile_sa_tau.exp()
-        attn = scores.softmax(dim=-1)
-        tiles = self.tile_sa_norm(tiles + torch.matmul(attn, v))
+        attn_out = F.scaled_dot_product_attention(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
+        ).squeeze(1)
+        tiles = self.tile_sa_norm(tiles + attn_out)
         return F.silu(tiles)
 
     def _cls_cross_attention(self, cls: torch.Tensor, tiles: torch.Tensor) -> torch.Tensor:
         q = F.normalize(self.cls_ca_q_proj(cls), dim=-1, eps=1e-6)
+        q = q * self.cls_ca_tau.exp()
         k = F.normalize(self.cls_ca_k_proj(tiles), dim=-1, eps=1e-6)
         v = self.cls_ca_v_proj(tiles)
-        scores = torch.matmul(q, k.transpose(-1, -2)) * self.cls_ca_tau.exp()
-        attn = scores.softmax(dim=-1)
-        cls = self.cls_ca_norm(cls + torch.matmul(attn, v))
+        attn_out = F.scaled_dot_product_attention(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
+        ).squeeze(1)
+        cls = self.cls_ca_norm(cls + attn_out)
         return F.silu(cls)
 
     def _latent_ffn(self, latent: torch.Tensor) -> torch.Tensor:

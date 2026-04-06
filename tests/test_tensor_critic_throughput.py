@@ -157,11 +157,12 @@ def test_critic_global_layout_keeps_padded_unit_queries_nonempty():
         n_rounds=2,
     )
 
-    assert layout.unit_attn_mask is not None
+    assert layout.unit_attn_bias is not None
     invalid_queries = ~layout.valid_unit_mask
     assert invalid_queries.any()
-    invalid_query_rows = layout.unit_attn_mask.squeeze(1)[invalid_queries]
-    assert invalid_query_rows.any(dim=-1).all()
+    # Padded unit key positions should have -inf bias
+    unit_bias_slice = layout.unit_attn_bias[:, 0, 0, layout.unit_start:]
+    assert (unit_bias_slice[invalid_queries] == float('-inf')).all()
 
 
 def test_critic_global_layout_initializes_padded_unit_rope_to_identity():
