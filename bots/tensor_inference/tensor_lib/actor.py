@@ -99,15 +99,6 @@ def _flat_zeros(size: int) -> array:
     return array("d", [0.0]) * size
 
 
-def _project_rows_flat(vecs: list[list[float]], rows: list[list[float]]) -> array:
-    out = array("d")
-    append = out.append
-    for vec in vecs:
-        for row in rows:
-            append(_DOT(vec, row))
-    return out
-
-
 def _flat_vecs(vecs: list[list[float]]) -> array:
     out = _flat_zeros(len(vecs) * TILE_EMBED_DIM)
     for idx, vec in enumerate(vecs):
@@ -144,41 +135,6 @@ def _residual_rmsnorm_silu_flat(
     inv_rms = 1.0 / (mean_sq / dim + eps) ** 0.5
     for i in range(dim):
         out[out_off + i] = _silu_scalar(out[out_off + i] * inv_rms * gamma[i])
-
-
-def _attention_update_flat_inplace(
-    q_view,
-    q_scale: float,
-    keys,
-    key_scales: list[float],
-    values,
-    scale: float,
-    scores: list[float],
-    out: array,
-    out_off: int,
-) -> None:
-    n_keys = len(keys)
-    dim = len(values[0])
-    best = float("-inf")
-    for i in range(n_keys):
-        score = scale * q_scale * key_scales[i] * _DOT(q_view, keys[i])
-        scores[i] = score
-        if score > best:
-            best = score
-
-    for j in range(dim):
-        out[out_off + j] = 0.0
-    z = 0.0
-    for i in range(n_keys):
-        weight = _EXP(scores[i] - best)
-        z += weight
-        value = values[i]
-        for j in range(dim):
-            out[out_off + j] += weight * value[j]
-
-    inv_z = 1.0 / z
-    for j in range(dim):
-        out[out_off + j] *= inv_z
 
 
 def _residual_rmsnorm_silu(
@@ -231,6 +187,38 @@ def _attention_update_inplace(
     inv_z = 1.0 / z
     for j in range(out_dim):
         out[j] *= inv_z
+    return out
+
+
+def _attention_prescaled(
+    scaled_q,
+    scaled_keys,
+    values_cols: list[list[float]],
+    scores: list[float],
+    out: list[float],
+    n_keys: int,
+    out_dim: int,
+) -> list[float]:
+    """Attention with pre-scaled Q/K and column-major values."""
+    best = -1e30
+    for i in range(n_keys):
+        score = _DOT(scaled_q, scaled_keys[i])
+        scores[i] = score
+        if score > best:
+            best = score
+    z = 0.0
+    for i in range(n_keys):
+        w = _EXP(scores[i] - best)
+        scores[i] = w
+        z += w
+    inv_z = 1.0 / z
+    if n_keys == len(scores):
+        for j in range(out_dim):
+            out[j] = _DOT(scores, values_cols[j]) * inv_z
+    else:
+        w = scores[:n_keys]
+        for j in range(out_dim):
+            out[j] = _DOT(w, values_cols[j]) * inv_z
     return out
 
 
@@ -301,7 +289,6 @@ class ActorModel:
         self._infer_cache: dict | None = None
         self._attn_scores = [0.0] * TILE_GRID_N
         self._attn_update = [0.0] * TILE_EMBED_DIM
-        self._attn_update_flat = _flat_zeros(TILE_EMBED_DIM)
         flat_size = TILE_GRID_N * TILE_EMBED_DIM
         self._encoded_flat = _flat_zeros(flat_size)
         self._tile_q_flat = _flat_zeros(flat_size)
@@ -330,11 +317,14 @@ class ActorModel:
         ]
         self._tile_q_scales = [0.0] * TILE_GRID_N
         self._tile_k_scales = [0.0] * TILE_GRID_N
-        self._cached_tile_obs = [0.0] * (TILE_GRID_N * TILE_FEATURES)
-        self._cached_tile_obs_valid = False
         self._cls_k_cache = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
         self._cls_v_cache = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
         self._cls_k_scales_cache = [0.0] * TILE_GRID_N
+        self._tile_v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
+        self._cls_v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
+        self._scaled_tile_k = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+        self._scaled_cls_k = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+        self._scaled_qi = [0.0] * TILE_EMBED_DIM
 
         self._init_identity_linear(self.tile_sa_q_proj)
         self._init_identity_linear(self.cls_ca_q_proj)
@@ -403,9 +393,6 @@ class ActorModel:
             b = list(layer.bias.data) if layer.bias is not None else None
             return rows, b
 
-        def _project_rows(vecs: list[list[float]], rows: list[list[float]]) -> list[list[float]]:
-            return [[_DOT(vec, row) for row in rows] for vec in vecs]
-
         action_heads = (
             ("build_type", self.head_build_type),
             ("build_dir", self.head_build_dir),
@@ -444,8 +431,17 @@ class ActorModel:
             latent_ffn_down = _linear_rows(self.latent_ffn_down)
 
         tile_rows_full, tile_bias = _linear_rows(self.tile_linear)
+        tile_q_rows, tile_q_bias = _linear_rows(self.tile_sa_q_proj)
+        tile_k_rows, tile_k_bias = _linear_rows(self.tile_sa_k_proj)
+        tile_v_rows, tile_v_bias = _linear_rows(self.tile_sa_v_proj)
         if tile_bias is None:
             tile_bias = [0.0] * TILE_EMBED_DIM
+        if tile_q_bias is None:
+            tile_q_bias = [0.0] * TILE_EMBED_DIM
+        if tile_k_bias is None:
+            tile_k_bias = [0.0] * TILE_EMBED_DIM
+        if tile_v_bias is None:
+            tile_v_bias = [0.0] * TILE_EMBED_DIM
         tile_dx_w = [row[0] for row in tile_rows_full]
         tile_dy_w = [row[1] for row in tile_rows_full]
         tile_rows = [row[2:] for row in tile_rows_full]
@@ -499,9 +495,9 @@ class ActorModel:
             "context_proj": _linear_rows(self.context_proj),
             "context_k_proj": _linear_rows(self.context_k_proj),
             "context_v_proj": _linear_rows(self.context_v_proj),
-            "tile_sa_q_proj": _linear_rows(self.tile_sa_q_proj),
-            "tile_sa_k_proj": _linear_rows(self.tile_sa_k_proj),
-            "tile_sa_v_proj": _linear_rows(self.tile_sa_v_proj),
+            "tile_sa_q_proj": (tile_q_rows, tile_q_bias),
+            "tile_sa_k_proj": (tile_k_rows, tile_k_bias),
+            "tile_sa_v_proj": (tile_v_rows, tile_v_bias),
             "cls_ca_q_proj": _linear_rows(self.cls_ca_q_proj),
             "cls_ca_k_proj": _linear_rows(self.cls_ca_k_proj),
             "cls_ca_v_proj": _linear_rows(self.cls_ca_v_proj),
@@ -555,13 +551,6 @@ class ActorModel:
         globals_end = tile_obs_end + GLOBAL_FEATURES
         globals_obs = features[tile_obs_end:globals_end]
         h_prev = features[globals_end:globals_end + H_DIM]
-        tile_obs_same = self._cached_tile_obs_valid
-        if tile_obs_same:
-            cached_tile_obs = self._cached_tile_obs
-            for idx in range(tile_obs_end):
-                if cached_tile_obs[idx] != features[idx]:
-                    tile_obs_same = False
-                    break
         base_flat = symbolic_tiles["base"]
         env_flat = symbolic_tiles["env"]
         imp_flat = symbolic_tiles["imp"]
@@ -576,133 +565,153 @@ class ActorModel:
         tile_k_flat = self._tile_k_flat
         tile_v_flat = self._tile_v_flat
         enriched_flat = self._enriched_flat
+        tile_q = self._tile_q_views
+        tile_k = self._tile_k_views
+        tile_v = self._tile_v_views
         tile_q_scales = self._tile_q_scales
         tile_k_scales = self._tile_k_scales
         cls_k = self._cls_k_cache
         cls_v = self._cls_v_cache
         cls_k_scales = self._cls_k_scales_cache
-        if not tile_obs_same:
-            cached_tile_obs = self._cached_tile_obs
-            for idx in range(tile_obs_end):
-                cached_tile_obs[idx] = features[idx]
-            self._cached_tile_obs_valid = True
-            for t in range(TILE_GRID_N):
-                base = t * TILE_FEATURES
-                off = t * TILE_EMBED_DIM
-                wall = features[base]
-                ore_ti = features[base + 1]
-                ore_ax = features[base + 2]
-                env_id = 1 if wall == 1.0 else 2 if ore_ti == 1.0 else 3 if ore_ax == 1.0 else 0
-                imp_id = int(features[base + 3])
-                build_idx = 0
-                for bidx in range(N_BLD_TYPES):
-                    if features[base + 4 + bidx] == 1.0:
-                        build_idx = bidx
-                        break
-                b_team = features[base + 14]
-                team_id = 0 if b_team < 0.0 else 2 if b_team > 0.0 else 1
-                dir_x = int(features[base + 15])
-                dir_y = int(features[base + 16])
-                dir_id = (dir_y + 1) * 3 + (dir_x + 1)
-                cooldown = features[base + 17]
-                stored = features[base + 18]
-                stored_id = 0 if stored < 0.0 else 2 if stored > 0.0 else 1
-                has_unit = features[base + 19]
-                unit_friendly = features[base + 20]
-                unit_id = 0 if has_unit == 0.0 else 1 if unit_friendly > 0.0 else 2
+        tile_sa_scale = _EXP(tile_sa_tau)
+        scaled_tile_k = self._scaled_tile_k
+        tile_v_cols = self._tile_v_cols
+        # Fused tile encoding + QKV projection + rotary + key pre-scaling + V transpose
+        for t in range(TILE_GRID_N):
+            base = t * TILE_FEATURES
+            off = t * TILE_EMBED_DIM
+            wall = features[base]
+            ore_ti = features[base + 1]
+            ore_ax = features[base + 2]
+            env_id = 1 if wall == 1.0 else 2 if ore_ti == 1.0 else 3 if ore_ax == 1.0 else 0
+            imp_id = int(features[base + 3])
+            build_idx = 0
+            for bidx in range(N_BLD_TYPES):
+                if features[base + 4 + bidx] == 1.0:
+                    build_idx = bidx
+                    break
+            b_team = features[base + 14]
+            team_id = 0 if b_team < 0.0 else 2 if b_team > 0.0 else 1
+            dir_x = int(features[base + 15])
+            dir_y = int(features[base + 16])
+            dir_id = (dir_y + 1) * 3 + (dir_x + 1)
+            cooldown = features[base + 17]
+            stored = features[base + 18]
+            stored_id = 0 if stored < 0.0 else 2 if stored > 0.0 else 1
+            has_unit = features[base + 19]
+            unit_friendly = features[base + 20]
+            unit_id = 0 if has_unit == 0.0 else 1 if unit_friendly > 0.0 else 2
 
-                env_off = env_id * TILE_EMBED_DIM
-                imp_off = imp_id * TILE_EMBED_DIM
-                build_off = build_idx * TILE_EMBED_DIM
-                team_off = team_id * TILE_EMBED_DIM
-                dir_off = dir_id * TILE_EMBED_DIM
-                stored_off = stored_id * TILE_EMBED_DIM
-                unit_off = unit_id * TILE_EMBED_DIM
+            env_off = env_id * TILE_EMBED_DIM
+            imp_off = imp_id * TILE_EMBED_DIM
+            build_off = build_idx * TILE_EMBED_DIM
+            team_off = team_id * TILE_EMBED_DIM
+            dir_off = dir_id * TILE_EMBED_DIM
+            stored_off = stored_id * TILE_EMBED_DIM
+            unit_off = unit_id * TILE_EMBED_DIM
 
-                for j in range(TILE_EMBED_DIM):
-                    x = (
-                        base_flat[off + j]
-                        + env_flat[env_off + j]
-                        + imp_flat[imp_off + j]
-                        + build_flat[build_off + j]
-                        + team_flat[team_off + j]
-                        + dir_flat[dir_off + j]
-                        + cooldown * cooldown_w[j]
-                        + stored_flat[stored_off + j]
-                        + unit_flat[unit_off + j]
-                    )
-                    encoded_flat[off + j] = _silu_scalar(x)
-            for t in range(TILE_GRID_N):
-                off = t * TILE_EMBED_DIM
-                token = self._encoded_views[t]
-                for j in range(TILE_EMBED_DIM):
-                    q_val = _DOT(token, tile_q_rows[j])
-                    k_val = _DOT(token, tile_k_rows[j])
-                    v_val = _DOT(token, tile_v_rows[j])
-                    if tile_q_bias is not None:
-                        q_val += tile_q_bias[j]
-                    if tile_k_bias is not None:
-                        k_val += tile_k_bias[j]
-                    if tile_v_bias is not None:
-                        v_val += tile_v_bias[j]
-                    tile_q_flat[off + j] = q_val
-                    tile_k_flat[off + j] = k_val
-                    tile_v_flat[off + j] = v_val
-                tile_q_scales[t] = _norm_inverse_flat(tile_q_flat, off, TILE_EMBED_DIM)
-                tile_k_scales[t] = _norm_inverse_flat(tile_k_flat, off, TILE_EMBED_DIM)
-                _apply_rotary_inplace(tile_q_flat, off, self._rope_cos[t], self._rope_sin[t])
-                _apply_rotary_inplace(tile_k_flat, off, self._rope_cos[t], self._rope_sin[t])
-
-            tile_sa_scale = _EXP(tile_sa_tau)
-            for i in range(TILE_GRID_N):
-                off = i * TILE_EMBED_DIM
-                _attention_update_inplace(
-                    self._tile_q_views[i],
-                    tile_q_scales[i],  # type: ignore[arg-type]
-                    self._tile_k_views,
-                    tile_k_scales,
-                    self._tile_v_views,
-                    tile_sa_scale,
-                    attn_scores,
-                    attn_update,
+            # Tile embedding + SiLU → encoded_flat, and build local token list for QKV
+            token = [0.0] * TILE_EMBED_DIM
+            for j in range(TILE_EMBED_DIM):
+                x = (
+                    base_flat[off + j]
+                    + env_flat[env_off + j]
+                    + imp_flat[imp_off + j]
+                    + build_flat[build_off + j]
+                    + team_flat[team_off + j]
+                    + dir_flat[dir_off + j]
+                    + cooldown * cooldown_w[j]
+                    + stored_flat[stored_off + j]
+                    + unit_flat[unit_off + j]
                 )
-                _residual_rmsnorm_silu_flat(
-                    encoded_flat,
-                    off,
-                    attn_update,
-                    0,
-                    tile_norm_gamma,
-                    tile_norm_eps,
-                    enriched_flat,
-                    off,
-                    TILE_EMBED_DIM,
-                )
+                if x >= 0.0:
+                    x = x / (1.0 + _EXP(-x))
+                else:
+                    e = _EXP(x)
+                    x = x * e / (1.0 + e)
+                encoded_flat[off + j] = x
+                token[j] = x
+            # QKV projection using local token list (faster than memoryview)
+            q_nsq = 0.0
+            k_nsq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                q_val = _DOT(token, tile_q_rows[j]) + tile_q_bias[j]
+                k_val = _DOT(token, tile_k_rows[j]) + tile_k_bias[j]
+                v_val = _DOT(token, tile_v_rows[j]) + tile_v_bias[j]
+                tile_q_flat[off + j] = q_val
+                tile_k_flat[off + j] = k_val
+                tile_v_flat[off + j] = v_val
+                q_nsq += q_val * q_val
+                k_nsq += k_val * k_val
+                tile_v_cols[j][t] = v_val  # V transpose inline
+            tile_q_scales[t] = 1.0 / max(math.sqrt(q_nsq), 1e-6)
+            k_scale = 1.0 / max(math.sqrt(k_nsq), 1e-6)
+            tile_k_scales[t] = k_scale
+            # Rotary + pre-scale keys in one pass
+            cos_t = self._rope_cos[t]
+            sin_t = self._rope_sin[t]
+            half = TILE_EMBED_DIM // 2
+            sk = scaled_tile_k[t]
+            s = k_scale * tile_sa_scale
+            for ri in range(half):
+                x1 = tile_q_flat[off + ri]
+                x2 = tile_q_flat[off + half + ri]
+                tile_q_flat[off + ri] = x1 * cos_t[ri] - x2 * sin_t[ri]
+                tile_q_flat[off + half + ri] = x1 * sin_t[ri] + x2 * cos_t[ri]
+                x1 = tile_k_flat[off + ri]
+                x2 = tile_k_flat[off + half + ri]
+                rk1 = x1 * cos_t[ri] - x2 * sin_t[ri]
+                rk2 = x1 * sin_t[ri] + x2 * cos_t[ri]
+                tile_k_flat[off + ri] = rk1
+                tile_k_flat[off + half + ri] = rk2
+                sk[ri] = rk1 * s
+                sk[half + ri] = rk2 * s
+        scaled_qi = self._scaled_qi
+        for i in range(TILE_GRID_N):
+            off = i * TILE_EMBED_DIM
+            # Pre-scale query: fold tile_q_scales into query vector
+            qi = tile_q[i]
+            qs = tile_q_scales[i]
+            for j in range(TILE_EMBED_DIM):
+                scaled_qi[j] = qi[j] * qs
+            # Score loop: zero multiplications per key, just sumprod
+            best = -1e30
+            for k in range(TILE_GRID_N):
+                score = _DOT(scaled_qi, scaled_tile_k[k])
+                attn_scores[k] = score
+                if score > best:
+                    best = score
+            z = 0.0
+            for k in range(TILE_GRID_N):
+                w = _EXP(attn_scores[k] - best)
+                attn_scores[k] = w
+                z += w
+            inv_z = 1.0 / z
+            # Fused weighted sum + residual + RMSNorm + SiLU
+            mean_sq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                x = encoded_flat[off + j] + _DOT(attn_scores, tile_v_cols[j]) * inv_z
+                enriched_flat[off + j] = x
+                mean_sq += x * x
+            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_norm_eps) ** 0.5
+            for j in range(TILE_EMBED_DIM):
+                x = enriched_flat[off + j] * inv_rms * tile_norm_gamma[j]
+                if x >= 0.0:
+                    enriched_flat[off + j] = x / (1.0 + _EXP(-x))
+                else:
+                    e = _EXP(x)
+                    enriched_flat[off + j] = x * e / (1.0 + e)
 
-            for idx in range(TILE_GRID_N):
-                token = self._enriched_views[idx]
-                k_tok = cls_k[idx]
-                v_tok = cls_v[idx]
-                for j in range(TILE_EMBED_DIM):
-                    k_val = _DOT(token, cls_k_rows[j])
-                    v_val = _DOT(token, cls_v_rows[j])
-                    if cls_k_bias is not None:
-                        k_val += cls_k_bias[j]
-                    if cls_v_bias is not None:
-                        v_val += cls_v_bias[j]
-                    k_tok[j] = k_val
-                    v_tok[j] = v_val
-                cls_k_scales[idx] = _norm_inverse(k_tok)
+        # CLS K/V projection — will pre-scale keys after cls_ca_scale is known
 
         global_ctx = [0.0] * ACTOR_CONTEXT_DIM
         for j in range(ACTOR_CONTEXT_DIM):
-            x = _DOT(globals_obs, context_rows[j])
-            if context_bias is not None:
-                x += context_bias[j]
-            global_ctx[j] = x
+            global_ctx[j] = _DOT(globals_obs, context_rows[j]) + context_bias[j]
         projected_ctx_k: list[list[float]] = []
         projected_ctx_k_scales: list[float] = []
         projected_ctx_v: list[list[float]] = []
-        for chunk_idx in range(ACTOR_CONTEXT_CHUNKS * 2):
+        n_ctx_chunks = ACTOR_CONTEXT_CHUNKS * 2
+        for chunk_idx in range(n_ctx_chunks):
             if chunk_idx < ACTOR_CONTEXT_CHUNKS:
                 token = global_ctx[
                     chunk_idx * TILE_EMBED_DIM:(chunk_idx + 1) * TILE_EMBED_DIM
@@ -714,73 +723,124 @@ class ActorModel:
                 ]
             k_tok = [0.0] * TILE_EMBED_DIM
             v_tok = [0.0] * TILE_EMBED_DIM
+            k_nsq = 0.0
             for j in range(TILE_EMBED_DIM):
-                k_val = _DOT(token, ctx_k_rows[j])
-                v_val = _DOT(token, ctx_v_rows[j])
-                if ctx_k_bias is not None:
-                    k_val += ctx_k_bias[j]
-                if ctx_v_bias is not None:
-                    v_val += ctx_v_bias[j]
+                k_val = _DOT(token, ctx_k_rows[j]) + ctx_k_bias[j]
+                v_val = _DOT(token, ctx_v_rows[j]) + ctx_v_bias[j]
                 k_tok[j] = k_val
                 v_tok[j] = v_val
-            projected_ctx_k_scales.append(_norm_inverse(k_tok))
+                k_nsq += k_val * k_val
+            projected_ctx_k_scales.append(1.0 / max(math.sqrt(k_nsq), 1e-6))
             projected_ctx_k.append(k_tok)
             projected_ctx_v.append(v_tok)
+        # Transpose context values to column-major for sumprod
+        ctx_v_cols = [
+            [projected_ctx_v[i][j] for i in range(n_ctx_chunks)]
+            for j in range(TILE_EMBED_DIM)
+        ]
 
         cls_state = [
             cls_tokens_flat[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM]
             for i in range(ACTOR_CLS_TOKENS)
         ]
         for i, token in enumerate(cls_state):
-            q_scale = _norm_inverse(token)
-            update = _attention_update_inplace(
-                token,
-                q_scale,
-                projected_ctx_k,
-                projected_ctx_k_scales,
-                projected_ctx_v,
-                _EXP(context_tau[i]),
+            # Pre-scale context keys with key_scales * tau for this query
+            ctx_scale = _EXP(context_tau[i])
+            scaled_ctx_k = [
+                [projected_ctx_k[ci][j] * projected_ctx_k_scales[ci] * ctx_scale
+                 for j in range(TILE_EMBED_DIM)]
+                for ci in range(n_ctx_chunks)
+            ]
+            # Pre-scale query
+            q_nsq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                v = token[j]
+                q_nsq += v * v
+            q_scale = 1.0 / max(math.sqrt(q_nsq), 1e-6)
+            scaled_q = [token[j] * q_scale for j in range(TILE_EMBED_DIM)]
+            update = _attention_prescaled(
+                scaled_q,
+                scaled_ctx_k,
+                ctx_v_cols,
                 attn_scores,
                 attn_update,
+                n_ctx_chunks,
+                TILE_EMBED_DIM,
             )
-            cls_state[i] = _residual_rmsnorm_silu(
-                token,
-                update,
-                context_norm_gamma,
-                context_norm_eps,
-            )
+            # Inlined _residual_rmsnorm_silu
+            out = [0.0] * TILE_EMBED_DIM
+            mean_sq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                x = token[j] + update[j]
+                out[j] = x
+                mean_sq += x * x
+            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + context_norm_eps) ** 0.5
+            for j in range(TILE_EMBED_DIM):
+                x = out[j] * inv_rms * context_norm_gamma[j]
+                if x >= 0.0:
+                    out[j] = x / (1.0 + _EXP(-x))
+                else:
+                    e = _EXP(x)
+                    out[j] = x * e / (1.0 + e)
+            cls_state[i] = out
 
         cls_ca_scale = _EXP(cls_ca_tau)
+        # Fused CLS K/V projection + key pre-scaling + V transpose
+        scaled_cls_k = self._scaled_cls_k
+        cls_v_cols = self._cls_v_cols
+        for idx in range(TILE_GRID_N):
+            token = self._enriched_views[idx]
+            sk = scaled_cls_k[idx]
+            v_tok = cls_v[idx]
+            k_nsq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                k_val = _DOT(token, cls_k_rows[j]) + cls_k_bias[j]
+                v_val = _DOT(token, cls_v_rows[j]) + cls_v_bias[j]
+                sk[j] = k_val  # store raw K temporarily
+                v_tok[j] = v_val
+                cls_v_cols[j][idx] = v_val  # V transpose inline
+                k_nsq += k_val * k_val
+            # Pre-scale key: fold norm_inverse * cls_ca_scale
+            s = cls_ca_scale / max(math.sqrt(k_nsq), 1e-6)
+            for j in range(TILE_EMBED_DIM):
+                sk[j] *= s
         for i, token in enumerate(cls_state):
             q_tok = [0.0] * TILE_EMBED_DIM
+            q_nsq = 0.0
             for j in range(TILE_EMBED_DIM):
-                q_val = _DOT(token, cls_q_rows[j])
-                if cls_q_bias is not None:
-                    q_val += cls_q_bias[j]
+                q_val = _DOT(token, cls_q_rows[j]) + cls_q_bias[j]
                 q_tok[j] = q_val
-            q_scale = _norm_inverse(q_tok)
-            update = _attention_update_inplace(
+                q_nsq += q_val * q_val
+            q_scale = 1.0 / max(math.sqrt(q_nsq), 1e-6)
+            for j in range(TILE_EMBED_DIM):
+                q_tok[j] *= q_scale
+            update = _attention_prescaled(
                 q_tok,
-                q_scale,
-                cls_k,
-                cls_k_scales,
-                cls_v,
-                cls_ca_scale,
+                scaled_cls_k,
+                cls_v_cols,
                 attn_scores,
                 attn_update,
+                TILE_GRID_N,
+                TILE_EMBED_DIM,
             )
-            cls_state[i] = _residual_rmsnorm_silu(
-                token,
-                update,
-                cls_norm_gamma,
-                cls_norm_eps,
-            )
-
-        latent_input = [0.0] * ACTOR_LATENT_DIM
-        for i, token in enumerate(cls_state):
-            base = i * TILE_EMBED_DIM
+            # Inlined _residual_rmsnorm_silu
+            out = [0.0] * TILE_EMBED_DIM
+            mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                latent_input[base + j] = token[j]
+                x = token[j] + update[j]
+                out[j] = x
+                mean_sq += x * x
+            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + cls_norm_eps) ** 0.5
+            for j in range(TILE_EMBED_DIM):
+                x = out[j] * inv_rms * cls_norm_gamma[j]
+                if x >= 0.0:
+                    out[j] = x / (1.0 + _EXP(-x))
+                else:
+                    e = _EXP(x)
+                    out[j] = x * e / (1.0 + e)
+            cls_state[i] = out
+
+        latent_input = [x for token in cls_state for x in token]
         latent = _rmsnorm(latent_input, latent_norm_gamma, latent_norm_eps)
         if not latent_ffn_noop:
             latent_ffn_norm_gamma, latent_ffn_norm_eps = latent_ffn_norm  # type: ignore[misc]
@@ -793,16 +853,9 @@ class ActorModel:
         action_names, action_slices, action_rows, action_bias = cache["action_heads"]
         outputs: dict[str, list[float]] = {}
         for name, (start, end) in zip(action_names, action_slices):
-            head_out = [0.0] * (end - start)
-            for out_idx, row_idx in enumerate(range(start, end)):
-                head_out[out_idx] = _DOT(latent, action_rows[row_idx]) + action_bias[row_idx]
-            outputs[name] = head_out
+            outputs[name] = [_DOT(latent, action_rows[j]) + action_bias[j] for j in range(start, end)]
 
-        gru_in = [0.0] * ACTOR_GRU_INPUT_DIM
-        for i in range(ACTOR_LATENT_DIM):
-            gru_in[i] = latent[i]
-        for i in range(H_DIM):
-            gru_in[ACTOR_LATENT_DIM + i] = h_prev[i]
+        gru_in = latent + list(h_prev)
         gate_rows, gate_bias = cache["head_h_gate"]
         cand_rows, cand_bias = cache["head_h_cand"]
         h_gate = [_DOT(gru_in, gate_rows[j]) + gate_bias[j] for j in range(H_DIM)]
