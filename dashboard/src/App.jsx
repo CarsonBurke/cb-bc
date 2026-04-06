@@ -33,7 +33,7 @@ export default function App() {
     content = <TrainingView key={`training:${trainSession || 'default'}`} />
   } else if (currentView === 'replays') {
     content = <ReplayViewer key="replays" />
-  } else if (overviewQuery.isPending) {
+  } else if (overviewQuery.isPending || !overview) {
     content = <LoadingState message="Loading dashboard data..." />
   } else if (overviewQuery.isError) {
     content = <LoadingState message="Failed to load dashboard data." />

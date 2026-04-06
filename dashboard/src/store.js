@@ -67,13 +67,6 @@ export const trainSessionPersistAtom = atom(
   },
 )
 
-// Listen for back/forward navigation
-if (typeof window !== 'undefined') {
-  window.addEventListener('popstate', () => {
-    // Atoms won't auto-update from this — the App component handles it
-  })
-}
-
 // Export a hook-friendly updater for popstate
 export const syncFromHash = (set) => {
   const { mode, view, session } = parseHash()

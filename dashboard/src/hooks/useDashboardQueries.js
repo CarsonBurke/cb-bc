@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { apiUrl, fetchJsonApi } from '../api'
+import { fetchJsonApi } from '../api'
 import { usePageVisible } from './usePageVisible'
 
 const TRAINING_POLL_MS = 2000
@@ -75,7 +75,7 @@ export function useTrainLogQuery(session) {
 
       return {
         episodes: previous.episodes.concat(newEpisodes),
-        config: previous.config,
+        config: payload.config || previous.config,
         total: serverTotal,
       }
     },
@@ -91,13 +91,8 @@ export function useLeagueQuery(session) {
     queryKey: ['league', session || null],
     queryFn: async ({ signal }) => {
       const qs = session ? `?session=${encodeURIComponent(session)}` : ''
-      const response = await fetch(apiUrl(`/api/league${qs}`), { signal })
-      const text = await response.text()
-      try {
-        return JSON.parse(text).models || []
-      } catch {
-        return []
-      }
+      const data = await fetchJsonApi(`/api/league${qs}`, { signal })
+      return data.models || []
     },
     refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
     staleTime: 0,
@@ -190,7 +185,7 @@ export function useGameLogQuery(session) {
       if (after > 0) params.set('after', String(after))
       const qs = params.toString() ? `?${params}` : ''
       const payload = await fetchJsonApi(`/api/game-log${qs}`, { signal })
-      const newGames = payload.games || payload
+      const newGames = Array.isArray(payload.games) ? payload.games : Array.isArray(payload) ? payload : []
       const serverTotal = payload.total ?? (after + newGames.length)
 
       if (!previous || after === 0) {

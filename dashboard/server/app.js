@@ -298,13 +298,16 @@ function tryServeViewerFile(res, pathname) {
 
 function tryServeDashboardFile(res, pathname) {
   const normalized = pathname === '/' ? '/index.html' : pathname
-  const distPath = resolve(DIST_DIR, normalized.slice(1))
+  const relative = normalized.slice(1)
+  if (!relative || relative.includes('..') || relative.includes('\\')) return false
+
+  const distPath = resolve(DIST_DIR, relative)
   if (existsSync(distPath) && statSync(distPath).isFile()) {
     serveFile(res, distPath)
     return true
   }
 
-  const publicPath = resolve(PUBLIC_DIR, normalized.slice(1))
+  const publicPath = resolve(PUBLIC_DIR, relative)
   if (existsSync(publicPath) && statSync(publicPath).isFile()) {
     serveFile(res, publicPath)
     return true
@@ -366,13 +369,14 @@ async function handleRequest(req, res) {
   }
 
   if (pathname === '/api/train-replays') {
-    const dir = sessionDir(url) ? resolve(sessionDir(url), 'replays') : TRAINING_REPLAYS_DIR
+    const sd = sessionDir(url)
+    const dir = sd ? resolve(sd, 'replays') : TRAINING_REPLAYS_DIR
     const minEp = url.searchParams.has('min_ep') ? Number(url.searchParams.get('min_ep')) : null
     const maxEp = url.searchParams.has('max_ep') ? Number(url.searchParams.get('max_ep')) : null
     try {
       let replays = getReplayListing(dir)
       if (minEp != null || maxEp != null) {
-        const baseDir = sessionDir(url) || TENSOR_DIR
+        const baseDir = sd || TENSOR_DIR
         const logPath = resolve(baseDir, 'game_log.jsonl')
         try {
           const entry = readIncrementalJsonl(gameLogCache, logPath)
@@ -528,7 +532,8 @@ async function handleRequest(req, res) {
   }
 
   if (pathname === '/api/league') {
-    const baseDir = sessionDir(url) ? resolve(sessionDir(url), 'league') : resolve(TENSOR_DIR, 'league')
+    const sd2 = sessionDir(url)
+    const baseDir = sd2 ? resolve(sd2, 'league') : resolve(TENSOR_DIR, 'league')
     const modelsPath = resolve(baseDir, 'models.json')
     try {
       const models = JSON.parse(readLeagueData(modelsPath))
@@ -564,8 +569,8 @@ async function handleRequest(req, res) {
 
   if (pathname === '/api/watch') {
     const matchId = url.searchParams.get('match_id')
-    if (!matchId) {
-      sendJson(res, { error: 'match_id required' }, 400)
+    if (!matchId || /[^a-zA-Z0-9_\-]/.test(matchId)) {
+      sendJson(res, { error: 'match_id required (alphanumeric, hyphens, underscores only)' }, 400)
       return
     }
 
@@ -578,29 +583,27 @@ async function handleRequest(req, res) {
 
     let responded = false
 
+    function finish(payload, statusCode = 200) {
+      if (responded) return
+      responded = true
+      proc.kill()
+      sendJson(res, payload, statusCode)
+    }
+
     function respondWithUrl(chunk) {
       const match = chunk.toString().match(/https?:\/\/[^\s]+/)
-      if (match && !responded) {
-        responded = true
-        sendJson(res, { url: match[0] })
-      }
+      if (match) finish({ url: match[0] })
     }
 
     proc.stdout.on('data', respondWithUrl)
     proc.stderr.on('data', respondWithUrl)
 
     proc.on('error', () => {
-      if (!responded) {
-        responded = true
-        sendJson(res, { error: 'Failed to launch cambc watch' }, 500)
-      }
+      finish({ error: 'Failed to launch cambc watch' }, 500)
     })
 
     setTimeout(() => {
-      if (!responded) {
-        responded = true
-        sendJson(res, { error: 'Timeout waiting for visualizer' }, 504)
-      }
+      finish({ error: 'Timeout waiting for visualizer' }, 504)
     }, 5000)
     return
   }
