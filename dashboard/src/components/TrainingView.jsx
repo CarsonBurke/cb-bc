@@ -420,27 +420,29 @@ const LogitScaleChart = memo(function LogitScaleChart({ series }) {
   )
 })
 
-const LogitScaleMeanChart = memo(function LogitScaleMeanChart() {
+const TempMeanChart = memo(function TempMeanChart() {
   return (
     <LogitScaleChart
       series={[
-        { key: 'ls_bt_mean', label: 'Build Type', color: '#f38ba8' },
-        { key: 'ls_bd_mean', label: 'Build Dir', color: '#89b4fa' },
-        { key: 'ls_cd_mean', label: 'Conv Dir', color: '#f9e2af' },
-        { key: 'ls_md_mean', label: 'Move Dir', color: '#a6e3a1' },
+        { key: 'temp_bt_mean', label: 'Build Type', color: '#f38ba8' },
+        { key: 'temp_bd_mean', label: 'Build Dir', color: '#89b4fa' },
+        { key: 'temp_cd_mean', label: 'Conv Dir', color: '#f9e2af' },
+        { key: 'temp_brt_mean', label: 'Bridge Target', color: '#cba6f7' },
+        { key: 'temp_md_mean', label: 'Move Dir', color: '#a6e3a1' },
       ]}
     />
   )
 })
 
-const LogitScaleStdChart = memo(function LogitScaleStdChart() {
+const TempStdChart = memo(function TempStdChart() {
   return (
     <LogitScaleChart
       series={[
-        { key: 'ls_bt_std', label: 'Build Type', color: '#f38ba8' },
-        { key: 'ls_bd_std', label: 'Build Dir', color: '#89b4fa' },
-        { key: 'ls_cd_std', label: 'Conv Dir', color: '#f9e2af' },
-        { key: 'ls_md_std', label: 'Move Dir', color: '#a6e3a1' },
+        { key: 'temp_bt_std', label: 'Build Type', color: '#f38ba8' },
+        { key: 'temp_bd_std', label: 'Build Dir', color: '#89b4fa' },
+        { key: 'temp_cd_std', label: 'Conv Dir', color: '#f9e2af' },
+        { key: 'temp_brt_std', label: 'Bridge Target', color: '#cba6f7' },
+        { key: 'temp_md_std', label: 'Move Dir', color: '#a6e3a1' },
       ]}
     />
   )
@@ -1053,8 +1055,8 @@ const TRAINING_CARDS = {
   'train-return-range':       { title: 'Return Range',        defaultOpen: false, hasEma: true, hasLegend: true, render: () => <ReturnRangeChart /> },
   'train-ret-oob':            { title: 'Return OOB Frac',     defaultOpen: false, hasEma: true, render: () => <RetOobFracChart /> },
   'train-actor-lr':           { title: 'Actor LR',            defaultOpen: false, hasEma: true, render: () => <ActorLrChart /> },
-  'train-logit-scale-mean': { title: 'Logit Scale Mean',    defaultOpen: false, hasEma: true, render: () => <LogitScaleMeanChart /> },
-  'train-logit-scale-std':  { title: 'Logit Scale Std',     defaultOpen: false, hasEma: true, render: () => <LogitScaleStdChart /> },
+  'train-temp-mean': { title: 'Temperature Mean',    defaultOpen: false, hasEma: true, render: () => <TempMeanChart /> },
+  'train-temp-std':  { title: 'Temperature Std',     defaultOpen: false, hasEma: true, render: () => <TempStdChart /> },
   'train-log-table':        { title: 'Episode Log',         defaultOpen: false, render: () => <EpisodeLogTable /> },
   'train-replays':          { title: 'Training Replays',    render: () => <TrainingReplaysContent /> },
   'train-pretrain-loss':    { title: 'Pretrain Loss',       defaultOpen: false, hasEma: true, render: () => <BCLossChart /> },
