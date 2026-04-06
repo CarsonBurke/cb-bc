@@ -189,8 +189,13 @@ def test_build_game_launch_specs_is_deterministic_for_benchmark_seed(tmp_path):
     assert first == second
     assert [Path(spec.map_path).name for spec in first] == [Path(spec.map_path).name for spec in second]
     assert [spec.seed for spec in first] == [spec.seed for spec in second]
-    assert first[1].bot_b == "bot_b_dummy.py"
-    assert first[0].bot_b == "bot_b_proxy.py"
+    assert [spec.swapped for spec in first] == [spec.swapped for spec in second]
+    # The dummy game always pairs bot_a with bot_b_dummy (possibly swapped).
+    dummy_spec = first[1]
+    assert {dummy_spec.bot_a, dummy_spec.bot_b} == {"bot_a.py", "bot_b_dummy.py"}
+    # The proxy games always pair bot_a with bot_b_proxy (possibly swapped).
+    proxy_spec = first[0]
+    assert {proxy_spec.bot_a, proxy_spec.bot_b} == {"bot_a.py", "bot_b_proxy.py"}
 
 
 def test_build_game_launch_specs_uses_requested_benchmark_maps(tmp_path):
@@ -209,6 +214,48 @@ def test_build_game_launch_specs_uses_requested_benchmark_maps(tmp_path):
     )
 
     assert [Path(spec.map_path).name for spec in specs] == ["beta.map26", "beta.map26"]
+
+
+def test_build_game_launch_specs_swaps_sides(tmp_path):
+    """Over many seeds, side swapping should produce both swapped and non-swapped games."""
+    swapped_count = 0
+    n_trials = 200
+    for seed in range(n_trials):
+        specs = train_batched_mod._build_game_launch_specs(
+            opp_weight_paths=["opp.pkl"],
+            opp_ids=["opp"],
+            maps=["m.map26"],
+            episode_num=seed,
+            replay_dir=tmp_path,
+            bot_a="bot_a.py",
+            bot_b_proxy="bot_b_proxy.py",
+            bot_b_dummy="bot_b_dummy.py",
+            engine_root="/engine",
+        )
+        assert len(specs) == 1
+        spec = specs[0]
+        if spec.swapped:
+            assert spec.bot_b == "bot_a.py"
+            assert spec.bot_a == "bot_b_proxy.py"
+            assert spec.actor_team == 1
+            swapped_count += 1
+        else:
+            assert spec.bot_a == "bot_a.py"
+            assert spec.bot_b == "bot_b_proxy.py"
+            assert spec.actor_team == 0
+    # Expect roughly 50% swapped — must see both to confirm randomization.
+    assert 30 < swapped_count < 170, f"Expected ~50% swapped, got {swapped_count}/{n_trials}"
+
+
+def test_game_launch_spec_worker_args_includes_actor_team():
+    spec = train_batched_mod.GameLaunchSpec(
+        game_idx=0, opponent_id="opp", opponent_weight_path="w.pkl",
+        map_path="/m.map26", replay_path="/r.replay26", seed=1,
+        bot_a="a.py", bot_b="b.py", engine_root="/e", swapped=True,
+    )
+    args = spec.worker_args()
+    assert len(args) == 7
+    assert args[-1] == 1  # actor_team
 
 
 def test_hidden_state_bank_reuses_updated_rows_without_aliasing():

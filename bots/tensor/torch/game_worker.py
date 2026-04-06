@@ -112,11 +112,11 @@ def _build_global_states(rd: ReplayData, result_path: str, *, max_turns: int | N
 
 
 def _run_game_proxy(args, result_path: str):
-    bot_a, bot_b, map_path, engine_root, replay_path, seed = args
+    bot_a, bot_b, map_path, engine_root, replay_path, seed, actor_team = args
     from cambc.cambc_engine import run_game
 
     run_game(bot_a, bot_b, engine_root, map_path, replay_path, seed)
-    rd = ReplayData.from_file(replay_path, team=0)
+    rd = ReplayData.from_file(replay_path, team=int(actor_team))
     working = rd.working_harvesters_dict()
     winner = rd.winner_str
     global_states = _build_global_states(rd, result_path, max_turns=_training_turn_cap())

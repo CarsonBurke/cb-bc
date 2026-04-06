@@ -207,9 +207,14 @@ class GameLaunchSpec:
     bot_a: str
     bot_b: str
     engine_root: str
+    swapped: bool = False  # True when training bot plays as team B
 
-    def worker_args(self) -> tuple[str, str, str, str, str, int]:
-        return (self.bot_a, self.bot_b, self.map_path, self.engine_root, self.replay_path, self.seed)
+    @property
+    def actor_team(self) -> int:
+        return 1 if self.swapped else 0
+
+    def worker_args(self) -> tuple[str, str, str, str, str, int, int]:
+        return (self.bot_a, self.bot_b, self.map_path, self.engine_root, self.replay_path, self.seed, self.actor_team)
 
     def metadata(self) -> dict[str, object]:
         payload = asdict(self)
@@ -305,7 +310,13 @@ def _build_game_launch_specs(
         map_name = rng.choice(candidate_maps)
         replay_path = str(replay_dir / f"ep{episode_num}_{opp_id}_g{i}.replay26")
         seed = rng.randint(1, 2**31)
-        bot_b = bot_b_dummy if opp_weight_path == DUMMY_OPP_PATH else bot_b_proxy
+        bot_b_bot = bot_b_dummy if opp_weight_path == DUMMY_OPP_PATH else bot_b_proxy
+        # Randomly swap sides so the training bot learns to play as both team A and B.
+        swapped = bool(rng.getrandbits(1))
+        if swapped:
+            spec_bot_a, spec_bot_b = bot_b_bot, bot_a
+        else:
+            spec_bot_a, spec_bot_b = bot_a, bot_b_bot
         game_specs.append(
             GameLaunchSpec(
                 game_idx=i,
@@ -314,9 +325,10 @@ def _build_game_launch_specs(
                 map_path=str(PROJECT_ROOT / "maps" / map_name),
                 replay_path=replay_path,
                 seed=seed,
-                bot_a=bot_a,
-                bot_b=bot_b,
+                bot_a=spec_bot_a,
+                bot_b=spec_bot_b,
                 engine_root=engine_root,
+                swapped=swapped,
             )
         )
     return game_specs
@@ -1280,15 +1292,20 @@ def collect_games_batched(
         if not trajectories_by_unit:
             raise RuntimeError(f"missing collected actor trajectories for game {i}")
         game_trajs = [trajectories_by_unit[unit_id] for unit_id in sorted(trajectories_by_unit)]
+        # Normalize winner to training bot's perspective: "a" = our bot won.
+        # When swapped (training bot played as team B), flip the raw winner.
         w = result.winner
+        if game_specs[i].swapped and w in ("a", "b"):
+            w = "b" if w == "a" else "a"
         gstates = result.global_states
+        actor_team = game_specs[i].actor_team
         # Inject replay-derived resource reward as per-step reward (training only)
         if gstates and REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW):
             from flow_reward import compute_dense_delivery_rewards, compute_dense_flow_rewards, augment_trajectories_with_flow_rewards
             if REWARD_MODE == RewardMode.INCOME:
                 rewards = compute_dense_delivery_rewards(gstates)
             else:
-                rewards = compute_dense_flow_rewards(gstates)
+                rewards = compute_dense_flow_rewards(gstates, team=actor_team)
             game_trajs = augment_trajectories_with_flow_rewards(game_trajs, rewards)
             # Track delivery totals separately for logging
             delivery_rewards = compute_dense_delivery_rewards(gstates)
@@ -1323,7 +1340,8 @@ def collect_games_batched(
     preload_replay_buffers(all_global_states)
 
     shutil.rmtree(tmpdir, ignore_errors=True)
-    print(f"    [{n_games} games, {total_inferences} GPU inferences]")
+    n_swapped = sum(1 for spec in game_specs if spec.swapped)
+    print(f"    [{n_games} games ({n_swapped} swapped), {total_inferences} GPU inferences]")
     return trajectories, winners, per_opp_winners, all_global_states, traj_game_map, game_origin, game_delivery_totals, game_specs
 
 
