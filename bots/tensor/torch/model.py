@@ -3036,7 +3036,7 @@ def ppo_update(
     clip_eps: float = 0.2,
     clip_eps_higher: float | None = 0.28,
     vf_coeff: float = 0.5,
-    entropy_coeff: float = 0.001,
+    entropy_coeff: float = 0.005,
     max_grad_norm: float = 0.5,
     target_kl: float | None = None,
     profile: dict[str, float] | None = None,
