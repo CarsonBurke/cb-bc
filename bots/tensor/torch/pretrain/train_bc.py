@@ -48,6 +48,7 @@ from model import (
     conveyor_dir_mask,
 )
 
+from training_utils import jsonl_line, jsonl_init
 from dataset import ActorBCDataset
 from pretrain.gpu import (
     autocast_context,
@@ -1177,7 +1178,7 @@ def train_actor_bc(
                             "elapsed": round(time.time() - t0, 1),
                             "n_samples": total_samples,
                         }
-                        log_file.write(json.dumps(entry) + "\n")
+                        log_file.write(jsonl_line(entry))
 
                 with ThreadPoolExecutor(max_workers=2) as prefetch_pool:
                     future = _submit_batch(prefetch_pool, 0)
@@ -1269,8 +1270,7 @@ def main():
         "session": session_name,
         "step_log_every": args.step_log_every,
     }
-    with open(log_path, "w") as f:
-        f.write(json.dumps({"config": config}) + "\n")
+    jsonl_init(log_path, config=config)
 
     print(f"Replay dir: {replay_dir}")
     print(f"Session: {session_name}")

@@ -41,6 +41,7 @@ from model import (
     win_probability,
 )
 
+from training_utils import jsonl_line, jsonl_init
 from dataset import CriticBCDataset, _cache_path, _file_signature, _atomic_torch_save, _CRITIC_CACHE_VERSION
 from pretrain.gpu import (
     autocast_context,
@@ -724,7 +725,7 @@ def train_critic(
             }
             if wc_data["round_offset"] > 0:
                 entry["round_offset"] = wc_data["round_offset"]
-            game_log_file.write(json.dumps(entry) + "\n")
+            game_log_file.write(jsonl_line(entry))
 
     try:
         stop_requested = False
@@ -927,7 +928,7 @@ def train_critic(
                                 "elapsed": round(time.time() - t0, 1),
                                 "n_samples": total_samples,
                             }
-                            log_file.write(json.dumps(entry) + "\n")
+                            log_file.write(jsonl_line(entry))
 
 
                         if stop_after_optimizer_steps is not None and global_optimizer_step >= stop_after_optimizer_steps:
@@ -1130,9 +1131,8 @@ def main():
         "session": session_name,
         "actor_weights": args.actor_weights,
     }
-    with open(log_path, "w") as f:
-        f.write(json.dumps({"config": config}) + "\n")
-    game_log_path.write_text("")
+    jsonl_init(log_path, config=config)
+    jsonl_init(game_log_path)
 
     print(f"Replay dir: {replay_dir}")
     print(f"Session: {session_name}")

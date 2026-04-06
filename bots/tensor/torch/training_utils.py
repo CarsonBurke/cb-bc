@@ -20,6 +20,39 @@ except ImportError:
     from bots.tensor.shared import H_DIM, INPUT_SIZE
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+
+# ---- JSONL utilities ----
+
+def _sanitize_for_json(obj):
+    """Replace NaN/Infinity floats with None so json.dumps produces valid JSON."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
+def jsonl_line(obj: dict) -> str:
+    """Serialize a dict to a single JSONL line (with trailing newline), sanitizing NaN/Infinity."""
+    return json.dumps(_sanitize_for_json(obj), separators=(",", ":")) + "\n"
+
+
+def jsonl_append(path: Path, obj: dict) -> None:
+    """Append a single JSON object as a line to a JSONL file."""
+    with open(path, "a") as f:
+        f.write(jsonl_line(obj))
+
+
+def jsonl_init(path: Path, config: dict | None = None) -> None:
+    """Initialize a JSONL file. If config is provided, writes it as the first line."""
+    with open(path, "w") as f:
+        if config is not None:
+            f.write(jsonl_line({"config": config}))
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 
@@ -66,6 +99,7 @@ def _init_session(name: str) -> dict:
         "critic_weight_path": critic_weight_path,
         "weight_path": actor_weight_path,
         "log_path": d / "train_log.jsonl",
+        "game_log_path": d / "game_log.jsonl",
         "replay_dir": replay_dir,
     }
 
@@ -103,9 +137,8 @@ class League:
             # Write migrated matches as JSONL
             matches = data.get("matches", [])
             if matches:
-                with open(self.matches_jsonl, "a") as f:
-                    for m in matches:
-                        f.write(json.dumps(m) + "\n")
+                for m in matches:
+                    jsonl_append(self.matches_jsonl, m)
             self.save()
             old_json.unlink()
         elif self.models_json.exists():
@@ -239,10 +272,9 @@ class League:
         a["elo"] = _ts_elo(new_a)
         b["elo"] = _ts_elo(new_b)
 
-        with open(self.matches_jsonl, "a") as f:
-            f.write(json.dumps({
-                "a": model_a_id, "b": model_b_id, "winner": winner, "timestamp": time.time(),
-            }) + "\n")
+        jsonl_append(self.matches_jsonl, {
+            "a": model_a_id, "b": model_b_id, "winner": winner, "timestamp": time.time(),
+        })
 
     def get_rankings(self) -> list[dict]:
         return sorted(self.models, key=lambda m: m["elo"], reverse=True)

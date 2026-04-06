@@ -168,7 +168,7 @@ SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 WORKER_PYTHON = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 
-from training_utils import League, _init_session, _default_session_name
+from training_utils import League, _init_session, _default_session_name, jsonl_append, jsonl_init
 
 # Shared collector protocol constants
 _OBS_FLOATS = OBS_SIZE + H_DIM
@@ -1505,7 +1505,7 @@ def main():
     log_path = sess["log_path"]
     replay_dir = sess["replay_dir"]
     state_path = _session_state_path(sess)
-    game_log_path = Path(str(log_path).replace("train_log.jsonl", "game_log.jsonl"))
+    game_log_path = sess["game_log_path"]
     profile_episodes = parse_profile_episode_spec(args.profile_episodes)
     profile_cfg = None
     if profile_episodes:
@@ -1611,8 +1611,7 @@ def main():
             pass
 
     if not args.resume or not Path(log_path).exists():
-        with open(str(log_path), "w") as f:
-            f.write(json.dumps({"config": _log_config}) + "\n")
+        jsonl_init(log_path, config=_log_config)
 
     for ep in range(start_episode, args.episodes):
         t0 = time.time()
@@ -1834,8 +1833,7 @@ def main():
 
         # Append single line — O(1) per episode instead of O(n) rewrite
         with trace_scope(episode_trace, "episode.logging"):
-            with open(str(log_path), "a") as f:
-                f.write(json.dumps(ep_entry) + "\n")
+            jsonl_append(log_path, ep_entry)
 
         # Per-game log: aggregate trajectories by game index
         _N_REWARD_FIELDS = 12  # matches _traj_reward tuple length
@@ -1848,29 +1846,28 @@ def main():
             for k in range(_N_REWARD_FIELDS):
                 game_rewards[gi][k] += r[k]
             game_rewards[gi][_N_REWARD_FIELDS] += 1
-        with open(game_log_path, "a") as gf:
-            for gi in sorted(game_rewards):
-                gr = game_rewards[gi]
-                w = all_winners[gi] if gi < len(all_winners) else None
-                orig_i = game_origin[gi] if gi < len(game_origin) else gi
-                oid = all_opp_ids[orig_i] if orig_i < len(all_opp_ids) else "?"
-                ti = game_delivery_totals.get(gi, 0.0)
-                nu = max(gr[_N_REWARD_FIELDS], 1)
-                gf.write(json.dumps({
-                    "episode": ep + 1, "game": orig_i,
-                    "opp": oid, "winner": w,
-                    "reward": round(game_shared_flow.get(gi, 0.0), 3), "units": gr[_N_REWARD_FIELDS],
-                    "harv_attempts": round(gr[4] / nu, 3),
-                    "harv_failures": round(gr[5] / nu, 3),
-                    "harv_prox_gate": round(gr[6] / nu, 3),
-                    "harv_prox_paid": round(gr[7] / nu, 3),
-                    "conv_attempts": round(gr[8] / nu, 3),
-                    "conv_failures": round(gr[9] / nu, 3),
-                    "conv_prox_gate": round(gr[10] / nu, 3),
-                    "conv_prox_paid": round(gr[11] / nu, 3),
-                    "resources": round(ti, 1),
-                    "replay": f"ep{ep + 1}_{oid}_g{orig_i}.replay26",
-                }) + "\n")
+        for gi in sorted(game_rewards):
+            gr = game_rewards[gi]
+            w = all_winners[gi] if gi < len(all_winners) else None
+            orig_i = game_origin[gi] if gi < len(game_origin) else gi
+            oid = all_opp_ids[orig_i] if orig_i < len(all_opp_ids) else "?"
+            ti = game_delivery_totals.get(gi, 0.0)
+            nu = max(gr[_N_REWARD_FIELDS], 1)
+            jsonl_append(game_log_path, {
+                "episode": ep + 1, "game": orig_i,
+                "opp": oid, "winner": w,
+                "reward": round(game_shared_flow.get(gi, 0.0), 3), "units": gr[_N_REWARD_FIELDS],
+                "harv_attempts": round(gr[4] / nu, 3),
+                "harv_failures": round(gr[5] / nu, 3),
+                "harv_prox_gate": round(gr[6] / nu, 3),
+                "harv_prox_paid": round(gr[7] / nu, 3),
+                "conv_attempts": round(gr[8] / nu, 3),
+                "conv_failures": round(gr[9] / nu, 3),
+                "conv_prox_gate": round(gr[10] / nu, 3),
+                "conv_prox_paid": round(gr[11] / nu, 3),
+                "resources": round(ti, 1),
+                "replay": f"ep{ep + 1}_{oid}_g{orig_i}.replay26",
+            })
 
         with trace_scope(episode_trace, "episode.resume_state"):
             _atomic_torch_save({
