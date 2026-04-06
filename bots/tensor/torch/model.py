@@ -584,7 +584,6 @@ class CriticAttentionBlock(nn.Module):
         n_heads: int = 4,
         n_kv_heads: int = 2,
         mlp_ratio: int = 4,
-        layer_scale_init: float = 1e-4,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -605,9 +604,6 @@ class CriticAttentionBlock(nn.Module):
         mlp_hidden = dim * mlp_ratio
         self.mlp_fc1 = nn.Linear(dim, mlp_hidden, bias=False)
         self.mlp_fc2 = nn.Linear(mlp_hidden, dim, bias=False)
-
-        self.ls1 = nn.Parameter(layer_scale_init * torch.ones(dim))
-        self.ls2 = nn.Parameter(layer_scale_init * torch.ones(dim))
 
         self._init_weights()
 
@@ -656,16 +652,13 @@ class CriticAttentionBlock(nn.Module):
         return attn_out.transpose(1, 2).reshape(B, N_q, self.n_heads * self.head_dim)
 
     def project_attn_residual(self, attn_out: torch.Tensor) -> torch.Tensor:
-        """Project attention outputs and scale them for the residual update."""
-        projected = self.out_proj(attn_out)
-        return self.ls1.to(dtype=projected.dtype) * projected
+        """Project attention outputs for the residual update."""
+        return self.out_proj(attn_out)
 
     def apply_mlp_residual(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the post-attention MLP residual block."""
         h = self.norm2(x)
-        mlp_out = self.mlp_fc2(F.silu(self.mlp_fc1(h)))
-        ls2 = self.ls2.to(dtype=mlp_out.dtype)
-        return x + ls2 * mlp_out
+        return x + self.mlp_fc2(F.silu(self.mlp_fc1(h)))
 
     def apply_residual_mlp(
         self,
@@ -781,11 +774,10 @@ class CriticWindowedSA(nn.Module):
         n_kv_heads: int = 2,
         window_size: int = 5,
         mlp_ratio: int = 4,
-        layer_scale_init: float = 1e-4,
     ):
         super().__init__()
         self.window_size = window_size
-        self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio, layer_scale_init)
+        self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio)
         self.rope = RotaryEmbedding2D(dim // n_heads, max_size=window_size)
         ws = window_size
         h_coords = torch.arange(ws).unsqueeze(1).expand(ws, ws).reshape(-1)
@@ -834,13 +826,12 @@ class CriticGlobalSA(nn.Module):
         n_kv_heads: int = 2,
         n_global_cls: int = 8,
         mlp_ratio: int = 4,
-        layer_scale_init: float = 1e-4,
         max_grid_size: int = 25,
     ):
         super().__init__()
         self.dim = dim
         self.n_global_cls = n_global_cls
-        self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio, layer_scale_init)
+        self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio)
         self.rope = RotaryEmbedding2D(dim // n_heads, max_size=max_grid_size)
         head_dim_half = self.rope.freqs.shape[0] * 2
         self.register_buffer("_special_token_cos", torch.ones(1 + n_global_cls, head_dim_half))
@@ -986,11 +977,12 @@ class CriticGlobalSA(nn.Module):
         unit_cls: torch.Tensor,        # (B_total, dim)
         layout: CriticGlobalLayout,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns updated (patches, global_cls, unit_cls).
+        """Split attention with cross-group visibility.
 
-        Unit tokens remain permutation-equivariant: no token index is encoded,
-        and padded slots are masked only as keys, so reordering units only
-        reorders the corresponding outputs.
+        Patches query patches + scalar + CLS + units (full key set).
+        CLS query patches + scalar + CLS (see each other).
+        Units query everything (unchanged).
+        Shared MLP residual applied to all tokens.
         """
         R = layout.n_rounds
         N = patches.shape[1]
@@ -1027,6 +1019,7 @@ class CriticGlobalSA(nn.Module):
         global_tokens = all_tokens[:, scalar_end:shared_end]
         unit_tokens = all_tokens[:, shared_end:]
 
+        # Patches query patches + scalar + CLS (no mask needed, FA-eligible)
         patch_tokens = patch_tokens + self.attn.project_attn_residual(
             self.attn.attend(
                 q[:, :, :patch_end],
@@ -1034,11 +1027,12 @@ class CriticGlobalSA(nn.Module):
                 v[:, :, :shared_end],
             )
         )
+        # CLS query patches + scalar + CLS (see each other)
         global_tokens = global_tokens + self.attn.project_attn_residual(
             self.attn.attend(
                 q[:, :, scalar_end:shared_end],
-                k[:, :, :scalar_end],
-                v[:, :, :scalar_end],
+                k[:, :, :shared_end],
+                v[:, :, :shared_end],
             )
         )
         if layout.unit_attn_bias is not None:
@@ -1046,7 +1040,7 @@ class CriticGlobalSA(nn.Module):
                 q[:, :, shared_end:], k, v,
                 attn_mask=layout.unit_attn_bias,
             )
-            unit_attn_out *= layout.valid_unit_mask.unsqueeze(-1).to(dtype=unit_attn_out.dtype)
+            unit_attn_out = unit_attn_out * layout.valid_unit_mask.unsqueeze(-1).to(dtype=unit_attn_out.dtype)
             unit_tokens = unit_tokens + self.attn.project_attn_residual(unit_attn_out)
 
         all_tokens = torch.cat([patch_tokens, scalar_tokens, global_tokens, unit_tokens], dim=1)
@@ -1163,7 +1157,6 @@ class CentralizedCritic(nn.Module):
     _N_KV_HEADS = 2
     _WINDOW_SIZE = 5
     _MLP_RATIO = 4
-    _LAYER_SCALE_INIT = 1e-4
     _N_GLOBAL_CLS = 8
     _N_BLOCKS = 3
 
@@ -1177,12 +1170,12 @@ class CentralizedCritic(nn.Module):
         # 3 blocks, each with 2 windowed SA + 1 global SA
         self.windowed_sa = nn.ModuleList([
             CriticWindowedSA(dim, self._N_HEADS, self._N_KV_HEADS,
-                             self._WINDOW_SIZE, self._MLP_RATIO, self._LAYER_SCALE_INIT)
+                             self._WINDOW_SIZE, self._MLP_RATIO)
             for _ in range(self._N_BLOCKS * 2)
         ])
         self.global_sa = nn.ModuleList([
             CriticGlobalSA(dim, self._N_HEADS, self._N_KV_HEADS,
-                           self._N_GLOBAL_CLS, self._MLP_RATIO, self._LAYER_SCALE_INIT)
+                           self._N_GLOBAL_CLS, self._MLP_RATIO)
             for _ in range(self._N_BLOCKS)
         ])
 
@@ -1197,6 +1190,9 @@ class CentralizedCritic(nn.Module):
         # Learned global CLS tokens
         self.global_cls = nn.Parameter(torch.zeros(self._N_GLOBAL_CLS, dim))
         trunc_normal_(self.global_cls, std=0.02)
+
+        # Final norm for pre-norm transformer output
+        self.final_norm = RMSNorm(dim)
 
         # Unit CLS builder and value head
         self.unit_cls_builder = CriticUnitCLSBuilder(
@@ -1316,7 +1312,8 @@ class CentralizedCritic(nn.Module):
             global_cls, unit_cls = self._run_global_sa(
                 feat, round_scalars, round_idx, unit_xy, unit_cls,
             )
-        head_out = self.value_head(unit_cls.float(), global_cls.float(),
+        head_out = self.value_head(self.final_norm(unit_cls.float()),
+                                   self.final_norm(global_cls.float()),
                                    round_idx.long(), actor_latent.float())
         return self._decode_head_output(head_out)
 
@@ -1335,7 +1332,8 @@ class CentralizedCritic(nn.Module):
             global_cls, unit_cls = self._run_global_sa(
                 feat, round_scalars, round_idx, unit_xy, unit_cls,
             )
-        head_out = self.value_head(unit_cls.float(), global_cls.float(),
+        head_out = self.value_head(self.final_norm(unit_cls.float()),
+                                   self.final_norm(global_cls.float()),
                                    round_idx.long(), actor_latent.float())
         values = self._decode_head_output(head_out)
         return values, head_out
