@@ -2868,7 +2868,27 @@ def _actor_recurrent_step(
         cd_causal=cd_causal_t,
         brt_causal=brt_causal,
     )
-    ent = bt_ent + bd_ent + cd_ent * cd_causal_t + brt_ent * brt_causal + md_ent
+
+    # Adaptive per-head entropy: collapsed heads get a stronger bonus.
+    # weight = (1 - H/H_max) so near-uniform heads contribute ~0 and
+    # collapsed heads contribute ~H (pushing them back toward uniform).
+    bt_max = bt_mask_t.sum(dim=-1).clamp(min=1).float().log()
+    bd_max = bd_mask_t.sum(dim=-1).clamp(min=1).float().log()
+    cd_max = torch.tensor(N_CONV_DIR, device=bt_l.device, dtype=bt_l.dtype).log()
+    brt_max = torch.tensor(N_BRIDGE_TARGETS, device=bt_l.device, dtype=bt_l.dtype).log()
+    md_max = torch.tensor(N_DIR, device=bt_l.device, dtype=bt_l.dtype).log()
+
+    def _adaptive(ent, max_ent):
+        # H_max - H: full bonus when collapsed (H=0), zero when uniform (H=H_max).
+        return (max_ent.clamp(min=1e-6) - ent).clamp(min=0)
+
+    ent = (
+        _adaptive(bt_ent, bt_max)
+        + _adaptive(bd_ent, bd_max)
+        + _adaptive(cd_ent, cd_max) * cd_causal_t
+        + _adaptive(brt_ent, brt_max) * brt_causal
+        + _adaptive(md_ent, md_max)
+    )
     return new_lp, ent, head_temperature, h_new
 
 
