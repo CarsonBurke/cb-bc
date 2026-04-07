@@ -740,7 +740,7 @@ class CriticGlobalLayout:
 class CriticTileEmbed(nn.Module):
     """Per-tile two-layer MLP encoder."""
 
-    def __init__(self, in_channels: int = GLOBAL_MAP_CHANNELS, embed_dim: int = 12):
+    def __init__(self, in_channels: int = GLOBAL_MAP_CHANNELS, embed_dim: int = 8):
         super().__init__()
         self.embed_dim = embed_dim
         self.net = nn.Sequential(
@@ -1144,15 +1144,15 @@ class CentralizedCritic(nn.Module):
     """Transformer-based centralized per-unit critic over full replay map state.
 
     Architecture:
-      1. Per-tile MLP encodes 23-channel symbolic features → 12-dim embeddings.
-      2. 2×2 reshape packs tiles into patches (dim=48).
+      1. Per-tile MLP encodes 23-channel symbolic features → 8-dim embeddings.
+      2. 2×2 reshape packs tiles into patches (dim=32).
       3. Alternating windowed SA (local, translation-equivariant) and global SA
          (full map + special tokens) repeated 3 times.
       4. Per-unit value from unit CLS tokens + global CLS pooling + actor latent.
     """
 
-    _TILE_DIM = 12
-    _PATCH_DIM = 48  # 4 tiles × 12 dims
+    _TILE_DIM = 8
+    _PATCH_DIM = 32  # 4 tiles × 8 dims
     _N_HEADS = 4
     _N_KV_HEADS = 2
     _WINDOW_SIZE = 5
