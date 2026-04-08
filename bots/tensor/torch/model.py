@@ -54,6 +54,7 @@ except ImportError:
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _USE_BF16 = DEVICE.type == "cuda" and torch.cuda.is_bf16_supported()
+_TRAINING_DTYPE = torch.bfloat16 if _USE_BF16 else torch.float32
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # ---- Architecture constants (imported from tensor_inference/model_constants.py) ----
@@ -545,8 +546,8 @@ class RotaryEmbedding2D(nn.Module):
         # Precompute cos/sin for grid up to max_size × max_size
         pos = torch.arange(max_size, dtype=torch.float32)
         angles = pos.unsqueeze(-1) * freqs.unsqueeze(0)  # (max_size, half//2)
-        self.register_buffer("_cos_cache", angles.cos())  # (max_size, half//2)
-        self.register_buffer("_sin_cache", angles.sin())
+        self.register_buffer("_cos_cache", angles.cos().to(_TRAINING_DTYPE))
+        self.register_buffer("_sin_cache", angles.sin().to(_TRAINING_DTYPE))
 
     def forward(
         self, h_coords: torch.Tensor, w_coords: torch.Tensor,
@@ -788,30 +789,14 @@ class CriticWindowedSA(nn.Module):
         self.register_buffer("_local_rope_cos", local_rope_cos)
         self.register_buffer("_local_rope_sin", local_rope_sin)
 
-    _MAX_WINDOWS = 16384  # SDPA batch dim limit on some GPUs
-
     def forward(self, patches: torch.Tensor, pH: int, pW: int) -> torch.Tensor:
         """patches: (R, N, dim) where N = pH * pW. Returns same shape."""
         R, N, C = patches.shape
         x = patches.reshape(R, pH, pW, C)
         windows, pad_hw = critic_window_partition(x, self.window_size)
-        rope_cos = self._local_rope_cos
-        rope_sin = self._local_rope_sin
-        if rope_cos.dtype != windows.dtype:
-            rope_cos = rope_cos.to(dtype=windows.dtype)
-            rope_sin = rope_sin.to(dtype=windows.dtype)
-        # Chunk to stay within SDPA batch limits
-        n_win = windows.shape[0]
-        if n_win > self._MAX_WINDOWS:
-            chunks = []
-            for i in range(0, n_win, self._MAX_WINDOWS):
-                chunks.append(self.attn(
-                    windows[i:i + self._MAX_WINDOWS],
-                    rope_cos=rope_cos, rope_sin=rope_sin,
-                ))
-            windows = torch.cat(chunks, dim=0)
-        else:
-            windows = self.attn(windows, rope_cos=rope_cos, rope_sin=rope_sin)
+        windows = self.attn(
+            windows, rope_cos=self._local_rope_cos, rope_sin=self._local_rope_sin,
+        )
         x = critic_window_unpartition(windows, self.window_size, pad_hw, (pH, pW), R)
         return x.reshape(R, N, C)
 
@@ -834,10 +819,10 @@ class CriticGlobalSA(nn.Module):
         self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio)
         self.rope = RotaryEmbedding2D(dim // n_heads, max_size=max_grid_size)
         head_dim_half = self.rope.freqs.shape[0] * 2
-        self.register_buffer("_special_token_cos", torch.ones(1 + n_global_cls, head_dim_half))
-        self.register_buffer("_special_token_sin", torch.zeros(1 + n_global_cls, head_dim_half))
+        self.register_buffer("_special_token_cos", torch.ones(1 + n_global_cls, head_dim_half, dtype=_TRAINING_DTYPE))
+        self.register_buffer("_special_token_sin", torch.zeros(1 + n_global_cls, head_dim_half, dtype=_TRAINING_DTYPE))
         self._patch_rope_cache: dict[
-            tuple[int, int, int, torch.dtype, tuple[str, int | None]],
+            tuple[int, int, int, tuple[str, int | None]],
             tuple[torch.Tensor, torch.Tensor],
         ] = {}
 
@@ -850,11 +835,10 @@ class CriticGlobalSA(nn.Module):
         n_patches: int,
         pH: int,
         pW: int,
-        dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return cached RoPE for patch tokens shared by all rounds."""
-        cache_key = (n_patches, pH, pW, dtype, self._device_key(device))
+        cache_key = (n_patches, pH, pW, self._device_key(device))
         cached = self._patch_rope_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -864,9 +848,6 @@ class CriticGlobalSA(nn.Module):
         grid_h = ph.unsqueeze(1).expand(pH, pW).reshape(-1)[:n_patches]
         grid_w = pw.unsqueeze(0).expand(pH, pW).reshape(-1)[:n_patches]
         rope_cos, rope_sin = self.rope(grid_h, grid_w)
-        if rope_cos.dtype != dtype:
-            rope_cos = rope_cos.to(dtype=dtype)
-            rope_sin = rope_sin.to(dtype=dtype)
         self._patch_rope_cache[cache_key] = (rope_cos, rope_sin)
         return rope_cos, rope_sin
 
@@ -886,13 +867,14 @@ class CriticGlobalSA(nn.Module):
         unit_start = n_patches + 1 + self.n_global_cls
         total_units = unit_cls.shape[0]
 
-        patch_rope_cos, patch_rope_sin = self._get_patch_rope(n_patches, pH, pW, dtype, device)
-        special_cos = self._special_token_cos.to(device=device, dtype=dtype)
-        special_sin = self._special_token_sin.to(device=device, dtype=dtype)
+        patch_rope_cos, patch_rope_sin = self._get_patch_rope(n_patches, pH, pW, device)
+        rope_dtype = patch_rope_cos.dtype
+        special_cos = self._special_token_cos
+        special_sin = self._special_token_sin
 
         if total_units == 0:
             total_tokens = unit_start
-            shared_rope_cos = torch.empty((total_tokens, patch_rope_cos.shape[-1]), device=device, dtype=dtype)
+            shared_rope_cos = torch.empty((total_tokens, patch_rope_cos.shape[-1]), device=device, dtype=rope_dtype)
             shared_rope_sin = torch.empty_like(shared_rope_cos)
             shared_rope_cos[:n_patches] = patch_rope_cos
             shared_rope_sin[:n_patches] = patch_rope_sin
@@ -936,21 +918,18 @@ class CriticGlobalSA(nn.Module):
             ~valid_unit_mask.unsqueeze(1).unsqueeze(2), float('-inf'),
         )
 
-        shared_rope_cos = torch.empty((unit_start, patch_rope_cos.shape[-1]), device=device, dtype=dtype)
+        shared_rope_cos = torch.empty((unit_start, patch_rope_cos.shape[-1]), device=device, dtype=rope_dtype)
         shared_rope_sin = torch.empty_like(shared_rope_cos)
         shared_rope_cos[:n_patches] = patch_rope_cos
         shared_rope_sin[:n_patches] = patch_rope_sin
         shared_rope_cos[n_patches:unit_start] = special_cos
         shared_rope_sin[n_patches:unit_start] = special_sin
-        unit_rope_cos = torch.ones((n_rounds, max_units, patch_rope_cos.shape[-1]), device=device, dtype=dtype)
+        unit_rope_cos = torch.ones((n_rounds, max_units, patch_rope_cos.shape[-1]), device=device, dtype=rope_dtype)
         unit_rope_sin = torch.zeros_like(unit_rope_cos)
         sorted_xy = unit_xy[perm]
         u_h = (sorted_xy[:, 1] // 2).clamp(0, pH - 1)
         u_w = (sorted_xy[:, 0] // 2).clamp(0, pW - 1)
         u_cos, u_sin = self.rope(u_h, u_w)
-        if u_cos.dtype != dtype:
-            u_cos = u_cos.to(dtype=dtype)
-            u_sin = u_sin.to(dtype=dtype)
         unit_rope_cos[sorted_round_idx, local_pos] = u_cos
         unit_rope_sin[sorted_round_idx, local_pos] = u_sin
 
