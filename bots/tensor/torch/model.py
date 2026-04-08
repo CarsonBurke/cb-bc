@@ -3825,6 +3825,10 @@ def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.o
     cuda_cfg = _ensure_critic_cuda_runtime()
     if _centralized_critic is None:
         _centralized_critic = CentralizedCritic().to(DEVICE)
+        if cuda_cfg.compile_model:
+            _centralized_critic.encode_map = torch.compile(
+                _centralized_critic.encode_map,
+            )
         _centralized_optimizer = torch.optim.Adam(
             _centralized_critic.parameters(), lr=lr,
         )
@@ -3841,7 +3845,8 @@ def get_centralized_critic_step() -> nn.Module:
     global _centralized_critic_step
     critic, _ = get_centralized_critic()
     if _centralized_critic_step is None:
-        # Transformer critic has dynamic per-round loops; skip torch.compile.
+        # encode_map is compiled separately; global SA has dynamic per-round
+        # loops that prevent whole-module compile.
         _centralized_critic_step = CriticPpoStep(critic)
     _centralized_critic_step.train()
     return _centralized_critic_step
@@ -3852,7 +3857,8 @@ def get_centralized_critic_loss_step() -> nn.Module:
     global _centralized_critic_loss_step
     critic, _ = get_centralized_critic()
     if _centralized_critic_loss_step is None:
-        # Transformer critic has dynamic per-round loops; skip torch.compile.
+        # encode_map is compiled separately; global SA has dynamic per-round
+        # loops that prevent whole-module compile.
         _centralized_critic_loss_step = CriticPpoLossStep(critic)
     _centralized_critic_loss_step.train()
     return _centralized_critic_loss_step
