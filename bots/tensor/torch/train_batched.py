@@ -184,7 +184,7 @@ import ctypes as _ctypes
 WORKER_LAUNCH_STAGGER_S = 0.005
 DUMMY_OPP_PATH = "__dummy__"
 DUMMY_OPP_ID = "dummy"
-TRAIN_MAX_TURNS = 200
+TRAIN_MAX_TURNS = 300
 _DUMMY_DIR_TILES = (6, 7, 8, 11, 12, 13, 16, 17, 18)
 _dummy_idx_cache = {}
 _OPP_GRAPH_TEMP = 0.5
