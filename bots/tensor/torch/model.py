@@ -3827,7 +3827,7 @@ def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.o
         _centralized_critic = CentralizedCritic().to(DEVICE)
         if cuda_cfg.compile_model:
             _centralized_critic.encode_map = torch.compile(
-                _centralized_critic.encode_map,
+                _centralized_critic.encode_map, fullgraph=True,
             )
         _centralized_optimizer = torch.optim.Adam(
             _centralized_critic.parameters(), lr=lr,
