@@ -33,7 +33,7 @@ def test_resolve_cuda_config_disables_gpu_paths_on_cpu():
     assert not cfg.compile_model
 
 
-def test_resolve_cuda_config_prefers_bf16_and_channels_last_on_cuda():
+def test_resolve_cuda_config_prefers_bf16_and_disables_compile_for_spatial_cuda():
     cfg = gpu.resolve_cuda_config(
         torch.device("cuda"),
         spatial_inputs=True,
@@ -44,7 +44,7 @@ def test_resolve_cuda_config_prefers_bf16_and_channels_last_on_cuda():
     assert cfg.enabled
     assert cfg.amp_dtype == torch.bfloat16
     assert cfg.channels_last
-    assert cfg.compile_model
+    assert not cfg.compile_model
 
 
 def test_resolve_cuda_config_falls_back_to_fp16_without_compile():
@@ -59,3 +59,17 @@ def test_resolve_cuda_config_falls_back_to_fp16_without_compile():
     assert cfg.amp_dtype == torch.float16
     assert not cfg.channels_last
     assert not cfg.compile_model
+
+
+def test_resolve_cuda_config_keeps_compile_for_nonspatial_cuda():
+    cfg = gpu.resolve_cuda_config(
+        torch.device("cuda"),
+        spatial_inputs=False,
+        enable_compile=True,
+        bf16_supported=True,
+        compile_supported=True,
+    )
+    assert cfg.enabled
+    assert cfg.amp_dtype == torch.bfloat16
+    assert not cfg.channels_last
+    assert cfg.compile_model

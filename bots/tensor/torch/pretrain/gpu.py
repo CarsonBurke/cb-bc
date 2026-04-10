@@ -38,11 +38,15 @@ def resolve_cuda_config(
     if compile_supported is None:
         compile_supported = hasattr(torch, "compile")
 
+    # Dynamic spatial workloads (variable map batches/shapes) trigger very
+    # expensive torch.compile recompiles, so keep compile for non-spatial paths.
+    compile_model = enable_compile and compile_supported and not spatial_inputs
+
     return PretrainCudaConfig(
         enabled=True,
         amp_dtype=torch.bfloat16 if bf16_supported else torch.float16,
         channels_last=spatial_inputs,
-        compile_model=enable_compile and compile_supported,
+        compile_model=compile_model,
     )
 
 
