@@ -113,9 +113,10 @@ def test_tile_rbf_gamma_gradient_matches_explicit_logits():
 
     with torch.no_grad():
         tiles, _ = model._split_obs_pre(model._obs_encoder_pre(packed[:, :OBS_SIZE]))
-        q = model.tile_sa_q_proj(tiles)
-        k = model.tile_sa_k_proj(tiles)
-        v = model.tile_sa_v_proj(tiles)
+        normed_tiles = model.tile_sa_norm(tiles)
+        q = model.tile_sa_q_proj(normed_tiles)
+        k = model.tile_sa_k_proj(normed_tiles)
+        v = model.tile_sa_v_proj(normed_tiles)
 
     gamma_param_actual = model.tile_sa_gamma.detach().clone().requires_grad_(True)
     gamma_actual = gamma_param_actual.exp()

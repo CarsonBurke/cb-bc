@@ -379,6 +379,15 @@ class ActorModel:
             b = list(layer.bias.data) if layer.bias is not None else None
             return rows, b
 
+        def _scale_input_rows(
+            rows: list[list[float]],
+            input_scales: list[float],
+        ) -> list[list[float]]:
+            return [
+                [row[i] * input_scales[i] for i in range(len(input_scales))]
+                for row in rows
+            ]
+
         action_heads = (
             ("build_type", self.head_build_type),
             ("build_dir", self.head_build_dir),
@@ -476,19 +485,20 @@ class ActorModel:
             "cooldown": array("d", cooldown_w),
         }
 
+        tile_sa_norm_gamma = list(self.tile_sa_norm.gamma.data)
         cache = {
             "symbolic_tiles": symbolic_tiles,
             "context_proj": _linear_rows(self.context_proj),
             "context_k_proj": _linear_rows(self.context_k_proj),
             "context_v_proj": _linear_rows(self.context_v_proj),
-            "tile_sa_q_proj": (tile_q_rows, tile_q_bias),
-            "tile_sa_k_proj": (tile_k_rows, tile_k_bias),
-            "tile_sa_v_proj": (tile_v_rows, tile_v_bias),
+            "tile_sa_q_proj": (_scale_input_rows(tile_q_rows, tile_sa_norm_gamma), tile_q_bias),
+            "tile_sa_k_proj": (_scale_input_rows(tile_k_rows, tile_sa_norm_gamma), tile_k_bias),
+            "tile_sa_v_proj": (_scale_input_rows(tile_v_rows, tile_sa_norm_gamma), tile_v_bias),
             "cls_ca_q_proj": _linear_rows(self.cls_ca_q_proj),
             "cls_ca_k_proj": _linear_rows(self.cls_ca_k_proj),
             "cls_ca_v_proj": _linear_rows(self.cls_ca_v_proj),
             "context_ca_norm": (list(self.context_ca_norm.gamma.data), self.context_ca_norm.eps),
-            "tile_sa_norm": (list(self.tile_sa_norm.gamma.data), self.tile_sa_norm.eps),
+            "tile_sa_norm": (tile_sa_norm_gamma, self.tile_sa_norm.eps),
             "cls_ca_norm": (list(self.cls_ca_norm.gamma.data), self.cls_ca_norm.eps),
             "latent_norm": (list(self.latent_norm.gamma.data), self.latent_norm.eps),
             "cls_tokens": list(self.cls_tokens.data),
@@ -524,7 +534,7 @@ class ActorModel:
         cls_k_rows, cls_k_bias = cache["cls_ca_k_proj"]
         cls_v_rows, cls_v_bias = cache["cls_ca_v_proj"]
         context_norm_gamma, context_norm_eps = cache["context_ca_norm"]
-        tile_norm_gamma, tile_norm_eps = cache["tile_sa_norm"]
+        _tile_norm_gamma, tile_norm_eps = cache["tile_sa_norm"]
         cls_norm_gamma, cls_norm_eps = cache["cls_ca_norm"]
         latent_norm_gamma, latent_norm_eps = cache["latent_norm"]
         latent_ffn_noop = cache["latent_ffn_noop"]
@@ -557,6 +567,7 @@ class ActorModel:
         tile_k_flat = self._tile_k_flat
         tile_v_flat = self._tile_v_flat
         enriched_flat = self._enriched_flat
+        encoded = self._encoded_views
         tile_q = self._tile_q_views
         tile_k = self._tile_k_views
         tile_v = self._tile_v_views
@@ -600,8 +611,9 @@ class ActorModel:
             stored_off = stored_id * TILE_EMBED_DIM
             unit_off = unit_id * TILE_EMBED_DIM
 
-            # Tile embedding + SiLU → encoded_flat, and build local token list for QKV
-            token = [0.0] * TILE_EMBED_DIM
+            # Tile embedding + SiLU → encoded_flat
+            token = encoded[t]
+            mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
                 x = (
                     base_flat[off + j]
@@ -620,20 +632,21 @@ class ActorModel:
                     e = _EXP(x)
                     x = x * e / (1.0 + e)
                 encoded_flat[off + j] = x
-                token[j] = x
-            # QKV projection — no QK-norm, no RoPE
+                mean_sq += x * x
+            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_norm_eps) ** 0.5
+            # Pre-norm QKV projection — no QK-norm, no RoPE
             k_nsq = 0.0
             for j in range(TILE_EMBED_DIM):
-                q_val = _DOT(token, tile_q_rows[j]) + tile_q_bias[j]
-                k_val = _DOT(token, tile_k_rows[j]) + tile_k_bias[j]
-                v_val = _DOT(token, tile_v_rows[j]) + tile_v_bias[j]
+                q_val = inv_rms * _DOT(token, tile_q_rows[j]) + tile_q_bias[j]
+                k_val = inv_rms * _DOT(token, tile_k_rows[j]) + tile_k_bias[j]
+                v_val = inv_rms * _DOT(token, tile_v_rows[j]) + tile_v_bias[j]
                 tile_q_flat[off + j] = q_val
                 tile_k_flat[off + j] = k_val
                 tile_v_flat[off + j] = v_val
                 k_nsq += k_val * k_val
                 tile_v_cols[j][t] = v_val  # V transpose inline
             tile_k_norm_sq[t] = k_nsq
-        # RBF attention: softmax(2γ(QK^T) - γ||K||²) @ V
+        # Pre-norm RBF attention: softmax(2γ(QK^T) - γ||K||²) @ V
         for i in range(TILE_GRID_N):
             off = i * TILE_EMBED_DIM
             qi = tile_q[i]
@@ -649,26 +662,14 @@ class ActorModel:
                 attn_scores[k] = w
                 z += w
             inv_z = 1.0 / z
-            # Fused weighted sum + residual + RMSNorm + SiLU
-            mean_sq = 0.0
+            # Fused weighted sum + residual
             for j in range(TILE_EMBED_DIM):
-                x = encoded_flat[off + j] + _DOT(attn_scores, tile_v_cols[j]) * inv_z
-                enriched_flat[off + j] = x
-                mean_sq += x * x
-            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_norm_eps) ** 0.5
-            for j in range(TILE_EMBED_DIM):
-                x = enriched_flat[off + j] * inv_rms * tile_norm_gamma[j]
-                if x >= 0.0:
-                    enriched_flat[off + j] = x / (1.0 + _EXP(-x))
-                else:
-                    e = _EXP(x)
-                    enriched_flat[off + j] = x * e / (1.0 + e)
+                enriched_flat[off + j] = encoded_flat[off + j] + _DOT(attn_scores, tile_v_cols[j]) * inv_z
 
-        # Tile FFN: residual MLP on SA output before CLS reads them
+        # Tile FFN: pre-norm residual MLP on SA output before CLS reads them
         tile_ffn_hidden = TILE_EMBED_DIM * 2
         for t in range(TILE_GRID_N):
             off = t * TILE_EMBED_DIM
-            # RMSNorm
             mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
                 x = enriched_flat[off + j]

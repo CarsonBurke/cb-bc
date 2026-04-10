@@ -2436,10 +2436,11 @@ class BuilderMLP(nn.Module):
         return F.silu(cls)
 
     def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
-        """RBF attention: softmax(2γ(QK^T) - γ||K||²) @ V via SDPA."""
-        q = self.tile_sa_q_proj(tiles)
-        k = self.tile_sa_k_proj(tiles)
-        v = self.tile_sa_v_proj(tiles)
+        """Pre-norm RBF self-attention + FFN residual block over tile tokens."""
+        normed_tiles = self.tile_sa_norm(tiles)
+        q = self.tile_sa_q_proj(normed_tiles)
+        k = self.tile_sa_k_proj(normed_tiles)
+        v = self.tile_sa_v_proj(normed_tiles)
         gamma = self.tile_sa_gamma.exp()
         k_norm_sq = (k * k).sum(dim=-1, keepdim=True).transpose(-1, -2)
         gamma_scale = torch.sqrt(2.0 * gamma)
@@ -2451,9 +2452,7 @@ class BuilderMLP(nn.Module):
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
             attn_mask=rbf_bias, scale=1.0,
         ).squeeze(1)
-        tiles = self.tile_sa_norm(tiles + attn_out)
-        tiles = F.silu(tiles)
-        # Tile FFN: transform SA results before CLS reads them
+        tiles = tiles + attn_out
         tiles = tiles + self.tile_ffn_down(F.silu(self.tile_ffn_up(self.tile_ffn_norm(tiles))))
         return tiles
 
