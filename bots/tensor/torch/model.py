@@ -577,7 +577,7 @@ def apply_rotary_2d(
 
 
 class CriticAttentionBlock(nn.Module):
-    """Transformer block with GQA, QK-norm, layer scale, and optional RoPE."""
+    """Transformer block with GQA, QK-norm, and optional RoPE."""
 
     def __init__(
         self,
@@ -634,6 +634,33 @@ class CriticAttentionBlock(nn.Module):
             k = apply_rotary_2d(k, rope_cos, rope_sin)
         return q, k, v
 
+    def project_qkv_grouped(
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project grouped local blocks into Q/K/V.
+
+        Args:
+            x: (B, G, N, dim)
+        Returns:
+            Q/K/V in (B, G, heads, N, head_dim) form.
+        """
+        B, G, N, _ = x.shape
+        h = self.norm1(x)
+        q = self.q_proj(h).reshape(B, G, N, self.n_heads, self.head_dim).movedim(3, 2)
+        k = self.k_proj(h).reshape(B, G, N, self.n_kv_heads, self.head_dim).movedim(3, 2)
+        v = self.v_proj(h).reshape(B, G, N, self.n_kv_heads, self.head_dim).movedim(3, 2)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if rope_cos is not None:
+            q = apply_rotary_2d(q, rope_cos, rope_sin)
+            k = apply_rotary_2d(k, rope_cos, rope_sin)
+        return q, k, v
+
     def attend(
         self,
         q: torch.Tensor,
@@ -651,6 +678,31 @@ class CriticAttentionBlock(nn.Module):
             enable_gqa=self.kv_group_size > 1,
         )
         return attn_out.transpose(1, 2).reshape(B, N_q, self.n_heads * self.head_dim)
+
+    def attend_grouped(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run SDPA over grouped local blocks without flattening them into batch.
+
+        The group axis is folded into the head axis so the underlying SDPA call
+        stays 4D and remains flash-attention eligible.
+        """
+        B, n_groups, _, N_q, _ = q.shape
+        N_k = k.shape[-2]
+        q_folded = q.reshape(B, n_groups * self.n_heads, N_q, self.head_dim)
+        k_folded = k.reshape(B, n_groups * self.n_kv_heads, N_k, self.head_dim)
+        v_folded = v.reshape(B, n_groups * self.n_kv_heads, N_k, self.head_dim)
+        attn_out = F.scaled_dot_product_attention(
+            q_folded,
+            k_folded,
+            v_folded,
+            enable_gqa=self.kv_group_size > 1,
+        )
+        attn_out = attn_out.reshape(B, n_groups, self.n_heads, N_q, self.head_dim)
+        return attn_out.transpose(2, 3).reshape(B, n_groups, N_q, self.n_heads * self.head_dim)
 
     def project_attn_residual(self, attn_out: torch.Tensor) -> torch.Tensor:
         """Project attention outputs for the residual update."""
@@ -681,34 +733,52 @@ class CriticAttentionBlock(nn.Module):
         attn_out = self.attend(q, k, v, attn_mask=attn_mask)
         return self.apply_residual_mlp(x, attn_out)
 
+    def forward_grouped(
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply attention to grouped local blocks while preserving window locality."""
+        q, k, v = self.project_qkv_grouped(x, rope_cos=rope_cos, rope_sin=rope_sin)
+        attn_out = self.attend_grouped(q, k, v)
+        return self.apply_residual_mlp(x, attn_out)
+
 
 def critic_window_partition(
     x: torch.Tensor, window_size: int,
 ) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Partition (B, H, W, C) into non-overlapping windows. Returns (B*nw, ws*ws, C)."""
+    """Partition (B, H, W, C) into grouped non-overlapping windows.
+
+    Returns ``(B, n_windows, window_size * window_size, C)`` plus the padded
+    spatial shape.
+    """
     B, H, W, C = x.shape
     pad_h = (window_size - H % window_size) % window_size
     pad_w = (window_size - W % window_size) % window_size
     if pad_h > 0 or pad_w > 0:
         x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
     Hp, Wp = H + pad_h, W + pad_w
-    x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_size * window_size, C)
+    n_win_h = Hp // window_size
+    n_win_w = Wp // window_size
+    x = x.view(B, n_win_h, window_size, n_win_w, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).reshape(B, n_win_h * n_win_w, window_size * window_size, C)
     return windows, (Hp, Wp)
 
 
 def critic_window_unpartition(
     windows: torch.Tensor, window_size: int,
-    pad_hw: tuple[int, int], hw: tuple[int, int], batch_size: int,
+    pad_hw: tuple[int, int], hw: tuple[int, int],
 ) -> torch.Tensor:
-    """Reverse window partition. Returns (B, H, W, C)."""
+    """Reverse grouped window partition. Returns (B, H, W, C)."""
     Hp, Wp = pad_hw
     H, W = hw
+    B = windows.shape[0]
     C = windows.shape[-1]
     x = windows.reshape(
-        batch_size, Hp // window_size, Wp // window_size, window_size, window_size, C,
+        B, Hp // window_size, Wp // window_size, window_size, window_size, C,
     )
-    x = x.permute(0, 1, 3, 2, 4, 5).reshape(batch_size, Hp, Wp, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, Hp, Wp, C)
     if Hp > H or Wp > W:
         x = x[:, :H, :W, :]
     return x
@@ -794,10 +864,10 @@ class CriticWindowedSA(nn.Module):
         R, N, C = patches.shape
         x = patches.reshape(R, pH, pW, C)
         windows, pad_hw = critic_window_partition(x, self.window_size)
-        windows = self.attn(
+        windows = self.attn.forward_grouped(
             windows, rope_cos=self._local_rope_cos, rope_sin=self._local_rope_sin,
         )
-        x = critic_window_unpartition(windows, self.window_size, pad_hw, (pH, pW), R)
+        x = critic_window_unpartition(windows, self.window_size, pad_hw, (pH, pW))
         return x.reshape(R, N, C)
 
 
@@ -2305,8 +2375,13 @@ class BuilderMLP(nn.Module):
 
         self.actor_cls = nn.Parameter(torch.zeros(self._actor_cls_tokens, TILE_EMBED_DIM))
         self.context_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))
-        self.tile_sa_tau = nn.Parameter(torch.zeros(1))
-        self.cls_ca_tau = nn.Parameter(torch.zeros(1))
+        self.tile_sa_gamma = nn.Parameter(torch.zeros(1))  # exp(0) = 1.0 init
+        self.cls_ca_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))  # per-seed temperature
+
+        tile_ffn_hidden = TILE_EMBED_DIM * 2
+        self.tile_ffn_norm = RMSNorm(TILE_EMBED_DIM)
+        self.tile_ffn_up = _ortho_init(nn.Linear(TILE_EMBED_DIM, tile_ffn_hidden))
+        self.tile_ffn_down = nn.Linear(tile_ffn_hidden, TILE_EMBED_DIM)
 
         latent_ffn_hidden = self._actor_latent_dim * 2
         self.latent_ffn_norm = RMSNorm(self._actor_latent_dim)
@@ -2323,11 +2398,6 @@ class BuilderMLP(nn.Module):
         self.head_h_cand = _ortho_init(nn.Linear(self._recurrent_input_dim, H_DIM), std=0.01)
 
         self.register_buffer("_tile_dxdy", _TILE_DXDY.clone())
-        tile_coords = torch.arange(TILE_GRID_N, dtype=torch.long)
-        rope = RotaryEmbedding2D(TILE_EMBED_DIM, max_size=GRID_SIZE)
-        rope_cos, rope_sin = rope(tile_coords // GRID_SIZE, tile_coords % GRID_SIZE)
-        self.register_buffer("_tile_rope_cos", rope_cos)
-        self.register_buffer("_tile_rope_sin", rope_sin)
 
         with torch.no_grad():
             trunc_normal_(self.actor_cls, std=0.02)
@@ -2335,6 +2405,8 @@ class BuilderMLP(nn.Module):
             self.tile_sa_q_proj.bias.zero_()
             nn.init.eye_(self.cls_ca_q_proj.weight)
             self.cls_ca_q_proj.bias.zero_()
+            self.tile_ffn_down.weight.zero_()
+            self.tile_ffn_down.bias.zero_()
             self.latent_ffn_down.weight.zero_()
             self.latent_ffn_down.bias.zero_()
             self.head_build_type.bias.copy_(
@@ -2347,14 +2419,6 @@ class BuilderMLP(nn.Module):
                 if hasattr(self, attr):
                     delattr(self, attr)
         return super().train(mode)
-
-    def _apply_tile_rope(self, x: torch.Tensor) -> torch.Tensor:
-        rope_cos = self._tile_rope_cos
-        rope_sin = self._tile_rope_sin
-        if rope_cos.dtype != x.dtype:
-            rope_cos = rope_cos.to(dtype=x.dtype)
-            rope_sin = rope_sin.to(dtype=x.dtype)
-        return apply_rotary_2d(x.unsqueeze(1), rope_cos, rope_sin).squeeze(1)
 
     def _context_cross_attention(
         self,
@@ -2372,20 +2436,30 @@ class BuilderMLP(nn.Module):
         return F.silu(cls)
 
     def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
-        q = F.normalize(self._apply_tile_rope(self.tile_sa_q_proj(tiles)), dim=-1, eps=1e-6)
-        q = q * self.tile_sa_tau.exp()
-        k = self._apply_tile_rope(self.tile_sa_k_proj(tiles))
-        k = F.normalize(k, dim=-1, eps=1e-6)
+        """RBF attention: softmax(2γ(QK^T) - γ||K||²) @ V via SDPA."""
+        q = self.tile_sa_q_proj(tiles)
+        k = self.tile_sa_k_proj(tiles)
         v = self.tile_sa_v_proj(tiles)
+        gamma = self.tile_sa_gamma.exp()
+        k_norm_sq = (k * k).sum(dim=-1, keepdim=True).transpose(-1, -2)
+        gamma_scale = torch.sqrt(2.0 * gamma)
+        q = q * gamma_scale
+        k = k * gamma_scale
+        # attn_mask = -γ||k||² broadcast as (B, 1, 1, N_k)
+        rbf_bias = (-gamma * k_norm_sq).unsqueeze(1)
         attn_out = F.scaled_dot_product_attention(
-            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
+            attn_mask=rbf_bias, scale=1.0,
         ).squeeze(1)
         tiles = self.tile_sa_norm(tiles + attn_out)
-        return F.silu(tiles)
+        tiles = F.silu(tiles)
+        # Tile FFN: transform SA results before CLS reads them
+        tiles = tiles + self.tile_ffn_down(F.silu(self.tile_ffn_up(self.tile_ffn_norm(tiles))))
+        return tiles
 
     def _cls_cross_attention(self, cls: torch.Tensor, tiles: torch.Tensor) -> torch.Tensor:
         q = F.normalize(self.cls_ca_q_proj(cls), dim=-1, eps=1e-6)
-        q = q * self.cls_ca_tau.exp()
+        q = q * self.cls_ca_tau.exp().view(1, -1, 1)  # per-seed temperature
         k = F.normalize(self.cls_ca_k_proj(tiles), dim=-1, eps=1e-6)
         v = self.cls_ca_v_proj(tiles)
         attn_out = F.scaled_dot_product_attention(
@@ -2562,11 +2636,14 @@ class BuilderMLP(nn.Module):
             ("linear", self.head_h_cand),
             ("linear", self.tile_sa_q_proj),
             ("linear", self.cls_ca_q_proj),
-            ("param", self.tile_sa_tau),
+            ("param", self.tile_sa_gamma),
             ("param", self.cls_ca_tau),
             ("norm", self.latent_ffn_norm),
             ("linear", self.latent_ffn_up),
             ("linear", self.latent_ffn_down),
+            ("norm", self.tile_ffn_norm),
+            ("linear", self.tile_ffn_up),
+            ("linear", self.tile_ffn_down),
         ]
 
     def export_weights(self) -> list[list[float]]:
@@ -2588,15 +2665,18 @@ class BuilderMLP(nn.Module):
     def import_weights(self, state: list[list[float]]) -> None:
         """Load weights from tensor_lib JSON format."""
         entries = self._policy_state_entries()
-        new_item_count = 11
+        tile_ffn_item_count = 5
+        new_item_count = 16
         expected = sum(2 if kind == "linear" else 1 for kind, _ in entries)
+        previous_expected = expected - tile_ffn_item_count
         legacy_expected = expected - new_item_count
-        if len(state) not in (expected, legacy_expected):
+        supported = (expected, previous_expected, legacy_expected)
+        if len(state) not in supported:
             raise AssertionError(
-                f"State has {len(state)} entries, expected {expected} or legacy {legacy_expected}"
+                f"State has {len(state)} entries, expected one of {supported}"
             )
         dev = next(self.parameters()).device
-        if len(state) == legacy_expected:
+        if len(state) != expected:
             fresh = type(self)(hidden=list(self._hidden)).to(device=dev)
             default_state = fresh.export_weights()
             state = list(state) + default_state[len(state):]
@@ -2616,7 +2696,10 @@ class BuilderMLP(nn.Module):
                 idx += 1
             else:
                 param = obj
-                param.data = torch.tensor(state[idx], dtype=torch.float32, device=dev).view_as(param)
+                s = state[idx]
+                if len(s) == 1 and param.numel() > 1:
+                    s = s * param.numel()  # broadcast scalar to match new shape
+                param.data = torch.tensor(s, dtype=torch.float32, device=dev).view_as(param)
                 idx += 1
 
     def save_weights(self, path: str | Path = WEIGHT_PATH) -> None:
@@ -3827,7 +3910,7 @@ def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.o
         _centralized_critic = CentralizedCritic().to(DEVICE)
         if cuda_cfg.compile_model:
             _centralized_critic.encode_map = torch.compile(
-                _centralized_critic.encode_map, fullgraph=True,
+                _centralized_critic.encode_map,
             )
         _centralized_optimizer = torch.optim.Adam(
             _centralized_critic.parameters(), lr=lr,

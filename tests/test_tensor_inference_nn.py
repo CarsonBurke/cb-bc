@@ -3,6 +3,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INFER_DIR = PROJECT_ROOT / "bots" / "tensor_inference"
@@ -106,10 +107,50 @@ def test_actor_model_matches_exported_torch_actor():
     assert infer_out["h_cand"] == pytest.approx(cand[0].tolist(), rel=1e-5, abs=1e-5)
 
 
-def test_actor_load_accepts_legacy_state_prefix():
+def test_tile_rbf_gamma_gradient_matches_explicit_logits():
+    model = BuilderMLP().eval()
+    packed = torch.randn(2, OBS_SIZE + H_DIM)
+
+    with torch.no_grad():
+        tiles, _ = model._split_obs_pre(model._obs_encoder_pre(packed[:, :OBS_SIZE]))
+        q = model.tile_sa_q_proj(tiles)
+        k = model.tile_sa_k_proj(tiles)
+        v = model.tile_sa_v_proj(tiles)
+
+    gamma_param_actual = model.tile_sa_gamma.detach().clone().requires_grad_(True)
+    gamma_actual = gamma_param_actual.exp()
+    k_norm_sq = (k * k).sum(dim=-1, keepdim=True).transpose(-1, -2)
+    gamma_scale = torch.sqrt(2.0 * gamma_actual)
+    actual = F.scaled_dot_product_attention(
+        (q * gamma_scale).unsqueeze(1),
+        (k * gamma_scale).unsqueeze(1),
+        v.unsqueeze(1),
+        attn_mask=(-gamma_actual * k_norm_sq).unsqueeze(1),
+        scale=1.0,
+    ).squeeze(1)
+    actual.sum().backward()
+
+    gamma_param_expected = model.tile_sa_gamma.detach().clone().requires_grad_(True)
+    gamma_expected = gamma_param_expected.exp()
+    qk = torch.bmm(q, k.transpose(-1, -2))
+    expected_scores = 2.0 * gamma_expected * qk - gamma_expected * k_norm_sq
+    expected = torch.bmm(torch.softmax(expected_scores, dim=-1), v)
+    expected.sum().backward()
+
+    assert gamma_param_actual.grad is not None
+    assert gamma_param_expected.grad is not None
+    torch.testing.assert_close(
+        gamma_param_actual.grad,
+        gamma_param_expected.grad,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_actor_load_accepts_legacy_state_schema():
     torch_model = BuilderMLP().eval()
     full_state = torch_model.export_weights()
-    legacy_state = full_state[:-11]
+    legacy_state = full_state[:-16]
 
     infer_model = ActorModel(
         output_heads={
@@ -142,6 +183,30 @@ def test_actor_load_accepts_legacy_state_prefix():
     assert infer_out["conv_dir"] == pytest.approx(cd_l[0].tolist(), rel=1e-5, abs=1e-5)
     assert infer_out["bridge_target"] == pytest.approx(brt_l[0].tolist(), rel=1e-5, abs=1e-5)
     assert infer_out["move_dir"] == pytest.approx(md_l[0].tolist(), rel=1e-5, abs=1e-5)
+
+
+def test_actor_load_rejects_partial_truncation():
+    full_state = BuilderMLP().eval().export_weights()
+    truncated_state = full_state[:-1]
+
+    infer_model = ActorModel(
+        output_heads={
+            "build_type": 13,
+            "build_dir": 9,
+            "conv_dir": 4,
+            "bridge_target": 28,
+            "move_dir": 9,
+            "temperature": 5,
+            "h_gate": H_DIM,
+            "h_cand": H_DIM,
+        },
+    )
+
+    with pytest.raises(AssertionError, match="expected"):
+        infer_model.load(truncated_state)
+
+    with pytest.raises(AssertionError, match="expected"):
+        BuilderMLP().eval().import_weights(truncated_state)
 
 
 def test_actor_model_matches_exported_torch_actor_on_symbolic_obs():

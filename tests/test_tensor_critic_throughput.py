@@ -165,6 +165,38 @@ def test_critic_global_layout_keeps_padded_unit_queries_nonempty():
     assert (unit_bias_slice[invalid_queries] == float('-inf')).all()
 
 
+def test_critic_windowed_sa_grouped_flash_layout_matches_flattened_windows():
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    layer = model_mod.CriticWindowedSA().to(device).eval()
+    pH, pW = 7, 9
+    n_rounds = 3
+    dim = layer.attn.n_heads * layer.attn.head_dim
+    patches = torch.randn(n_rounds, pH * pW, dim, device=device)
+
+    with torch.no_grad():
+        actual = layer(patches, pH, pW)
+
+        x = patches.reshape(n_rounds, pH, pW, dim)
+        grouped_windows, pad_hw = model_mod.critic_window_partition(x, layer.window_size)
+        flat_windows = grouped_windows.reshape(-1, grouped_windows.shape[-2], grouped_windows.shape[-1])
+        q, k, v = layer.attn.project_qkv(
+            flat_windows,
+            rope_cos=layer._local_rope_cos,
+            rope_sin=layer._local_rope_sin,
+        )
+        flat_out = layer.attn.attend(q, k, v)
+        expected_windows = layer.attn.apply_residual_mlp(flat_windows, flat_out)
+        expected = model_mod.critic_window_unpartition(
+            expected_windows.reshape_as(grouped_windows),
+            layer.window_size,
+            pad_hw,
+            (pH, pW),
+        ).reshape(n_rounds, pH * pW, dim)
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_critic_global_layout_initializes_padded_unit_rope_to_identity():
     device = torch.device("cpu")
     layer = model_mod.CriticGlobalSA().to(device)
