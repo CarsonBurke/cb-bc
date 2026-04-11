@@ -2692,9 +2692,7 @@ class BuilderMLP(nn.Module):
             )
         dev = next(self.parameters()).device
         if len(state) != expected:
-            fresh = type(self)(hidden=list(self._hidden)).to(device=dev)
-            default_state = fresh.export_weights()
-            state = list(state) + default_state[len(state):]
+            state = list(state) + self._legacy_policy_padding(len(state))
         idx = 0
         for kind, obj in entries:
             if kind == "linear":
@@ -2716,6 +2714,79 @@ class BuilderMLP(nn.Module):
                     s = s * param.numel()  # broadcast scalar to match new shape
                 param.data = torch.tensor(s, dtype=torch.float32, device=dev).view_as(param)
                 idx += 1
+
+    def _legacy_policy_padding(self, state_len: int) -> list[list[float]]:
+        """Deterministic compatibility padding for old inference schemas."""
+        pad: list[list[float]] = []
+
+        if state_len <= 43:
+            pad.append([0.0] * self.cls_ca_tau.numel())
+            pad.append([1.0] * self.latent_ffn_norm.weight.numel())
+            pad.append([0.0] * (self.latent_ffn_up.in_features * self.latent_ffn_up.out_features))
+            pad.append([0.0] * self.latent_ffn_up.out_features)
+            pad.append([0.0] * (self.latent_ffn_down.in_features * self.latent_ffn_down.out_features))
+            pad.append([0.0] * self.latent_ffn_down.out_features)
+
+        if state_len <= 49:
+            pad.append([1.0] * self.tile_ffn_norm.weight.numel())
+            pad.append([0.0] * (self.tile_ffn_up.in_features * self.tile_ffn_up.out_features))
+            pad.append([0.0] * self.tile_ffn_up.out_features)
+            pad.append([0.0] * (self.tile_ffn_down.in_features * self.tile_ffn_down.out_features))
+            pad.append([0.0] * self.tile_ffn_down.out_features)
+
+        if state_len <= 54:
+            for norm in (
+                self.context_ca_input_norm,
+                self.tile_sa_out_norm,
+                self.tile_ffn_out_norm,
+                self.cls_ca_input_norm,
+                self.latent_ffn_out_norm,
+            ):
+                pad.append([1.0] * norm.weight.numel())
+
+        return pad
+
+    def _legacy_state_dict_defaults(self) -> dict[str, torch.Tensor]:
+        """Compatibility defaults for parameters absent from old actor state_dicts."""
+        defaults: dict[str, torch.Tensor] = {
+            "cls_ca_tau": torch.zeros_like(self.cls_ca_tau),
+            "latent_ffn_norm.weight": torch.ones_like(self.latent_ffn_norm.weight),
+            "latent_ffn_up.weight": torch.zeros_like(self.latent_ffn_up.weight),
+            "latent_ffn_up.bias": torch.zeros_like(self.latent_ffn_up.bias),
+            "latent_ffn_down.weight": torch.zeros_like(self.latent_ffn_down.weight),
+            "latent_ffn_down.bias": torch.zeros_like(self.latent_ffn_down.bias),
+            "tile_ffn_norm.weight": torch.ones_like(self.tile_ffn_norm.weight),
+            "tile_ffn_up.weight": torch.zeros_like(self.tile_ffn_up.weight),
+            "tile_ffn_up.bias": torch.zeros_like(self.tile_ffn_up.bias),
+            "tile_ffn_down.weight": torch.zeros_like(self.tile_ffn_down.weight),
+            "tile_ffn_down.bias": torch.zeros_like(self.tile_ffn_down.bias),
+            "context_ca_input_norm.weight": torch.ones_like(self.context_ca_input_norm.weight),
+            "tile_sa_out_norm.weight": torch.ones_like(self.tile_sa_out_norm.weight),
+            "tile_ffn_out_norm.weight": torch.ones_like(self.tile_ffn_out_norm.weight),
+            "cls_ca_input_norm.weight": torch.ones_like(self.cls_ca_input_norm.weight),
+            "latent_ffn_out_norm.weight": torch.ones_like(self.latent_ffn_out_norm.weight),
+        }
+        return defaults
+
+    def _import_legacy_state_dict(self, data: dict[str, torch.Tensor]) -> None:
+        """Load legacy actor state_dicts with deterministic defaults for new params."""
+        current = self.state_dict()
+        compat = {k: v.clone() for k, v in current.items()}
+        compat.update({k: v.clone() for k, v in self._legacy_state_dict_defaults().items()})
+
+        for key, value in data.items():
+            if key not in compat:
+                continue
+            target = compat[key]
+            if not isinstance(value, torch.Tensor):
+                continue
+            incoming = value.to(device=target.device, dtype=target.dtype)
+            if incoming.shape == target.shape:
+                compat[key] = incoming
+            elif incoming.numel() == 1 and target.numel() > 1:
+                compat[key] = incoming.reshape(1).expand_as(target).clone()
+
+        self.load_state_dict(compat, strict=True)
 
     def save_weights(self, path: str | Path = WEIGHT_PATH) -> None:
         """Save weights. Uses JSON for .json, pickle list format for .pkl (bot compat)."""
@@ -2742,7 +2813,7 @@ class BuilderMLP(nn.Module):
                     data = pickle.load(f)
                 if isinstance(data, dict):
                     # torch state_dict format (legacy, may have extra critic keys)
-                    self.load_state_dict(data, strict=False)
+                    self._import_legacy_state_dict(data)
                 else:
                     # list-of-lists format (current + old pickle)
                     self.import_weights(data)

@@ -1,4 +1,5 @@
 from pathlib import Path
+import pickle
 import sys
 
 import pytest
@@ -184,6 +185,47 @@ def test_actor_load_accepts_legacy_state_schema():
     assert infer_out["conv_dir"] == pytest.approx(cd_l[0].tolist(), rel=1e-5, abs=1e-5)
     assert infer_out["bridge_target"] == pytest.approx(brt_l[0].tolist(), rel=1e-5, abs=1e-5)
     assert infer_out["move_dir"] == pytest.approx(md_l[0].tolist(), rel=1e-5, abs=1e-5)
+
+
+def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
+    torch_model = BuilderMLP().eval()
+    full_state = torch_model.state_dict()
+    legacy_keys = {
+        "cls_ca_tau",
+        "latent_ffn_norm.weight",
+        "latent_ffn_up.weight",
+        "latent_ffn_up.bias",
+        "latent_ffn_down.weight",
+        "latent_ffn_down.bias",
+        "tile_ffn_norm.weight",
+        "tile_ffn_up.weight",
+        "tile_ffn_up.bias",
+        "tile_ffn_down.weight",
+        "tile_ffn_down.bias",
+        "context_ca_input_norm.weight",
+        "tile_sa_out_norm.weight",
+        "tile_ffn_out_norm.weight",
+        "cls_ca_input_norm.weight",
+        "latent_ffn_out_norm.weight",
+    }
+    legacy_state = {k: v.clone() for k, v in full_state.items() if k not in legacy_keys}
+    ckpt_path = tmp_path / "legacy_actor_state.pkl"
+    with ckpt_path.open("wb") as f:
+        pickle.dump(legacy_state, f)
+
+    compat_model = BuilderMLP().eval()
+    compat_model.import_weights(torch_model.export_weights()[:-16])
+
+    loaded_model = BuilderMLP().eval()
+    assert loaded_model.load_weights(ckpt_path)
+
+    obs, h_prev, packed = _make_valid_packed_obs()
+    with torch.no_grad():
+        compat_out = compat_model.infer_packed(packed)
+        loaded_out = loaded_model.infer_packed(packed)
+
+    for compat_tensor, loaded_tensor in zip(compat_out[:5], loaded_out[:5], strict=True):
+        assert loaded_tensor[0].tolist() == pytest.approx(compat_tensor[0].tolist(), rel=1e-5, abs=1e-5)
 
 
 def test_actor_load_rejects_partial_truncation():

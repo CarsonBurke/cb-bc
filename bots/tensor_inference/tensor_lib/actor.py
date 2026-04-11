@@ -898,8 +898,7 @@ class ActorModel:
                 f"State has {len(state)} entries, expected one of {supported}"
             )
         if len(state) != len(params):
-            default_state = ActorModel(self._output_heads).save()
-            state = list(state) + default_state[len(state):]
+            state = list(state) + self._legacy_padding(len(state))
         for p, s in zip(params, state):
             if len(p.data) != len(s):
                 # Handle shape migration (e.g. cls_ca_tau 1→4): broadcast scalar
@@ -909,3 +908,34 @@ class ActorModel:
                     raise AssertionError(f"Param size mismatch: {len(p.data)} vs {len(s)}")
             p.data[:] = s
         self._infer_cache = None
+
+    def _legacy_padding(self, state_len: int) -> list[list[float]]:
+        """Deterministic compatibility padding for old exported actor schemas."""
+        pad: list[list[float]] = []
+
+        if state_len <= 43:
+            pad.append([0.0] * len(self.cls_ca_tau.data))
+            pad.append([1.0] * len(self.latent_ffn_norm.gamma.data))
+            pad.append([0.0] * len(self.latent_ffn_up.weight.data))
+            pad.append([0.0] * len(self.latent_ffn_up.bias.data))
+            pad.append([0.0] * len(self.latent_ffn_down.weight.data))
+            pad.append([0.0] * len(self.latent_ffn_down.bias.data))
+
+        if state_len <= 49:
+            pad.append([1.0] * len(self.tile_ffn_norm.gamma.data))
+            pad.append([0.0] * len(self.tile_ffn_up.weight.data))
+            pad.append([0.0] * len(self.tile_ffn_up.bias.data))
+            pad.append([0.0] * len(self.tile_ffn_down.weight.data))
+            pad.append([0.0] * len(self.tile_ffn_down.bias.data))
+
+        if state_len <= 54:
+            for norm in (
+                self.context_ca_input_norm,
+                self.tile_sa_out_norm,
+                self.tile_ffn_out_norm,
+                self.cls_ca_input_norm,
+                self.latent_ffn_out_norm,
+            ):
+                pad.append([1.0] * len(norm.gamma.data))
+
+        return pad
