@@ -613,7 +613,7 @@ class CriticAttentionBlock(nn.Module):
     def _init_weights(self):
         for m in [self.q_proj, self.k_proj, self.v_proj, self.out_proj,
                    self.mlp_fc1, self.mlp_fc2]:
-            trunc_normal_(m.weight, std=0.02)
+            nn.init.xavier_uniform_(m.weight)
 
     def project_qkv(
         self,
@@ -827,7 +827,9 @@ class CriticTileEmbed(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=0.02)
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (R, C, H, W) → (R, embed_dim, H, W)."""
@@ -1132,7 +1134,7 @@ class CriticUnitCLSBuilder(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=0.02)
+                nn.init.xavier_uniform_(m.weight)
 
     def forward(self, actor_latent: torch.Tensor, unit_context: torch.Tensor) -> torch.Tensor:
         """actor_latent: (B, 64), unit_context: (B, 7) → (B, out_dim)."""
@@ -1171,7 +1173,7 @@ class CriticValueHead(nn.Module):
     def _init_weights(self):
         for m in self.mlp:
             if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=0.02)
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         nn.init.zeros_(self.mlp[-1].weight)
@@ -1236,7 +1238,7 @@ class CentralizedCritic(nn.Module):
             RMSNorm(dim),
             nn.SiLU(),
         )
-        trunc_normal_(self.scalar_proj[0].weight, std=0.02)
+        nn.init.xavier_uniform_(self.scalar_proj[0].weight)
 
         # Learned global CLS tokens
         self.global_cls = nn.Parameter(torch.zeros(self._N_GLOBAL_CLS, dim))
@@ -1918,6 +1920,14 @@ def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float =
     return layer
 
 
+def _xavier_init(layer: nn.Linear, gain: float = 1.0, bias_const: float = 0.0) -> nn.Linear:
+    """Xavier uniform init for Peri-LN transformer-style linear layers."""
+    nn.init.xavier_uniform_(layer.weight, gain=gain)
+    if layer.bias is not None:
+        nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
 def _temperature_scaled_log_probs(
     logits: torch.Tensor,
     mask: torch.Tensor | None = None,
@@ -2359,16 +2369,16 @@ class BuilderMLP(nn.Module):
             self._actor_latent_dim = self._actor_cls_tokens * TILE_EMBED_DIM
         self._recurrent_input_dim = self._actor_latent_dim + H_DIM
 
-        self.tile_linear = _ortho_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM))
-        self.context_proj = _ortho_init(nn.Linear(GLOBAL_FEATURES, ACTOR_CONTEXT_DIM))
-        self.context_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.context_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.tile_sa_q_proj = nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
-        self.tile_sa_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.tile_sa_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.cls_ca_q_proj = nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
-        self.cls_ca_k_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.cls_ca_v_proj = _ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_linear = _xavier_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM))
+        self.context_proj = _xavier_init(nn.Linear(GLOBAL_FEATURES, ACTOR_CONTEXT_DIM))
+        self.context_k_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.context_v_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_q_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_k_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_v_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_q_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_k_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_v_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
 
         self.context_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
@@ -2386,14 +2396,14 @@ class BuilderMLP(nn.Module):
 
         tile_ffn_hidden = TILE_EMBED_DIM * 2
         self.tile_ffn_norm = RMSNorm(TILE_EMBED_DIM)
-        self.tile_ffn_up = _ortho_init(nn.Linear(TILE_EMBED_DIM, tile_ffn_hidden))
-        self.tile_ffn_down = nn.Linear(tile_ffn_hidden, TILE_EMBED_DIM)
+        self.tile_ffn_up = _xavier_init(nn.Linear(TILE_EMBED_DIM, tile_ffn_hidden))
+        self.tile_ffn_down = _xavier_init(nn.Linear(tile_ffn_hidden, TILE_EMBED_DIM))
 
         latent_ffn_hidden = self._actor_latent_dim * 2
         self.latent_ffn_norm = RMSNorm(self._actor_latent_dim)
         self.latent_ffn_out_norm = RMSNorm(self._actor_latent_dim)
-        self.latent_ffn_up = _ortho_init(nn.Linear(self._actor_latent_dim, latent_ffn_hidden))
-        self.latent_ffn_down = nn.Linear(latent_ffn_hidden, self._actor_latent_dim)
+        self.latent_ffn_up = _xavier_init(nn.Linear(self._actor_latent_dim, latent_ffn_hidden))
+        self.latent_ffn_down = _xavier_init(nn.Linear(latent_ffn_hidden, self._actor_latent_dim))
 
         self.head_build_type = _ortho_init(nn.Linear(self._actor_latent_dim, N_BUILD), std=0.01)
         self.head_build_dir = _ortho_init(nn.Linear(self._actor_latent_dim, N_DIR), std=0.01)
@@ -2408,14 +2418,6 @@ class BuilderMLP(nn.Module):
 
         with torch.no_grad():
             trunc_normal_(self.actor_cls, std=0.02)
-            nn.init.eye_(self.tile_sa_q_proj.weight)
-            self.tile_sa_q_proj.bias.zero_()
-            nn.init.eye_(self.cls_ca_q_proj.weight)
-            self.cls_ca_q_proj.bias.zero_()
-            self.tile_ffn_down.weight.zero_()
-            self.tile_ffn_down.bias.zero_()
-            self.latent_ffn_down.weight.zero_()
-            self.latent_ffn_down.bias.zero_()
             self.head_build_type.bias.copy_(
                 torch.tensor(INITIAL_BUILD_TYPE_BIAS, dtype=torch.float32),
             )

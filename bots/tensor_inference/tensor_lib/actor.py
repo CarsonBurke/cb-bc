@@ -319,23 +319,6 @@ class ActorModel:
         self._cls_v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
         self._scaled_cls_k = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
 
-        self._init_identity_linear(self.tile_sa_q_proj)
-        self._init_identity_linear(self.cls_ca_q_proj)
-        self.latent_ffn_down.weight.data[:] = [0.0] * len(self.latent_ffn_down.weight.data)
-        self.latent_ffn_down.bias.data[:] = [0.0] * len(self.latent_ffn_down.bias.data)
-        self.tile_ffn_down.weight.data[:] = [0.0] * len(self.tile_ffn_down.weight.data)
-        self.tile_ffn_down.bias.data[:] = [0.0] * len(self.tile_ffn_down.bias.data)
-
-    @staticmethod
-    def _init_identity_linear(layer: Linear) -> None:
-        data = layer.weight.data
-        for i in range(layer.in_features):
-            row_base = i * layer.out_features
-            for j in range(layer.out_features):
-                data[row_base + j] = 1.0 if i == j else 0.0
-        if layer.bias is not None:
-            layer.bias.data[:] = [0.0] * len(layer.bias.data)
-
     def parameters(self) -> list[Tensor]:
         params: list[Tensor] = []
         for layer in (
