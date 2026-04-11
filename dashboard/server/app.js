@@ -20,6 +20,9 @@ const trainLogCache = new Map()
 const gameLogCache = new Map()
 const leagueCache = new Map()
 const jsonResponseCache = new Map()
+const jsonResponseKeysByFile = new Map()
+const trainSessionsListCache = { mtime: 0, data: null }
+const dashboardFileCache = new Map()
 
 const MIME_TYPES = {
   '.css': 'text/css; charset=utf-8',
@@ -60,7 +63,7 @@ function sendJson(res, payload, statusCode = 200) {
   res.end(JSON.stringify(payload))
 }
 
-function sendCachedJson(res, cacheKey, buildPayload) {
+function sendCachedJson(res, cacheKey, buildPayload, filePath = null) {
   const cached = jsonResponseCache.get(cacheKey)
   if (cached) {
     sendBuffer(res, cached, 'application/json; charset=utf-8')
@@ -68,6 +71,14 @@ function sendCachedJson(res, cacheKey, buildPayload) {
   }
   const buf = Buffer.from(JSON.stringify(buildPayload()))
   jsonResponseCache.set(cacheKey, buf)
+  if (filePath) {
+    let set = jsonResponseKeysByFile.get(filePath)
+    if (!set) {
+      set = new Set()
+      jsonResponseKeysByFile.set(filePath, set)
+    }
+    set.add(cacheKey)
+  }
   sendBuffer(res, buf, 'application/json; charset=utf-8')
 }
 
@@ -130,7 +141,32 @@ function getReplayListing(dir) {
   return files
 }
 
+function countJsonlEpisodes(filePath) {
+  let stats
+  try {
+    stats = statSync(filePath)
+  } catch {
+    return null
+  }
+  const cached = trainSessionLogCache.get(filePath)
+  if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
+    return cached.episodes
+  }
+  const buf = readFileSync(filePath)
+  let newlines = 0
+  for (let i = 0; i < buf.length; i++) if (buf[i] === 10) newlines++
+  if (buf.length > 0 && buf[buf.length - 1] !== 10) newlines++
+  const episodes = Math.max(0, newlines - 1)
+  trainSessionLogCache.set(filePath, { mtime: stats.mtimeMs, size: stats.size, episodes })
+  return episodes
+}
+
 function readTrainSessions() {
+  const sessionsMtime = statSync(SESSIONS_DIR).mtimeMs
+  if (trainSessionsListCache.data && trainSessionsListCache.mtime === sessionsMtime) {
+    return trainSessionsListCache.data
+  }
+
   const dirs = readdirSync(SESSIONS_DIR, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => {
@@ -144,37 +180,37 @@ function readTrainSessions() {
       }
 
       let episodes = 0
-      try {
-        const jsonlPath = resolve(sessionPath, 'train_log.jsonl')
-        const jsonPath = resolve(sessionPath, 'train_log.json')
-        if (existsSync(jsonlPath)) {
-          const stats = statSync(jsonlPath)
-          const cached = trainSessionLogCache.get(jsonlPath)
-          if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
-            episodes = cached.episodes
-          } else {
-            const lines = readFileSync(jsonlPath, 'utf8').trimEnd().split('\n')
-            episodes = Math.max(0, lines.length - 1)
-            trainSessionLogCache.set(jsonlPath, { mtime: stats.mtimeMs, size: stats.size, episodes })
-          }
-        } else if (existsSync(jsonPath)) {
+      const jsonlPath = resolve(sessionPath, 'train_log.jsonl')
+      const counted = countJsonlEpisodes(jsonlPath)
+      if (counted != null) {
+        episodes = counted
+      } else {
+        try {
+          const jsonPath = resolve(sessionPath, 'train_log.json')
           const log = JSON.parse(readFileSync(jsonPath, 'utf8'))
           episodes = log.episodes?.length || 0
+        } catch {
+          // Ignore broken session logs.
         }
-      } catch {
-        // Ignore broken session logs.
       }
 
-      const stats = statSync(sessionPath)
+      let sessionMtime = 0
+      try {
+        sessionMtime = statSync(sessionPath).mtimeMs
+      } catch {
+        // session dir vanished mid-iteration; leave mtime = 0
+      }
       return {
         id: entry.name,
         ...meta,
         episodes,
-        mtime: stats.mtimeMs,
+        mtime: sessionMtime,
       }
     })
     .sort((a, b) => b.mtime - a.mtime)
 
+  trainSessionsListCache.data = dirs
+  trainSessionsListCache.mtime = sessionsMtime
   return dirs
 }
 
@@ -190,8 +226,10 @@ function readIncrementalJsonl(cacheMap, filePath, parseFirstLineAsConfig = false
 
   if (!cached || cached.size !== stats.size) {
     // Evict serialized response cache — underlying data changed
-    for (const key of jsonResponseCache.keys()) {
-      if (key.includes(filePath)) jsonResponseCache.delete(key)
+    const affectedKeys = jsonResponseKeysByFile.get(filePath)
+    if (affectedKeys) {
+      for (const key of affectedKeys) jsonResponseCache.delete(key)
+      affectedKeys.clear()
     }
     let updatedIncrementally = false
     if (canIncrementallyRead) {
@@ -296,30 +334,52 @@ function tryServeViewerFile(res, pathname) {
   return true
 }
 
-function tryServeDashboardFile(res, pathname) {
+function statFileOrNull(filePath) {
+  try {
+    const st = statSync(filePath)
+    return st.isFile() ? st : null
+  } catch {
+    return null
+  }
+}
+
+function resolveDashboardPath(pathname) {
+  const cached = dashboardFileCache.get(pathname)
+  if (cached !== undefined) return cached
+
   const normalized = pathname === '/' ? '/index.html' : pathname
   const relative = normalized.slice(1)
-  if (!relative || relative.includes('..') || relative.includes('\\')) return false
+  if (!relative || relative.includes('..') || relative.includes('\\')) {
+    dashboardFileCache.set(pathname, null)
+    return null
+  }
 
   const distPath = resolve(DIST_DIR, relative)
-  if (existsSync(distPath) && statSync(distPath).isFile()) {
-    serveFile(res, distPath)
-    return true
+  if (statFileOrNull(distPath)) {
+    dashboardFileCache.set(pathname, distPath)
+    return distPath
   }
 
   const publicPath = resolve(PUBLIC_DIR, relative)
-  if (existsSync(publicPath) && statSync(publicPath).isFile()) {
-    serveFile(res, publicPath)
-    return true
+  if (statFileOrNull(publicPath)) {
+    dashboardFileCache.set(pathname, publicPath)
+    return publicPath
   }
 
   const indexPath = resolve(DIST_DIR, 'index.html')
-  if (existsSync(indexPath)) {
-    serveFile(res, indexPath)
-    return true
+  if (statFileOrNull(indexPath)) {
+    dashboardFileCache.set(pathname, indexPath)
+    return indexPath
   }
 
-  return false
+  return null
+}
+
+function tryServeDashboardFile(res, pathname) {
+  const filePath = resolveDashboardPath(pathname)
+  if (!filePath) return false
+  serveFile(res, filePath)
+  return true
 }
 
 async function handleRequest(req, res) {
@@ -439,7 +499,7 @@ async function handleRequest(req, res) {
             config: entry.config,
             total: entry.rows.length,
           }
-        })
+        }, jsonlPath)
       } else {
         sendBuffer(res, Buffer.from(readFileSync(jsonPath, 'utf8')), 'application/json; charset=utf-8')
       }
@@ -474,7 +534,7 @@ async function handleRequest(req, res) {
           )
         }
         return { games, total: entry.rows.length }
-      })
+      }, logPath)
     } catch {
       sendJson(res, { games: [], total: 0 })
     }
@@ -524,7 +584,7 @@ async function handleRequest(req, res) {
         const latestEp = summaries.length ? summaries[summaries.length - 1].episode : null
         const latestGames = latestEp != null ? (byEp.get(latestEp) || []) : []
         return { episodes: summaries.map(s => s.episode), summaries, latestEp, latestGames }
-      })
+      }, logPath)
     } catch {
       sendJson(res, { episodes: [], summaries: [] })
     }
