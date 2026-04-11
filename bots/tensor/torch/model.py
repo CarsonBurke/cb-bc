@@ -577,7 +577,7 @@ def apply_rotary_2d(
 
 
 class CriticAttentionBlock(nn.Module):
-    """Transformer block with GQA, QK-norm, and optional RoPE."""
+    """Peri-LN transformer block with GQA, QK-norm, and optional RoPE."""
 
     def __init__(
         self,
@@ -593,18 +593,20 @@ class CriticAttentionBlock(nn.Module):
         self.kv_group_size = n_heads // n_kv_heads
         kv_dim = n_kv_heads * self.head_dim
 
-        self.norm1 = RMSNorm(dim)
+        self.attn_input_norm = RMSNorm(dim)
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, kv_dim, bias=False)
         self.v_proj = nn.Linear(dim, kv_dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.attn_output_norm = RMSNorm(dim)
 
-        self.norm2 = RMSNorm(dim)
+        self.mlp_input_norm = RMSNorm(dim)
         mlp_hidden = dim * mlp_ratio
         self.mlp_fc1 = nn.Linear(dim, mlp_hidden, bias=False)
         self.mlp_fc2 = nn.Linear(mlp_hidden, dim, bias=False)
+        self.mlp_output_norm = RMSNorm(dim)
 
         self._init_weights()
 
@@ -621,7 +623,7 @@ class CriticAttentionBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project normalized tokens into Q/K/V, applying RoPE when requested."""
         B, N, _ = x.shape
-        h = self.norm1(x)
+        h = self.attn_input_norm(x)
         q = self.q_proj(h).reshape(B, N, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(h).reshape(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(h).reshape(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -648,7 +650,7 @@ class CriticAttentionBlock(nn.Module):
             Q/K/V in (B, G, heads, N, head_dim) form.
         """
         B, G, N, _ = x.shape
-        h = self.norm1(x)
+        h = self.attn_input_norm(x)
         q = self.q_proj(h).reshape(B, G, N, self.n_heads, self.head_dim).movedim(3, 2)
         k = self.k_proj(h).reshape(B, G, N, self.n_kv_heads, self.head_dim).movedim(3, 2)
         v = self.v_proj(h).reshape(B, G, N, self.n_kv_heads, self.head_dim).movedim(3, 2)
@@ -709,9 +711,9 @@ class CriticAttentionBlock(nn.Module):
         return self.out_proj(attn_out)
 
     def apply_mlp_residual(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the post-attention MLP residual block."""
-        h = self.norm2(x)
-        return x + self.mlp_fc2(F.silu(self.mlp_fc1(h)))
+        """Apply the peri-normalized MLP residual block."""
+        h = self.mlp_input_norm(x)
+        return x + self.mlp_output_norm(self.mlp_fc2(F.silu(self.mlp_fc1(h))))
 
     def apply_residual_mlp(
         self,
@@ -719,7 +721,7 @@ class CriticAttentionBlock(nn.Module):
         attn_out: torch.Tensor,
     ) -> torch.Tensor:
         """Apply output projection, residual update, and MLP block."""
-        x = x + self.project_attn_residual(attn_out)
+        x = x + self.attn_output_norm(self.project_attn_residual(attn_out))
         return self.apply_mlp_residual(x)
 
     def forward(
@@ -2372,6 +2374,10 @@ class BuilderMLP(nn.Module):
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
         self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_norm = RMSNorm(self._actor_latent_dim)
+        self.context_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
+        self.tile_sa_out_norm = RMSNorm(TILE_EMBED_DIM)
+        self.tile_ffn_out_norm = RMSNorm(TILE_EMBED_DIM)
+        self.cls_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
 
         self.actor_cls = nn.Parameter(torch.zeros(self._actor_cls_tokens, TILE_EMBED_DIM))
         self.context_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))
@@ -2385,6 +2391,7 @@ class BuilderMLP(nn.Module):
 
         latent_ffn_hidden = self._actor_latent_dim * 2
         self.latent_ffn_norm = RMSNorm(self._actor_latent_dim)
+        self.latent_ffn_out_norm = RMSNorm(self._actor_latent_dim)
         self.latent_ffn_up = _ortho_init(nn.Linear(self._actor_latent_dim, latent_ffn_hidden))
         self.latent_ffn_down = nn.Linear(latent_ffn_hidden, self._actor_latent_dim)
 
@@ -2426,17 +2433,17 @@ class BuilderMLP(nn.Module):
         context_tokens: torch.Tensor,
     ) -> torch.Tensor:
         # Fold per-token tau into q so SDPA uses scale=1.0 (CUDA-graph safe).
-        q = F.normalize(cls, dim=-1, eps=1e-6) * self.context_tau.exp().view(1, -1, 1)
+        q = F.normalize(self.context_ca_input_norm(cls), dim=-1, eps=1e-6)
+        q = q * self.context_tau.exp().view(1, -1, 1)
         k = F.normalize(self.context_k_proj(context_tokens), dim=-1, eps=1e-6)
         v = self.context_v_proj(context_tokens)
         attn_out = F.scaled_dot_product_attention(
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
         ).squeeze(1)
-        cls = self.context_ca_norm(cls + attn_out)
-        return F.silu(cls)
+        return F.silu(cls + self.context_ca_norm(attn_out))
 
     def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
-        """Pre-norm RBF self-attention + FFN residual block over tile tokens."""
+        """Peri-LN RBF self-attention + FFN residual block over tile tokens."""
         normed_tiles = self.tile_sa_norm(tiles)
         q = self.tile_sa_q_proj(normed_tiles)
         k = self.tile_sa_k_proj(normed_tiles)
@@ -2452,24 +2459,25 @@ class BuilderMLP(nn.Module):
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
             attn_mask=rbf_bias, scale=1.0,
         ).squeeze(1)
-        tiles = tiles + attn_out
-        tiles = tiles + self.tile_ffn_down(F.silu(self.tile_ffn_up(self.tile_ffn_norm(tiles))))
+        tiles = tiles + self.tile_sa_out_norm(attn_out)
+        tiles = tiles + self.tile_ffn_out_norm(
+            self.tile_ffn_down(F.silu(self.tile_ffn_up(self.tile_ffn_norm(tiles)))),
+        )
         return tiles
 
     def _cls_cross_attention(self, cls: torch.Tensor, tiles: torch.Tensor) -> torch.Tensor:
-        q = F.normalize(self.cls_ca_q_proj(cls), dim=-1, eps=1e-6)
+        q = F.normalize(self.cls_ca_q_proj(self.cls_ca_input_norm(cls)), dim=-1, eps=1e-6)
         q = q * self.cls_ca_tau.exp().view(1, -1, 1)  # per-seed temperature
         k = F.normalize(self.cls_ca_k_proj(tiles), dim=-1, eps=1e-6)
         v = self.cls_ca_v_proj(tiles)
         attn_out = F.scaled_dot_product_attention(
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
         ).squeeze(1)
-        cls = self.cls_ca_norm(cls + attn_out)
-        return F.silu(cls)
+        return F.silu(cls + self.cls_ca_norm(attn_out))
 
     def _latent_ffn(self, latent: torch.Tensor) -> torch.Tensor:
         hidden = F.silu(self.latent_ffn_up(self.latent_ffn_norm(latent)))
-        return latent + self.latent_ffn_down(hidden)
+        return latent + self.latent_ffn_out_norm(self.latent_ffn_down(hidden))
 
     def _encode_tiles(self, obs: torch.Tensor) -> torch.Tensor:
         B = obs.shape[0]
@@ -2497,8 +2505,8 @@ class BuilderMLP(nn.Module):
         cls = self._context_cross_attention(cls, torch.cat([global_ctx, recurrent_ctx], dim=1))
         tiles = self._tile_self_attention(tiles)
         cls = self._cls_cross_attention(cls, tiles)
-        latent = self.latent_norm(cls.reshape(obs_pre.shape[0], self._actor_latent_dim))
-        return self._latent_ffn(latent)
+        latent = self._latent_ffn(cls.reshape(obs_pre.shape[0], self._actor_latent_dim))
+        return self.latent_norm(latent)
 
     def actor_latent(self, x: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         obs_pre = self._obs_encoder_pre(x)
@@ -2643,6 +2651,11 @@ class BuilderMLP(nn.Module):
             ("norm", self.tile_ffn_norm),
             ("linear", self.tile_ffn_up),
             ("linear", self.tile_ffn_down),
+            ("norm", self.context_ca_input_norm),
+            ("norm", self.tile_sa_out_norm),
+            ("norm", self.tile_ffn_out_norm),
+            ("norm", self.cls_ca_input_norm),
+            ("norm", self.latent_ffn_out_norm),
         ]
 
     def export_weights(self) -> list[list[float]]:
@@ -2664,12 +2677,13 @@ class BuilderMLP(nn.Module):
     def import_weights(self, state: list[list[float]]) -> None:
         """Load weights from tensor_lib JSON format."""
         entries = self._policy_state_entries()
-        tile_ffn_item_count = 5
-        new_item_count = 16
         expected = sum(2 if kind == "linear" else 1 for kind, _ in entries)
-        previous_expected = expected - tile_ffn_item_count
-        legacy_expected = expected - new_item_count
-        supported = (expected, previous_expected, legacy_expected)
+        supported = (
+            expected,
+            expected - 5,
+            expected - 10,
+            expected - 16,
+        )
         if len(state) not in supported:
             raise AssertionError(
                 f"State has {len(state)} entries, expected one of {supported}"

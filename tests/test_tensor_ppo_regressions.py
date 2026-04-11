@@ -20,6 +20,7 @@ from model import (
     BRIDGE_BUILD_TYPE,
     BuilderMLP,
     CentralizedCritic,
+    CriticAttentionBlock,
     CONVEYOR_BUILD_TYPES,
     GLOBAL_MAP_CHANNELS,
     GLOBAL_SCALAR_DIM,
@@ -857,6 +858,29 @@ class TestCentralizedCritic:
 
         feat = critic.encode_map(map_tensor, valid_mask)
         assert (feat.patches == 0).all(), "Fully masked map should produce zero patch features"
+
+    def test_attention_block_applies_output_norms_on_both_residual_branches(self):
+        """Peri-LN normalizes the branch output before adding it to the residual path."""
+        block = CriticAttentionBlock(dim=8, n_heads=2, n_kv_heads=1, mlp_ratio=2).eval()
+        with torch.no_grad():
+            for layer in (block.q_proj, block.k_proj, block.v_proj, block.mlp_fc1, block.mlp_fc2):
+                layer.weight.zero_()
+            block.out_proj.weight.copy_(torch.eye(8))
+            for norm in (
+                block.attn_input_norm,
+                block.attn_output_norm,
+                block.mlp_input_norm,
+                block.mlp_output_norm,
+                block.q_norm,
+                block.k_norm,
+            ):
+                norm.weight.fill_(1.0)
+
+        x = torch.randn(2, 4, 8)
+        attn_out = torch.randn_like(x)
+        out = block.apply_residual_mlp(x, attn_out)
+        expected = x + block.attn_output_norm(attn_out)
+        torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
 
     def test_different_maps_same_mask_different_features(self):
         """Different map content in valid region should change encoded features."""

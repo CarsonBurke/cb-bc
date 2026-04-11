@@ -242,7 +242,12 @@ class ActorModel:
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
         self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_norm = RMSNorm(ACTOR_LATENT_DIM)
+        self.context_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
+        self.tile_sa_out_norm = RMSNorm(TILE_EMBED_DIM)
+        self.tile_ffn_out_norm = RMSNorm(TILE_EMBED_DIM)
+        self.cls_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_ffn_norm = RMSNorm(ACTOR_LATENT_DIM)
+        self.latent_ffn_out_norm = RMSNorm(ACTOR_LATENT_DIM)
 
         self.cls_tokens = Tensor.zeros((ACTOR_CLS_TOKENS, TILE_EMBED_DIM))
         self.context_tau = Tensor.zeros((ACTOR_CLS_TOKENS,))
@@ -273,6 +278,19 @@ class ActorModel:
         self._infer_cache: dict | None = None
         self._attn_scores = [0.0] * TILE_GRID_N
         self._attn_update = [0.0] * TILE_EMBED_DIM
+        self._tile_ffn_hidden = [0.0] * (TILE_EMBED_DIM * 2)
+        self._tile_ffn_normed = [0.0] * TILE_EMBED_DIM
+        self._cls_q_buf = [0.0] * TILE_EMBED_DIM
+        self._tmp_token = [0.0] * TILE_EMBED_DIM
+        self._latent_input = [0.0] * ACTOR_LATENT_DIM
+        self._global_ctx = [0.0] * ACTOR_CONTEXT_DIM
+        self._cls_state = [[0.0] * TILE_EMBED_DIM for _ in range(ACTOR_CLS_TOKENS)]
+        n_ctx_tokens = ACTOR_CONTEXT_CHUNKS * 2
+        self._projected_ctx_k = [[0.0] * TILE_EMBED_DIM for _ in range(n_ctx_tokens)]
+        self._projected_ctx_k_scales = [0.0] * n_ctx_tokens
+        self._scaled_ctx_k = [[0.0] * TILE_EMBED_DIM for _ in range(n_ctx_tokens)]
+        self._ctx_attn_scores = [0.0] * n_ctx_tokens
+        self._ctx_v_cols = [[0.0] * n_ctx_tokens for _ in range(TILE_EMBED_DIM)]
         flat_size = TILE_GRID_N * TILE_EMBED_DIM
         self._encoded_flat = _flat_zeros(flat_size)
         self._tile_q_flat = _flat_zeros(flat_size)
@@ -291,18 +309,12 @@ class ActorModel:
             memoryview(self._tile_k_flat)[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM]
             for i in range(TILE_GRID_N)
         ]
-        self._tile_v_views = [
-            memoryview(self._tile_v_flat)[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM]
-            for i in range(TILE_GRID_N)
-        ]
         self._enriched_views = [
             memoryview(self._enriched_flat)[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM]
             for i in range(TILE_GRID_N)
         ]
         self._tile_k_norm_sq = [0.0] * TILE_GRID_N
-        self._cls_k_cache = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
         self._cls_v_cache = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
-        self._cls_k_scales_cache = [0.0] * TILE_GRID_N
         self._tile_v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
         self._cls_v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
         self._scaled_cls_k = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
@@ -364,6 +376,11 @@ class ActorModel:
         params.extend(self.tile_ffn_norm.parameters())
         params.extend(self.tile_ffn_up.parameters())
         params.extend(self.tile_ffn_down.parameters())
+        params.extend(self.context_ca_input_norm.parameters())
+        params.extend(self.tile_sa_out_norm.parameters())
+        params.extend(self.tile_ffn_out_norm.parameters())
+        params.extend(self.cls_ca_input_norm.parameters())
+        params.extend(self.latent_ffn_out_norm.parameters())
         return params
 
     def train(self, mode: bool = True) -> None:
@@ -394,7 +411,6 @@ class ActorModel:
             ("conv_dir", self.head_conv_dir),
             ("bridge_target", self.head_bridge_target),
             ("move_dir", self.head_move_dir),
-            ("temperature", self.head_temperature),
         )
         action_names: list[str] = []
         action_slices: list[tuple[int, int]] = []
@@ -501,12 +517,17 @@ class ActorModel:
             "tile_sa_norm": (tile_sa_norm_gamma, self.tile_sa_norm.eps),
             "cls_ca_norm": (list(self.cls_ca_norm.gamma.data), self.cls_ca_norm.eps),
             "latent_norm": (list(self.latent_norm.gamma.data), self.latent_norm.eps),
+            "context_ca_input_norm": (list(self.context_ca_input_norm.gamma.data), self.context_ca_input_norm.eps),
+            "tile_sa_out_norm": (list(self.tile_sa_out_norm.gamma.data), self.tile_sa_out_norm.eps),
+            "tile_ffn_out_norm": (list(self.tile_ffn_out_norm.gamma.data), self.tile_ffn_out_norm.eps),
+            "cls_ca_input_norm": (list(self.cls_ca_input_norm.gamma.data), self.cls_ca_input_norm.eps),
             "cls_tokens": list(self.cls_tokens.data),
-            "context_tau": list(self.context_tau.data),
-            "tile_sa_gamma": list(self.tile_sa_gamma.data),
-            "cls_ca_tau": list(self.cls_ca_tau.data),
+            "context_tau": [_EXP(t) for t in self.context_tau.data],
+            "tile_sa_gamma": _EXP(self.tile_sa_gamma.data[0]),
+            "cls_ca_tau": [_EXP(t) for t in self.cls_ca_tau.data],
             "latent_ffn_noop": latent_ffn_noop,
             "latent_ffn_norm": latent_ffn_norm,
+            "latent_ffn_out_norm": (list(self.latent_ffn_out_norm.gamma.data), self.latent_ffn_out_norm.eps),
             "latent_ffn_up": latent_ffn_up,
             "latent_ffn_down": latent_ffn_down,
             "action_heads": (action_names, action_slices, action_rows, action_bias),
@@ -537,17 +558,26 @@ class ActorModel:
         _tile_norm_gamma, tile_norm_eps = cache["tile_sa_norm"]
         cls_norm_gamma, cls_norm_eps = cache["cls_ca_norm"]
         latent_norm_gamma, latent_norm_eps = cache["latent_norm"]
+        context_in_norm_gamma, context_in_norm_eps = cache["context_ca_input_norm"]
+        tile_sa_out_norm_gamma, tile_sa_out_norm_eps = cache["tile_sa_out_norm"]
+        tile_ffn_out_norm_gamma, tile_ffn_out_norm_eps = cache["tile_ffn_out_norm"]
+        cls_in_norm_gamma, cls_in_norm_eps = cache["cls_ca_input_norm"]
         latent_ffn_noop = cache["latent_ffn_noop"]
         latent_ffn_norm = cache["latent_ffn_norm"]
+        latent_ffn_out_norm_gamma, latent_ffn_out_norm_eps = cache["latent_ffn_out_norm"]
         cls_tokens_flat = cache["cls_tokens"]
         context_tau = cache["context_tau"]
-        tile_sa_gamma = _EXP(cache["tile_sa_gamma"][0])
-        cls_ca_tau = [_EXP(t) for t in cache["cls_ca_tau"]]  # per-seed
+        tile_sa_gamma = cache["tile_sa_gamma"]
+        cls_ca_tau = cache["cls_ca_tau"]
         tile_ffn_norm_gamma, tile_ffn_norm_eps = cache["tile_ffn_norm"]
         tile_ffn_up_rows, tile_ffn_up_bias = cache["tile_ffn_up"]
         tile_ffn_down_rows, tile_ffn_down_bias = cache["tile_ffn_down"]
         attn_scores = self._attn_scores
         attn_update = self._attn_update
+        tile_ffn_hidden_buf = self._tile_ffn_hidden
+        tile_ffn_normed_buf = self._tile_ffn_normed
+        cls_q_buf = self._cls_q_buf
+        tmp_token = self._tmp_token
 
         tile_obs_end = TILE_GRID_N * TILE_FEATURES
         globals_end = tile_obs_end + GLOBAL_FEATURES
@@ -570,12 +600,16 @@ class ActorModel:
         encoded = self._encoded_views
         tile_q = self._tile_q_views
         tile_k = self._tile_k_views
-        tile_v = self._tile_v_views
         tile_k_norm_sq = self._tile_k_norm_sq
-        cls_k = self._cls_k_cache
         cls_v = self._cls_v_cache
-        cls_k_scales = self._cls_k_scales_cache
         tile_v_cols = self._tile_v_cols
+        global_ctx = self._global_ctx
+        cls_state = self._cls_state
+        projected_ctx_k = self._projected_ctx_k
+        projected_ctx_k_scales = self._projected_ctx_k_scales
+        scaled_ctx_k = self._scaled_ctx_k
+        ctx_attn_scores = self._ctx_attn_scores
+        ctx_v_cols = self._ctx_v_cols
         tile_sa_g2 = 2.0 * tile_sa_gamma
         # Fused tile encoding + QKV projection + V transpose
         for t in range(TILE_GRID_N):
@@ -646,7 +680,7 @@ class ActorModel:
                 k_nsq += k_val * k_val
                 tile_v_cols[j][t] = v_val  # V transpose inline
             tile_k_norm_sq[t] = k_nsq
-        # Pre-norm RBF attention: softmax(2γ(QK^T) - γ||K||²) @ V
+        # Peri-LN RBF attention: input-norm QKV, then output-norm branch before residual add.
         for i in range(TILE_GRID_N):
             off = i * TILE_EMBED_DIM
             qi = tile_q[i]
@@ -662,23 +696,30 @@ class ActorModel:
                 attn_scores[k] = w
                 z += w
             inv_z = 1.0 / z
-            # Fused weighted sum + residual
+            mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                enriched_flat[off + j] = encoded_flat[off + j] + _DOT(attn_scores, tile_v_cols[j]) * inv_z
+                x = _DOT(attn_scores, tile_v_cols[j]) * inv_z
+                tmp_token[j] = x
+                mean_sq += x * x
+            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_sa_out_norm_eps) ** 0.5
+            for j in range(TILE_EMBED_DIM):
+                enriched_flat[off + j] = encoded_flat[off + j] + tmp_token[j] * inv_rms * tile_sa_out_norm_gamma[j]
 
-        # Tile FFN: pre-norm residual MLP on SA output before CLS reads them
+        # Tile FFN: pre-norm MLP followed by output-norm branch before residual add.
         tile_ffn_hidden = TILE_EMBED_DIM * 2
         for t in range(TILE_GRID_N):
             off = t * TILE_EMBED_DIM
+            token = self._enriched_views[t]
             mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                x = enriched_flat[off + j]
+                x = token[j]
                 mean_sq += x * x
             inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_ffn_norm_eps) ** 0.5
-            normed = [enriched_flat[off + j] * inv_rms * tile_ffn_norm_gamma[j]
-                      for j in range(TILE_EMBED_DIM)]
+            normed = tile_ffn_normed_buf
+            for j in range(TILE_EMBED_DIM):
+                normed[j] = token[j] * inv_rms * tile_ffn_norm_gamma[j]
             # Up + SiLU
-            hidden = [0.0] * tile_ffn_hidden
+            hidden = tile_ffn_hidden_buf
             for j in range(tile_ffn_hidden):
                 x = _DOT(normed, tile_ffn_up_rows[j]) + tile_ffn_up_bias[j]
                 if x >= 0.0:
@@ -686,18 +727,19 @@ class ActorModel:
                 else:
                     e = _EXP(x)
                     hidden[j] = x * e / (1.0 + e)
-            # Down + residual
+            mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                enriched_flat[off + j] += _DOT(hidden, tile_ffn_down_rows[j]) + tile_ffn_down_bias[j]
+                x = _DOT(hidden, tile_ffn_down_rows[j]) + tile_ffn_down_bias[j]
+                tmp_token[j] = x
+                mean_sq += x * x
+            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_ffn_out_norm_eps) ** 0.5
+            for j in range(TILE_EMBED_DIM):
+                enriched_flat[off + j] = token[j] + tmp_token[j] * inv_rms * tile_ffn_out_norm_gamma[j]
 
         # CLS K/V projection — will pre-scale keys after cls_ca_scale is known
 
-        global_ctx = [0.0] * ACTOR_CONTEXT_DIM
         for j in range(ACTOR_CONTEXT_DIM):
             global_ctx[j] = _DOT(globals_obs, context_rows[j]) + context_bias[j]
-        projected_ctx_k: list[list[float]] = []
-        projected_ctx_k_scales: list[float] = []
-        projected_ctx_v: list[list[float]] = []
         n_ctx_chunks = ACTOR_CONTEXT_CHUNKS * 2
         for chunk_idx in range(n_ctx_chunks):
             if chunk_idx < ACTOR_CONTEXT_CHUNKS:
@@ -709,68 +751,63 @@ class ActorModel:
                 token = h_prev[
                     h_idx * TILE_EMBED_DIM:(h_idx + 1) * TILE_EMBED_DIM
                 ]
-            k_tok = [0.0] * TILE_EMBED_DIM
-            v_tok = [0.0] * TILE_EMBED_DIM
+            k_tok = projected_ctx_k[chunk_idx]
             k_nsq = 0.0
             for j in range(TILE_EMBED_DIM):
                 k_val = _DOT(token, ctx_k_rows[j]) + ctx_k_bias[j]
                 v_val = _DOT(token, ctx_v_rows[j]) + ctx_v_bias[j]
                 k_tok[j] = k_val
-                v_tok[j] = v_val
+                ctx_v_cols[j][chunk_idx] = v_val
                 k_nsq += k_val * k_val
-            projected_ctx_k_scales.append(1.0 / max(math.sqrt(k_nsq), 1e-6))
-            projected_ctx_k.append(k_tok)
-            projected_ctx_v.append(v_tok)
-        # Transpose context values to column-major for sumprod
-        ctx_v_cols = [
-            [projected_ctx_v[i][j] for i in range(n_ctx_chunks)]
-            for j in range(TILE_EMBED_DIM)
-        ]
+            projected_ctx_k_scales[chunk_idx] = 1.0 / max(math.sqrt(k_nsq), 1e-6)
 
-        cls_state = [
-            cls_tokens_flat[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM]
-            for i in range(ACTOR_CLS_TOKENS)
-        ]
+        for i in range(ACTOR_CLS_TOKENS):
+            token = cls_state[i]
+            off = i * TILE_EMBED_DIM
+            for j in range(TILE_EMBED_DIM):
+                token[j] = cls_tokens_flat[off + j]
         for i, token in enumerate(cls_state):
-            # Pre-scale context keys with key_scales * tau for this query
-            ctx_scale = _EXP(context_tau[i])
-            scaled_ctx_k = [
-                [projected_ctx_k[ci][j] * projected_ctx_k_scales[ci] * ctx_scale
-                 for j in range(TILE_EMBED_DIM)]
-                for ci in range(n_ctx_chunks)
-            ]
-            # Pre-scale query
+            ctx_scale = context_tau[i]
+            mean_sq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                mean_sq += token[j] * token[j]
+            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + context_in_norm_eps) ** 0.5
             q_nsq = 0.0
             for j in range(TILE_EMBED_DIM):
-                v = token[j]
-                q_nsq += v * v
+                x = token[j] * inv_rms * context_in_norm_gamma[j]
+                cls_q_buf[j] = x
+                q_nsq += x * x
             q_scale = 1.0 / max(math.sqrt(q_nsq), 1e-6)
-            scaled_q = [token[j] * q_scale for j in range(TILE_EMBED_DIM)]
+            for j in range(TILE_EMBED_DIM):
+                cls_q_buf[j] *= q_scale
+            for ci in range(n_ctx_chunks):
+                key_scale = projected_ctx_k_scales[ci] * ctx_scale
+                src_key = projected_ctx_k[ci]
+                dst_key = scaled_ctx_k[ci]
+                for j in range(TILE_EMBED_DIM):
+                    dst_key[j] = src_key[j] * key_scale
             update = _attention_prescaled(
-                scaled_q,
+                cls_q_buf,
                 scaled_ctx_k,
                 ctx_v_cols,
-                attn_scores,
+                ctx_attn_scores,
                 attn_update,
                 n_ctx_chunks,
                 TILE_EMBED_DIM,
             )
-            # Inlined _residual_rmsnorm_silu
-            out = [0.0] * TILE_EMBED_DIM
             mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                x = token[j] + update[j]
-                out[j] = x
+                x = update[j]
+                tmp_token[j] = x
                 mean_sq += x * x
             inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + context_norm_eps) ** 0.5
             for j in range(TILE_EMBED_DIM):
-                x = out[j] * inv_rms * context_norm_gamma[j]
+                x = token[j] + tmp_token[j] * inv_rms * context_norm_gamma[j]
                 if x >= 0.0:
-                    out[j] = x / (1.0 + _EXP(-x))
+                    token[j] = x / (1.0 + _EXP(-x))
                 else:
                     e = _EXP(x)
-                    out[j] = x * e / (1.0 + e)
-            cls_state[i] = out
+                    token[j] = x * e / (1.0 + e)
 
         # CLS K/V projection + key pre-scaling (normalize only, tau folded into Q)
         scaled_cls_k = self._scaled_cls_k
@@ -792,10 +829,16 @@ class ActorModel:
             for j in range(TILE_EMBED_DIM):
                 sk[j] *= s
         for i, token in enumerate(cls_state):
-            q_tok = [0.0] * TILE_EMBED_DIM
+            q_tok = cls_q_buf
+            mean_sq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                mean_sq += token[j] * token[j]
+            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + cls_in_norm_eps) ** 0.5
+            for j in range(TILE_EMBED_DIM):
+                tmp_token[j] = token[j] * inv_rms * cls_in_norm_gamma[j]
             q_nsq = 0.0
             for j in range(TILE_EMBED_DIM):
-                q_val = _DOT(token, cls_q_rows[j]) + cls_q_bias[j]
+                q_val = _DOT(tmp_token, cls_q_rows[j]) + cls_q_bias[j]
                 q_tok[j] = q_val
                 q_nsq += q_val * q_val
             # Fold per-seed tau * q_norm into query
@@ -811,46 +854,49 @@ class ActorModel:
                 TILE_GRID_N,
                 TILE_EMBED_DIM,
             )
-            # Inlined _residual_rmsnorm_silu
-            out = [0.0] * TILE_EMBED_DIM
             mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                x = token[j] + update[j]
-                out[j] = x
+                x = update[j]
+                tmp_token[j] = x
                 mean_sq += x * x
             inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + cls_norm_eps) ** 0.5
             for j in range(TILE_EMBED_DIM):
-                x = out[j] * inv_rms * cls_norm_gamma[j]
+                x = token[j] + tmp_token[j] * inv_rms * cls_norm_gamma[j]
                 if x >= 0.0:
-                    out[j] = x / (1.0 + _EXP(-x))
+                    token[j] = x / (1.0 + _EXP(-x))
                 else:
                     e = _EXP(x)
-                    out[j] = x * e / (1.0 + e)
-            cls_state[i] = out
+                    token[j] = x * e / (1.0 + e)
 
-        latent_input = [x for token in cls_state for x in token]
-        latent = _rmsnorm(latent_input, latent_norm_gamma, latent_norm_eps)
+        latent_input = self._latent_input
+        for i in range(ACTOR_CLS_TOKENS):
+            off = i * TILE_EMBED_DIM
+            token = cls_state[i]
+            for j in range(TILE_EMBED_DIM):
+                latent_input[off + j] = token[j]
+        latent = list(latent_input)
         if not latent_ffn_noop:
             latent_ffn_norm_gamma, latent_ffn_norm_eps = latent_ffn_norm  # type: ignore[misc]
             latent_ffn_up_rows, latent_ffn_up_bias = cache["latent_ffn_up"]
             latent_ffn_down_rows, latent_ffn_down_bias = cache["latent_ffn_down"]
             latent_hidden = _silu_vec(_linear(_rmsnorm(latent, latent_ffn_norm_gamma, latent_ffn_norm_eps), latent_ffn_up_rows, latent_ffn_up_bias))
             latent_delta = _linear(latent_hidden, latent_ffn_down_rows, latent_ffn_down_bias)
+            latent_delta = _rmsnorm(latent_delta, latent_ffn_out_norm_gamma, latent_ffn_out_norm_eps)
             latent = [latent[i] + latent_delta[i] for i in range(ACTOR_LATENT_DIM)]
+        latent = _rmsnorm(latent, latent_norm_gamma, latent_norm_eps)
 
         action_names, action_slices, action_rows, action_bias = cache["action_heads"]
         outputs: dict[str, list[float]] = {}
         for name, (start, end) in zip(action_names, action_slices):
             outputs[name] = [_DOT(latent, action_rows[j]) + action_bias[j] for j in range(start, end)]
 
-        gru_in = latent + list(h_prev)
+        gru_in = latent + h_prev
         gate_rows, gate_bias = cache["head_h_gate"]
         cand_rows, cand_bias = cache["head_h_cand"]
         h_gate = [_DOT(gru_in, gate_rows[j]) + gate_bias[j] for j in range(H_DIM)]
         h_cand = [math.tanh(_DOT(gru_in, cand_rows[j]) + cand_bias[j]) for j in range(H_DIM)]
         outputs["h_gate"] = h_gate
         outputs["h_cand"] = h_cand
-        outputs.pop("temperature", None)
         return outputs
 
     def save(self) -> list[list[float]]:
@@ -858,9 +904,12 @@ class ActorModel:
 
     def load(self, state: list[list[float]]) -> None:
         params = self.parameters()
-        previous_expected = len(params) - 5
-        legacy_expected = len(params) - 16
-        supported = (len(params), previous_expected, legacy_expected)
+        supported = (
+            len(params),
+            len(params) - 5,
+            len(params) - 10,
+            len(params) - 16,
+        )
         if len(state) not in supported:
             raise AssertionError(
                 f"State has {len(state)} entries, expected one of {supported}"
