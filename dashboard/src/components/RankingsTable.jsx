@@ -1,7 +1,11 @@
+import { useMemo } from 'react'
 import { Table, Th, Td, Thead, Tr } from './Table'
 
 export default function RankingsTable({ bots, prevBots, lineage }) {
-  const sorted = Object.entries(bots).sort((a, b) => b[1].elo - a[1].elo)
+  const sorted = useMemo(
+    () => Object.entries(bots).sort((a, b) => b[1].elo - a[1].elo),
+    [bots],
+  )
 
   return (
     <Table>

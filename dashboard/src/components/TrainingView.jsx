@@ -20,7 +20,8 @@ import TileLayout from './TileLayout'
 import { useCardSettings } from './CardSettingsContext'
 
 const TrainEpisodesCtx = createContext([])
-const DownsampledCtx = createContext([])
+const EMPTY_LABELS = []
+const DownsampledCtx = createContext({ ds: EMPTY_LABELS, labels: EMPTY_LABELS })
 const TrainConfigCtx = createContext({})
 const TrainLoadingCtx = createContext(true)
 const TrainLeagueCtx = createContext([])
@@ -49,7 +50,11 @@ function useTrainGameLog() {
 }
 
 function useDownsampled() {
-  return useContext(DownsampledCtx)
+  return useContext(DownsampledCtx).ds
+}
+
+function useDownsampledLabels() {
+  return useContext(DownsampledCtx).labels
 }
 
 function TrainingDataProvider({ session, children }) {
@@ -132,9 +137,39 @@ function percentileValue(data, p) {
   return values[lo] + (values[hi] - values[lo]) * frac
 }
 
+function percentileValueMulti(arrays, p) {
+  let total = 0
+  for (const a of arrays) for (let i = 0; i < a.length; i++) if (a[i] != null) total++
+  if (!total) return null
+  const flat = new Float64Array(total)
+  let k = 0
+  for (const a of arrays) for (let i = 0; i < a.length; i++) {
+    const v = a[i]
+    if (v != null) flat[k++] = v
+  }
+  flat.sort()
+  const pos = Math.max(0, Math.min(total - 1, (total - 1) * p))
+  const lo = Math.floor(pos)
+  const hi = Math.ceil(pos)
+  const frac = pos - lo
+  return flat[lo] + (flat[hi] - flat[lo]) * frac
+}
+
 function percentileViewport(data, low = 0.05, high = 0.95) {
   const min = percentileValue(data, low)
   const max = percentileValue(data, high)
+  if (min == null || max == null) return null
+  if (min === max) {
+    const pad = Math.abs(min || 1) * 0.05 || 1
+    return { min: min - pad, max: max + pad }
+  }
+  const pad = (max - min) * 0.05
+  return { min: min - pad, max: max + pad }
+}
+
+function percentileViewportMulti(arrays, low = 0.05, high = 0.95) {
+  const min = percentileValueMulti(arrays, low)
+  const max = percentileValueMulti(arrays, high)
   if (min == null || max == null) return null
   if (min === max) {
     const pad = Math.abs(min || 1) * 0.05 || 1
@@ -168,8 +203,12 @@ function chartBase(yViewport = null) {
 
 function DownsampledProvider({ children }) {
   const episodes = useRangedEpisodes()
-  const ds = useMemo(() => downsample(episodes), [episodes])
-  return <DownsampledCtx.Provider value={ds}>{children}</DownsampledCtx.Provider>
+  const value = useMemo(() => {
+    const ds = downsample(episodes)
+    const labels = ds.map(e => e.episode)
+    return { ds, labels }
+  }, [episodes])
+  return <DownsampledCtx.Provider value={value}>{children}</DownsampledCtx.Provider>
 }
 
 // ---- Card content components ----
@@ -210,10 +249,12 @@ function StatusPanel() {
 
 const RewardChart = memo(function RewardChart() {
   const ds = useDownsampled()
+  const labels = useDownsampledLabels()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const raw = useMemo(() => ds.map(e => e.reward), [ds])
+  const yViewport = useMemo(() => (bandsOn ? percentileViewport(raw) : null), [raw, bandsOn])
+  const options = useMemo(() => chartBase(yViewport), [yViewport])
   if (ds.length <= 1) return <NoData />
-  const raw = ds.map(e => e.reward)
-  const yViewport = bandsOn ? percentileViewport(raw) : null
   const datasets = [{
     label: 'Reward', data: raw,
     borderColor: emaOn ? '#a6e3a140' : '#a6e3a1', backgroundColor: '#a6e3a120',
@@ -225,142 +266,177 @@ const RewardChart = memo(function RewardChart() {
   })
   return (
     <div className="min-h-[200px]">
-      <Line data={{ labels: ds.map(e => e.episode), datasets }} options={chartBase(yViewport)} />
+      <Line data={{ labels, datasets }} options={options} />
     </div>
   )
 })
+
+const REWARD_BREAKDOWN_SERIES = [
+  { key: 'r_flow', altKey: 'r_work', label: 'Flow', color: '#f9e2af' },
+  { key: 'r_delivery', label: 'Delivery', color: '#a6e3a1' },
+  { key: 'r_dmg', label: 'Damage', color: '#f38ba8' },
+  { key: 'r_own_dmg', label: 'Own Core Dmg', color: '#cba6f7' },
+]
 
 const RewardBreakdownChart = memo(function RewardBreakdownChart() {
   const ds = useDownsampled()
+  const labels = useDownsampledLabels()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const raws = useMemo(
+    () => REWARD_BREAKDOWN_SERIES.map(({ key, altKey }) => ds.map(e => e[key] ?? e[altKey] ?? 0)),
+    [ds],
+  )
+  const yViewport = useMemo(
+    () => bandsOn ? percentileViewportMulti(raws) : null,
+    [raws, bandsOn],
+  )
+  const options = useMemo(
+    () => ({
+      ...chartBase(yViewport),
+      plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+    }),
+    [yViewport],
+  )
   if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const series = [
-    { key: 'r_flow', altKey: 'r_work', label: 'Flow', color: '#f9e2af' },
-    { key: 'r_delivery', label: 'Delivery', color: '#a6e3a1' },
-    { key: 'r_dmg', label: 'Damage', color: '#f38ba8' },
-    { key: 'r_own_dmg', label: 'Own Core Dmg', color: '#cba6f7' },
-  ]
-  const datasets = series.flatMap(({ key, altKey, label, color }) => {
-    const raw = ds.map(e => e[key] ?? e[altKey] ?? 0)
-    const result = [{
+  const datasets = []
+  for (let i = 0; i < REWARD_BREAKDOWN_SERIES.length; i++) {
+    const { label, color } = REWARD_BREAKDOWN_SERIES[i]
+    const raw = raws[i]
+    datasets.push({
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
-    }]
-    if (emaOn) result.push({
+    })
+    if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3,
     })
-    return result
-  })
-  const yViewport = bandsOn
-    ? percentileViewport(series.flatMap(({ key, altKey }) => ds.map(e => e[key] ?? e[altKey] ?? 0)))
-    : null
+  }
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels: ds.map(e => e.episode), datasets }}
-        options={{
-          ...chartBase(yViewport),
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={options} />
     </div>
   )
 })
 
+
+const HARV_DEBUG_SERIES = [
+  { key: 'harv_attempts', label: 'Attempts', color: '#89b4fa' },
+  { key: 'harv_failures', label: 'Failures', color: '#f38ba8' },
+  { key: 'harv_prox_gate', label: 'Gate', color: '#f9e2af' },
+  { key: 'harv_prox_paid', label: 'Paid', color: '#a6e3a1' },
+]
+
+const CONV_DEBUG_SERIES = [
+  { key: 'conv_attempts', label: 'Attempts', color: '#89b4fa' },
+  { key: 'conv_failures', label: 'Failures', color: '#f38ba8' },
+  { key: 'conv_prox_gate', label: 'Gate', color: '#f9e2af' },
+  { key: 'conv_prox_paid', label: 'Paid', color: '#a6e3a1' },
+]
+
 const HarvesterDebugChart = memo(function HarvesterDebugChart() {
   const ds = useDownsampled()
+  const labels = useDownsampledLabels()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const raws = useMemo(
+    () => HARV_DEBUG_SERIES.map(({ key }) => ds.map(e => e[key] ?? 0)),
+    [ds],
+  )
+  const yViewport = useMemo(
+    () => bandsOn ? percentileViewportMulti(raws) : null,
+    [raws, bandsOn],
+  )
+  const options = useMemo(
+    () => ({
+      ...chartBase(yViewport),
+      plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+    }),
+    [yViewport],
+  )
   if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const series = [
-    { key: 'harv_attempts', label: 'Attempts', color: '#89b4fa' },
-    { key: 'harv_failures', label: 'Failures', color: '#f38ba8' },
-    { key: 'harv_prox_gate', label: 'Gate', color: '#f9e2af' },
-    { key: 'harv_prox_paid', label: 'Paid', color: '#a6e3a1' },
-  ]
-  const datasets = series.flatMap(({ key, label, color }) => {
-    const raw = ds.map(e => e[key] ?? 0)
-    const result = [{
+  const datasets = []
+  for (let i = 0; i < HARV_DEBUG_SERIES.length; i++) {
+    const { label, color } = HARV_DEBUG_SERIES[i]
+    const raw = raws[i]
+    datasets.push({
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
-    }]
-    if (emaOn) result.push({
+    })
+    if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3,
     })
-    return result
-  })
-  const yViewport = bandsOn
-    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key] ?? 0)))
-    : null
+  }
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels: ds.map(e => e.episode), datasets }}
-        options={{
-          ...chartBase(yViewport),
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={options} />
     </div>
   )
 })
 
 const ConveyorDebugChart = memo(function ConveyorDebugChart() {
   const ds = useDownsampled()
+  const labels = useDownsampledLabels()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const raws = useMemo(
+    () => CONV_DEBUG_SERIES.map(({ key }) => ds.map(e => e[key] ?? 0)),
+    [ds],
+  )
+  const yViewport = useMemo(
+    () => bandsOn ? percentileViewportMulti(raws) : null,
+    [raws, bandsOn],
+  )
+  const options = useMemo(
+    () => ({
+      ...chartBase(yViewport),
+      plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+    }),
+    [yViewport],
+  )
   if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const series = [
-    { key: 'conv_attempts', label: 'Attempts', color: '#89b4fa' },
-    { key: 'conv_failures', label: 'Failures', color: '#f38ba8' },
-    { key: 'conv_prox_gate', label: 'Gate', color: '#f9e2af' },
-    { key: 'conv_prox_paid', label: 'Paid', color: '#a6e3a1' },
-  ]
-  const datasets = series.flatMap(({ key, label, color }) => {
-    const raw = ds.map(e => e[key] ?? 0)
-    const result = [{
+  const datasets = []
+  for (let i = 0; i < CONV_DEBUG_SERIES.length; i++) {
+    const { label, color } = CONV_DEBUG_SERIES[i]
+    const raw = raws[i]
+    datasets.push({
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
-    }]
-    if (emaOn) result.push({
+    })
+    if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3,
     })
-    return result
-  })
-  const yViewport = bandsOn
-    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key] ?? 0)))
-    : null
+  }
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels: ds.map(e => e.episode), datasets }}
-        options={{
-          ...chartBase(yViewport),
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={options} />
     </div>
   )
 })
 
 function makeSimpleChart(label, dataKey, color, opts = {}) {
+  const altKey = opts.altKey
+  const fill = opts.fill
   return memo(function SimpleChart() {
     "use no memo"
     const ds = useDownsampled()
+    const labels = useDownsampledLabels()
     const { ema: emaOn, bands: bandsOn } = useCardSettings()
+    const raw = useMemo(
+      () => ds.map(e => e[dataKey] ?? (altKey ? e[altKey] : null) ?? null),
+      [ds],
+    )
+    const yViewport = useMemo(() => (bandsOn ? percentileViewport(raw) : null), [raw, bandsOn])
+    const options = useMemo(() => chartBase(yViewport), [yViewport])
     if (ds.length <= 1) return <NoData />
-    const raw = ds.map(e => e[dataKey] ?? e[opts.altKey] ?? null)
-    const yViewport = bandsOn ? percentileViewport(raw) : null
     const dim = emaOn
     const datasets = [{
       label, data: raw,
       borderColor: dim ? color + '40' : color,
-      backgroundColor: opts.fill || color + '20',
-      fill: !!opts.fill,
+      backgroundColor: fill || color + '20',
+      fill: !!fill,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
     }]
     if (emaOn) datasets.push({
@@ -369,7 +445,7 @@ function makeSimpleChart(label, dataKey, color, opts = {}) {
     })
     return (
       <div className="min-h-[200px]">
-        <Line data={{ labels: ds.map(e => e.episode), datasets }} options={chartBase(yViewport)} />
+        <Line data={{ labels, datasets }} options={options} />
       </div>
     )
   })
@@ -389,98 +465,111 @@ const ActorLrChart = makeSimpleChart('Actor LR', 'actor_lr', '#89dceb')
 
 const LogitScaleChart = memo(function LogitScaleChart({ series }) {
   const ds = useDownsampled()
+  const labels = useDownsampledLabels()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const raws = useMemo(
+    () => series.map(({ key }) => ds.map(e => e[key])),
+    [ds, series],
+  )
+  const yViewport = useMemo(
+    () => (bandsOn ? percentileViewportMulti(raws) : null),
+    [raws, bandsOn],
+  )
+  const options = useMemo(
+    () => ({
+      ...chartBase(yViewport),
+      plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+    }),
+    [yViewport],
+  )
   if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const datasets = series.flatMap(({ key, label, color }) => {
-    const raw = ds.map(e => e[key])
-    const result = [{
+  const datasets = []
+  for (let i = 0; i < series.length; i++) {
+    const { label, color } = series[i]
+    const raw = raws[i]
+    datasets.push({
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
-    }]
-    if (emaOn) result.push({
+    })
+    if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
     })
-    return result
-  })
-  const yViewport = bandsOn
-    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key]).filter(v => v != null)))
-    : null
+  }
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels: ds.map(e => e.episode), datasets }}
-        options={{
-          ...chartBase(yViewport),
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={options} />
     </div>
   )
 })
 
+const TEMP_MEAN_SERIES = [
+  { key: 'temp_bt_mean', label: 'Build Type', color: '#f38ba8' },
+  { key: 'temp_bd_mean', label: 'Build Dir', color: '#89b4fa' },
+  { key: 'temp_cd_mean', label: 'Conv Dir', color: '#f9e2af' },
+  { key: 'temp_brt_mean', label: 'Bridge Target', color: '#cba6f7' },
+  { key: 'temp_md_mean', label: 'Move Dir', color: '#a6e3a1' },
+]
+
+const TEMP_STD_SERIES = [
+  { key: 'temp_bt_std', label: 'Build Type', color: '#f38ba8' },
+  { key: 'temp_bd_std', label: 'Build Dir', color: '#89b4fa' },
+  { key: 'temp_cd_std', label: 'Conv Dir', color: '#f9e2af' },
+  { key: 'temp_brt_std', label: 'Bridge Target', color: '#cba6f7' },
+  { key: 'temp_md_std', label: 'Move Dir', color: '#a6e3a1' },
+]
+
 const TempMeanChart = memo(function TempMeanChart() {
-  return (
-    <LogitScaleChart
-      series={[
-        { key: 'temp_bt_mean', label: 'Build Type', color: '#f38ba8' },
-        { key: 'temp_bd_mean', label: 'Build Dir', color: '#89b4fa' },
-        { key: 'temp_cd_mean', label: 'Conv Dir', color: '#f9e2af' },
-        { key: 'temp_brt_mean', label: 'Bridge Target', color: '#cba6f7' },
-        { key: 'temp_md_mean', label: 'Move Dir', color: '#a6e3a1' },
-      ]}
-    />
-  )
+  return <LogitScaleChart series={TEMP_MEAN_SERIES} />
 })
 
 const TempStdChart = memo(function TempStdChart() {
-  return (
-    <LogitScaleChart
-      series={[
-        { key: 'temp_bt_std', label: 'Build Type', color: '#f38ba8' },
-        { key: 'temp_bd_std', label: 'Build Dir', color: '#89b4fa' },
-        { key: 'temp_cd_std', label: 'Conv Dir', color: '#f9e2af' },
-        { key: 'temp_brt_std', label: 'Bridge Target', color: '#cba6f7' },
-        { key: 'temp_md_std', label: 'Move Dir', color: '#a6e3a1' },
-      ]}
-    />
-  )
+  return <LogitScaleChart series={TEMP_STD_SERIES} />
 })
+
+const LOSS_SERIES = [
+  { key: 'pi_loss', label: 'Policy Loss', color: '#f38ba8' },
+  { key: 'vf_loss', label: 'Value Loss', color: '#f9e2af' },
+]
 
 const LossChart = memo(function LossChart() {
   const ds = useDownsampled()
+  const labels = useDownsampledLabels()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const raws = useMemo(
+    () => LOSS_SERIES.map(({ key }) => ds.map(e => e[key])),
+    [ds],
+  )
+  const yViewport = useMemo(
+    () => (bandsOn ? percentileViewportMulti(raws) : null),
+    [raws, bandsOn],
+  )
+  const options = useMemo(
+    () => ({
+      ...chartBase(yViewport),
+      plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+    }),
+    [yViewport],
+  )
   if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const series = [
-    { key: 'pi_loss', label: 'Policy Loss', color: '#f38ba8' },
-    { key: 'vf_loss', label: 'Value Loss', color: '#f9e2af' },
-  ]
-  const datasets = series.flatMap(({ key, label, color }) => {
-    const raw = ds.map(e => e[key])
-    const result = [{
+  const datasets = []
+  for (let i = 0; i < LOSS_SERIES.length; i++) {
+    const { label, color } = LOSS_SERIES[i]
+    const raw = raws[i]
+    datasets.push({
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5,
-    }]
-    if (emaOn) result.push({
+    })
+    if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3,
     })
-    return result
-  })
-  const yViewport = bandsOn
-    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key])))
-    : null
+  }
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels: ds.map(e => e.episode), datasets }}
-        options={{
-          ...chartBase(yViewport),
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={options} />
     </div>
   )
 })
@@ -726,6 +815,18 @@ const WinConfidenceChart = memo(function WinConfidenceChart() {
   )
 })
 
+const PERCENT_0_100_OPTIONS = (() => {
+  const scales = chartScales()
+  return {
+    ...chartBase(),
+    scales: {
+      ...scales,
+      y: { ...scales.y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
+    },
+    plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+  }
+})()
+
 const WinPredictionAccuracyChart = memo(function WinPredictionAccuracyChart() {
   const session = useAtomValue(trainSessionAtom)
   const { ema: emaOn } = useCardSettings()
@@ -766,20 +867,23 @@ const WinPredictionAccuracyChart = memo(function WinPredictionAccuracyChart() {
 
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels, datasets }}
-        options={{
-          ...chartBase(),
-          scales: {
-            ...chartScales(),
-            y: { ...chartScales().y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
-          },
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={PERCENT_0_100_OPTIONS} />
     </div>
   )
 })
+
+const ROUND_ACCURACY_OPTIONS = (() => {
+  const scales = chartScales()
+  return {
+    ...chartBase(),
+    scales: {
+      ...scales,
+      y: { ...scales.y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
+      x: { ...scales.x, title: { display: true, text: 'Round', color: CHART_THEME.subtext } },
+    },
+    plugins: { legend: { display: false } },
+  }
+})()
 
 const RoundAccuracyChart = memo(function RoundAccuracyChart() {
   const session = useAtomValue(trainSessionAtom)
@@ -830,18 +934,7 @@ const RoundAccuracyChart = memo(function RoundAccuracyChart() {
 
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels, datasets }}
-        options={{
-          ...chartBase(),
-          scales: {
-            ...chartScales(),
-            y: { ...chartScales().y, min: 0, max: 100, title: { display: true, text: '%', color: CHART_THEME.subtext } },
-            x: { ...chartScales().x, title: { display: true, text: 'Round', color: CHART_THEME.subtext } },
-          },
-          plugins: { legend: { display: false } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={ROUND_ACCURACY_OPTIONS} />
     </div>
   )
 })
@@ -910,40 +1003,49 @@ function EpisodeSelector() {
   )
 }
 
+const RETURN_RANGE_SERIES = [
+  { key: 'ret_min', label: 'Min', color: '#f38ba8' },
+  { key: 'ret_mean', label: 'Mean', color: '#a6e3a1' },
+  { key: 'ret_max', label: 'Max', color: '#89b4fa' },
+]
+
 const ReturnRangeChart = memo(function ReturnRangeChart() {
   const ds = useDownsampled()
+  const labels = useDownsampledLabels()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const raws = useMemo(
+    () => RETURN_RANGE_SERIES.map(({ key }) => ds.map(e => e[key] ?? null)),
+    [ds],
+  )
+  const yViewport = useMemo(
+    () => (bandsOn ? percentileViewportMulti(raws) : null),
+    [raws, bandsOn],
+  )
+  const options = useMemo(
+    () => ({
+      ...chartBase(yViewport),
+      plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+    }),
+    [yViewport],
+  )
   if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const series = [
-    { key: 'ret_min', label: 'Min', color: '#f38ba8' },
-    { key: 'ret_mean', label: 'Mean', color: '#a6e3a1' },
-    { key: 'ret_max', label: 'Max', color: '#89b4fa' },
-  ]
-  const datasets = series.flatMap(({ key, label, color }) => {
-    const raw = ds.map(e => e[key] ?? null)
-    const result = [{
+  const datasets = []
+  for (let i = 0; i < RETURN_RANGE_SERIES.length; i++) {
+    const { label, color } = RETURN_RANGE_SERIES[i]
+    const raw = raws[i]
+    datasets.push({
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
-    }]
-    if (emaOn) result.push({
+    })
+    if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
     })
-    return result
-  })
-  const yViewport = bandsOn
-    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key])))
-    : null
+  }
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels: ds.map(e => e.episode), datasets }}
-        options={{
-          ...chartBase(yViewport),
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={options} />
     </div>
   )
 })
@@ -953,42 +1055,51 @@ const ReturnRangeChart = memo(function ReturnRangeChart() {
 const BCLossChart = makeSimpleChart('Loss', 'loss', '#f38ba8')
 const BCGradNormChart = makeSimpleChart('Grad Norm', 'grad_norm', '#94e2d5')
 
+const BC_HEAD_LOSS_SERIES = [
+  { key: 'loss_bt', label: 'Build Type', color: '#89b4fa' },
+  { key: 'loss_bd', label: 'Build Dir', color: '#a6e3a1' },
+  { key: 'loss_cd', label: 'Card', color: '#fab387' },
+  { key: 'loss_brt', label: 'Bridge Target', color: '#cba6f7' },
+  { key: 'loss_md', label: 'Move Dir', color: '#f9e2af' },
+]
+
 const BCHeadLossChart = memo(function BCHeadLossChart() {
   const ds = useDownsampled()
+  const labels = useDownsampledLabels()
   const { ema: emaOn, bands: bandsOn } = useCardSettings()
+  const raws = useMemo(
+    () => BC_HEAD_LOSS_SERIES.map(({ key }) => ds.map(e => e[key] ?? null)),
+    [ds],
+  )
+  const yViewport = useMemo(
+    () => (bandsOn ? percentileViewportMulti(raws) : null),
+    [raws, bandsOn],
+  )
+  const options = useMemo(
+    () => ({
+      ...chartBase(yViewport),
+      plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
+    }),
+    [yViewport],
+  )
   if (ds.length <= 1) return <NoData />
   const dim = emaOn
-  const series = [
-    { key: 'loss_bt', label: 'Build Type', color: '#89b4fa' },
-    { key: 'loss_bd', label: 'Build Dir', color: '#a6e3a1' },
-    { key: 'loss_cd', label: 'Card', color: '#fab387' },
-    { key: 'loss_brt', label: 'Bridge Target', color: '#cba6f7' },
-    { key: 'loss_md', label: 'Move Dir', color: '#f9e2af' },
-  ]
-  const datasets = series.flatMap(({ key, label, color }) => {
-    const raw = ds.map(e => e[key] ?? null)
-    const result = [{
+  const datasets = []
+  for (let i = 0; i < BC_HEAD_LOSS_SERIES.length; i++) {
+    const { label, color } = BC_HEAD_LOSS_SERIES[i]
+    const raw = raws[i]
+    datasets.push({
       label, data: raw, borderColor: dim ? color + '40' : color,
       tension: 0, pointRadius: 0, borderWidth: dim ? 1 : 1.5, spanGaps: true,
-    }]
-    if (emaOn) result.push({
+    })
+    if (emaOn) datasets.push({
       label: `${label} EMA`, data: ema(raw), borderColor: color,
       borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true,
     })
-    return result
-  })
-  const yViewport = bandsOn
-    ? percentileViewport(series.flatMap(({ key }) => ds.map(e => e[key])))
-    : null
+  }
   return (
     <div className="min-h-[200px]">
-      <Line
-        data={{ labels: ds.map(e => e.episode), datasets }}
-        options={{
-          ...chartBase(yViewport),
-          plugins: { legend: { labels: { color: CHART_THEME.text, font: { size: 10 } } } },
-        }}
-      />
+      <Line data={{ labels, datasets }} options={options} />
     </div>
   )
 })

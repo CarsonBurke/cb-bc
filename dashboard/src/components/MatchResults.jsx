@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState, useCallback } from 'react'
 import { useSetAtom } from 'jotai'
 import { viewerAtom, viewerMinimizedAtom } from '../store'
 import MatchStats from './MatchStats'
@@ -75,24 +75,30 @@ export default function MatchResults({ matches }) {
   const setViewer = useSetAtom(viewerAtom)
   const setMinimized = useSetAtom(viewerMinimizedAtom)
 
-  function handleWatch(matchId) {
+  const handleWatch = useCallback((matchId) => {
     setViewer({
       url: viewerUrl(`/api/replay/match_${matchId}.replay26`),
       title: `Match ${matchId}`,
     })
     setMinimized(false)
-  }
+  }, [setViewer, setMinimized])
 
-  const byMap = {}
-  ;(matches || []).forEach((m, idx) => {
-    const map = m.map || 'unknown'
-    if (!byMap[map]) byMap[map] = []
-    byMap[map].push({ ...m, _idx: idx })
-  })
+  const groupedMaps = useMemo(() => {
+    const byMap = new Map()
+    const list = matches || []
+    for (let idx = 0; idx < list.length; idx++) {
+      const m = list[idx]
+      const map = m.map || 'unknown'
+      let arr = byMap.get(map)
+      if (!arr) { arr = []; byMap.set(map, arr) }
+      arr.push({ ...m, _idx: idx })
+    }
+    return [...byMap.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+  }, [matches])
 
   return (
     <div className="space-y-5">
-      {Object.keys(byMap).sort().map(map => (
+      {groupedMaps.map(([map, rows]) => (
         <div key={map}>
           <h4 className="text-[12px] text-overlay0 font-medium mb-2">{map}</h4>
           <Table>
@@ -103,7 +109,7 @@ export default function MatchResults({ matches }) {
               <Th className="w-32">Actions</Th>
             </Thead>
             <tbody>
-              {byMap[map].map((m, i) => (
+              {rows.map((m, i) => (
                 <MatchRow key={i} match={m} onWatch={handleWatch} />
               ))}
             </tbody>

@@ -1,36 +1,47 @@
+import { useMemo } from 'react'
+
 export default function WinRateMatrix({ bots, matches }) {
-  const sortedBots = Object.keys(bots).sort()
-  const wins = {}
-  const games = {}
+  const { sortedBots, cells } = useMemo(() => {
+    const sortedBots = Object.keys(bots).sort()
+    const idx = new Map(sortedBots.map((b, i) => [b, i]))
+    const n = sortedBots.length
+    const wins = new Int32Array(n * n)
+    const games = new Int32Array(n * n)
 
-  sortedBots.forEach(b => {
-    wins[b] = {}
-    games[b] = {}
-    sortedBots.forEach(o => { wins[b][o] = 0; games[b][o] = 0 })
-  })
+    for (const m of matches || []) {
+      const a = idx.get(m.bot_a)
+      const b = idx.get(m.bot_b)
+      if (a === undefined || b === undefined) continue
+      games[a * n + b]++
+      games[b * n + a]++
+      if (m.winner === m.bot_a) wins[a * n + b]++
+      else if (m.winner === m.bot_b) wins[b * n + a]++
+    }
 
-  ;(matches || []).forEach(m => {
-    if (!(m.bot_a in bots) || !(m.bot_b in bots)) return
-    games[m.bot_a][m.bot_b]++
-    games[m.bot_b][m.bot_a]++
-    if (m.winner === m.bot_a) wins[m.bot_a][m.bot_b]++
-    else if (m.winner === m.bot_b) wins[m.bot_b][m.bot_a]++
-  })
-
-  function cellStyle(bot, opp) {
-    if (bot === opp) return 'text-overlay0'
-    if (games[bot][opp] === 0) return 'text-overlay0'
-    const rate = Math.round(100 * wins[bot][opp] / games[bot][opp])
-    if (rate >= 60) return 'bg-green/12 text-green font-semibold'
-    if (rate <= 40) return 'bg-red/12 text-red font-semibold'
-    return 'bg-yellow/10 text-yellow font-semibold'
-  }
-
-  function cellText(bot, opp) {
-    if (bot === opp) return '—'
-    if (games[bot][opp] === 0) return '—'
-    return Math.round(100 * wins[bot][opp] / games[bot][opp]) + '%'
-  }
+    const cells = new Array(n)
+    for (let i = 0; i < n; i++) {
+      const row = new Array(n)
+      for (let j = 0; j < n; j++) {
+        if (i === j) {
+          row[j] = { style: 'text-overlay0', text: '—' }
+        } else {
+          const g = games[i * n + j]
+          if (g === 0) {
+            row[j] = { style: 'text-overlay0', text: '—' }
+          } else {
+            const rate = Math.round(100 * wins[i * n + j] / g)
+            let style
+            if (rate >= 60) style = 'bg-green/12 text-green font-semibold'
+            else if (rate <= 40) style = 'bg-red/12 text-red font-semibold'
+            else style = 'bg-yellow/10 text-yellow font-semibold'
+            row[j] = { style, text: rate + '%' }
+          }
+        }
+      }
+      cells[i] = row
+    }
+    return { sortedBots, cells }
+  }, [bots, matches])
 
   return (
     <div className="overflow-x-auto">
@@ -46,12 +57,12 @@ export default function WinRateMatrix({ bots, matches }) {
           </tr>
         </thead>
         <tbody>
-          {sortedBots.map(b => (
+          {sortedBots.map((b, i) => (
             <tr key={b} className="border-b border-surface0/50">
               <td className="p-2 font-medium text-text whitespace-nowrap">{b}</td>
-              {sortedBots.map(o => (
-                <td key={o} className={`p-2 text-center ${cellStyle(b, o)}`}>
-                  {cellText(b, o)}
+              {sortedBots.map((o, j) => (
+                <td key={o} className={`p-2 text-center ${cells[i][j].style}`}>
+                  {cells[i][j].text}
                 </td>
               ))}
             </tr>

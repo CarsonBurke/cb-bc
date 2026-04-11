@@ -17,6 +17,7 @@ export default function Card({ title, subtitle, children, className = '', defaul
   const [size, setSize] = useAtom(sizeAtom)
   const [ema, setEma] = useAtom(emaAtom)
   const [bands, setBands] = useAtom(bandsAtom)
+  const settingsValue = useMemo(() => ({ ema, bands }), [ema, bands])
   const didDrag = useRef(false)
 
   const headerDragProps = dragHandleProps ? {
@@ -123,7 +124,7 @@ export default function Card({ title, subtitle, children, className = '', defaul
       )}
       {open && (
         <div className="overflow-hidden">
-          <CardSettingsCtx.Provider value={{ ema, bands }}>
+          <CardSettingsCtx.Provider value={settingsValue}>
             <div
               className={`${title ? 'px-5 pt-4 pb-5' : 'p-5'} ${
                 SIZE_HEIGHTS[size] ? 'flex flex-col overflow-hidden [&>div]:flex-1 [&>div]:min-h-0 [&>div]:max-h-none' : ''

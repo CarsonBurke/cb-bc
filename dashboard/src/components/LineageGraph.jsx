@@ -1,6 +1,24 @@
 import { useMemo, useState } from 'react'
 import { botColor } from '../data'
 
+function eloColor(elo, minElo, maxElo) {
+  if (elo == null || maxElo === minElo) return '#f9e2af'
+  const t = (elo - minElo) / (maxElo - minElo)
+  // red(f38ba8) → yellow(f9e2af) → green(a6e3a1)
+  if (t < 0.5) {
+    const s = t * 2
+    const r = Math.round(0xf3 + (0xf9 - 0xf3) * s)
+    const g = Math.round(0x8b + (0xe2 - 0x8b) * s)
+    const b = Math.round(0xa8 + (0xaf - 0xa8) * s)
+    return `rgb(${r},${g},${b})`
+  }
+  const s = (t - 0.5) * 2
+  const r = Math.round(0xf9 + (0xa6 - 0xf9) * s)
+  const g = Math.round(0xe2 + (0xe3 - 0xe2) * s)
+  const b = Math.round(0xaf + (0xa1 - 0xaf) * s)
+  return `rgb(${r},${g},${b})`
+}
+
 export default function LineageGraph({ lineage, allBots, latestBots }) {
   const nodes = useMemo(() => Object.keys(lineage || {}), [lineage])
   const [hovered, setHovered] = useState(null)
@@ -42,47 +60,36 @@ export default function LineageGraph({ lineage, allBots, latestBots }) {
 
     roots.sort().forEach((root) => layout(root, 0))
 
-    const allX = Object.values(positions).map((point) => point.x)
-    const allY = Object.values(positions).map((point) => point.y)
+    let maxX = -Infinity, localMinX = Infinity, maxY = -Infinity
+    for (const p of Object.values(positions)) {
+      if (p.x > maxX) maxX = p.x
+      if (p.x < localMinX) localMinX = p.x
+      if (p.y > maxY) maxY = p.y
+    }
     const margin = 70
-    const minX = Math.min(...allX) - margin
-    const width = Math.max(...allX) - minX + margin + 160
-    const height = Math.max(...allY) + margin * 2
+    const minX = localMinX - margin
+    const width = maxX - minX + margin + 160
+    const height = maxY + margin * 2
 
     return { positions, minX, width, height }
   }, [lineage, nodes])
 
-  const latestElos = useMemo(
-    () => Object.values(latestBots || {}).filter((elo) => elo != null),
-    [latestBots],
-  )
-  const minElo = Math.min(...latestElos, 1000)
-  const maxElo = Math.max(...latestElos, 1000)
+  const { minElo, maxElo } = useMemo(() => {
+    let min = 1000, max = 1000
+    const values = Object.values(latestBots || {})
+    for (const v of values) {
+      if (v == null) continue
+      if (v < min) min = v
+      if (v > max) max = v
+    }
+    return { minElo: min, maxElo: max }
+  }, [latestBots])
   const botIndex = useMemo(
     () => new Map(allBots.map((name, index) => [name, index])),
     [allBots],
   )
 
   if (!nodes.length) return <p className="text-overlay0 text-sm">No lineage data.</p>
-
-  function eloColor(elo) {
-    if (elo == null || maxElo === minElo) return '#f9e2af'
-    const t = (elo - minElo) / (maxElo - minElo)
-    // red(f38ba8) → yellow(f9e2af) → green(a6e3a1)
-    if (t < 0.5) {
-      const s = t * 2
-      const r = Math.round(0xf3 + (0xf9 - 0xf3) * s)
-      const g = Math.round(0x8b + (0xe2 - 0x8b) * s)
-      const b = Math.round(0xa8 + (0xaf - 0xa8) * s)
-      return `rgb(${r},${g},${b})`
-    } else {
-      const s = (t - 0.5) * 2
-      const r = Math.round(0xf9 + (0xa6 - 0xf9) * s)
-      const g = Math.round(0xe2 + (0xe3 - 0xe2) * s)
-      const b = Math.round(0xaf + (0xa1 - 0xaf) * s)
-      return `rgb(${r},${g},${b})`
-    }
-  }
 
   return (
     <div className="overflow-auto">
@@ -135,7 +142,7 @@ export default function LineageGraph({ lineage, allBots, latestBots }) {
               />
               <text x={18} y={4} fill="#cdd6f4" fontSize={13} fontWeight={600}>{n}</text>
               {elo != null && (
-                <text x={18} y={18} fill={eloColor(elo)} fontSize={11} fontWeight={600}>
+                <text x={18} y={18} fill={eloColor(elo, minElo, maxElo)} fontSize={11} fontWeight={600}>
                   ELO {elo}
                 </text>
               )}
