@@ -42,7 +42,9 @@ from model import (
     _build_bptt_chunks,
     _compute_gae,
     _make_bucket_centers,
+    _normalize_advantages,
     _normalize_actor_latent_dim,
+    _policy_weight_from_advantages,
     _temperature_head_init_bias,
     _precompute_policy_masks,
     _recurrent_actor_pass,
@@ -1070,17 +1072,27 @@ class TestAdvantageNormalization:
     def test_normalized_advantages_zero_mean_unit_var(self):
         """After normalization, advantages should have ~0 mean and ~1 std."""
         adv = torch.randn(1000) * 10 + 5  # non-zero mean, large std
-        norm_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        norm_adv = _normalize_advantages(adv)
         assert norm_adv.mean().item() == pytest.approx(0.0, abs=1e-5)
         assert norm_adv.std().item() == pytest.approx(1.0, abs=1e-2)
 
     def test_constant_advantages_no_nan(self):
         """All-equal advantages shouldn't produce NaN after normalization."""
         adv = torch.full((100,), 3.0)
-        norm_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        norm_adv = _normalize_advantages(adv)
         assert not torch.isnan(norm_adv).any()
         # Should be all ~0
         assert norm_adv.abs().max().item() < 1e-4
+
+    def test_pmpo_policy_weight_uses_advantage_sign(self):
+        adv = torch.tensor([-3.0, -0.2, 0.0, 0.7, 5.0])
+        weights = _policy_weight_from_advantages(adv, use_pmpo=True)
+        assert torch.equal(weights, torch.tensor([-1.0, -1.0, 0.0, 1.0, 1.0]))
+
+    def test_plain_ppo_policy_weight_keeps_advantage_magnitude(self):
+        adv = torch.tensor([-3.0, -0.2, 0.0, 0.7, 5.0])
+        weights = _policy_weight_from_advantages(adv, use_pmpo=False)
+        assert torch.equal(weights, adv)
 
 
 # =====================================================================

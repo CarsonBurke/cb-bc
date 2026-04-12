@@ -1480,6 +1480,12 @@ def main():
     )
     parser.add_argument("--critic-no-compile", action="store_true", help="Disable torch.compile for PPO critic updates")
     parser.add_argument("--freeze-critic", action="store_true", help="Skip critic updates during PPO (actor-only training)")
+    parser.add_argument(
+        "--use-pmpo",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use PMPO sign-weighted policy updates and disable advantage normalization",
+    )
     parser.add_argument("--profile-episodes", type=str, default="", help="1-based episode list/ranges to profile end-to-end, e.g. 1,5-7")
     parser.add_argument("--profile-dir", type=str, default="", help="Output dir for profiler traces (default: <session>/profiles)")
     parser.add_argument("--profile-ops", action="store_true", help="Also capture torch op-level profiling data (much heavier than scope tracing)")
@@ -1684,6 +1690,7 @@ def main():
                 target_kl=0.03,
                 actor_minibatch_size=args.actor_minibatch_size or None,
                 freeze_critic=args.freeze_critic,
+                use_pmpo=args.use_pmpo,
                 profile=episode_profile,
                 trace=episode_trace,
             )

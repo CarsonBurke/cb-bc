@@ -351,6 +351,69 @@ def test_build_critic_epoch_plan_packs_round_major_slices(monkeypatch):
     assert plan.local_round_idx_by_batch[1].tolist() == [0, 0, 1]
 
 
+def test_build_critic_epoch_plan_spreads_positive_rounds_without_splitting_rounds(monkeypatch):
+    monkeypatch.setattr(
+        model_mod.torch,
+        "randperm",
+        lambda n, device=None: torch.arange(n, device=device),
+    )
+
+    step_round_idx = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.long)
+    step_unit_xy = torch.tensor(
+        [[10, 0], [11, 0], [20, 0], [21, 0], [30, 0], [31, 0], [40, 0], [41, 0]],
+        dtype=torch.long,
+    )
+    step_unit_float = torch.arange(8, dtype=torch.float32).unsqueeze(1)
+    step_rv = torch.stack([torch.arange(8, dtype=torch.float32), torch.arange(100, 108, dtype=torch.float32)], dim=1)
+    positive_mask = torch.tensor([False, False, False, False, True, True, True, True], dtype=torch.bool)
+
+    plan = model_mod._build_critic_epoch_plan(
+        step_round_idx,
+        step_unit_xy,
+        step_unit_float,
+        step_rv,
+        target_steps=4,
+        positive_mask=positive_mask,
+    )
+
+    assert plan.round_ids.tolist() == [2, 0, 3, 1]
+    assert plan.batch_ranges == [(0, 2), (2, 4)]
+    assert plan.round_offsets.tolist() == [0, 2, 4, 6, 8]
+    assert torch.equal(plan.packed_xy[:, 0], torch.tensor([30, 31, 10, 11, 40, 41, 20, 21]))
+    assert plan.local_round_idx_by_batch[0].tolist() == [0, 0, 1, 1]
+    assert plan.local_round_idx_by_batch[1].tolist() == [0, 0, 1, 1]
+
+
+def test_build_critic_epoch_plan_positive_path_respects_round_cap(monkeypatch):
+    monkeypatch.setattr(
+        model_mod.torch,
+        "randperm",
+        lambda n, device=None: torch.arange(n, device=device),
+    )
+
+    step_round_idx = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.long)
+    step_unit_xy = torch.tensor(
+        [[10, 0], [11, 0], [20, 0], [21, 0], [30, 0], [31, 0], [40, 0], [41, 0]],
+        dtype=torch.long,
+    )
+    step_unit_float = torch.arange(8, dtype=torch.float32).unsqueeze(1)
+    step_rv = torch.stack([torch.arange(8, dtype=torch.float32), torch.arange(100, 108, dtype=torch.float32)], dim=1)
+    positive_mask = torch.tensor([False, False, False, False, True, True, True, True], dtype=torch.bool)
+
+    plan = model_mod._build_critic_epoch_plan(
+        step_round_idx,
+        step_unit_xy,
+        step_unit_float,
+        step_rv,
+        target_steps=8,
+        positive_mask=positive_mask,
+        max_rounds=1,
+    )
+
+    assert plan.batch_ranges == [(0, 1), (1, 2), (2, 3), (3, 4)]
+    assert plan.round_ids.tolist() == [2, 3, 0, 1]
+
+
 def test_coerce_replay_buffer_reuses_writable_bytearray():
     buf = bytearray(range(8))
     out = model_mod._coerce_replay_buffer(buf)
