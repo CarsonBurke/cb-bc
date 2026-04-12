@@ -556,6 +556,13 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.is_cuda:
+            # Keep bf16/fp16 activations, but accumulate the norm in fp32.
+            # Recent critic changes add more RMSNorm applications in deep
+            # attention stacks, and bf16-native norm math is prone to rare
+            # instability on large PPO critic batches.
+            if x.dtype in (torch.float16, torch.bfloat16):
+                out = F.rms_norm(x.float(), (self.dim,), self.weight.float(), self.eps)
+                return out.to(dtype=x.dtype)
             weight = self.weight if self.weight.dtype == x.dtype else self.weight.to(dtype=x.dtype)
             return F.rms_norm(x, (self.dim,), weight, self.eps)
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps) * self.weight
@@ -658,7 +665,7 @@ class CriticAttentionBlock(nn.Module):
     def _init_weights(self):
         for m in [self.q_proj, self.k_proj, self.v_proj, self.out_proj,
                    self.mlp_fc1, self.mlp_fc2]:
-            nn.init.xavier_uniform_(m.weight)
+            trunc_normal_(m.weight, std=0.02)
 
     def project_qkv(
         self,
@@ -756,9 +763,9 @@ class CriticAttentionBlock(nn.Module):
         return self.out_proj(attn_out)
 
     def apply_mlp_residual(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the peri-normalized MLP residual block."""
+        """Apply the pre-norm MLP residual block."""
         h = self.mlp_input_norm(x)
-        return x + self.mlp_output_norm(self.mlp_fc2(F.silu(self.mlp_fc1(h))))
+        return x + self.mlp_fc2(F.silu(self.mlp_fc1(h)))
 
     def apply_residual_mlp(
         self,
@@ -766,7 +773,7 @@ class CriticAttentionBlock(nn.Module):
         attn_out: torch.Tensor,
     ) -> torch.Tensor:
         """Apply output projection, residual update, and MLP block."""
-        x = x + self.attn_output_norm(self.project_attn_residual(attn_out))
+        x = x + self.project_attn_residual(attn_out)
         return self.apply_mlp_residual(x)
 
     def forward(
@@ -872,7 +879,7 @@ class CriticTileEmbed(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -1117,21 +1124,26 @@ class CriticGlobalSA(nn.Module):
         global_tokens = all_tokens[:, scalar_end:shared_end]
         unit_tokens = all_tokens[:, shared_end:]
 
+        def _peri_residual(tokens: torch.Tensor, branch_out: torch.Tensor) -> torch.Tensor:
+            return tokens + self.attn.attn_output_norm(self.attn.project_attn_residual(branch_out))
+
         # Patches query patches + scalar + CLS (no mask needed, FA-eligible)
-        patch_tokens = patch_tokens + self.attn.project_attn_residual(
+        patch_tokens = _peri_residual(
+            patch_tokens,
             self.attn.attend(
                 q[:, :, :patch_end],
                 k[:, :, :shared_end],
                 v[:, :, :shared_end],
-            )
+            ),
         )
         # CLS query patches + scalar + CLS (see each other)
-        global_tokens = global_tokens + self.attn.project_attn_residual(
+        global_tokens = _peri_residual(
+            global_tokens,
             self.attn.attend(
                 q[:, :, scalar_end:shared_end],
                 k[:, :, :shared_end],
                 v[:, :, :shared_end],
-            )
+            ),
         )
         if layout.unit_attn_bias is not None:
             unit_attn_out = self.attn.attend(
@@ -1139,7 +1151,7 @@ class CriticGlobalSA(nn.Module):
                 attn_mask=layout.unit_attn_bias,
             )
             unit_attn_out = unit_attn_out * layout.valid_unit_mask.unsqueeze(-1).to(dtype=unit_attn_out.dtype)
-            unit_tokens = unit_tokens + self.attn.project_attn_residual(unit_attn_out)
+            unit_tokens = _peri_residual(unit_tokens, unit_attn_out)
 
         all_tokens = torch.cat([patch_tokens, scalar_tokens, global_tokens, unit_tokens], dim=1)
         all_tokens = self.attn.apply_mlp_residual(all_tokens)
@@ -1179,7 +1191,7 @@ class CriticUnitCLSBuilder(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                trunc_normal_(m.weight, std=0.02)
 
     def forward(self, actor_latent: torch.Tensor, unit_context: torch.Tensor) -> torch.Tensor:
         """actor_latent: (B, 64), unit_context: (B, 7) → (B, out_dim)."""
@@ -1218,7 +1230,7 @@ class CriticValueHead(nn.Module):
     def _init_weights(self):
         for m in self.mlp:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         nn.init.zeros_(self.mlp[-1].weight)
@@ -1283,7 +1295,7 @@ class CentralizedCritic(nn.Module):
             RMSNorm(dim),
             nn.SiLU(),
         )
-        nn.init.xavier_uniform_(self.scalar_proj[0].weight)
+        trunc_normal_(self.scalar_proj[0].weight, std=0.02)
 
         # Learned global CLS tokens
         self.global_cls = nn.Parameter(torch.zeros(self._N_GLOBAL_CLS, dim))

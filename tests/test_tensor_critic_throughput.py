@@ -223,6 +223,60 @@ def test_critic_global_layout_initializes_padded_unit_rope_to_identity():
     assert torch.equal(unit_rope_sin[invalid_queries], torch.zeros_like(unit_rope_sin[invalid_queries]))
 
 
+def test_critic_global_sa_applies_attn_output_norm_to_global_cls_tokens(monkeypatch):
+    device = torch.device("cpu")
+    layer = model_mod.CriticGlobalSA(dim=8, n_heads=2, n_kv_heads=1, n_global_cls=2, max_grid_size=2).to(device).eval()
+
+    with torch.no_grad():
+        layer.attn.out_proj.weight.copy_(torch.eye(8))
+        for norm in (
+            layer.attn.attn_input_norm,
+            layer.attn.attn_output_norm,
+            layer.attn.mlp_input_norm,
+            layer.attn.mlp_output_norm,
+            layer.attn.q_norm,
+            layer.attn.k_norm,
+        ):
+            norm.weight.fill_(1.0)
+        layer.attn.mlp_fc1.weight.zero_()
+        layer.attn.mlp_fc2.weight.zero_()
+
+    call_idx = {"value": 0}
+
+    def fake_attend(q, k, v, attn_mask=None):
+        del k, v, attn_mask
+        fill = 2.0 if call_idx["value"] == 0 else 3.0
+        call_idx["value"] += 1
+        B, _, N_q, _ = q.shape
+        return torch.full((B, N_q, layer.dim), fill, device=q.device, dtype=q.dtype)
+
+    monkeypatch.setattr(layer.attn, "attend", fake_attend)
+
+    patches = torch.zeros(1, 4, layer.dim, device=device)
+    global_cls = torch.zeros(1, 2, layer.dim, device=device)
+    scalar_tok = torch.zeros(1, 1, layer.dim, device=device)
+    unit_cls = torch.zeros(0, layer.dim, device=device)
+    layout = layer.prepare_layout(
+        n_patches=4,
+        pH=2,
+        pW=2,
+        unit_cls=unit_cls,
+        unit_xy=torch.zeros(0, 2, dtype=torch.long, device=device),
+        unit_round_idx=torch.zeros(0, dtype=torch.long, device=device),
+        n_rounds=1,
+    )
+
+    out_patches, out_global_cls, out_unit_cls = layer(
+        patches, global_cls, scalar_tok, unit_cls, layout,
+    )
+
+    expected_patch = layer.attn.attn_output_norm(torch.full_like(out_patches, 2.0))
+    expected_global = layer.attn.attn_output_norm(torch.full_like(out_global_cls, 3.0))
+    torch.testing.assert_close(out_patches, expected_patch, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(out_global_cls, expected_global, atol=1e-6, rtol=1e-6)
+    assert out_unit_cls.shape == (0, layer.dim)
+
+
 def test_critic_global_layout_keeps_shared_rope_prefix_round_independent():
     device = torch.device("cpu")
     layer = model_mod.CriticGlobalSA().to(device)

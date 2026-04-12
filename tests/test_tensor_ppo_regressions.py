@@ -28,6 +28,7 @@ from model import (
     HARVESTER_BUILD_TYPE,
     NUM_BUCKETS,
     OBS_SIZE,
+    RMSNorm,
     TEMP_MIN,
     TEMP_MAX,
     TILE_FEATURES,
@@ -954,8 +955,8 @@ class TestCentralizedCritic:
         feat = critic.encode_map(map_tensor, valid_mask)
         assert (feat.patches == 0).all(), "Fully masked map should produce zero patch features"
 
-    def test_attention_block_applies_output_norms_on_both_residual_branches(self):
-        """Peri-LN normalizes the branch output before adding it to the residual path."""
+    def test_attention_block_residual_paths_are_pre_norm(self):
+        """Critic residual branches use pre-norm inputs and raw branch outputs."""
         block = CriticAttentionBlock(dim=8, n_heads=2, n_kv_heads=1, mlp_ratio=2).eval()
         with torch.no_grad():
             for layer in (block.q_proj, block.k_proj, block.v_proj, block.mlp_fc1, block.mlp_fc2):
@@ -974,8 +975,42 @@ class TestCentralizedCritic:
         x = torch.randn(2, 4, 8)
         attn_out = torch.randn_like(x)
         out = block.apply_residual_mlp(x, attn_out)
-        expected = x + block.attn_output_norm(attn_out)
+        expected = x + attn_out
         torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
+
+    def test_rmsnorm_cuda_bf16_matches_fp32_reference(self):
+        if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+            pytest.skip("requires CUDA bf16")
+
+        norm = RMSNorm(32).cuda().eval()
+        x = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16) * 100
+
+        with torch.no_grad():
+            actual = norm(x)
+            expected = F.rms_norm(
+                x.float(),
+                (32,),
+                norm.weight.float(),
+                norm.eps,
+            ).to(dtype=torch.bfloat16)
+
+        assert torch.isfinite(actual).all()
+        assert torch.allclose(actual, expected, atol=1e-2, rtol=1e-2)
+
+    def test_critic_transformer_linears_keep_small_std_init(self):
+        torch.manual_seed(0)
+        critic = CentralizedCritic().eval()
+
+        weights = [
+            critic.tile_embed.net[0].weight,
+            critic.windowed_sa[0].attn.q_proj.weight,
+            critic.unit_cls_builder.pos_proj.weight,
+            critic.value_head.mlp[0].weight,
+            critic.scalar_proj[0].weight,
+        ]
+
+        for weight in weights:
+            assert weight.std().item() < 0.05
 
     def test_different_maps_same_mask_different_features(self):
         """Different map content in valid region should change encoded features."""
