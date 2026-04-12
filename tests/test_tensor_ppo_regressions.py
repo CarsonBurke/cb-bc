@@ -29,8 +29,11 @@ from model import (
     NUM_BUCKETS,
     OBS_SIZE,
     TEMP_MIN,
+    TEMP_MAX,
     TILE_FEATURES,
     UNIT_CONTEXT_DIM,
+    _POLICY_HEAD_LOGIT_CAPS,
+    _categorical_logit_softcap,
     _MASK_BD_TILES,
     _OBS_AX,
     _OBS_SCALE,
@@ -39,6 +42,7 @@ from model import (
     _compute_gae,
     _make_bucket_centers,
     _normalize_actor_latent_dim,
+    _temperature_head_init_bias,
     _precompute_policy_masks,
     _recurrent_actor_pass,
     _recurrent_logprob_pass,
@@ -743,6 +747,97 @@ class TestSoftCrossEntropy:
             target = F.softmax(torch.randn(3, 10), dim=-1)
             ce = soft_cross_entropy_from_logits(logits, target)
             assert (ce >= -1e-6).all()
+
+
+def test_categorical_logit_softcap_matches_85_percent_top1_target():
+    assert _categorical_logit_softcap(4) == pytest.approx(2.833213344056216, abs=1e-9)
+    assert _categorical_logit_softcap(9) == pytest.approx(3.8140425970679424, abs=1e-9)
+    assert _categorical_logit_softcap(13) == pytest.approx(4.219507705176107, abs=1e-9)
+    assert _categorical_logit_softcap(28) == pytest.approx(5.030437921392435, abs=1e-9)
+
+
+def test_project_policy_heads_softcap_saturates_each_categorical_head():
+    model = BuilderMLP().eval()
+    latent = torch.zeros(1, ACTOR_LATENT_DIM)
+
+    with torch.no_grad():
+        for head in (
+            model.head_build_type,
+            model.head_build_dir,
+            model.head_conv_dir,
+            model.head_bridge_target,
+            model.head_move_dir,
+            model.head_temperature,
+        ):
+            head.weight.zero_()
+            head.bias.zero_()
+        model.head_build_type.bias[:3] = torch.tensor([100.0, -100.0, 0.0])
+        model.head_build_dir.bias[:3] = torch.tensor([100.0, -100.0, 0.0])
+        model.head_conv_dir.bias[:3] = torch.tensor([100.0, -100.0, 0.0])
+        model.head_bridge_target.bias[:3] = torch.tensor([100.0, -100.0, 0.0])
+        model.head_move_dir.bias[:3] = torch.tensor([100.0, -100.0, 0.0])
+
+    bt_l, bd_l, cd_l, brt_l, md_l, _head_temperature = model._project_policy_heads(latent)
+
+    for logits, cap in zip((bt_l, bd_l, cd_l, brt_l, md_l), _POLICY_HEAD_LOGIT_CAPS, strict=True):
+        assert logits[0, 0].item() == pytest.approx(cap, abs=1e-5)
+        assert logits[0, 1].item() == pytest.approx(-cap, abs=1e-5)
+        assert logits[0, 2].item() == pytest.approx(0.0, abs=1e-7)
+
+
+def test_project_policy_heads_temperature_stays_in_configured_range():
+    model = BuilderMLP().eval()
+    latent = torch.randn(32, ACTOR_LATENT_DIM)
+
+    with torch.no_grad():
+        for head in (
+            model.head_build_type,
+            model.head_build_dir,
+            model.head_conv_dir,
+            model.head_bridge_target,
+            model.head_move_dir,
+        ):
+            head.weight.zero_()
+            head.bias.zero_()
+        model.head_temperature.weight.zero_()
+        model.head_temperature.bias.copy_(torch.tensor([-100.0, -1.0, 0.0, 1.0, 100.0]))
+
+    _bt_l, _bd_l, _cd_l, _brt_l, _md_l, head_temperature = model._project_policy_heads(latent)
+
+    assert torch.all(head_temperature >= TEMP_MIN)
+    assert torch.all(head_temperature <= TEMP_MAX)
+    torch.testing.assert_close(
+        head_temperature[0],
+        torch.tensor([TEMP_MIN, 1.3437475, 1.7320508, 2.2325623, TEMP_MAX], dtype=head_temperature.dtype),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_temperature_head_init_bias_sets_default_temperature_to_1p2():
+    model = BuilderMLP().eval()
+    latent = torch.zeros(1, ACTOR_LATENT_DIM)
+
+    with torch.no_grad():
+        for head in (
+            model.head_build_type,
+            model.head_build_dir,
+            model.head_conv_dir,
+            model.head_bridge_target,
+            model.head_move_dir,
+        ):
+            head.weight.zero_()
+            head.bias.zero_()
+        model.head_temperature.weight.zero_()
+        model.head_temperature.bias.fill_(_temperature_head_init_bias())
+
+    _bt_l, _bd_l, _cd_l, _brt_l, _md_l, head_temperature = model._project_policy_heads(latent)
+    torch.testing.assert_close(
+        head_temperature[0],
+        torch.full((model.head_temperature.out_features,), 1.2, dtype=head_temperature.dtype),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 # =====================================================================

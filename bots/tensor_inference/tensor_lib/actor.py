@@ -44,6 +44,7 @@ except ImportError:
 
 _SQRT_TILE_DIM = TILE_EMBED_DIM ** 0.5
 _EXP = math.exp
+_ACTION_LOGIT_TOP1_TARGET = 0.85
 
 
 def _sigmoid_scalar(x: float) -> float:
@@ -72,6 +73,19 @@ def _silu_vec(values: list[float]) -> list[float]:
 def _rmsnorm(vec: list[float], gamma: list[float], eps: float) -> list[float]:
     inv_rms = 1.0 / (sum(x * x for x in vec) / len(vec) + eps) ** 0.5
     return [vec[i] * inv_rms * gamma[i] for i in range(len(vec))]
+
+
+def _categorical_logit_softcap(n_actions: int, top1_prob: float = _ACTION_LOGIT_TOP1_TARGET) -> float:
+    if n_actions < 2:
+        return 0.0
+    return math.log(((n_actions - 1) * top1_prob) / (1.0 - top1_prob))
+
+
+def _softcap_logits(values: list[float], cap: float) -> list[float]:
+    if cap <= 0.0:
+        return [0.0] * len(values)
+    inv_cap = 1.0 / cap
+    return [cap * math.tanh(v * inv_cap) for v in values]
 
 
 def _l2_normalize(vec: list[float], eps: float = 1e-6) -> list[float]:
@@ -397,6 +411,7 @@ class ActorModel:
         )
         action_names: list[str] = []
         action_slices: list[tuple[int, int]] = []
+        action_caps: list[float] = []
         action_rows: list[list[float]] = []
         action_bias: list[float] = []
         offset = 0
@@ -404,6 +419,7 @@ class ActorModel:
             rows, bias = _linear_rows(head)
             action_names.append(name)
             action_slices.append((offset, offset + head.out_features))
+            action_caps.append(_categorical_logit_softcap(head.out_features))
             action_rows.extend(rows)
             if bias is None:
                 action_bias.extend([0.0] * head.out_features)
@@ -513,7 +529,7 @@ class ActorModel:
             "latent_ffn_out_norm": (list(self.latent_ffn_out_norm.gamma.data), self.latent_ffn_out_norm.eps),
             "latent_ffn_up": latent_ffn_up,
             "latent_ffn_down": latent_ffn_down,
-            "action_heads": (action_names, action_slices, action_rows, action_bias),
+            "action_heads": (action_names, action_slices, action_caps, action_rows, action_bias),
             "head_h_gate": (head_h_gate_rows, head_h_gate_bias),
             "head_h_cand": (head_h_cand_rows, head_h_cand_bias),
             "tile_ffn_norm": (list(self.tile_ffn_norm.gamma.data), self.tile_ffn_norm.eps),
@@ -868,10 +884,11 @@ class ActorModel:
             latent = [latent[i] + latent_delta[i] for i in range(ACTOR_LATENT_DIM)]
         latent = _rmsnorm(latent, latent_norm_gamma, latent_norm_eps)
 
-        action_names, action_slices, action_rows, action_bias = cache["action_heads"]
+        action_names, action_slices, action_caps, action_rows, action_bias = cache["action_heads"]
         outputs: dict[str, list[float]] = {}
-        for name, (start, end) in zip(action_names, action_slices):
-            outputs[name] = [_DOT(latent, action_rows[j]) + action_bias[j] for j in range(start, end)]
+        for name, (start, end), cap in zip(action_names, action_slices, action_caps):
+            logits = [_DOT(latent, action_rows[j]) + action_bias[j] for j in range(start, end)]
+            outputs[name] = _softcap_logits(logits, cap)
 
         gru_in = latent + h_prev
         gate_rows, gate_bias = cache["head_h_gate"]

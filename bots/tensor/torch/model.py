@@ -84,8 +84,53 @@ assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder alway
 HARVESTER_BUILD_TYPE = 1
 BRIDGE_BUILD_TYPE = 12
 CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
-TEMP_MIN = 0.5
-TEMP_MAX = 2.0
+TEMP_MIN = 1.0
+TEMP_MAX = 3.0
+INITIAL_HEAD_TEMPERATURE = 1.2
+_ACTION_LOGIT_TOP1_TARGET = 0.85
+
+
+def _categorical_logit_softcap(n_actions: int, top1_prob: float = _ACTION_LOGIT_TOP1_TARGET) -> float:
+    """Soft-cap value whose saturated top-1 mass is ``top1_prob`` for a K-way softmax."""
+    if n_actions < 2:
+        return 0.0
+    if not 0.0 < top1_prob < 1.0:
+        raise ValueError(f"top1_prob must be in (0, 1), got {top1_prob}")
+    return math.log(((n_actions - 1) * top1_prob) / (1.0 - top1_prob))
+
+
+def _temperature_head_init_bias(
+    initial_temperature: float = INITIAL_HEAD_TEMPERATURE,
+    temp_min: float = TEMP_MIN,
+    temp_max: float = TEMP_MAX,
+) -> float:
+    if not temp_min <= initial_temperature <= temp_max:
+        raise ValueError(
+            f"initial_temperature must be in [{temp_min}, {temp_max}], got {initial_temperature}"
+        )
+    if temp_min <= 0.0 or temp_max <= 0.0:
+        raise ValueError("temperature range must be positive")
+    if temp_min == temp_max:
+        return 0.0
+    s = (math.log(initial_temperature) - math.log(temp_min)) / (math.log(temp_max) - math.log(temp_min))
+    s = min(max(s, 1e-6), 1.0 - 1e-6)
+    return math.log(s / (1.0 - s))
+
+
+def _softcap_logits(logits: torch.Tensor, cap: float) -> torch.Tensor:
+    if cap <= 0.0:
+        return torch.zeros_like(logits)
+    return cap * torch.tanh(logits / cap)
+
+
+_POLICY_HEAD_LOGIT_CAPS = (
+    _categorical_logit_softcap(N_BUILD),
+    _categorical_logit_softcap(N_DIR),
+    _categorical_logit_softcap(N_CONV_DIR),
+    _categorical_logit_softcap(N_BRIDGE_TARGETS),
+    _categorical_logit_softcap(N_DIR),
+)
+
 INITIAL_BUILD_TYPE_BIAS = [
     -2.0,  # none
     1.1,   # harvester
@@ -2421,6 +2466,7 @@ class BuilderMLP(nn.Module):
             self.head_build_type.bias.copy_(
                 torch.tensor(INITIAL_BUILD_TYPE_BIAS, dtype=torch.float32),
             )
+            self.head_temperature.bias.fill_(_temperature_head_init_bias())
 
     def train(self, mode=True):
         if mode:
@@ -2561,6 +2607,11 @@ class BuilderMLP(nn.Module):
             [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, N_ACTION_TEMPERATURES],
             dim=-1,
         )
+        bt_l = _softcap_logits(bt_l, _POLICY_HEAD_LOGIT_CAPS[0])
+        bd_l = _softcap_logits(bd_l, _POLICY_HEAD_LOGIT_CAPS[1])
+        cd_l = _softcap_logits(cd_l, _POLICY_HEAD_LOGIT_CAPS[2])
+        brt_l = _softcap_logits(brt_l, _POLICY_HEAD_LOGIT_CAPS[3])
+        md_l = _softcap_logits(md_l, _POLICY_HEAD_LOGIT_CAPS[4])
         log_temp = torch.sigmoid(temp_raw) * (math.log(TEMP_MAX) - math.log(TEMP_MIN)) + math.log(TEMP_MIN)
         head_temperature = log_temp.exp()
         return bt_l, bd_l, cd_l, brt_l, md_l, head_temperature
