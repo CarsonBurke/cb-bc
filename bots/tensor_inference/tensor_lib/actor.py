@@ -44,7 +44,7 @@ except ImportError:
 
 _SQRT_TILE_DIM = TILE_EMBED_DIM ** 0.5
 _EXP = math.exp
-_ACTION_LOGIT_TOP1_TARGET = 0.85
+_FFN_LEAKY_RELU_SLOPE = 0.01
 
 
 def _sigmoid_scalar(x: float) -> float:
@@ -56,6 +56,12 @@ def _sigmoid_scalar(x: float) -> float:
 
 def _silu_scalar(x: float) -> float:
     return x * _sigmoid_scalar(x)
+
+
+def _ffn_activation_scalar(x: float) -> float:
+    if x < 0.0:
+        x *= _FFN_LEAKY_RELU_SLOPE
+    return x * x
 
 
 def _linear(vec: list[float], rows: list[list[float]], bias: list[float] | None) -> list[float]:
@@ -70,22 +76,23 @@ def _silu_vec(values: list[float]) -> list[float]:
     return [_silu_scalar(v) for v in values]
 
 
+def _ffn_activation_vec(values: list[float]) -> list[float]:
+    return [_ffn_activation_scalar(v) for v in values]
+
+
+def _residual_mix_token_inplace(
+    token: list[float],
+    anchor: list[float],
+    cur_mix: list[float],
+    anchor_mix: list[float],
+) -> None:
+    for i in range(len(token)):
+        token[i] = cur_mix[i] * token[i] + anchor_mix[i] * anchor[i]
+
+
 def _rmsnorm(vec: list[float], gamma: list[float], eps: float) -> list[float]:
     inv_rms = 1.0 / (sum(x * x for x in vec) / len(vec) + eps) ** 0.5
     return [vec[i] * inv_rms * gamma[i] for i in range(len(vec))]
-
-
-def _categorical_logit_softcap(n_actions: int, top1_prob: float = _ACTION_LOGIT_TOP1_TARGET) -> float:
-    if n_actions < 2:
-        return 0.0
-    return math.log(((n_actions - 1) * top1_prob) / (1.0 - top1_prob))
-
-
-def _softcap_logits(values: list[float], cap: float) -> list[float]:
-    if cap <= 0.0:
-        return [0.0] * len(values)
-    inv_cap = 1.0 / cap
-    return [cap * math.tanh(v * inv_cap) for v in values]
 
 
 def _l2_normalize(vec: list[float], eps: float = 1e-6) -> list[float]:
@@ -267,6 +274,14 @@ class ActorModel:
         self.context_tau = Tensor.zeros((ACTOR_CLS_TOKENS,))
         self.tile_sa_gamma = Tensor.zeros((1,))
         self.cls_ca_tau = Tensor.zeros((ACTOR_CLS_TOKENS,))
+        self.context_resid_mix = Tensor(
+            [1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM,
+            (2, TILE_EMBED_DIM),
+        )
+        self.cls_resid_mix = Tensor(
+            [1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM,
+            (2, TILE_EMBED_DIM),
+        )
 
         self.latent_ffn_up = Linear(ACTOR_LATENT_DIM, ACTOR_LATENT_DIM * 2)
         self.latent_ffn_down = Linear(ACTOR_LATENT_DIM * 2, ACTOR_LATENT_DIM)
@@ -321,6 +336,10 @@ class ActorModel:
         ]
         self._tile_k_views = [
             memoryview(self._tile_k_flat)[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM]
+            for i in range(TILE_GRID_N)
+        ]
+        self._tile_v_views = [
+            memoryview(self._tile_v_flat)[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM]
             for i in range(TILE_GRID_N)
         ]
         self._enriched_views = [
@@ -378,6 +397,8 @@ class ActorModel:
         params.extend(self.tile_ffn_out_norm.parameters())
         params.extend(self.cls_ca_input_norm.parameters())
         params.extend(self.latent_ffn_out_norm.parameters())
+        params.append(self.context_resid_mix)
+        params.append(self.cls_resid_mix)
         return params
 
     def train(self, mode: bool = True) -> None:
@@ -411,7 +432,6 @@ class ActorModel:
         )
         action_names: list[str] = []
         action_slices: list[tuple[int, int]] = []
-        action_caps: list[float] = []
         action_rows: list[list[float]] = []
         action_bias: list[float] = []
         offset = 0
@@ -419,7 +439,6 @@ class ActorModel:
             rows, bias = _linear_rows(head)
             action_names.append(name)
             action_slices.append((offset, offset + head.out_features))
-            action_caps.append(_categorical_logit_softcap(head.out_features))
             action_rows.extend(rows)
             if bias is None:
                 action_bias.extend([0.0] * head.out_features)
@@ -524,12 +543,20 @@ class ActorModel:
             "context_tau": [_EXP(t) for t in self.context_tau.data],
             "tile_sa_gamma": _EXP(self.tile_sa_gamma.data[0]),
             "cls_ca_tau": [_EXP(t) for t in self.cls_ca_tau.data],
+            "context_resid_mix": (
+                list(self.context_resid_mix[0].data),
+                list(self.context_resid_mix[1].data),
+            ),
+            "cls_resid_mix": (
+                list(self.cls_resid_mix[0].data),
+                list(self.cls_resid_mix[1].data),
+            ),
             "latent_ffn_noop": latent_ffn_noop,
             "latent_ffn_norm": latent_ffn_norm,
             "latent_ffn_out_norm": (list(self.latent_ffn_out_norm.gamma.data), self.latent_ffn_out_norm.eps),
             "latent_ffn_up": latent_ffn_up,
             "latent_ffn_down": latent_ffn_down,
-            "action_heads": (action_names, action_slices, action_caps, action_rows, action_bias),
+            "action_heads": (action_names, action_slices, action_rows, action_bias),
             "head_h_gate": (head_h_gate_rows, head_h_gate_bias),
             "head_h_cand": (head_h_cand_rows, head_h_cand_bias),
             "tile_ffn_norm": (list(self.tile_ffn_norm.gamma.data), self.tile_ffn_norm.eps),
@@ -568,6 +595,8 @@ class ActorModel:
         context_tau = cache["context_tau"]
         tile_sa_gamma = cache["tile_sa_gamma"]
         cls_ca_tau = cache["cls_ca_tau"]
+        context_resid_mix_cur, context_resid_mix_anchor = cache["context_resid_mix"]
+        cls_resid_mix_cur, cls_resid_mix_anchor = cache["cls_resid_mix"]
         tile_ffn_norm_gamma, tile_ffn_norm_eps = cache["tile_ffn_norm"]
         tile_ffn_up_rows, tile_ffn_up_bias = cache["tile_ffn_up"]
         tile_ffn_down_rows, tile_ffn_down_bias = cache["tile_ffn_down"]
@@ -599,6 +628,7 @@ class ActorModel:
         encoded = self._encoded_views
         tile_q = self._tile_q_views
         tile_k = self._tile_k_views
+        tile_v = self._tile_v_views
         tile_k_norm_sq = self._tile_k_norm_sq
         cls_v = self._cls_v_cache
         tile_v_cols = self._tile_v_cols
@@ -683,6 +713,7 @@ class ActorModel:
         for i in range(TILE_GRID_N):
             off = i * TILE_EMBED_DIM
             qi = tile_q[i]
+            vi = tile_v[i]
             best = -1e30
             for k in range(TILE_GRID_N):
                 score = tile_sa_g2 * _DOT(qi, tile_k[k]) - tile_sa_gamma * tile_k_norm_sq[k]
@@ -695,9 +726,17 @@ class ActorModel:
                 attn_scores[k] = w
                 z += w
             inv_z = 1.0 / z
-            mean_sq = 0.0
+            vi_norm_sq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                vi_norm_sq += vi[j] * vi[j]
             for j in range(TILE_EMBED_DIM):
                 x = _DOT(attn_scores, tile_v_cols[j]) * inv_z
+                tmp_token[j] = x
+            vi_inv_norm = 1.0 / max(vi_norm_sq ** 0.5, 1e-6)
+            proj_scale = _DOT(tmp_token, vi) * vi_inv_norm
+            mean_sq = 0.0
+            for j in range(TILE_EMBED_DIM):
+                x = tmp_token[j] - proj_scale * vi[j] * vi_inv_norm
                 tmp_token[j] = x
                 mean_sq += x * x
             inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_sa_out_norm_eps) ** 0.5
@@ -717,15 +756,11 @@ class ActorModel:
             normed = tile_ffn_normed_buf
             for j in range(TILE_EMBED_DIM):
                 normed[j] = token[j] * inv_rms * tile_ffn_norm_gamma[j]
-            # Up + SiLU
+            # Up + LeakyReLU^2
             hidden = tile_ffn_hidden_buf
             for j in range(tile_ffn_hidden):
                 x = _DOT(normed, tile_ffn_up_rows[j]) + tile_ffn_up_bias[j]
-                if x >= 0.0:
-                    hidden[j] = x / (1.0 + _EXP(-x))
-                else:
-                    e = _EXP(x)
-                    hidden[j] = x * e / (1.0 + e)
+                hidden[j] = _ffn_activation_scalar(x)
             mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
                 x = _DOT(hidden, tile_ffn_down_rows[j]) + tile_ffn_down_bias[j]
@@ -766,6 +801,12 @@ class ActorModel:
             for j in range(TILE_EMBED_DIM):
                 token[j] = cls_tokens_flat[off + j]
         for i, token in enumerate(cls_state):
+            _residual_mix_token_inplace(
+                token,
+                cls_tokens_flat[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM],
+                context_resid_mix_cur,
+                context_resid_mix_anchor,
+            )
             ctx_scale = context_tau[i]
             mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
@@ -828,6 +869,12 @@ class ActorModel:
             for j in range(TILE_EMBED_DIM):
                 sk[j] *= s
         for i, token in enumerate(cls_state):
+            _residual_mix_token_inplace(
+                token,
+                cls_tokens_flat[i * TILE_EMBED_DIM:(i + 1) * TILE_EMBED_DIM],
+                cls_resid_mix_cur,
+                cls_resid_mix_anchor,
+            )
             q_tok = cls_q_buf
             mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
@@ -878,17 +925,18 @@ class ActorModel:
             latent_ffn_norm_gamma, latent_ffn_norm_eps = latent_ffn_norm  # type: ignore[misc]
             latent_ffn_up_rows, latent_ffn_up_bias = cache["latent_ffn_up"]
             latent_ffn_down_rows, latent_ffn_down_bias = cache["latent_ffn_down"]
-            latent_hidden = _silu_vec(_linear(_rmsnorm(latent, latent_ffn_norm_gamma, latent_ffn_norm_eps), latent_ffn_up_rows, latent_ffn_up_bias))
+            latent_hidden = _ffn_activation_vec(
+                _linear(_rmsnorm(latent, latent_ffn_norm_gamma, latent_ffn_norm_eps), latent_ffn_up_rows, latent_ffn_up_bias)
+            )
             latent_delta = _linear(latent_hidden, latent_ffn_down_rows, latent_ffn_down_bias)
             latent_delta = _rmsnorm(latent_delta, latent_ffn_out_norm_gamma, latent_ffn_out_norm_eps)
             latent = [latent[i] + latent_delta[i] for i in range(ACTOR_LATENT_DIM)]
         latent = _rmsnorm(latent, latent_norm_gamma, latent_norm_eps)
 
-        action_names, action_slices, action_caps, action_rows, action_bias = cache["action_heads"]
+        action_names, action_slices, action_rows, action_bias = cache["action_heads"]
         outputs: dict[str, list[float]] = {}
-        for name, (start, end), cap in zip(action_names, action_slices, action_caps):
-            logits = [_DOT(latent, action_rows[j]) + action_bias[j] for j in range(start, end)]
-            outputs[name] = _softcap_logits(logits, cap)
+        for name, (start, end) in zip(action_names, action_slices):
+            outputs[name] = [_DOT(latent, action_rows[j]) + action_bias[j] for j in range(start, end)]
 
         gru_in = latent + h_prev
         gate_rows, gate_bias = cache["head_h_gate"]
@@ -906,9 +954,10 @@ class ActorModel:
         params = self.parameters()
         supported = (
             len(params),
-            len(params) - 5,
-            len(params) - 10,
-            len(params) - 16,
+            len(params) - 2,
+            len(params) - 7,
+            len(params) - 12,
+            len(params) - 18,
         )
         if len(state) not in supported:
             raise AssertionError(
@@ -954,5 +1003,9 @@ class ActorModel:
                 self.latent_ffn_out_norm,
             ):
                 pad.append([1.0] * len(norm.gamma.data))
+
+        if state_len <= 59:
+            pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
+            pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
 
         return pad

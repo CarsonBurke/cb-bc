@@ -35,8 +35,6 @@ from model import (
     TEMP_MAX,
     TILE_FEATURES,
     UNIT_CONTEXT_DIM,
-    _POLICY_HEAD_LOGIT_CAPS,
-    _categorical_logit_softcap,
     _MASK_BD_TILES,
     _OBS_AX,
     _OBS_SCALE,
@@ -46,6 +44,7 @@ from model import (
     _make_bucket_centers,
     _normalize_advantages,
     _normalize_actor_latent_dim,
+    _parameter_golf_ortho_init,
     _policy_weight_from_advantages,
     _temperature_head_init_bias,
     _precompute_policy_masks,
@@ -55,11 +54,14 @@ from model import (
     _sequential_logprobs,
     _split_chunk_ids,
     action_log_prob_and_entropy,
+    apply_rotary_2d,
     compute_action_masks,
     bd_has_ore,
     conveyor_dir_mask,
     decode_value,
     distributional_value_loss,
+    exclusive_self_attention,
+    residual_mix_input,
     soft_cross_entropy_from_logits,
     symexp,
     symlog,
@@ -758,14 +760,7 @@ class TestSoftCrossEntropy:
             assert (ce >= -1e-6).all()
 
 
-def test_categorical_logit_softcap_matches_85_percent_top1_target():
-    assert _categorical_logit_softcap(4) == pytest.approx(2.833213344056216, abs=1e-9)
-    assert _categorical_logit_softcap(9) == pytest.approx(3.8140425970679424, abs=1e-9)
-    assert _categorical_logit_softcap(13) == pytest.approx(4.219507705176107, abs=1e-9)
-    assert _categorical_logit_softcap(28) == pytest.approx(5.030437921392435, abs=1e-9)
-
-
-def test_project_policy_heads_softcap_saturates_each_categorical_head():
+def test_project_policy_heads_keep_raw_categorical_logits():
     model = BuilderMLP().eval()
     latent = torch.zeros(1, ACTOR_LATENT_DIM)
 
@@ -788,44 +783,30 @@ def test_project_policy_heads_softcap_saturates_each_categorical_head():
 
     bt_l, bd_l, cd_l, brt_l, md_l, _head_temperature = model._project_policy_heads(latent)
 
-    for logits, cap in zip((bt_l, bd_l, cd_l, brt_l, md_l), _POLICY_HEAD_LOGIT_CAPS, strict=True):
-        assert logits[0, 0].item() == pytest.approx(cap, abs=1e-5)
-        assert logits[0, 1].item() == pytest.approx(-cap, abs=1e-5)
+    for logits in (bt_l, bd_l, cd_l, brt_l, md_l):
+        assert logits[0, 0].item() == pytest.approx(100.0, abs=1e-5)
+        assert logits[0, 1].item() == pytest.approx(-100.0, abs=1e-5)
         assert logits[0, 2].item() == pytest.approx(0.0, abs=1e-7)
 
 
-def test_project_policy_heads_temperature_stays_in_configured_range():
+def test_mu_center_policy_heads_preserves_categorical_distributions():
     model = BuilderMLP().eval()
-    latent = torch.randn(32, ACTOR_LATENT_DIM)
+    latent = torch.randn(5, ACTOR_LATENT_DIM)
 
     with torch.no_grad():
-        for head in (
-            model.head_build_type,
-            model.head_build_dir,
-            model.head_conv_dir,
-            model.head_bridge_target,
-            model.head_move_dir,
-        ):
-            head.weight.zero_()
-            head.bias.zero_()
-        model.head_temperature.weight.zero_()
-        model.head_temperature.bias.copy_(torch.tensor([-100.0, -1.0, 0.0, 1.0, 100.0]))
+        before = model._project_policy_heads(latent)[:5]
+        before_probs = [torch.softmax(logits, dim=-1) for logits in before]
+        model.mu_center_policy_heads()
+        after = model._project_policy_heads(latent)[:5]
+        after_probs = [torch.softmax(logits, dim=-1) for logits in after]
 
-    _bt_l, _bd_l, _cd_l, _brt_l, _md_l, head_temperature = model._project_policy_heads(latent)
-
-    assert torch.all(head_temperature >= TEMP_MIN)
-    assert torch.all(head_temperature <= TEMP_MAX)
-    torch.testing.assert_close(
-        head_temperature[0],
-        torch.tensor([TEMP_MIN, 1.3437475, 1.7320508, 2.2325623, TEMP_MAX], dtype=head_temperature.dtype),
-        rtol=1e-5,
-        atol=1e-5,
-    )
+    for lhs, rhs in zip(before_probs, after_probs, strict=True):
+        torch.testing.assert_close(lhs, rhs, rtol=1e-6, atol=1e-6)
 
 
-def test_temperature_head_init_bias_sets_default_temperature_to_1p2():
+def test_project_policy_heads_temperature_initializes_near_1p0():
     model = BuilderMLP().eval()
-    latent = torch.zeros(1, ACTOR_LATENT_DIM)
+    latent = torch.randn(32, ACTOR_LATENT_DIM)
 
     with torch.no_grad():
         for head in (
@@ -841,12 +822,31 @@ def test_temperature_head_init_bias_sets_default_temperature_to_1p2():
         model.head_temperature.bias.fill_(_temperature_head_init_bias())
 
     _bt_l, _bd_l, _cd_l, _brt_l, _md_l, head_temperature = model._project_policy_heads(latent)
+
     torch.testing.assert_close(
         head_temperature[0],
-        torch.full((model.head_temperature.out_features,), 1.2, dtype=head_temperature.dtype),
+        torch.full((model.head_temperature.out_features,), 1.0000011, dtype=head_temperature.dtype),
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_entropy_gradient_does_not_flow_into_temperature_when_detached():
+    logits = torch.tensor([[2.0, -1.0]], requires_grad=True)
+    temperature = torch.tensor([1.5], requires_grad=True)
+    actions = torch.tensor([0], dtype=torch.long)
+
+    _chosen, entropy = action_log_prob_and_entropy(
+        logits,
+        actions,
+        temperature=temperature,
+        entropy_temperature=temperature.detach(),
+    )
+    entropy.sum().backward()
+
+    assert logits.grad is not None
+    assert logits.grad.abs().sum().item() > 0.0
+    assert temperature.grad is None or temperature.grad.abs().max().item() == pytest.approx(0.0, abs=1e-12)
 
 
 # =====================================================================
@@ -963,8 +963,8 @@ class TestCentralizedCritic:
         feat = critic.encode_map(map_tensor, valid_mask)
         assert (feat.patches == 0).all(), "Fully masked map should produce zero patch features"
 
-    def test_attention_block_residual_paths_are_pre_norm(self):
-        """Critic residual branches use pre-norm inputs and raw branch outputs."""
+    def test_attention_block_applies_peri_norm_to_both_residual_branches(self):
+        """Critic residual branches apply branch-side norms before the residual add."""
         block = CriticAttentionBlock(dim=8, n_heads=2, n_kv_heads=1, mlp_ratio=2).eval()
         with torch.no_grad():
             for layer in (block.q_proj, block.k_proj, block.v_proj, block.mlp_fc1, block.mlp_fc2):
@@ -983,8 +983,44 @@ class TestCentralizedCritic:
         x = torch.randn(2, 4, 8)
         attn_out = torch.randn_like(x)
         out = block.apply_residual_mlp(x, attn_out)
-        expected = x + attn_out
+        expected = x + block.attn_output_norm(attn_out)
         torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
+
+    def test_exclusive_self_attention_removes_self_value_component(self):
+        attn_out = torch.tensor([[[1.0, 2.0, 3.0]]], dtype=torch.float32)
+        self_value = torch.tensor([[[0.0, 0.0, 4.0]]], dtype=torch.float32)
+
+        out = exclusive_self_attention(attn_out, self_value)
+
+        torch.testing.assert_close(
+            out,
+            torch.tensor([[[1.0, 2.0, 0.0]]], dtype=torch.float32),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    def test_residual_mix_input_blends_running_state_with_anchor(self):
+        x = torch.tensor([[[2.0, 4.0]]], dtype=torch.float32)
+        x0 = torch.tensor([[[10.0, 20.0]]], dtype=torch.float32)
+        mix = torch.tensor([[0.25, 0.5], [0.75, 0.5]], dtype=torch.float32)
+
+        out = residual_mix_input(x, x0, mix)
+
+        torch.testing.assert_close(
+            out,
+            torch.tensor([[[8.0, 12.0]]], dtype=torch.float32),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    def test_partial_rotary_preserves_unrotated_tail(self):
+        x = torch.tensor([[[[1.0, 2.0, 3.0, 4.0, 9.0, 8.0]]]] , dtype=torch.float32)
+        cos = torch.tensor([[0.0, 1.0]], dtype=torch.float32)
+        sin = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+
+        out = apply_rotary_2d(x, cos, sin)
+
+        torch.testing.assert_close(out[..., 4:], x[..., 4:], atol=1e-6, rtol=1e-6)
 
     def test_rmsnorm_cuda_bf16_matches_fp32_reference(self):
         if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
@@ -1005,20 +1041,55 @@ class TestCentralizedCritic:
         assert torch.isfinite(actual).all()
         assert torch.allclose(actual, expected, atol=1e-2, rtol=1e-2)
 
-    def test_critic_transformer_linears_keep_small_std_init(self):
+    def test_parameter_golf_ortho_init_gates_large_matrices_and_scales_projections(self):
+        torch.manual_seed(0)
+        large_proj = torch.nn.Linear(128, 128, bias=False)
+        small_rect = torch.nn.Linear(32, 64, bias=False)
+
+        _parameter_golf_ortho_init(large_proj, n_residual_layers=8, scale_proj=True)
+        _parameter_golf_ortho_init(small_rect)
+
+        large_expected = (1.0 / math.sqrt(128.0)) * (1.0 / math.sqrt(16.0))
+        small_expected = math.sqrt(2.0 / (32.0 + 64.0))
+
+        assert large_proj.weight.std().item() == pytest.approx(large_expected, rel=0.2)
+        assert small_rect.weight.std().item() == pytest.approx(small_expected, rel=0.25)
+
+    def test_critic_transformer_linears_follow_parameter_golf_large_matrix_gate(self):
         torch.manual_seed(0)
         critic = CentralizedCritic().eval()
 
         weights = [
-            critic.tile_embed.net[0].weight,
-            critic.windowed_sa[0].attn.q_proj.weight,
-            critic.unit_cls_builder.pos_proj.weight,
-            critic.value_head.mlp[0].weight,
-            critic.scalar_proj[0].weight,
+            (critic.windowed_sa[0].attn.q_proj.weight, math.sqrt(2.0 / (32.0 + 32.0))),
+            (critic.windowed_sa[0].attn.out_proj.weight, math.sqrt(2.0 / (32.0 + 32.0))),
+            (critic.value_head.mlp[0].weight, 1.0 / math.sqrt(128.0)),
+            (critic.scalar_proj[0].weight, math.sqrt(2.0 / (GLOBAL_SCALAR_DIM + 32.0))),
+            (critic.global_cls, math.sqrt(2.0 / (critic.global_cls.shape[0] + critic.global_cls.shape[1]))),
         ]
 
-        for weight in weights:
-            assert weight.std().item() < 0.05
+        for weight, expected_std in weights:
+            assert weight.std().item() == pytest.approx(expected_std, rel=0.3)
+
+    def test_actor_attention_and_ffn_linears_follow_parameter_golf_large_matrix_gate(self):
+        torch.manual_seed(0)
+        actor = BuilderMLP().eval()
+
+        expected = [
+            math.sqrt(2.0 / (actor.tile_sa_q_proj.in_features + actor.tile_sa_q_proj.out_features)),
+            math.sqrt(2.0 / (actor.cls_ca_q_proj.in_features + actor.cls_ca_q_proj.out_features)),
+            math.sqrt(2.0 / (actor.latent_ffn_up.in_features + actor.latent_ffn_up.out_features)),
+            math.sqrt(2.0 / (actor.latent_ffn_down.in_features + actor.latent_ffn_down.out_features)),
+        ]
+
+        actual_weights = [
+            actor.tile_sa_q_proj.weight,
+            actor.cls_ca_q_proj.weight,
+            actor.latent_ffn_up.weight,
+            actor.latent_ffn_down.weight,
+        ]
+
+        for weight, expected_std in zip(actual_weights, expected, strict=True):
+            assert weight.std().item() == pytest.approx(expected_std, rel=0.3)
 
     def test_normuon_split_keeps_actor_heads_on_aux_adam(self):
         actor = BuilderMLP().eval()

@@ -91,17 +91,8 @@ BRIDGE_BUILD_TYPE = 12
 CONVEYOR_BUILD_TYPES = (2, 7, 8)  # conveyor, splitter, armoured_conveyor
 TEMP_MIN = 1.0
 TEMP_MAX = 3.0
-INITIAL_HEAD_TEMPERATURE = 1.2
-_ACTION_LOGIT_TOP1_TARGET = 0.85
-
-
-def _categorical_logit_softcap(n_actions: int, top1_prob: float = _ACTION_LOGIT_TOP1_TARGET) -> float:
-    """Soft-cap value whose saturated top-1 mass is ``top1_prob`` for a K-way softmax."""
-    if n_actions < 2:
-        return 0.0
-    if not 0.0 < top1_prob < 1.0:
-        raise ValueError(f"top1_prob must be in (0, 1), got {top1_prob}")
-    return math.log(((n_actions - 1) * top1_prob) / (1.0 - top1_prob))
+INITIAL_HEAD_TEMPERATURE = 1.0
+_FFN_LEAKY_RELU_SLOPE = 0.01
 
 
 def _temperature_head_init_bias(
@@ -120,21 +111,6 @@ def _temperature_head_init_bias(
     s = (math.log(initial_temperature) - math.log(temp_min)) / (math.log(temp_max) - math.log(temp_min))
     s = min(max(s, 1e-6), 1.0 - 1e-6)
     return math.log(s / (1.0 - s))
-
-
-def _softcap_logits(logits: torch.Tensor, cap: float) -> torch.Tensor:
-    if cap <= 0.0:
-        return torch.zeros_like(logits)
-    return cap * torch.tanh(logits / cap)
-
-
-_POLICY_HEAD_LOGIT_CAPS = (
-    _categorical_logit_softcap(N_BUILD),
-    _categorical_logit_softcap(N_DIR),
-    _categorical_logit_softcap(N_CONV_DIR),
-    _categorical_logit_softcap(N_BRIDGE_TARGETS),
-    _categorical_logit_softcap(N_DIR),
-)
 
 INITIAL_BUILD_TYPE_BIAS = [
     -2.0,  # none
@@ -625,9 +601,15 @@ CRITIC_STAGE_B_HEADS = 6
 class RotaryEmbedding2D(nn.Module):
     """2D axial rotary position embeddings for spatial grids."""
 
-    def __init__(self, head_dim: int, max_size: int = 25):
+    def __init__(self, head_dim: int, max_size: int = 25, rotary_dim: int | None = None):
         super().__init__()
-        half = head_dim // 2
+        self.head_dim = head_dim
+        self.rotary_dim = head_dim if rotary_dim is None else rotary_dim
+        if self.rotary_dim <= 0 or self.rotary_dim > head_dim or self.rotary_dim % 4 != 0:
+            raise ValueError(
+                f"rotary_dim must be in (0, {head_dim}] and divisible by 4, got {self.rotary_dim}"
+            )
+        half = self.rotary_dim // 2
         freqs = 1.0 / (10000.0 ** (torch.arange(0, half, 2, dtype=torch.float32)[: half // 2] / half))
         self.register_buffer("freqs", freqs)  # (half//2,)
         # Precompute cos/sin for grid up to max_size × max_size
@@ -659,8 +641,40 @@ def apply_rotary_2d(
         sin = sin.unsqueeze(0)
     cos = cos.unsqueeze(1)  # (B|1, 1, N, hd//2)
     sin = sin.unsqueeze(1)
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    rotary_dim = cos.shape[-1] * 2
+    x_rope = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+    x1, x2 = x_rope.chunk(2, dim=-1)
+    x_rope = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    if x_pass.numel() == 0:
+        return x_rope
+    return torch.cat([x_rope, x_pass], dim=-1)
+
+
+def ffn_activation(x: torch.Tensor) -> torch.Tensor:
+    """Cheap FFN activation used by actor and critic transformer blocks."""
+    return F.leaky_relu(x, negative_slope=_FFN_LEAKY_RELU_SLOPE).square()
+
+
+def residual_mix_input(
+    x: torch.Tensor,
+    x0: torch.Tensor,
+    mix: torch.Tensor,
+) -> torch.Tensor:
+    """Blend the running residual stream with a fixed stack anchor."""
+    mix = mix.to(dtype=x.dtype)
+    view_shape = (1,) * (x.dim() - 1) + (x.shape[-1],)
+    return mix[0].view(view_shape) * x + mix[1].view(view_shape) * x0
+
+
+def exclusive_self_attention(
+    attn_out: torch.Tensor,
+    self_value: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Remove the component of the attention update aligned with the self value."""
+    self_value_hat = F.normalize(self_value, dim=-1, eps=eps)
+    return attn_out - (attn_out * self_value_hat).sum(dim=-1, keepdim=True) * self_value_hat
 
 
 class CriticAttentionBlock(nn.Module):
@@ -672,12 +686,14 @@ class CriticAttentionBlock(nn.Module):
         n_heads: int = 4,
         n_kv_heads: int = 2,
         mlp_ratio: int = 4,
+        n_residual_layers: int = 1,
     ):
         super().__init__()
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = dim // n_heads
         self.kv_group_size = n_heads // n_kv_heads
+        self.n_residual_layers = n_residual_layers
         kv_dim = n_kv_heads * self.head_dim
 
         self.attn_input_norm = RMSNorm(dim)
@@ -694,13 +710,25 @@ class CriticAttentionBlock(nn.Module):
         self.mlp_fc1 = nn.Linear(dim, mlp_hidden, bias=False)
         self.mlp_fc2 = nn.Linear(mlp_hidden, dim, bias=False)
         self.mlp_output_norm = RMSNorm(dim)
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
         self._init_weights()
 
     def _init_weights(self):
-        for m in [self.q_proj, self.k_proj, self.v_proj, self.out_proj,
-                   self.mlp_fc1, self.mlp_fc2]:
-            trunc_normal_(m.weight, std=0.02)
+        _parameter_golf_ortho_init(self.q_proj)
+        _parameter_golf_ortho_init(self.k_proj)
+        _parameter_golf_ortho_init(self.v_proj)
+        _parameter_golf_ortho_init(
+            self.out_proj,
+            n_residual_layers=self.n_residual_layers,
+            scale_proj=True,
+        )
+        _parameter_golf_ortho_init(self.mlp_fc1)
+        _parameter_golf_ortho_init(
+            self.mlp_fc2,
+            n_residual_layers=self.n_residual_layers,
+            scale_proj=True,
+        )
 
     def project_qkv(
         self,
@@ -756,6 +784,7 @@ class CriticAttentionBlock(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        self_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run SDPA on projected heads and return token-major outputs."""
         B, _, N_q, _ = q.shape
@@ -766,6 +795,10 @@ class CriticAttentionBlock(nn.Module):
             attn_mask=attn_mask,
             enable_gqa=self.kv_group_size > 1,
         )
+        if self_value is not None:
+            if self.kv_group_size > 1:
+                self_value = self_value.repeat_interleave(self.kv_group_size, dim=1)
+            attn_out = exclusive_self_attention(attn_out, self_value)
         return attn_out.transpose(1, 2).reshape(B, N_q, self.n_heads * self.head_dim)
 
     def attend_grouped(
@@ -773,6 +806,7 @@ class CriticAttentionBlock(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        self_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run SDPA over grouped local blocks without flattening them into batch.
 
@@ -791,16 +825,31 @@ class CriticAttentionBlock(nn.Module):
             enable_gqa=self.kv_group_size > 1,
         )
         attn_out = attn_out.reshape(B, n_groups, self.n_heads, N_q, self.head_dim)
+        if self_value is not None:
+            if self.kv_group_size > 1:
+                self_value = self_value.repeat_interleave(self.kv_group_size, dim=2)
+            attn_out = exclusive_self_attention(attn_out, self_value)
         return attn_out.transpose(2, 3).reshape(B, n_groups, N_q, self.n_heads * self.head_dim)
 
     def project_attn_residual(self, attn_out: torch.Tensor) -> torch.Tensor:
         """Project attention outputs for the residual update."""
         return self.out_proj(attn_out)
 
+    def mix_residual_input(self, x: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
+        return residual_mix_input(x, x0, self.resid_mix)
+
+    def apply_attn_residual(
+        self,
+        x: torch.Tensor,
+        attn_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the Peri-LN attention residual update."""
+        return x + self.attn_output_norm(self.project_attn_residual(attn_out))
+
     def apply_mlp_residual(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the pre-norm MLP residual block."""
+        """Apply the Peri-LN MLP residual block."""
         h = self.mlp_input_norm(x)
-        return x + self.mlp_fc2(F.silu(self.mlp_fc1(h)))
+        return x + self.mlp_output_norm(self.mlp_fc2(ffn_activation(self.mlp_fc1(h))))
 
     def apply_residual_mlp(
         self,
@@ -808,29 +857,33 @@ class CriticAttentionBlock(nn.Module):
         attn_out: torch.Tensor,
     ) -> torch.Tensor:
         """Apply output projection, residual update, and MLP block."""
-        x = x + self.project_attn_residual(attn_out)
+        x = self.apply_attn_residual(x, attn_out)
         return self.apply_mlp_residual(x)
 
     def forward(
         self,
         x: torch.Tensor,
+        x0: torch.Tensor,
         rope_cos: torch.Tensor | None = None,
         rope_sin: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        x = self.mix_residual_input(x, x0)
         q, k, v = self.project_qkv(x, rope_cos=rope_cos, rope_sin=rope_sin)
-        attn_out = self.attend(q, k, v, attn_mask=attn_mask)
+        attn_out = self.attend(q, k, v, attn_mask=attn_mask, self_value=v)
         return self.apply_residual_mlp(x, attn_out)
 
     def forward_grouped(
         self,
         x: torch.Tensor,
+        x0: torch.Tensor,
         rope_cos: torch.Tensor | None = None,
         rope_sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply attention to grouped local blocks while preserving window locality."""
+        x = self.mix_residual_input(x, x0)
         q, k, v = self.project_qkv_grouped(x, rope_cos=rope_cos, rope_sin=rope_sin)
-        attn_out = self.attend_grouped(q, k, v)
+        attn_out = self.attend_grouped(q, k, v, self_value=v)
         return self.apply_residual_mlp(x, attn_out)
 
 
@@ -914,9 +967,7 @@ class CriticTileEmbed(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                _parameter_golf_ortho_init(m)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (R, C, H, W) → (R, embed_dim, H, W)."""
@@ -936,11 +987,19 @@ class CriticWindowedSA(nn.Module):
         n_kv_heads: int = 2,
         window_size: int = 5,
         mlp_ratio: int = 4,
+        rope_dim: int | None = None,
+        n_residual_layers: int = 1,
     ):
         super().__init__()
         self.window_size = window_size
-        self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio)
-        self.rope = RotaryEmbedding2D(dim // n_heads, max_size=window_size)
+        self.attn = CriticAttentionBlock(
+            dim,
+            n_heads,
+            n_kv_heads,
+            mlp_ratio,
+            n_residual_layers,
+        )
+        self.rope = RotaryEmbedding2D(dim // n_heads, max_size=window_size, rotary_dim=rope_dim)
         ws = window_size
         h_coords = torch.arange(ws).unsqueeze(1).expand(ws, ws).reshape(-1)
         w_coords = torch.arange(ws).unsqueeze(0).expand(ws, ws).reshape(-1)
@@ -950,13 +1009,24 @@ class CriticWindowedSA(nn.Module):
         self.register_buffer("_local_rope_cos", local_rope_cos)
         self.register_buffer("_local_rope_sin", local_rope_sin)
 
-    def forward(self, patches: torch.Tensor, pH: int, pW: int) -> torch.Tensor:
+    def forward(
+        self,
+        patches: torch.Tensor,
+        pH: int,
+        pW: int,
+        anchor_patches: torch.Tensor,
+    ) -> torch.Tensor:
         """patches: (R, N, dim) where N = pH * pW. Returns same shape."""
         R, N, C = patches.shape
         x = patches.reshape(R, pH, pW, C)
+        x0 = anchor_patches.reshape(R, pH, pW, C)
         windows, pad_hw = critic_window_partition(x, self.window_size)
+        anchor_windows, _ = critic_window_partition(x0, self.window_size)
         windows = self.attn.forward_grouped(
-            windows, rope_cos=self._local_rope_cos, rope_sin=self._local_rope_sin,
+            windows,
+            anchor_windows,
+            rope_cos=self._local_rope_cos,
+            rope_sin=self._local_rope_sin,
         )
         x = critic_window_unpartition(windows, self.window_size, pad_hw, (pH, pW))
         return x.reshape(R, N, C)
@@ -973,12 +1043,20 @@ class CriticGlobalSA(nn.Module):
         n_global_cls: int = 8,
         mlp_ratio: int = 4,
         max_grid_size: int = 25,
+        rope_dim: int | None = None,
+        n_residual_layers: int = 1,
     ):
         super().__init__()
         self.dim = dim
         self.n_global_cls = n_global_cls
-        self.attn = CriticAttentionBlock(dim, n_heads, n_kv_heads, mlp_ratio)
-        self.rope = RotaryEmbedding2D(dim // n_heads, max_size=max_grid_size)
+        self.attn = CriticAttentionBlock(
+            dim,
+            n_heads,
+            n_kv_heads,
+            mlp_ratio,
+            n_residual_layers,
+        )
+        self.rope = RotaryEmbedding2D(dim // n_heads, max_size=max_grid_size, rotary_dim=rope_dim)
         head_dim_half = self.rope.freqs.shape[0] * 2
         self.register_buffer("_special_token_cos", torch.ones(1 + n_global_cls, head_dim_half, dtype=_TRAINING_DTYPE))
         self.register_buffer("_special_token_sin", torch.zeros(1 + n_global_cls, head_dim_half, dtype=_TRAINING_DTYPE))
@@ -1112,9 +1190,13 @@ class CriticGlobalSA(nn.Module):
     def forward(
         self,
         patches: torch.Tensor,        # (R, N_patches, dim)
+        anchor_patches: torch.Tensor,  # (R, N_patches, dim)
         global_cls: torch.Tensor,      # (R, n_global_cls, dim)
+        anchor_global_cls: torch.Tensor,  # (R, n_global_cls, dim)
         scalar_tok: torch.Tensor,      # (R, 1, dim)
+        anchor_scalar_tok: torch.Tensor,  # (R, 1, dim)
         unit_cls: torch.Tensor,        # (B_total, dim)
+        anchor_unit_cls: torch.Tensor,  # (B_total, dim)
         layout: CriticGlobalLayout,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Split attention with cross-group visibility.
@@ -1130,8 +1212,15 @@ class CriticGlobalSA(nn.Module):
         all_tokens[:, :N] = patches
         all_tokens[:, N:N + 1] = scalar_tok
         all_tokens[:, N + 1:layout.unit_start] = global_cls
+        anchor_tokens = patches.new_zeros((R, layout.total_tokens, patches.shape[-1]))
+        anchor_tokens[:, :N] = anchor_patches
+        anchor_tokens[:, N:N + 1] = anchor_scalar_tok
+        anchor_tokens[:, N + 1:layout.unit_start] = anchor_global_cls
         if layout.perm.numel() > 0:
             all_tokens[layout.sorted_round_idx, layout.unit_start + layout.local_pos] = unit_cls[layout.perm]
+            anchor_tokens[layout.sorted_round_idx, layout.unit_start + layout.local_pos] = anchor_unit_cls[layout.perm]
+
+        all_tokens = self.attn.mix_residual_input(all_tokens, anchor_tokens)
 
         q, k, v = self.attn.project_qkv(all_tokens)
 
@@ -1159,34 +1248,34 @@ class CriticGlobalSA(nn.Module):
         global_tokens = all_tokens[:, scalar_end:shared_end]
         unit_tokens = all_tokens[:, shared_end:]
 
-        def _peri_residual(tokens: torch.Tensor, branch_out: torch.Tensor) -> torch.Tensor:
-            return tokens + self.attn.attn_output_norm(self.attn.project_attn_residual(branch_out))
-
         # Patches query patches + scalar + CLS (no mask needed, FA-eligible)
-        patch_tokens = _peri_residual(
+        patch_tokens = self.attn.apply_attn_residual(
             patch_tokens,
             self.attn.attend(
                 q[:, :, :patch_end],
                 k[:, :, :shared_end],
                 v[:, :, :shared_end],
+                self_value=v[:, :, :patch_end],
             ),
         )
         # CLS query patches + scalar + CLS (see each other)
-        global_tokens = _peri_residual(
+        global_tokens = self.attn.apply_attn_residual(
             global_tokens,
             self.attn.attend(
                 q[:, :, scalar_end:shared_end],
                 k[:, :, :shared_end],
                 v[:, :, :shared_end],
+                self_value=v[:, :, scalar_end:shared_end],
             ),
         )
         if layout.unit_attn_bias is not None:
             unit_attn_out = self.attn.attend(
                 q[:, :, shared_end:], k, v,
                 attn_mask=layout.unit_attn_bias,
+                self_value=v[:, :, shared_end:],
             )
             unit_attn_out = unit_attn_out * layout.valid_unit_mask.unsqueeze(-1).to(dtype=unit_attn_out.dtype)
-            unit_tokens = _peri_residual(unit_tokens, unit_attn_out)
+            unit_tokens = self.attn.apply_attn_residual(unit_tokens, unit_attn_out)
 
         all_tokens = torch.cat([patch_tokens, scalar_tokens, global_tokens, unit_tokens], dim=1)
         all_tokens = self.attn.apply_mlp_residual(all_tokens)
@@ -1226,7 +1315,7 @@ class CriticUnitCLSBuilder(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=0.02)
+                _parameter_golf_ortho_init(m)
 
     def forward(self, actor_latent: torch.Tensor, unit_context: torch.Tensor) -> torch.Tensor:
         """actor_latent: (B, 64), unit_context: (B, 7) → (B, out_dim)."""
@@ -1263,11 +1352,12 @@ class CriticValueHead(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for m in self.mlp:
+        for m in self.mlp[:-1]:
             if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                _parameter_golf_ortho_init(m)
+        if isinstance(self.mlp[-1], nn.Linear):
+            if self.mlp[-1].bias is not None:
+                nn.init.zeros_(self.mlp[-1].bias)
         nn.init.zeros_(self.mlp[-1].weight)
 
     def forward(
@@ -1304,23 +1394,26 @@ class CentralizedCritic(nn.Module):
     _MLP_RATIO = 4
     _N_GLOBAL_CLS = 8
     _N_BLOCKS = 3
+    _ROPE_DIM = 4  # partial 2D RoPE over the first half of each 8-dim head
 
     def __init__(self, map_channels: int = GLOBAL_MAP_CHANNELS, value_mode: CriticValueMode = CRITIC_VALUE_MODE):
         super().__init__()
         self.value_mode = value_mode
         dim = self._PATCH_DIM
+        n_residual_layers = self._N_BLOCKS * 3
 
         self.tile_embed = CriticTileEmbed(map_channels, self._TILE_DIM)
 
         # 3 blocks, each with 2 windowed SA + 1 global SA
         self.windowed_sa = nn.ModuleList([
             CriticWindowedSA(dim, self._N_HEADS, self._N_KV_HEADS,
-                             self._WINDOW_SIZE, self._MLP_RATIO)
+                             self._WINDOW_SIZE, self._MLP_RATIO, self._ROPE_DIM, n_residual_layers)
             for _ in range(self._N_BLOCKS * 2)
         ])
         self.global_sa = nn.ModuleList([
             CriticGlobalSA(dim, self._N_HEADS, self._N_KV_HEADS,
-                           self._N_GLOBAL_CLS, self._MLP_RATIO)
+                           self._N_GLOBAL_CLS, self._MLP_RATIO, rope_dim=self._ROPE_DIM,
+                           n_residual_layers=n_residual_layers)
             for _ in range(self._N_BLOCKS)
         ])
 
@@ -1330,11 +1423,11 @@ class CentralizedCritic(nn.Module):
             RMSNorm(dim),
             nn.SiLU(),
         )
-        trunc_normal_(self.scalar_proj[0].weight, std=0.02)
+        _parameter_golf_ortho_init(self.scalar_proj[0])
 
         # Learned global CLS tokens
         self.global_cls = nn.Parameter(torch.zeros(self._N_GLOBAL_CLS, dim))
-        trunc_normal_(self.global_cls, std=0.02)
+        nn.init.xavier_uniform_(self.global_cls)
 
         # Final norm for pre-norm transformer output
         self.final_norm = RMSNorm(dim)
@@ -1389,9 +1482,10 @@ class CentralizedCritic(nn.Module):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
             tiles = self.tile_embed(map_tensor)  # (R, tile_dim, H, W)
             patches, pH, pW = self._patchify(tiles, valid_mask)
+            patch_anchor = patches
             for i in range(self._N_BLOCKS):
-                patches = self.windowed_sa[i * 2](patches, pH, pW)
-                patches = self.windowed_sa[i * 2 + 1](patches, pH, pW)
+                patches = self.windowed_sa[i * 2](patches, pH, pW, patch_anchor)
+                patches = self.windowed_sa[i * 2 + 1](patches, pH, pW, patch_anchor)
 
         R = map_tensor.shape[0]
         global_cls = self.global_cls.unsqueeze(0).expand(R, -1, -1)
@@ -1418,6 +1512,10 @@ class CentralizedCritic(nn.Module):
             scalar_tok = self.scalar_proj(round_scalars).unsqueeze(1).to(dtype=token_dtype)
             global_cls = state.global_cls.to(dtype=token_dtype)
             unit_cls = unit_cls.to(dtype=token_dtype)
+            patch_anchor = patches
+            global_cls_anchor = global_cls
+            scalar_anchor = scalar_tok
+            unit_anchor = unit_cls
 
             # Remap round_idx to local 0..R-1
             ri = round_idx.long()
@@ -1428,9 +1526,13 @@ class CentralizedCritic(nn.Module):
             for layer in self.global_sa:
                 patches, global_cls, unit_cls = layer(
                     patches,
+                    patch_anchor,
                     global_cls,
+                    global_cls_anchor,
                     scalar_tok,
+                    scalar_anchor,
                     unit_cls,
+                    unit_anchor,
                     layout,
                 )
 
@@ -2112,6 +2214,30 @@ def _ortho_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float =
     return layer
 
 
+def _parameter_golf_ortho_init(
+    layer: nn.Linear,
+    *,
+    n_residual_layers: int | None = None,
+    scale_proj: bool = False,
+    min_dim: int = 64,
+    bias_const: float = 0.0,
+) -> nn.Linear:
+    """Mimic parameter-golf: ortho only on large matrices, else keep Xavier fallback."""
+    use_ortho = min(layer.weight.shape) >= min_dim
+    if use_ortho:
+        nn.init.orthogonal_(layer.weight, gain=1.0)
+    else:
+        nn.init.xavier_uniform_(layer.weight, gain=1.0)
+    if use_ortho and scale_proj:
+        if n_residual_layers is None or n_residual_layers <= 0:
+            raise ValueError("n_residual_layers must be positive when scale_proj=True")
+        with torch.no_grad():
+            layer.weight.mul_(1.0 / math.sqrt(2.0 * n_residual_layers))
+    if layer.bias is not None:
+        nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
 def _xavier_init(layer: nn.Linear, gain: float = 1.0, bias_const: float = 0.0) -> nn.Linear:
     """Xavier uniform init for Peri-LN transformer-style linear layers."""
     nn.init.xavier_uniform_(layer.weight, gain=gain)
@@ -2178,13 +2304,17 @@ def action_log_prob_and_entropy(
     actions: torch.Tensor,
     mask: torch.Tensor | None = None,
     temperature: torch.Tensor | float = 1.0,
+    entropy_temperature: torch.Tensor | float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return chosen-action log_probs and categorical entropy from logits."""
     log_probs = _temperature_scaled_log_probs(logits, mask, temperature)
     chosen = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    if entropy_temperature is None:
+        entropy_temperature = temperature
     # nan_to_num handles 0 * -inf from masked actions.
-    probs = log_probs.exp()
-    entropy = -(probs * log_probs).nan_to_num().sum(dim=-1)
+    entropy_log_probs = _temperature_scaled_log_probs(logits, mask, entropy_temperature)
+    probs = entropy_log_probs.exp()
+    entropy = -(probs * entropy_log_probs).nan_to_num().sum(dim=-1)
     return chosen, entropy
 
 
@@ -2574,17 +2704,18 @@ class BuilderMLP(nn.Module):
             )
             self._actor_latent_dim = self._actor_cls_tokens * TILE_EMBED_DIM
         self._recurrent_input_dim = self._actor_latent_dim + H_DIM
+        n_actor_residual_layers = 5
 
-        self.tile_linear = _xavier_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM))
-        self.context_proj = _xavier_init(nn.Linear(GLOBAL_FEATURES, ACTOR_CONTEXT_DIM))
-        self.context_k_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.context_v_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.tile_sa_q_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.tile_sa_k_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.tile_sa_v_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.cls_ca_q_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.cls_ca_k_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
-        self.cls_ca_v_proj = _xavier_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_linear = _parameter_golf_ortho_init(nn.Linear(TILE_INPUT_DIM, TILE_EMBED_DIM))
+        self.context_proj = _parameter_golf_ortho_init(nn.Linear(GLOBAL_FEATURES, ACTOR_CONTEXT_DIM))
+        self.context_k_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.context_v_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_q_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_k_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.tile_sa_v_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_q_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_k_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
+        self.cls_ca_v_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
 
         self.context_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
@@ -2599,17 +2730,31 @@ class BuilderMLP(nn.Module):
         self.context_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))
         self.tile_sa_gamma = nn.Parameter(torch.zeros(1))  # exp(0) = 1.0 init
         self.cls_ca_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))  # per-seed temperature
+        self.context_resid_mix = nn.Parameter(
+            torch.stack((torch.ones(TILE_EMBED_DIM), torch.zeros(TILE_EMBED_DIM))).float()
+        )
+        self.cls_resid_mix = nn.Parameter(
+            torch.stack((torch.ones(TILE_EMBED_DIM), torch.zeros(TILE_EMBED_DIM))).float()
+        )
 
         tile_ffn_hidden = TILE_EMBED_DIM * 2
         self.tile_ffn_norm = RMSNorm(TILE_EMBED_DIM)
-        self.tile_ffn_up = _xavier_init(nn.Linear(TILE_EMBED_DIM, tile_ffn_hidden))
-        self.tile_ffn_down = _xavier_init(nn.Linear(tile_ffn_hidden, TILE_EMBED_DIM))
+        self.tile_ffn_up = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, tile_ffn_hidden))
+        self.tile_ffn_down = _parameter_golf_ortho_init(
+            nn.Linear(tile_ffn_hidden, TILE_EMBED_DIM),
+            n_residual_layers=n_actor_residual_layers,
+            scale_proj=True,
+        )
 
         latent_ffn_hidden = self._actor_latent_dim * 2
         self.latent_ffn_norm = RMSNorm(self._actor_latent_dim)
         self.latent_ffn_out_norm = RMSNorm(self._actor_latent_dim)
-        self.latent_ffn_up = _xavier_init(nn.Linear(self._actor_latent_dim, latent_ffn_hidden))
-        self.latent_ffn_down = _xavier_init(nn.Linear(latent_ffn_hidden, self._actor_latent_dim))
+        self.latent_ffn_up = _parameter_golf_ortho_init(nn.Linear(self._actor_latent_dim, latent_ffn_hidden))
+        self.latent_ffn_down = _parameter_golf_ortho_init(
+            nn.Linear(latent_ffn_hidden, self._actor_latent_dim),
+            n_residual_layers=n_actor_residual_layers,
+            scale_proj=True,
+        )
 
         self.head_build_type = _ortho_init(nn.Linear(self._actor_latent_dim, N_BUILD), std=0.01)
         self.head_build_dir = _ortho_init(nn.Linear(self._actor_latent_dim, N_DIR), std=0.01)
@@ -2640,7 +2785,9 @@ class BuilderMLP(nn.Module):
         self,
         cls: torch.Tensor,
         context_tokens: torch.Tensor,
+        cls0: torch.Tensor,
     ) -> torch.Tensor:
+        cls = residual_mix_input(cls, cls0, self.context_resid_mix)
         # Fold per-token tau into q so SDPA uses scale=1.0 (CUDA-graph safe).
         q = F.normalize(self.context_ca_input_norm(cls), dim=-1, eps=1e-6)
         q = q * self.context_tau.exp().view(1, -1, 1)
@@ -2668,13 +2815,20 @@ class BuilderMLP(nn.Module):
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
             attn_mask=rbf_bias, scale=1.0,
         ).squeeze(1)
+        attn_out = exclusive_self_attention(attn_out, v)
         tiles = tiles + self.tile_sa_out_norm(attn_out)
         tiles = tiles + self.tile_ffn_out_norm(
-            self.tile_ffn_down(F.silu(self.tile_ffn_up(self.tile_ffn_norm(tiles)))),
+            self.tile_ffn_down(ffn_activation(self.tile_ffn_up(self.tile_ffn_norm(tiles)))),
         )
         return tiles
 
-    def _cls_cross_attention(self, cls: torch.Tensor, tiles: torch.Tensor) -> torch.Tensor:
+    def _cls_cross_attention(
+        self,
+        cls: torch.Tensor,
+        tiles: torch.Tensor,
+        cls0: torch.Tensor,
+    ) -> torch.Tensor:
+        cls = residual_mix_input(cls, cls0, self.cls_resid_mix)
         q = F.normalize(self.cls_ca_q_proj(self.cls_ca_input_norm(cls)), dim=-1, eps=1e-6)
         q = q * self.cls_ca_tau.exp().view(1, -1, 1)  # per-seed temperature
         k = F.normalize(self.cls_ca_k_proj(tiles), dim=-1, eps=1e-6)
@@ -2685,7 +2839,7 @@ class BuilderMLP(nn.Module):
         return F.silu(cls + self.cls_ca_norm(attn_out))
 
     def _latent_ffn(self, latent: torch.Tensor) -> torch.Tensor:
-        hidden = F.silu(self.latent_ffn_up(self.latent_ffn_norm(latent)))
+        hidden = ffn_activation(self.latent_ffn_up(self.latent_ffn_norm(latent)))
         return latent + self.latent_ffn_out_norm(self.latent_ffn_down(hidden))
 
     def _encode_tiles(self, obs: torch.Tensor) -> torch.Tensor:
@@ -2709,11 +2863,12 @@ class BuilderMLP(nn.Module):
 
     def _latent_from_obs_pre(self, obs_pre: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         tiles, global_ctx = self._split_obs_pre(obs_pre)
-        cls = self.actor_cls.unsqueeze(0).expand(obs_pre.shape[0], -1, -1)
+        cls0 = self.actor_cls.unsqueeze(0).expand(obs_pre.shape[0], -1, -1)
+        cls = cls0
         recurrent_ctx = h_prev.reshape(obs_pre.shape[0], ACTOR_CONTEXT_CHUNKS, TILE_EMBED_DIM)
-        cls = self._context_cross_attention(cls, torch.cat([global_ctx, recurrent_ctx], dim=1))
+        cls = self._context_cross_attention(cls, torch.cat([global_ctx, recurrent_ctx], dim=1), cls0)
         tiles = self._tile_self_attention(tiles)
-        cls = self._cls_cross_attention(cls, tiles)
+        cls = self._cls_cross_attention(cls, tiles, cls0)
         latent = self._latent_ffn(cls.reshape(obs_pre.shape[0], self._actor_latent_dim))
         return self.latent_norm(latent)
 
@@ -2768,11 +2923,6 @@ class BuilderMLP(nn.Module):
             [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, N_ACTION_TEMPERATURES],
             dim=-1,
         )
-        bt_l = _softcap_logits(bt_l, _POLICY_HEAD_LOGIT_CAPS[0])
-        bd_l = _softcap_logits(bd_l, _POLICY_HEAD_LOGIT_CAPS[1])
-        cd_l = _softcap_logits(cd_l, _POLICY_HEAD_LOGIT_CAPS[2])
-        brt_l = _softcap_logits(brt_l, _POLICY_HEAD_LOGIT_CAPS[3])
-        md_l = _softcap_logits(md_l, _POLICY_HEAD_LOGIT_CAPS[4])
         log_temp = torch.sigmoid(temp_raw) * (math.log(TEMP_MAX) - math.log(TEMP_MIN)) + math.log(TEMP_MIN)
         head_temperature = log_temp.exp()
         return bt_l, bd_l, cd_l, brt_l, md_l, head_temperature
@@ -2870,6 +3020,8 @@ class BuilderMLP(nn.Module):
             ("norm", self.tile_ffn_out_norm),
             ("norm", self.cls_ca_input_norm),
             ("norm", self.latent_ffn_out_norm),
+            ("param", self.context_resid_mix),
+            ("param", self.cls_resid_mix),
         ]
 
     def export_weights(self) -> list[list[float]]:
@@ -2894,9 +3046,10 @@ class BuilderMLP(nn.Module):
         expected = sum(2 if kind == "linear" else 1 for kind, _ in entries)
         supported = (
             expected,
-            expected - 5,
-            expected - 10,
-            expected - 16,
+            expected - 2,
+            expected - 7,
+            expected - 12,
+            expected - 18,
         )
         if len(state) not in supported:
             raise AssertionError(
@@ -2956,6 +3109,10 @@ class BuilderMLP(nn.Module):
             ):
                 pad.append([1.0] * norm.weight.numel())
 
+        if state_len <= 59:
+            pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
+            pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
+
         return pad
 
     def _legacy_state_dict_defaults(self) -> dict[str, torch.Tensor]:
@@ -2977,6 +3134,14 @@ class BuilderMLP(nn.Module):
             "tile_ffn_out_norm.weight": torch.ones_like(self.tile_ffn_out_norm.weight),
             "cls_ca_input_norm.weight": torch.ones_like(self.cls_ca_input_norm.weight),
             "latent_ffn_out_norm.weight": torch.ones_like(self.latent_ffn_out_norm.weight),
+            "context_resid_mix": torch.stack((
+                torch.ones_like(self.context_resid_mix[0]),
+                torch.zeros_like(self.context_resid_mix[1]),
+            )),
+            "cls_resid_mix": torch.stack((
+                torch.ones_like(self.cls_resid_mix[0]),
+                torch.zeros_like(self.cls_resid_mix[1]),
+            )),
         }
         return defaults
 
@@ -3212,11 +3377,31 @@ def _actor_recurrent_step(
     bd_l = bd_l.masked_fill(~bd_mask_t, -1e9)
     cd_l = cd_l.masked_fill(~cd_mask, -1e9)
 
-    bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask_t, head_temperature[:, 0])
-    bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask_t, head_temperature[:, 1])
-    cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, head_temperature[:, 2])
-    brt_lp, brt_ent = action_log_prob_and_entropy(brt_l, brt_act_t, temperature=head_temperature[:, 3])
-    md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act_t, temperature=head_temperature[:, 4])
+    bt_lp, bt_ent = action_log_prob_and_entropy(
+        bt_l, bt_act_t, bt_mask_t,
+        temperature=head_temperature[:, 0],
+        entropy_temperature=head_temperature[:, 0].detach(),
+    )
+    bd_lp, bd_ent = action_log_prob_and_entropy(
+        bd_l, bd_act_t, bd_mask_t,
+        temperature=head_temperature[:, 1],
+        entropy_temperature=head_temperature[:, 1].detach(),
+    )
+    cd_lp, cd_ent = action_log_prob_and_entropy(
+        cd_l, cd_act_t, cd_mask,
+        temperature=head_temperature[:, 2],
+        entropy_temperature=head_temperature[:, 2].detach(),
+    )
+    brt_lp, brt_ent = action_log_prob_and_entropy(
+        brt_l, brt_act_t,
+        temperature=head_temperature[:, 3],
+        entropy_temperature=head_temperature[:, 3].detach(),
+    )
+    md_lp, md_ent = action_log_prob_and_entropy(
+        md_l, md_act_t,
+        temperature=head_temperature[:, 4],
+        entropy_temperature=head_temperature[:, 4].detach(),
+    )
     brt_causal = bt_act_t == BRIDGE_BUILD_TYPE
 
     new_lp = _compose_action_log_prob(
@@ -3229,25 +3414,12 @@ def _actor_recurrent_step(
         brt_causal=brt_causal,
     )
 
-    # Adaptive per-head entropy: collapsed heads get a stronger bonus.
-    # weight = (1 - H/H_max) so near-uniform heads contribute ~0 and
-    # collapsed heads contribute ~H (pushing them back toward uniform).
-    bt_max = bt_mask_t.sum(dim=-1).clamp(min=1).float().log()
-    bd_max = bd_mask_t.sum(dim=-1).clamp(min=1).float().log()
-    cd_max = torch.tensor(N_CONV_DIR, device=bt_l.device, dtype=bt_l.dtype).log()
-    brt_max = torch.tensor(N_BRIDGE_TARGETS, device=bt_l.device, dtype=bt_l.dtype).log()
-    md_max = torch.tensor(N_DIR, device=bt_l.device, dtype=bt_l.dtype).log()
-
-    def _adaptive(ent, max_ent):
-        # H_max - H: full bonus when collapsed (H=0), zero when uniform (H=H_max).
-        return (max_ent.clamp(min=1e-6) - ent).clamp(min=0)
-
     ent = (
-        _adaptive(bt_ent, bt_max)
-        + _adaptive(bd_ent, bd_max)
-        + _adaptive(cd_ent, cd_max) * cd_causal_t
-        + _adaptive(brt_ent, brt_max) * brt_causal
-        + _adaptive(md_ent, md_max)
+        bt_ent
+        + bd_ent
+        + cd_ent * cd_causal_t
+        + brt_ent * brt_causal
+        + md_ent
     )
     return new_lp, ent, head_temperature, h_new
 
@@ -3578,6 +3750,8 @@ def ppo_update(
                     actor_loss.backward()
                     actor_gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
+                    if hasattr(model, "mu_center_policy_heads"):
+                        model.mu_center_policy_heads()
 
                     with torch.no_grad():
                         _actor_acc[0] += pi_loss

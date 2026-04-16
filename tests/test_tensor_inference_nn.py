@@ -108,7 +108,7 @@ def test_actor_model_matches_exported_torch_actor():
     assert infer_out["h_cand"] == pytest.approx(cand[0].tolist(), rel=1e-5, abs=1e-5)
 
 
-def test_actor_model_matches_softcapped_torch_actor_under_saturated_logits():
+def test_actor_model_matches_torch_actor_under_saturated_logits():
     torch_model = BuilderMLP().eval()
     with torch.no_grad():
         for head in (
@@ -198,7 +198,7 @@ def test_tile_rbf_gamma_gradient_matches_explicit_logits():
 def test_actor_load_accepts_legacy_state_schema():
     torch_model = BuilderMLP().eval()
     full_state = torch_model.export_weights()
-    legacy_state = full_state[:-16]
+    legacy_state = full_state[:-18]
 
     infer_model = ActorModel(
         output_heads={
@@ -253,6 +253,8 @@ def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
         "tile_ffn_out_norm.weight",
         "cls_ca_input_norm.weight",
         "latent_ffn_out_norm.weight",
+        "context_resid_mix",
+        "cls_resid_mix",
     }
     legacy_state = {k: v.clone() for k, v in full_state.items() if k not in legacy_keys}
     ckpt_path = tmp_path / "legacy_actor_state.pkl"
@@ -260,7 +262,7 @@ def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
         pickle.dump(legacy_state, f)
 
     compat_model = BuilderMLP().eval()
-    compat_model.import_weights(torch_model.export_weights()[:-16])
+    compat_model.import_weights(torch_model.export_weights()[:-18])
 
     loaded_model = BuilderMLP().eval()
     assert loaded_model.load_weights(ckpt_path)
