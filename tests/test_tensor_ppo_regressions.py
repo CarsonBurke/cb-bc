@@ -12,6 +12,8 @@ import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TORCH_DIR = PROJECT_ROOT / "bots" / "tensor" / "torch"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(TORCH_DIR) not in sys.path:
     sys.path.insert(0, str(TORCH_DIR))
 
@@ -62,6 +64,10 @@ from model import (
     symexp,
     symlog,
     value_target_probs,
+)
+from normuon import (
+    SingleDeviceNorMuonWithAuxAdam,
+    split_normuon_params,
 )
 
 
@@ -1013,6 +1019,50 @@ class TestCentralizedCritic:
 
         for weight in weights:
             assert weight.std().item() < 0.05
+
+    def test_normuon_split_keeps_actor_heads_on_aux_adam(self):
+        actor = BuilderMLP().eval()
+        muon_named, aux_named = split_normuon_params(actor.named_parameters())
+        muon_names = {name for name, _ in muon_named}
+        aux_names = {name for name, _ in aux_named}
+
+        assert "tile_sa_q_proj.weight" in muon_names
+        assert "latent_ffn_up.weight" in muon_names
+        assert "head_build_type.weight" in aux_names
+        assert "head_h_gate.weight" in aux_names
+        assert "actor_cls" in aux_names
+        assert "context_tau" in aux_names
+
+    def test_normuon_split_keeps_critic_output_head_on_aux_adam(self):
+        critic = CentralizedCritic().eval()
+        muon_named, aux_named = split_normuon_params(critic.named_parameters())
+        muon_names = {name for name, _ in muon_named}
+        aux_names = {name for name, _ in aux_named}
+
+        assert "windowed_sa.0.attn.q_proj.weight" in muon_names
+        assert "value_head.mlp.0.weight" in muon_names
+        assert "value_head.mlp.4.weight" in aux_names
+        assert "global_cls" in aux_names
+        assert "value_head.cls_weights" in aux_names
+
+    def test_normuon_optimizer_step_updates_muon_and_aux_parameters(self):
+        matrix = torch.nn.Parameter(torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.float32))
+        scalar = torch.nn.Parameter(torch.tensor([0.5], dtype=torch.float32))
+        optimizer = SingleDeviceNorMuonWithAuxAdam([
+            {"params": [matrix], "lr": 1e-2, "use_muon": True},
+            {"params": [scalar], "lr": 1e-2, "use_muon": False},
+        ])
+        matrix.grad = torch.tensor([[0.1, -0.2], [0.3, -0.4]], dtype=torch.float32)
+        scalar.grad = torch.tensor([0.25], dtype=torch.float32)
+
+        before_matrix = matrix.detach().clone()
+        before_scalar = scalar.detach().clone()
+        optimizer.step()
+
+        assert torch.isfinite(matrix).all()
+        assert torch.isfinite(scalar).all()
+        assert not torch.allclose(matrix, before_matrix)
+        assert not torch.allclose(scalar, before_scalar)
 
     def test_different_maps_same_mask_different_features(self):
         """Different map content in valid region should change encoded features."""

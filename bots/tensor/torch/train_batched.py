@@ -65,6 +65,7 @@ import torch
 import torch.nn.functional as F
 
 try:
+    from normuon import make_normuon_optimizer
     from hidden_state_bank import HiddenStateBank
     from replay_buffers import (
         AX_DELIVERED_BUFFER,
@@ -94,6 +95,7 @@ try:
         validate_worker_game_result,
     )
 except ImportError:
+    from bots.tensor.torch.normuon import make_normuon_optimizer
     from bots.tensor.torch.hidden_state_bank import HiddenStateBank
     from bots.tensor.torch.replay_buffers import (
         AX_DELIVERED_BUFFER,
@@ -445,7 +447,10 @@ def _load_resume_state(
         return None
     opt_state = payload.get("optimizer")
     if opt_state is not None:
-        optimizer.load_state_dict(opt_state)
+        try:
+            optimizer.load_state_dict(opt_state)
+        except Exception as exc:
+            print(f"Resume: incompatible actor optimizer state, resetting optimizer ({exc})")
     return payload
 
 
@@ -471,7 +476,10 @@ def _load_critic_init_weights(weight_path: str | Path, *, lr: float) -> bool:
         critic, critic_opt = get_centralized_critic(lr=lr)
         critic.load_state_dict(critic_state)
         if opt_state is not None:
-            critic_opt.load_state_dict(opt_state)
+            try:
+                critic_opt.load_state_dict(opt_state)
+            except Exception as exc:
+                print(f"Resume: incompatible critic optimizer state, resetting optimizer ({exc})")
         return True
     except Exception as e:
         print(f"Could not load critic init weights from {path}: {e}")
@@ -1543,7 +1551,7 @@ def main():
             raise SystemExit(f"Could not load actor weights from {args.init_weights}")
         print(f"Initialized actor from {args.init_weights}")
     _deferred_critic_path = args.critic_init_weights or None
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = make_normuon_optimizer(model, lr=args.lr, weight_decay=0.0)
     _kl_ema = KL_TARGET
 
     start_episode = 0

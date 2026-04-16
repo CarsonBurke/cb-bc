@@ -40,6 +40,7 @@ from model import (
     _make_bucket_centers, _normalize_actor_latent_dim,
     win_probability,
 )
+from normuon import make_normuon_optimizer
 
 from training_utils import jsonl_line, jsonl_init
 from dataset import CriticBCDataset, _cache_path, _file_signature, _atomic_torch_save, _CRITIC_CACHE_VERSION
@@ -679,7 +680,7 @@ def train_critic(
 
     bucket_centers = _make_bucket_centers().to(DEVICE)
 
-    optimizer = torch.optim.AdamW(critic.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = make_normuon_optimizer(critic, lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     critic.train()
     train_step = maybe_compile(CriticPretrainStep(critic), cuda_cfg, label="critic BC")

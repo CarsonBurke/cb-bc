@@ -52,6 +52,11 @@ except ImportError:
     from bots.tensor.trajectory_schema import TrajectoryStep
     from bots.tensor.torch.training_profile import trace_scope
 
+try:
+    from normuon import make_normuon_optimizer
+except ImportError:
+    from bots.tensor.torch.normuon import make_normuon_optimizer
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _USE_BF16 = DEVICE.type == "cuda" and torch.cuda.is_bf16_supported()
 _TRAINING_DTYPE = torch.bfloat16 if _USE_BF16 else torch.float32
@@ -4221,8 +4226,10 @@ def get_centralized_critic(lr: float = 3e-4) -> tuple[CentralizedCritic, torch.o
             _centralized_critic.encode_map = torch.compile(
                 _centralized_critic.encode_map,
             )
-        _centralized_optimizer = torch.optim.Adam(
-            _centralized_critic.parameters(), lr=lr,
+        _centralized_optimizer = make_normuon_optimizer(
+            _centralized_critic,
+            lr=lr,
+            weight_decay=0.0,
         )
         n_params = sum(p.numel() for p in _centralized_critic.parameters())
         print(
@@ -4279,7 +4286,10 @@ def load_centralized_critic_checkpoint(
             _require_finite_tree("critic optimizer checkpoint", opt_state)
         critic.load_state_dict(critic_state)
         if opt_state is not None:
-            critic_opt.load_state_dict(opt_state)
+            try:
+                critic_opt.load_state_dict(opt_state)
+            except Exception as exc:
+                print(f"Could not restore centralized critic optimizer state: {exc}")
         return True
     except Exception as e:
         print(f"Could not load centralized critic from {ckpt_path}: {e}")

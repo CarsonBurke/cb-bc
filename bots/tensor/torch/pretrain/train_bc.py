@@ -47,6 +47,7 @@ from model import (
     compute_harvester_build_dir_mask,
     conveyor_dir_mask,
 )
+from normuon import make_normuon_optimizer
 
 from training_utils import jsonl_line, jsonl_init
 from dataset import ActorBCDataset
@@ -563,7 +564,7 @@ def _actor_bc_optimizer(
     weight_decay: float = 1e-4,
 ) -> torch.optim.Optimizer:
     """Actor-BC optimizer."""
-    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    return make_normuon_optimizer(model, lr=lr, weight_decay=weight_decay)
 
 
 def _run_eval_games(
