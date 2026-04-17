@@ -422,6 +422,69 @@ def bench_target(tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma):
     return out
 
 
+def bench_softmax_target(tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma):
+    """Production target: SuSIE additive position + softmax RBF + 1 look-away token.
+
+    Softmax form of RBF uses the identity softmax(-γ||q-k||²) ≡ softmax(2γ⟨q,k⟩ - γ||k||²)
+    (the softmax translation-invariance cancels -γ||q||²), so we only fold
+    -γ||k||² into a per-key bias and pre-scale Q/K by √(2γ).
+    """
+    N_REG = 1
+    N_TOT = TILE_GRID_N + N_REG
+    susie = _susie_tables(TILE_GRID_N, TILE_EMBED_DIM)
+    sqrt_g2 = (2.0 * gamma) ** 0.5
+
+    q_vecs = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+    k_vecs = [[0.0] * TILE_EMBED_DIM for _ in range(N_TOT)]
+    v_cols = [[0.0] * N_TOT for _ in range(TILE_EMBED_DIM)]
+    neg_g_knsq = [0.0] * N_TOT
+
+    # Register (look-away) token at slot 0: zero input → k,v = biases.
+    knsq0 = 0.0
+    for j in range(TILE_EMBED_DIM):
+        k_val = k_bias[j]
+        v_val = v_bias[j]
+        k_vecs[0][j] = k_val * sqrt_g2
+        v_cols[j][0] = v_val
+        knsq0 += k_val * k_val
+    neg_g_knsq[0] = -gamma * knsq0
+
+    for t in range(TILE_GRID_N):
+        token = tokens[t]
+        pos = susie[t]
+        knsq = 0.0
+        for j in range(TILE_EMBED_DIM):
+            q_val_raw = _DOT(token, q_rows[j]) + q_bias[j] + pos[j]
+            k_val_raw = _DOT(token, k_rows[j]) + k_bias[j] + pos[j]
+            v_val = _DOT(token, v_rows[j]) + v_bias[j]
+            q_vecs[t][j] = q_val_raw * sqrt_g2
+            k_vecs[N_REG + t][j] = k_val_raw * sqrt_g2
+            v_cols[j][N_REG + t] = v_val
+            knsq += k_val_raw * k_val_raw
+        neg_g_knsq[N_REG + t] = -gamma * knsq
+
+    scores = [0.0] * N_TOT
+    out = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+
+    for i in range(TILE_GRID_N):
+        qi = q_vecs[i]
+        best = -1e30
+        for k in range(N_TOT):
+            s = _DOT(qi, k_vecs[k]) + neg_g_knsq[k]
+            scores[k] = s
+            if s > best:
+                best = s
+        z = 0.0
+        for k in range(N_TOT):
+            w = _EXP(scores[k] - best)
+            scores[k] = w
+            z += w
+        inv_z = 1.0 / z
+        for j in range(TILE_EMBED_DIM):
+            out[i][j] = _DOT(scores, v_cols[j]) * inv_z
+    return out
+
+
 def main():
     data = setup()
     tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, rope_cos, rope_sin, tau, gamma = data
@@ -441,6 +504,8 @@ def main():
         ("RBF unnorm + fused γ,√2γ", lambda: bench_rbf_unnorm_fused(
             tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
         ("Target: unnorm+SuSIE+look-away", lambda: bench_target(
+            tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
+        ("Prod: softmax+SuSIE+look-away+fused", lambda: bench_softmax_target(
             tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
     ]
 
@@ -464,11 +529,11 @@ def main():
         results.append((name, us_per_call))
 
     baseline = results[0][1]
-    print(f"{'Variant':<38} {'µs/call':>8} {'vs current':>12}")
-    print(f"{'-'*38} {'-'*8} {'-'*12}")
+    print(f"{'Variant':<42} {'µs/call':>8} {'vs current':>12}")
+    print(f"{'-'*42} {'-'*8} {'-'*12}")
     for name, us in results:
         speedup = baseline / us
-        print(f"{name:<38} {us:>8.1f} {speedup:>11.2f}x")
+        print(f"{name:<42} {us:>8.1f} {speedup:>11.2f}x")
 
 
 if __name__ == "__main__":
