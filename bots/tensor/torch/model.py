@@ -4530,10 +4530,7 @@ def load_centralized_critic_checkpoint(
             _require_finite_tree("critic optimizer checkpoint", opt_state)
         critic.load_state_dict(critic_state)
         if opt_state is not None:
-            try:
-                critic_opt.load_state_dict(opt_state)
-            except Exception as exc:
-                print(f"Could not restore centralized critic optimizer state: {exc}")
+            critic_opt.load_state_dict(opt_state)
         return True
     except Exception as e:
         print(f"Could not load centralized critic from {ckpt_path}: {e}")

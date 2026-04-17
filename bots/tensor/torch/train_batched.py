@@ -447,10 +447,7 @@ def _load_resume_state(
         return None
     opt_state = payload.get("optimizer")
     if opt_state is not None:
-        try:
-            optimizer.load_state_dict(opt_state)
-        except Exception as exc:
-            print(f"Resume: incompatible actor optimizer state, resetting optimizer ({exc})")
+        optimizer.load_state_dict(opt_state)
     return payload
 
 
@@ -476,10 +473,7 @@ def _load_critic_init_weights(weight_path: str | Path, *, lr: float) -> bool:
         critic, critic_opt = get_centralized_critic(lr=lr)
         critic.load_state_dict(critic_state)
         if opt_state is not None:
-            try:
-                critic_opt.load_state_dict(opt_state)
-            except Exception as exc:
-                print(f"Resume: incompatible critic optimizer state, resetting optimizer ({exc})")
+            critic_opt.load_state_dict(opt_state)
         return True
     except Exception as e:
         print(f"Could not load critic init weights from {path}: {e}")
