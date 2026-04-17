@@ -9,6 +9,7 @@ import gc
 import json
 import os
 from enum import Enum
+from operator import attrgetter
 from pathlib import Path
 
 import math
@@ -3563,6 +3564,7 @@ def _sequential_logprobs(
         with autocast_context(_get_actor_cuda_config()):
             obs_pre_all = model._obs_encoder_pre(obs)
     bt_mask_all, bd_mask_all, cd_causal_all = _precompute_policy_masks(obs, bt_act, bd_act)
+    t_range_full = torch.arange(bptt_k, device=dev).unsqueeze(0)
 
     def _run_chunk_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
         for cb_start in range(0, chunk_ids.shape[0], B_chunk):
@@ -3570,9 +3572,12 @@ def _sequential_logprobs(
             B = batch_ids.shape[0]
             chunk_starts = all_starts[batch_ids]
             chunk_lens = all_lens[batch_ids]
-            K_max = bptt_k if full_length else int(chunk_lens[0].item())
-
-            t_range = torch.arange(K_max, device=dev).unsqueeze(0)
+            if full_length:
+                K_max = bptt_k
+                t_range = t_range_full
+            else:
+                K_max = int(chunk_lens[0].item())
+                t_range = t_range_full[:, :K_max]
             idx_grid = (chunk_starts.unsqueeze(1) + t_range).clamp(max=N - 1)
             flat_idx = idx_grid.reshape(-1)
 
@@ -3664,13 +3669,14 @@ def ppo_update(
     bucket_centers = _make_bucket_centers().to(device=obs.device)
     critic_cuda_cfg = None
 
-    # Explained variance
-    if old_values is not None:
-        with torch.no_grad():
-            var_y = returns.var().item()
-            ev = 0.0 if var_y == 0 else 1.0 - (returns - old_values).var().item() / var_y
-    else:
-        ev = 0.0
+    # Explained variance (computed on GPU; reduced to scalar at final batched sync)
+    with torch.no_grad():
+        if old_values is not None:
+            ev_var_y = returns.var()
+            ev_var_res = (returns - old_values).var()
+        else:
+            ev_var_y = torch.zeros((), device=dev)
+            ev_var_res = torch.zeros((), device=dev)
 
     # Build BPTT chunks from episode boundaries
     if bptt_chunks is None:
@@ -3697,6 +3703,10 @@ def ppo_update(
     else:
         B_chunk = max(1, (n_chunks + 7) // 8)
 
+    _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
+    # Precompute max-length arange once; slice per-batch for tail chunks.
+    t_range_full = torch.arange(bptt_k, device=dev).unsqueeze(0)
+
     # ---- Phase 1: Actor updates with BPTT ----
     actor_stopped_early = False
     actor_epochs_ran = 0
@@ -3722,8 +3732,12 @@ def ppo_update(
                     B = batch_ids.shape[0]
                     chunk_starts = all_chunk_starts[batch_ids]
                     chunk_lens = all_chunk_lens[batch_ids]
-                    K_max = bptt_k if full_length else int(chunk_lens[0].item())
-                    t_range = torch.arange(K_max, device=dev).unsqueeze(0)
+                    if full_length:
+                        K_max = bptt_k
+                        t_range = t_range_full
+                    else:
+                        K_max = int(chunk_lens[0].item())
+                        t_range = t_range_full[:, :K_max]
                     idx_grid = (chunk_starts.unsqueeze(1) + t_range).clamp(max=N - 1)
                     flat_idx = idx_grid.reshape(-1)
 
@@ -3761,31 +3775,29 @@ def ppo_update(
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     valid_mask = t_range < chunk_lens.unsqueeze(1)
+                    inv_valid = ~valid_mask
                     valid_denom = valid_mask.sum()
 
                     # Zero padding BEFORE ratio computation to prevent inf*0=NaN.
                     # Padded positions have garbage log_probs that diverge across
                     # PPO epochs; exp(large) → inf, and inf*0.0 = NaN in IEEE 754.
-                    new_lps = torch.where(valid_mask, new_lps, torch.zeros_like(new_lps))
-                    all_old_lp = torch.where(valid_mask, all_old_lp, torch.zeros_like(all_old_lp))
+                    new_lps = new_lps.masked_fill(inv_valid, 0.0)
+                    all_old_lp = all_old_lp.masked_fill(inv_valid, 0.0)
 
                     logratio = new_lps - all_old_lp
                     ratio = logratio.exp()
 
-                    mb_adv = all_adv.clone()
-                    mb_adv[~valid_mask] = 0.0
+                    mb_adv = all_adv.masked_fill(inv_valid, 0.0)
                     policy_weight = _policy_weight_from_advantages(mb_adv, use_pmpo=use_pmpo)
 
                     with torch.no_grad():
                         approx_kl = (((ratio - 1) - logratio) * valid_mask).sum() / valid_denom
                         _epoch_kl_acc += approx_kl
-                        _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
-                        clip_frac = (((ratio < (1 - clip_eps)) | (ratio > (1 + _hi))).float() * valid_mask).sum() / valid_denom
+                        clip_frac = (((ratio < (1 - clip_eps)) | (ratio > (1 + _hi))) & valid_mask).sum() / valid_denom
                         _actor_acc[3] += approx_kl
                         _actor_acc[4] += clip_frac
                         n_mb += 1
                     pg1 = -policy_weight * ratio
-                    _hi = clip_eps_higher if clip_eps_higher is not None else clip_eps
                     pg2 = -policy_weight * torch.clamp(ratio, 1 - clip_eps, 1 + _hi)
                     pi_loss = (torch.max(pg1, pg2) * valid_mask).sum() / valid_denom
                     ent_loss = (entropies * valid_mask).sum() / valid_denom
@@ -3953,6 +3965,7 @@ def ppo_update(
         _diag = torch.stack([
             returns.min(), returns.max(), returns.mean(),
             oob_frac, bucket_lo_orig.float(), bucket_hi_orig.float(),
+            ev_var_y, ev_var_res,
         ])
         # Batch all .item() calls into one contiguous CPU transfer
         _all_scalars = torch.cat([_actor_acc, _critic_acc, _diag, mean_temperature, std_temperature]).cpu()
@@ -3960,6 +3973,8 @@ def ppo_update(
     _a = _all_scalars
     _na = max(n_updates, 1)
     _nc = max(n_critic_updates, 1)
+    _var_y = _a[14].item()
+    ev = 0.0 if _var_y == 0 else 1.0 - _a[15].item() / _var_y
     return {
         "pi_loss": _a[0].item() / _na,
         "vf_loss": _a[5].item() / _nc,
@@ -3975,17 +3990,20 @@ def ppo_update(
         "ret_mean": round(_a[10].item(), 3),
         "ret_oob_frac": round(_a[11].item(), 4),
         "n_updates": n_updates,
-        "temp_bt_mean": _a[14].item(),
-        "temp_bd_mean": _a[15].item(),
-        "temp_cd_mean": _a[16].item(),
-        "temp_brt_mean": _a[17].item(),
-        "temp_md_mean": _a[18].item(),
-        "temp_bt_std": _a[19].item(),
-        "temp_bd_std": _a[20].item(),
-        "temp_cd_std": _a[21].item(),
-        "temp_brt_std": _a[22].item(),
-        "temp_md_std": _a[23].item(),
+        "temp_bt_mean": _a[16].item(),
+        "temp_bd_mean": _a[17].item(),
+        "temp_cd_mean": _a[18].item(),
+        "temp_brt_mean": _a[19].item(),
+        "temp_md_mean": _a[20].item(),
+        "temp_bt_std": _a[21].item(),
+        "temp_bd_std": _a[22].item(),
+        "temp_cd_std": _a[23].item(),
+        "temp_brt_std": _a[24].item(),
+        "temp_md_std": _a[25].item(),
     }
+
+
+_STEP_FIELDS_GETTER = attrgetter("bt", "bd", "cd", "brt", "md", "old_log_prob", "reward")
 
 
 def _parse_trajectories(
@@ -4046,14 +4064,18 @@ def _parse_trajectories(
             h_t[start:end] = torch.frombuffer(
                 memoryview(h_blob), dtype=torch.float32,
             ).reshape(traj_len, H_DIM)
-            bt_t[start:end] = torch.as_tensor([step.bt for step in traj], dtype=torch.long)
-            bd_t[start:end] = torch.as_tensor([step.bd for step in traj], dtype=torch.long)
-            cd_t[start:end] = torch.as_tensor([step.cd for step in traj], dtype=torch.long)
-            brt_t[start:end] = torch.as_tensor([step.brt for step in traj], dtype=torch.long)
-            md_t[start:end] = torch.as_tensor([step.md for step in traj], dtype=torch.long)
-            lp_t[start:end] = torch.as_tensor([step.old_log_prob for step in traj], dtype=torch.float32)
-            step_rewards = torch.as_tensor([step.reward for step in traj], dtype=torch.float32)
-            rw_t[start:end] = step_rewards if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW) else 0.0
+            # Single pass over traj, yielding all scalar fields as column tuples.
+            bts, bds, cds, brts, mds, lps, rws = zip(*map(_STEP_FIELDS_GETTER, traj))
+            bt_t[start:end] = torch.as_tensor(bts, dtype=torch.long)
+            bd_t[start:end] = torch.as_tensor(bds, dtype=torch.long)
+            cd_t[start:end] = torch.as_tensor(cds, dtype=torch.long)
+            brt_t[start:end] = torch.as_tensor(brts, dtype=torch.long)
+            md_t[start:end] = torch.as_tensor(mds, dtype=torch.long)
+            lp_t[start:end] = torch.as_tensor(lps, dtype=torch.float32)
+            if REWARD_MODE in (RewardMode.INCOME, RewardMode.FLOW):
+                rw_t[start:end] = torch.as_tensor(rws, dtype=torch.float32)
+            else:
+                rw_t[start:end] = 0.0
             idx = end
             ep_boundaries.append((start, end))
     finally:
