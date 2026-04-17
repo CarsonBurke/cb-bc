@@ -358,6 +358,20 @@ _TILE_DXDY = torch.tensor(
     dtype=torch.float32,
 )
 
+
+def _make_tile_susie(n_tokens: int, dim: int, theta: float = 10000.0) -> torch.Tensor:
+    """Unrotated sinusoid table used as additive SuSIE position for the tile grid.
+
+    Layout matches the reference: [sin(t*f₀)…sin(t*f_{d/2-1}), cos(t*f₀)…cos(t*f_{d/2-1})].
+    A learnable pos_weight of shape (dim/2,) is tied across sin/cos by repeat(2) at
+    forward time, so each frequency's sin and cos share a single scale.
+    """
+    half = dim // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    t = torch.arange(n_tokens, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)  # (n_tokens, half)
+    return torch.cat((freqs.sin(), freqs.cos()), dim=-1).contiguous()  # (n_tokens, dim)
+
 # ---- Action masking ----
 # Build costs (ti, ax) indexed by BUILD_ACTIONS:
 # none, harvester, conveyor, road, gunner, sentinel, breach, splitter,
@@ -2722,13 +2736,21 @@ class BuilderMLP(nn.Module):
         self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_norm = RMSNorm(self._actor_latent_dim)
         self.context_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
-        self.tile_sa_out_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_ffn_out_norm = RMSNorm(TILE_EMBED_DIM)
         self.cls_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
 
         self.actor_cls = nn.Parameter(torch.zeros(self._actor_cls_tokens, TILE_EMBED_DIM))
         self.context_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))
         self.tile_sa_gamma = nn.Parameter(torch.zeros(1))  # exp(0) = 1.0 init
+        # SuSIE additive position for tile self-attention: sinusoidal table
+        # scaled by a learnable per-freq weight (tied across sin/cos).
+        self.tile_sa_pos_weight = nn.Parameter(torch.full((TILE_EMBED_DIM // 2,), 0.5))
+        # Look-away register: zero-init input token prepended to the tile sequence
+        # so queries have a "safe sink" — ||q-0||² = ||q||² before projection.
+        self.tile_sa_lookaway = nn.Parameter(torch.zeros(TILE_EMBED_DIM))
+        self.register_buffer(
+            "tile_sa_susie", _make_tile_susie(TILE_GRID_N, TILE_EMBED_DIM), persistent=False
+        )
         self.cls_ca_tau = nn.Parameter(torch.zeros(self._actor_cls_tokens))  # per-seed temperature
         self.context_resid_mix = nn.Parameter(
             torch.stack((torch.ones(TILE_EMBED_DIM), torch.zeros(TILE_EMBED_DIM))).float()
@@ -2799,24 +2821,44 @@ class BuilderMLP(nn.Module):
         return F.silu(cls + self.context_ca_norm(attn_out))
 
     def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
-        """Peri-LN RBF self-attention + FFN residual block over tile tokens."""
-        normed_tiles = self.tile_sa_norm(tiles)
-        q = self.tile_sa_q_proj(normed_tiles)
-        k = self.tile_sa_k_proj(normed_tiles)
-        v = self.tile_sa_v_proj(normed_tiles)
+        """Peri-LN non-softmax RBF SA with SuSIE position and a register slot.
+
+        Weights are the raw RBF kernel exp(-γ||q-k||²); no softmax denominator.
+        Position is injected as additive SuSIE sinusoids on q and k. A single
+        zero-initialized register token is prepended to the tile sequence so
+        the model can learn a k/v slot that every query sees unconditionally
+        (the "look-away" — useful here because RMSNorm later re-standardizes
+        the attention output, so a constant-offset register can steer the
+        mean without growing unbounded).
+        """
+        B, N, D = tiles.shape
+        lookaway = self.tile_sa_lookaway.view(1, 1, D).expand(B, 1, D)
+        seq = torch.cat([lookaway, tiles], dim=1)  # (B, N+1, D)
+
+        normed = self.tile_sa_norm(seq)
+        q = self.tile_sa_q_proj(normed)
+        k = self.tile_sa_k_proj(normed)
+        v = self.tile_sa_v_proj(normed)
+
+        pos_weight = self.tile_sa_pos_weight.repeat(2).to(q.dtype)  # (D,)
+        pos_real = self.tile_sa_susie.to(q.dtype) * pos_weight  # (N, D)
+        pos_emb = F.pad(pos_real, (0, 0, 1, 0))  # (N+1, D), zero row for register
+        q = q + pos_emb
+        k = k + pos_emb
+
         gamma = self.tile_sa_gamma.exp()
-        k_norm_sq = (k * k).sum(dim=-1, keepdim=True).transpose(-1, -2)
-        gamma_scale = torch.sqrt(2.0 * gamma)
-        q = q * gamma_scale
-        k = k * gamma_scale
-        # attn_mask = -γ||k||² broadcast as (B, 1, 1, N_k)
-        rbf_bias = (-gamma * k_norm_sq).unsqueeze(1)
-        attn_out = F.scaled_dot_product_attention(
-            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
-            attn_mask=rbf_bias, scale=1.0,
-        ).squeeze(1)
-        attn_out = exclusive_self_attention(attn_out, v)
-        tiles = tiles + self.tile_sa_out_norm(attn_out)
+        q_norm_sq = (q * q).sum(dim=-1, keepdim=True)  # (B, N+1, 1)
+        k_norm_sq = (k * k).sum(dim=-1, keepdim=True)  # (B, N+1, 1)
+        qk = torch.matmul(q, k.transpose(-1, -2))  # (B, N+1, N+1)
+        dist_sq = (q_norm_sq + k_norm_sq.transpose(-1, -2) - 2.0 * qk).clamp(min=0.0)
+        weights = torch.exp(-gamma * dist_sq)
+
+        attn_out = torch.matmul(weights, v)  # (B, N+1, D)
+        attn_out = attn_out[:, 1:, :]  # drop register output
+
+        # No post-norm on attention output: keeping the raw non-softmax RBF magnitude
+        # preserves the "density of nearby keys" signal. FFN pre-norm handles scaling.
+        tiles = tiles + attn_out
         tiles = tiles + self.tile_ffn_out_norm(
             self.tile_ffn_down(ffn_activation(self.tile_ffn_up(self.tile_ffn_norm(tiles)))),
         )
@@ -3016,12 +3058,13 @@ class BuilderMLP(nn.Module):
             ("linear", self.tile_ffn_up),
             ("linear", self.tile_ffn_down),
             ("norm", self.context_ca_input_norm),
-            ("norm", self.tile_sa_out_norm),
             ("norm", self.tile_ffn_out_norm),
             ("norm", self.cls_ca_input_norm),
             ("norm", self.latent_ffn_out_norm),
             ("param", self.context_resid_mix),
             ("param", self.cls_resid_mix),
+            ("param", self.tile_sa_pos_weight),
+            ("param", self.tile_sa_lookaway),
         ]
 
     def export_weights(self) -> list[list[float]]:
@@ -3047,9 +3090,10 @@ class BuilderMLP(nn.Module):
         supported = (
             expected,
             expected - 2,
-            expected - 7,
-            expected - 12,
-            expected - 18,
+            expected - 4,
+            expected - 8,
+            expected - 13,
+            expected - 19,
         )
         if len(state) not in supported:
             raise AssertionError(
@@ -3102,16 +3146,19 @@ class BuilderMLP(nn.Module):
         if state_len <= 54:
             for norm in (
                 self.context_ca_input_norm,
-                self.tile_sa_out_norm,
                 self.tile_ffn_out_norm,
                 self.cls_ca_input_norm,
                 self.latent_ffn_out_norm,
             ):
                 pad.append([1.0] * norm.weight.numel())
 
-        if state_len <= 59:
+        if state_len <= 58:
             pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
             pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
+
+        if state_len <= 60:
+            pad.append([0.5] * (TILE_EMBED_DIM // 2))  # tile_sa_pos_weight
+            pad.append([0.0] * TILE_EMBED_DIM)          # tile_sa_lookaway
 
         return pad
 
@@ -3130,7 +3177,6 @@ class BuilderMLP(nn.Module):
             "tile_ffn_down.weight": torch.zeros_like(self.tile_ffn_down.weight),
             "tile_ffn_down.bias": torch.zeros_like(self.tile_ffn_down.bias),
             "context_ca_input_norm.weight": torch.ones_like(self.context_ca_input_norm.weight),
-            "tile_sa_out_norm.weight": torch.ones_like(self.tile_sa_out_norm.weight),
             "tile_ffn_out_norm.weight": torch.ones_like(self.tile_ffn_out_norm.weight),
             "cls_ca_input_norm.weight": torch.ones_like(self.cls_ca_input_norm.weight),
             "latent_ffn_out_norm.weight": torch.ones_like(self.latent_ffn_out_norm.weight),
@@ -3142,6 +3188,8 @@ class BuilderMLP(nn.Module):
                 torch.ones_like(self.cls_resid_mix[0]),
                 torch.zeros_like(self.cls_resid_mix[1]),
             )),
+            "tile_sa_pos_weight": torch.full_like(self.tile_sa_pos_weight, 0.5),
+            "tile_sa_lookaway": torch.zeros_like(self.tile_sa_lookaway),
         }
         return defaults
 

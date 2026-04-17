@@ -254,6 +254,174 @@ def bench_rbf_unnorm_efficient(tokens, q_rows, q_bias, k_rows, k_bias,
     return out
 
 
+def bench_rbf_softmax_fused(tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias,
+                            gamma):
+    """Softmax RBF with -γ folded into k_norm_sq and √(2γ) folded into q,k.
+
+    Pre-folding saves one scalar multiply per (i, k) pair; pre-scaling q,k
+    avoids the g2 multiply inside the score loop. Inner loop becomes a pure
+    dot plus add."""
+    sqrt_g2 = (2.0 * gamma) ** 0.5
+    q_vecs = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+    k_vecs = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+    v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
+    neg_g_knsq = [0.0] * TILE_GRID_N
+
+    for t in range(TILE_GRID_N):
+        token = tokens[t]
+        knsq = 0.0
+        for j in range(TILE_EMBED_DIM):
+            q_val = (_DOT(token, q_rows[j]) + q_bias[j]) * sqrt_g2
+            k_val_raw = _DOT(token, k_rows[j]) + k_bias[j]
+            k_val = k_val_raw * sqrt_g2
+            v_val = _DOT(token, v_rows[j]) + v_bias[j]
+            q_vecs[t][j] = q_val
+            k_vecs[t][j] = k_val
+            v_cols[j][t] = v_val
+            knsq += k_val_raw * k_val_raw
+        neg_g_knsq[t] = -gamma * knsq
+
+    scores = [0.0] * TILE_GRID_N
+    out = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+
+    for i in range(TILE_GRID_N):
+        qi = q_vecs[i]
+        best = -1e30
+        for k in range(TILE_GRID_N):
+            score = _DOT(qi, k_vecs[k]) + neg_g_knsq[k]
+            scores[k] = score
+            if score > best:
+                best = score
+        z = 0.0
+        for k in range(TILE_GRID_N):
+            w = _EXP(scores[k] - best)
+            scores[k] = w
+            z += w
+        inv_z = 1.0 / z
+        for j in range(TILE_EMBED_DIM):
+            out[i][j] = _DOT(scores, v_cols[j]) * inv_z
+    return out
+
+
+def bench_rbf_unnorm_fused(tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias,
+                           gamma):
+    """Non-softmax RBF + fusion: pre-fold γ into k_norm_sq and q_norm_sq,
+    pre-scale q,k by √(2γ). Inner loop: exp(dot + neg_g_knsq[k]) * q_factor."""
+    sqrt_g2 = (2.0 * gamma) ** 0.5
+    q_vecs = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+    k_vecs = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+    v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
+    neg_g_knsq = [0.0] * TILE_GRID_N
+    neg_g_qnsq = [0.0] * TILE_GRID_N
+
+    for t in range(TILE_GRID_N):
+        token = tokens[t]
+        knsq = 0.0
+        qnsq = 0.0
+        for j in range(TILE_EMBED_DIM):
+            q_val_raw = _DOT(token, q_rows[j]) + q_bias[j]
+            k_val_raw = _DOT(token, k_rows[j]) + k_bias[j]
+            v_val = _DOT(token, v_rows[j]) + v_bias[j]
+            q_vecs[t][j] = q_val_raw * sqrt_g2
+            k_vecs[t][j] = k_val_raw * sqrt_g2
+            v_cols[j][t] = v_val
+            qnsq += q_val_raw * q_val_raw
+            knsq += k_val_raw * k_val_raw
+        neg_g_knsq[t] = -gamma * knsq
+        neg_g_qnsq[t] = -gamma * qnsq
+
+    weights = [0.0] * TILE_GRID_N
+    out = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+
+    for i in range(TILE_GRID_N):
+        qi = q_vecs[i]
+        q_factor = _EXP(neg_g_qnsq[i])
+        for k in range(TILE_GRID_N):
+            weights[k] = _EXP(_DOT(qi, k_vecs[k]) + neg_g_knsq[k])
+        for j in range(TILE_EMBED_DIM):
+            out[i][j] = _DOT(weights, v_cols[j]) * q_factor
+    return out
+
+
+def _susie_tables(n_tokens, dim, seed=11):
+    """Precomputed additive sinusoidal table * learnable pos_weight (pretend
+    pos_weight=0.5, matching the ref's init). Shape: (n_tokens, dim)."""
+    # Reference constructs unrotated sinusoids [sin(t/θ^{2i/d}), cos(t/θ^{2i/d})]
+    # then multiplies by learnable pos_weight (head-wise, tied across sin/cos).
+    # For bench purposes we use a fixed scale of 0.5.
+    half = dim // 2
+    theta = 10000.0
+    inv_freq = [1.0 / (theta ** (2 * i / dim)) for i in range(half)]
+    table = []
+    for t in range(n_tokens):
+        row = [0.0] * dim
+        for i in range(half):
+            row[i] = math.sin(t * inv_freq[i]) * 0.5
+            row[half + i] = math.cos(t * inv_freq[i]) * 0.5
+        table.append(row)
+    return table
+
+
+def bench_target(tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma):
+    """Target: SuSIE additive position + non-softmax RBF + 1 look-away token.
+
+    - SuSIE: q,k gain an additive sinusoidal vector scaled by pos_weight.
+    - Register: one zero-input key/value slot at index 0 (projects to bias).
+    - Non-softmax: weights = exp(-γ||q-k||²), no denominator.
+    - Folded: γ pre-multiplied into k_norm_sq and q_norm_sq.
+    """
+    N_REG = 1
+    N_TOT = TILE_GRID_N + N_REG
+    susie = _susie_tables(TILE_GRID_N, TILE_EMBED_DIM)
+    sqrt_g2 = (2.0 * gamma) ** 0.5
+
+    q_vecs = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+    k_vecs = [[0.0] * TILE_EMBED_DIM for _ in range(N_TOT)]
+    v_cols = [[0.0] * N_TOT for _ in range(TILE_EMBED_DIM)]
+    neg_g_knsq = [0.0] * N_TOT
+    neg_g_qnsq = [0.0] * TILE_GRID_N
+
+    # Register (look-away) token at slot 0: zero input → k,v = biases.
+    knsq0 = 0.0
+    for j in range(TILE_EMBED_DIM):
+        k_val = k_bias[j]
+        v_val = v_bias[j]
+        k_vecs[0][j] = k_val * sqrt_g2
+        v_cols[j][0] = v_val
+        knsq0 += k_val * k_val
+    neg_g_knsq[0] = -gamma * knsq0
+
+    # Real tokens
+    for t in range(TILE_GRID_N):
+        token = tokens[t]
+        pos = susie[t]
+        knsq = 0.0
+        qnsq = 0.0
+        for j in range(TILE_EMBED_DIM):
+            q_val_raw = _DOT(token, q_rows[j]) + q_bias[j] + pos[j]
+            k_val_raw = _DOT(token, k_rows[j]) + k_bias[j] + pos[j]
+            v_val = _DOT(token, v_rows[j]) + v_bias[j]
+            q_vecs[t][j] = q_val_raw * sqrt_g2
+            k_vecs[N_REG + t][j] = k_val_raw * sqrt_g2
+            v_cols[j][N_REG + t] = v_val
+            qnsq += q_val_raw * q_val_raw
+            knsq += k_val_raw * k_val_raw
+        neg_g_knsq[N_REG + t] = -gamma * knsq
+        neg_g_qnsq[t] = -gamma * qnsq
+
+    weights = [0.0] * N_TOT
+    out = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
+
+    for i in range(TILE_GRID_N):
+        qi = q_vecs[i]
+        q_factor = _EXP(neg_g_qnsq[i])
+        for k in range(N_TOT):
+            weights[k] = _EXP(_DOT(qi, k_vecs[k]) + neg_g_knsq[k])
+        for j in range(TILE_EMBED_DIM):
+            out[i][j] = _DOT(weights, v_cols[j]) * q_factor
+    return out
+
+
 def main():
     data = setup()
     tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, rope_cos, rope_sin, tau, gamma = data
@@ -264,9 +432,15 @@ def main():
             rope_cos, rope_sin, tau)),
         ("RBF softmax (no norm/RoPE)", lambda: bench_rbf_softmax(
             tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
+        ("RBF softmax + fused γ,√2γ", lambda: bench_rbf_softmax_fused(
+            tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
         ("RBF unnorm (full dist)", lambda: bench_rbf_unnorm(
             tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
         ("RBF unnorm (efficient)", lambda: bench_rbf_unnorm_efficient(
+            tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
+        ("RBF unnorm + fused γ,√2γ", lambda: bench_rbf_unnorm_fused(
+            tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
+        ("Target: unnorm+SuSIE+look-away", lambda: bench_target(
             tokens, q_rows, q_bias, k_rows, k_bias, v_rows, v_bias, gamma)),
     ]
 

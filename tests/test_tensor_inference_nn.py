@@ -198,7 +198,9 @@ def test_tile_rbf_gamma_gradient_matches_explicit_logits():
 def test_actor_load_accepts_legacy_state_schema():
     torch_model = BuilderMLP().eval()
     full_state = torch_model.export_weights()
-    legacy_state = full_state[:-18]
+    # Deepest supported legacy schema: missing the two SuSIE/look-away params
+    # plus the resid_mix, peri-LN norms, tile-FFN, and latent-FFN entries.
+    legacy_state = full_state[:-19]
 
     infer_model = ActorModel(
         output_heads={
@@ -249,12 +251,13 @@ def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
         "tile_ffn_down.weight",
         "tile_ffn_down.bias",
         "context_ca_input_norm.weight",
-        "tile_sa_out_norm.weight",
         "tile_ffn_out_norm.weight",
         "cls_ca_input_norm.weight",
         "latent_ffn_out_norm.weight",
         "context_resid_mix",
         "cls_resid_mix",
+        "tile_sa_pos_weight",
+        "tile_sa_lookaway",
     }
     legacy_state = {k: v.clone() for k, v in full_state.items() if k not in legacy_keys}
     ckpt_path = tmp_path / "legacy_actor_state.pkl"
@@ -262,7 +265,7 @@ def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
         pickle.dump(legacy_state, f)
 
     compat_model = BuilderMLP().eval()
-    compat_model.import_weights(torch_model.export_weights()[:-18])
+    compat_model.import_weights(torch_model.export_weights()[:-19])
 
     loaded_model = BuilderMLP().eval()
     assert loaded_model.load_weights(ckpt_path)

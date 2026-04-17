@@ -581,6 +581,65 @@ class TestRBFModelIntegration:
             model2.tile_sa_gamma, model.tile_sa_gamma,
         )
 
+    def test_tile_sa_loss_decreases(self, model_and_obs):
+        """End-to-end smoke: training the new tile SA path should reduce MSE
+        against a fixed random target. Covers SuSIE pos_weight, look-away
+        register, γ and the non-softmax RBF kernel all receiving gradient."""
+        from model import BuilderMLP
+        torch.manual_seed(0)
+        model = BuilderMLP()
+        model.train()
+        B = 16
+        OBS_SIZE = model_and_obs[1]
+        obs = torch.randn(B, OBS_SIZE)
+        with torch.no_grad():
+            tiles0, _ = model._split_obs_pre(model._obs_encoder_pre(obs))
+        target = torch.randn_like(tiles0)
+
+        tile_sa_params = [
+            model.tile_sa_q_proj.weight, model.tile_sa_q_proj.bias,
+            model.tile_sa_k_proj.weight, model.tile_sa_k_proj.bias,
+            model.tile_sa_v_proj.weight, model.tile_sa_v_proj.bias,
+            model.tile_sa_norm.weight,
+            model.tile_sa_gamma,
+            model.tile_sa_pos_weight,
+            model.tile_sa_lookaway,
+            model.tile_ffn_norm.weight,
+            model.tile_ffn_up.weight, model.tile_ffn_up.bias,
+            model.tile_ffn_down.weight, model.tile_ffn_down.bias,
+            model.tile_ffn_out_norm.weight,
+        ]
+        opt = torch.optim.Adam(tile_sa_params, lr=1e-2)
+
+        initial_pos_weight = model.tile_sa_pos_weight.detach().clone()
+        initial_lookaway = model.tile_sa_lookaway.detach().clone()
+
+        with torch.no_grad():
+            tiles_in, _ = model._split_obs_pre(model._obs_encoder_pre(obs))
+        first_loss = (model._tile_self_attention(tiles_in) - target).pow(2).mean().item()
+
+        last_loss = first_loss
+        for _ in range(30):
+            opt.zero_grad()
+            with torch.no_grad():
+                tiles_in, _ = model._split_obs_pre(model._obs_encoder_pre(obs))
+            out = model._tile_self_attention(tiles_in)
+            loss = (out - target).pow(2).mean()
+            loss.backward()
+            opt.step()
+            last_loss = loss.item()
+
+        assert last_loss < first_loss * 0.5, (
+            f"loss did not halve: {first_loss:.4f} -> {last_loss:.4f}"
+        )
+        # Both new params must have received gradient and moved.
+        assert not torch.equal(model.tile_sa_pos_weight.detach(), initial_pos_weight), (
+            "tile_sa_pos_weight did not update"
+        )
+        assert not torch.equal(model.tile_sa_lookaway.detach(), initial_lookaway), (
+            "tile_sa_lookaway did not update"
+        )
+
     def test_full_actor_parity(self, model_and_obs):
         """Full forward pass: PyTorch actor matches stdlib inference actor."""
         from model import BuilderMLP, H_DIM
