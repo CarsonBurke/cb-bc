@@ -200,7 +200,7 @@ def test_actor_load_accepts_legacy_state_schema():
     full_state = torch_model.export_weights()
     # Deepest supported legacy schema: missing the two SuSIE/look-away params
     # plus the resid_mix, peri-LN norms, tile-FFN, and latent-FFN entries.
-    legacy_state = full_state[:-19]
+    legacy_state = full_state[:-20]
 
     infer_model = ActorModel(
         output_heads={
@@ -258,6 +258,7 @@ def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
         "cls_resid_mix",
         "tile_sa_pos_weight",
         "tile_sa_lookaway",
+        "tile_sa_q_norm.weight",
     }
     legacy_state = {k: v.clone() for k, v in full_state.items() if k not in legacy_keys}
     ckpt_path = tmp_path / "legacy_actor_state.pkl"
@@ -265,7 +266,7 @@ def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
         pickle.dump(legacy_state, f)
 
     compat_model = BuilderMLP().eval()
-    compat_model.import_weights(torch_model.export_weights()[:-19])
+    compat_model.import_weights(torch_model.export_weights()[:-20])
 
     loaded_model = BuilderMLP().eval()
     assert loaded_model.load_weights(ckpt_path)
@@ -281,7 +282,8 @@ def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
 
 def test_actor_load_rejects_partial_truncation():
     full_state = BuilderMLP().eval().export_weights()
-    truncated_state = full_state[:-1]
+    # Any length that isn't a known schema checkpoint should be rejected.
+    truncated_state = full_state[:-2]
 
     infer_model = ActorModel(
         output_heads={

@@ -601,6 +601,7 @@ class TestRBFModelIntegration:
             model.tile_sa_k_proj.weight, model.tile_sa_k_proj.bias,
             model.tile_sa_v_proj.weight, model.tile_sa_v_proj.bias,
             model.tile_sa_norm.weight,
+            model.tile_sa_q_norm.weight,
             model.tile_sa_gamma,
             model.tile_sa_pos_weight,
             model.tile_sa_lookaway,

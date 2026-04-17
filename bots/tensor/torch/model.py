@@ -2734,6 +2734,7 @@ class BuilderMLP(nn.Module):
 
         self.context_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
+        self.tile_sa_q_norm = RMSNorm(TILE_EMBED_DIM)
         self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_norm = RMSNorm(self._actor_latent_dim)
         self.context_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
@@ -2822,22 +2823,21 @@ class BuilderMLP(nn.Module):
         return F.silu(cls + self.context_ca_norm(attn_out))
 
     def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
-        """Peri-LN non-softmax RBF SA with SuSIE position and a register slot.
+        """Peri-LN softmax RBF SA with SuSIE position and a look-away register.
 
-        Weights are the raw RBF kernel exp(-γ||q-k||²); no softmax denominator.
-        Position is injected as additive SuSIE sinusoids on q and k. A single
-        zero-initialized register token is prepended to the tile sequence so
-        the model can learn a k/v slot that every query sees unconditionally
-        (the "look-away" — useful here because RMSNorm later re-standardizes
-        the attention output, so a constant-offset register can steer the
-        mean without growing unbounded).
+        Weights are softmax(2γ⟨q,k⟩ - γ‖k‖²) — equivalent to softmax(-γ‖q-k‖²)
+        since softmax is translation-invariant and cancels the ‖q‖² constant.
+        Position is additive SuSIE sinusoids on q and k. A zero-initialized
+        register token is prepended so the softmax has a competing "look-away"
+        sink: queries with no nearby real tile concentrate weight on the
+        register, whose projected V is near zero at init.
         """
         B, N, D = tiles.shape
         lookaway = self.tile_sa_lookaway.view(1, 1, D).expand(B, 1, D)
         seq = torch.cat([lookaway, tiles], dim=1)  # (B, N+1, D)
 
         normed = self.tile_sa_norm(seq)
-        q = self.tile_sa_q_proj(normed)
+        q = self.tile_sa_q_norm(self.tile_sa_q_proj(normed))
         k = self.tile_sa_k_proj(normed)
         v = self.tile_sa_v_proj(normed)
 
@@ -2848,17 +2848,16 @@ class BuilderMLP(nn.Module):
         k = k + pos_emb
 
         gamma = self.tile_sa_gamma.exp()
-        q_norm_sq = (q * q).sum(dim=-1, keepdim=True)  # (B, N+1, 1)
-        k_norm_sq = (k * k).sum(dim=-1, keepdim=True)  # (B, N+1, 1)
+        k_norm_sq = (k * k).sum(dim=-1, keepdim=True).transpose(-1, -2)  # (B, 1, N+1)
         qk = torch.matmul(q, k.transpose(-1, -2))  # (B, N+1, N+1)
-        dist_sq = (q_norm_sq + k_norm_sq.transpose(-1, -2) - 2.0 * qk).clamp(min=0.0)
-        weights = torch.exp(-gamma * dist_sq)
+        scores = 2.0 * gamma * qk - gamma * k_norm_sq
+        weights = torch.softmax(scores, dim=-1)
 
         attn_out = torch.matmul(weights, v)  # (B, N+1, D)
         attn_out = attn_out[:, 1:, :]  # drop register output
 
-        # No post-norm on attention output: keeping the raw non-softmax RBF magnitude
-        # preserves the "density of nearby keys" signal. FFN pre-norm handles scaling.
+        # Softmax already bounds attn_out to the convex hull of V, so no
+        # post-norm needed — the residual stream stays well-scaled.
         tiles = tiles + attn_out
         tiles = tiles + self.tile_ffn_out_norm(
             self.tile_ffn_down(ffn_activation(self.tile_ffn_up(self.tile_ffn_norm(tiles)))),
@@ -3066,6 +3065,7 @@ class BuilderMLP(nn.Module):
             ("param", self.cls_resid_mix),
             ("param", self.tile_sa_pos_weight),
             ("param", self.tile_sa_lookaway),
+            ("norm", self.tile_sa_q_norm),
         ]
 
     def export_weights(self) -> list[list[float]]:
@@ -3090,11 +3090,12 @@ class BuilderMLP(nn.Module):
         expected = sum(2 if kind == "linear" else 1 for kind, _ in entries)
         supported = (
             expected,
-            expected - 2,
-            expected - 4,
-            expected - 8,
-            expected - 13,
-            expected - 19,
+            expected - 1,
+            expected - 3,
+            expected - 5,
+            expected - 9,
+            expected - 14,
+            expected - 20,
         )
         if len(state) not in supported:
             raise AssertionError(
@@ -3161,6 +3162,9 @@ class BuilderMLP(nn.Module):
             pad.append([0.5] * (TILE_EMBED_DIM // 2))  # tile_sa_pos_weight
             pad.append([0.0] * TILE_EMBED_DIM)          # tile_sa_lookaway
 
+        if state_len <= 62:
+            pad.append([1.0] * self.tile_sa_q_norm.weight.numel())  # tile_sa_q_norm
+
         return pad
 
     def _legacy_state_dict_defaults(self) -> dict[str, torch.Tensor]:
@@ -3191,6 +3195,7 @@ class BuilderMLP(nn.Module):
             )),
             "tile_sa_pos_weight": torch.full_like(self.tile_sa_pos_weight, 0.5),
             "tile_sa_lookaway": torch.zeros_like(self.tile_sa_lookaway),
+            "tile_sa_q_norm.weight": torch.ones_like(self.tile_sa_q_norm.weight),
         }
         return defaults
 

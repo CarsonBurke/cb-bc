@@ -275,6 +275,7 @@ class ActorModel:
 
         self.context_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
+        self.tile_sa_q_norm = RMSNorm(TILE_EMBED_DIM)
         self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_norm = RMSNorm(ACTOR_LATENT_DIM)
         self.context_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
@@ -365,7 +366,6 @@ class ActorModel:
             for i in range(TILE_GRID_N)
         ]
         self._tile_k_norm_sq = [0.0] * TILE_GRID_N
-        self._tile_q_norm_sq = [0.0] * TILE_GRID_N
         self._cls_v_cache = [[0.0] * TILE_EMBED_DIM for _ in range(TILE_GRID_N)]
         self._tile_v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
         self._cls_v_cols = [[0.0] * TILE_GRID_N for _ in range(TILE_EMBED_DIM)]
@@ -419,6 +419,7 @@ class ActorModel:
         params.append(self.cls_resid_mix)
         params.append(self.tile_sa_pos_weight)
         params.append(self.tile_sa_lookaway)
+        params.extend(self.tile_sa_q_norm.parameters())
         return params
 
     def train(self, mode: bool = True) -> None:
@@ -567,6 +568,7 @@ class ActorModel:
             for j in range(TILE_EMBED_DIM)
         ]
         register_k_norm_sq = sum(x * x for x in register_k)
+        neg_g_register_k_norm_sq = -_EXP(self.tile_sa_gamma.data[0]) * register_k_norm_sq
 
         cache = {
             "symbolic_tiles": symbolic_tiles,
@@ -581,6 +583,7 @@ class ActorModel:
             "cls_ca_v_proj": _linear_rows(self.cls_ca_v_proj),
             "context_ca_norm": (list(self.context_ca_norm.gamma.data), self.context_ca_norm.eps),
             "tile_sa_norm": (tile_sa_norm_gamma, self.tile_sa_norm.eps),
+            "tile_sa_q_norm": (list(self.tile_sa_q_norm.gamma.data), self.tile_sa_q_norm.eps),
             "cls_ca_norm": (list(self.cls_ca_norm.gamma.data), self.cls_ca_norm.eps),
             "latent_norm": (list(self.latent_norm.gamma.data), self.latent_norm.eps),
             "context_ca_input_norm": (list(self.context_ca_input_norm.gamma.data), self.context_ca_input_norm.eps),
@@ -612,7 +615,7 @@ class ActorModel:
             "tile_sa_pos": tile_sa_pos,
             "tile_sa_register_k": register_k,
             "tile_sa_register_v": register_v,
-            "tile_sa_register_k_norm_sq": register_k_norm_sq,
+            "tile_sa_neg_g_register_k_norm_sq": neg_g_register_k_norm_sq,
         }
         return cache
 
@@ -633,6 +636,7 @@ class ActorModel:
         cls_v_rows, cls_v_bias = cache["cls_ca_v_proj"]
         context_norm_gamma, context_norm_eps = cache["context_ca_norm"]
         _tile_norm_gamma, tile_norm_eps = cache["tile_sa_norm"]
+        tile_sa_q_norm_gamma, tile_sa_q_norm_eps = cache["tile_sa_q_norm"]
         cls_norm_gamma, cls_norm_eps = cache["cls_ca_norm"]
         latent_norm_gamma, latent_norm_eps = cache["latent_norm"]
         context_in_norm_gamma, context_in_norm_eps = cache["context_ca_input_norm"]
@@ -692,8 +696,8 @@ class ActorModel:
         tile_sa_pos_list = cache["tile_sa_pos"]
         register_k = cache["tile_sa_register_k"]
         register_v = cache["tile_sa_register_v"]
-        register_k_norm_sq = cache["tile_sa_register_k_norm_sq"]
-        tile_q_norm_sq = self._tile_q_norm_sq
+        neg_g_register_k_norm_sq = cache["tile_sa_neg_g_register_k_norm_sq"]
+        tile_sa_g2 = 2.0 * tile_sa_gamma
         # Fused tile encoding + QKV projection + V transpose
         for t in range(TILE_GRID_N):
             base = t * TILE_FEATURES
@@ -751,49 +755,48 @@ class ActorModel:
                 encoded_flat[off + j] = x
                 mean_sq += x * x
             inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_norm_eps) ** 0.5
-            # Pre-norm QKV projection + additive SuSIE position on Q/K.
+            # Pre-norm QKV projection, Q-norm on Q (pre-position), SuSIE add on Q/K.
             pos_t = tile_sa_pos_list[t]
-            q_nsq = 0.0
             k_nsq = 0.0
+            q_mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                q_val = inv_rms * _DOT(token, tile_q_rows[j]) + tile_q_bias[j] + pos_t[j]
+                q_pre = inv_rms * _DOT(token, tile_q_rows[j]) + tile_q_bias[j]
                 k_val = inv_rms * _DOT(token, tile_k_rows[j]) + tile_k_bias[j] + pos_t[j]
                 v_val = inv_rms * _DOT(token, tile_v_rows[j]) + tile_v_bias[j]
-                tile_q_flat[off + j] = q_val
+                tmp_token[j] = q_pre
                 tile_k_flat[off + j] = k_val
                 tile_v_flat[off + j] = v_val
-                q_nsq += q_val * q_val
+                q_mean_sq += q_pre * q_pre
                 k_nsq += k_val * k_val
                 tile_v_cols[j][t] = v_val
-            tile_k_norm_sq[t] = k_nsq
-            tile_q_norm_sq[t] = q_nsq
-        # Non-softmax RBF over 25 real tiles + 1 register slot. No denominator,
-        # no self-value projection. The register adds an unconditional K/V that
-        # every query sees; the subsequent RMSNorm keeps the output bounded.
+            q_inv_rms = 1.0 / (q_mean_sq / TILE_EMBED_DIM + tile_sa_q_norm_eps) ** 0.5
+            for j in range(TILE_EMBED_DIM):
+                tile_q_flat[off + j] = tmp_token[j] * q_inv_rms * tile_sa_q_norm_gamma[j] + pos_t[j]
+            tile_k_norm_sq[t] = -tile_sa_gamma * k_nsq  # fused: -γ||k||² for softmax scores
+        # Softmax RBF: scores = 2γ⟨q,k⟩ - γ||k||². The register competes as a
+        # look-away sink; at init its V ≈ 0 so queries with no close real tile
+        # simply output ≈ 0 through the residual.
         for i in range(TILE_GRID_N):
             off = i * TILE_EMBED_DIM
             qi = tile_q[i]
-            qi_nsq = tile_q_norm_sq[i]
-            # Register slot contribution.
-            reg_dist_sq = qi_nsq - 2.0 * _DOT(qi, register_k) + register_k_norm_sq
-            if reg_dist_sq < 0.0:
-                reg_dist_sq = 0.0
-            reg_w = _EXP(-tile_sa_gamma * reg_dist_sq)
-            for j in range(TILE_EMBED_DIM):
-                tmp_token[j] = reg_w * register_v[j]
-            # Real tile contributions.
+            reg_score = tile_sa_g2 * _DOT(qi, register_k) + neg_g_register_k_norm_sq
+            best = reg_score
             for k in range(TILE_GRID_N):
-                dist_sq = qi_nsq - 2.0 * _DOT(qi, tile_k[k]) + tile_k_norm_sq[k]
-                if dist_sq < 0.0:
-                    dist_sq = 0.0
-                attn_scores[k] = _EXP(-tile_sa_gamma * dist_sq)
-            # No post-norm on attention output — preserves the non-softmax RBF
-            # density signal; the FFN pre-norm one step later handles scaling.
+                score = tile_sa_g2 * _DOT(qi, tile_k[k]) + tile_k_norm_sq[k]
+                attn_scores[k] = score
+                if score > best:
+                    best = score
+            reg_w = _EXP(reg_score - best)
+            z = reg_w
+            for k in range(TILE_GRID_N):
+                w = _EXP(attn_scores[k] - best)
+                attn_scores[k] = w
+                z += w
+            inv_z = 1.0 / z
             for j in range(TILE_EMBED_DIM):
                 enriched_flat[off + j] = (
                     encoded_flat[off + j]
-                    + tmp_token[j]
-                    + _DOT(attn_scores, tile_v_cols[j])
+                    + (reg_w * register_v[j] + _DOT(attn_scores, tile_v_cols[j])) * inv_z
                 )
 
         # Tile FFN: pre-norm MLP followed by output-norm branch before residual add.
@@ -1007,11 +1010,12 @@ class ActorModel:
         params = self.parameters()
         supported = (
             len(params),
-            len(params) - 2,
-            len(params) - 4,
-            len(params) - 8,
-            len(params) - 13,
-            len(params) - 19,
+            len(params) - 1,
+            len(params) - 3,
+            len(params) - 5,
+            len(params) - 9,
+            len(params) - 14,
+            len(params) - 20,
         )
         if len(state) not in supported:
             raise AssertionError(
@@ -1064,5 +1068,8 @@ class ActorModel:
         if state_len <= 60:
             pad.append([0.5] * (TILE_EMBED_DIM // 2))  # tile_sa_pos_weight
             pad.append([0.0] * TILE_EMBED_DIM)          # tile_sa_lookaway
+
+        if state_len <= 62:
+            pad.append([1.0] * len(self.tile_sa_q_norm.gamma.data))  # tile_sa_q_norm
 
         return pad
