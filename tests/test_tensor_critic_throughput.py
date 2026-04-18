@@ -173,20 +173,25 @@ def test_critic_windowed_sa_grouped_flash_layout_matches_flattened_windows():
     n_rounds = 3
     dim = layer.attn.n_heads * layer.attn.head_dim
     patches = torch.randn(n_rounds, pH * pW, dim, device=device)
+    anchor_patches = torch.randn(n_rounds, pH * pW, dim, device=device)
 
     with torch.no_grad():
-        actual = layer(patches, pH, pW)
+        actual = layer(patches, pH, pW, anchor_patches)
 
         x = patches.reshape(n_rounds, pH, pW, dim)
+        x0 = anchor_patches.reshape(n_rounds, pH, pW, dim)
         grouped_windows, pad_hw = model_mod.critic_window_partition(x, layer.window_size)
+        anchor_windows, _ = model_mod.critic_window_partition(x0, layer.window_size)
         flat_windows = grouped_windows.reshape(-1, grouped_windows.shape[-2], grouped_windows.shape[-1])
+        flat_anchor_windows = anchor_windows.reshape_as(flat_windows)
+        mixed_windows = layer.attn.mix_residual_input(flat_windows, flat_anchor_windows)
         q, k, v = layer.attn.project_qkv(
-            flat_windows,
+            mixed_windows,
             rope_cos=layer._local_rope_cos,
             rope_sin=layer._local_rope_sin,
         )
-        flat_out = layer.attn.attend(q, k, v)
-        expected_windows = layer.attn.apply_residual_mlp(flat_windows, flat_out)
+        flat_out = layer.attn.attend(q, k, v, self_value=v)
+        expected_windows = layer.attn.apply_residual_mlp(mixed_windows, flat_out)
         expected = model_mod.critic_window_unpartition(
             expected_windows.reshape_as(grouped_windows),
             layer.window_size,
@@ -194,7 +199,7 @@ def test_critic_windowed_sa_grouped_flash_layout_matches_flattened_windows():
             (pH, pW),
         ).reshape(n_rounds, pH * pW, dim)
 
-    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_critic_global_layout_initializes_padded_unit_rope_to_identity():
@@ -224,7 +229,7 @@ def test_critic_global_layout_initializes_padded_unit_rope_to_identity():
     assert torch.equal(unit_sin[invalid_queries], torch.zeros_like(unit_sin[invalid_queries]))
 
 
-def test_critic_global_sa_applies_attn_output_norm_to_global_cls_tokens(monkeypatch):
+def test_critic_global_sa_uses_single_shared_prefix_attend_for_patch_and_global_tokens(monkeypatch):
     device = torch.device("cpu")
     layer = model_mod.CriticGlobalSA(dim=8, n_heads=2, n_kv_heads=1, n_global_cls=2, max_grid_size=2).to(device).eval()
 
@@ -242,21 +247,37 @@ def test_critic_global_sa_applies_attn_output_norm_to_global_cls_tokens(monkeypa
         layer.attn.mlp_fc1.weight.zero_()
         layer.attn.mlp_fc2.weight.zero_()
 
-    call_idx = {"value": 0}
+    attend_calls: list[tuple[int, int]] = []
 
-    def fake_attend(q, k, v, attn_mask=None):
-        del k, v, attn_mask
-        fill = 2.0 if call_idx["value"] == 0 else 3.0
-        call_idx["value"] += 1
+    def fake_attend(q, k, v, attn_mask=None, self_value=None):
+        del v, attn_mask, self_value
         B, _, N_q, _ = q.shape
-        return torch.full((B, N_q, layer.dim), fill, device=q.device, dtype=q.dtype)
+        attend_calls.append((N_q, k.shape[-2]))
+        token_vectors = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            ],
+            device=q.device,
+            dtype=q.dtype,
+        )
+        return token_vectors[:N_q].unsqueeze(0).expand(B, -1, -1)
 
     monkeypatch.setattr(layer.attn, "attend", fake_attend)
 
     patches = torch.zeros(1, 4, layer.dim, device=device)
+    anchor_patches = torch.zeros_like(patches)
     global_cls = torch.zeros(1, 2, layer.dim, device=device)
+    anchor_global_cls = torch.zeros_like(global_cls)
     scalar_tok = torch.zeros(1, 1, layer.dim, device=device)
+    anchor_scalar_tok = torch.zeros_like(scalar_tok)
     unit_cls = torch.zeros(0, layer.dim, device=device)
+    anchor_unit_cls = torch.zeros_like(unit_cls)
     layout = layer.prepare_layout(
         n_patches=4,
         pH=2,
@@ -268,11 +289,38 @@ def test_critic_global_sa_applies_attn_output_norm_to_global_cls_tokens(monkeypa
     )
 
     out_patches, out_global_cls, out_unit_cls = layer(
-        patches, global_cls, scalar_tok, unit_cls, layout,
+        patches,
+        anchor_patches,
+        global_cls,
+        anchor_global_cls,
+        scalar_tok,
+        anchor_scalar_tok,
+        unit_cls,
+        anchor_unit_cls,
+        layout,
     )
 
-    expected_patch = layer.attn.attn_output_norm(torch.full_like(out_patches, 2.0))
-    expected_global = layer.attn.attn_output_norm(torch.full_like(out_global_cls, 3.0))
+    assert attend_calls == [(layout.unit_start, layout.unit_start)]
+    expected_patch = layer.attn.attn_output_norm(
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            device=device,
+        ).unsqueeze(0),
+    )
+    expected_global = layer.attn.attn_output_norm(
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            ],
+            device=device,
+        ).unsqueeze(0),
+    )
     torch.testing.assert_close(out_patches, expected_patch, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(out_global_cls, expected_global, atol=1e-6, rtol=1e-6)
     assert out_unit_cls.shape == (0, layer.dim)
