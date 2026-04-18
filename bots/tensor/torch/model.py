@@ -985,11 +985,15 @@ class CriticTileEmbed(nn.Module):
                 _parameter_golf_ortho_init(m)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (R, C, H, W) → (R, embed_dim, H, W)."""
+        """x: (R, C, H, W) → (R, H, W, embed_dim).
+
+        Returns NHWC so downstream patchify / mask broadcast avoid a
+        round-trip permute back into NCHW.
+        """
         R, C, H, W = x.shape
         x = x.permute(0, 2, 3, 1).reshape(R * H * W, C)
         x = self.net(x)
-        return x.reshape(R, H, W, self.embed_dim).permute(0, 3, 1, 2)
+        return x.reshape(R, H, W, self.embed_dim)
 
 
 class CriticWindowedSA(nn.Module):
@@ -1464,26 +1468,27 @@ class CentralizedCritic(nn.Module):
         """Convert tile features to patch tokens via 2×2 reshape.
 
         Args:
-            tiles: (R, tile_dim, H, W)
-            valid_mask: (R, 1, H, W)
+            tiles: (R, H, W, tile_dim) — NHWC, already contig out of tile_embed
+            valid_mask: (R, 1, H, W) — NCHW mask from the training pipeline
         Returns:
             patches: (R, N_patches, patch_dim), pH, pW
         """
-        R, D, H, W = tiles.shape
+        R, H, W, D = tiles.shape
         # Pad to even dimensions
         pad_h = H % 2
         pad_w = W % 2
         if pad_h or pad_w:
-            tiles = F.pad(tiles, (0, pad_w, 0, pad_h))
+            tiles = F.pad(tiles, (0, 0, 0, pad_w, 0, pad_h))
             valid_mask = F.pad(valid_mask, (0, pad_w, 0, pad_h))
         Hp, Wp = H + pad_h, W + pad_w
         pH, pW = Hp // 2, Wp // 2
 
-        # Zero out invalid tiles
-        tiles = tiles * valid_mask.to(tiles.dtype)
+        # Zero out invalid tiles (broadcast NHWC mask against NHWC tiles)
+        mask_nhwc = valid_mask.permute(0, 2, 3, 1).to(tiles.dtype)
+        tiles = tiles * mask_nhwc
 
-        # Reshape 2×2 → patch: (R, D, Hp, Wp) → (R, pH, 2, pW, 2, D) → (R, pH*pW, 4*D)
-        tiles = tiles.permute(0, 2, 3, 1)  # (R, Hp, Wp, D)
+        # (R, Hp, Wp, D) → (R, pH, 2, pW, 2, D) is a view (stride-compatible
+        # on NHWC-contig memory), so only the final reshape forces a copy.
         patches = tiles.reshape(R, pH, 2, pW, 2, D).permute(0, 1, 3, 2, 4, 5)
         patches = patches.reshape(R, pH * pW, 4 * D)  # (R, N, patch_dim)
         return patches, pH, pW
@@ -1495,7 +1500,7 @@ class CentralizedCritic(nn.Module):
     ) -> CriticMapState:
         """Run tile embed + patchify + windowed SA layers. Returns cached state."""
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
-            tiles = self.tile_embed(map_tensor)  # (R, tile_dim, H, W)
+            tiles = self.tile_embed(map_tensor)  # (R, H, W, tile_dim)
             patches, pH, pW = self._patchify(tiles, valid_mask)
             patch_anchor = patches
             for i in range(self._N_BLOCKS):

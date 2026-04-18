@@ -170,8 +170,8 @@ class TestCriticReconstructionLoss:
 
         losses = []
         for _ in range(20):
-            tile_embeds = critic.tile_embed(map_channels)
-            flat_embeds = tile_embeds.permute(0, 2, 3, 1).reshape(-1, critic.tile_embed.embed_dim)
+            tile_embeds = critic.tile_embed(map_channels)  # NHWC
+            flat_embeds = tile_embeds.reshape(-1, critic.tile_embed.embed_dim)
             decoded = decoder(flat_embeds)
             loss, _ = critic_reconstruction_loss(decoded, map_channels, valid_mask)
             opt.zero_grad()

@@ -456,8 +456,8 @@ def pretrain_critic_encoder(
                     valid_mask = torch.ones(R, 1, H, W, device=DEVICE)
 
                     with _autocast(cuda_config):
-                        tile_embeds = critic.tile_embed(map_batch)
-                        flat_embeds = tile_embeds.permute(0, 2, 3, 1).reshape(-1, embed_dim)
+                        tile_embeds = critic.tile_embed(map_batch)  # NHWC
+                        flat_embeds = tile_embeds.reshape(-1, embed_dim)
                         decoded = decoder(flat_embeds)
                         loss, metrics = critic_reconstruction_loss(decoded, map_batch, valid_mask)
 
