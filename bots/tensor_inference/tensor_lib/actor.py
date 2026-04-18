@@ -755,12 +755,12 @@ class ActorModel:
                 encoded_flat[off + j] = x
                 mean_sq += x * x
             inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_norm_eps) ** 0.5
-            # Pre-norm QKV projection, Q-norm on Q (pre-position), SuSIE add on Q/K.
+            # Pre-norm QKV projection, SuSIE add on Q/K, Q-norm on Q (post-position).
             pos_t = tile_sa_pos_list[t]
             k_nsq = 0.0
             q_mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                q_pre = inv_rms * _DOT(token, tile_q_rows[j]) + tile_q_bias[j]
+                q_pre = inv_rms * _DOT(token, tile_q_rows[j]) + tile_q_bias[j] + pos_t[j]
                 k_val = inv_rms * _DOT(token, tile_k_rows[j]) + tile_k_bias[j] + pos_t[j]
                 v_val = inv_rms * _DOT(token, tile_v_rows[j]) + tile_v_bias[j]
                 tmp_token[j] = q_pre
@@ -771,7 +771,7 @@ class ActorModel:
                 tile_v_cols[j][t] = v_val
             q_inv_rms = 1.0 / (q_mean_sq / TILE_EMBED_DIM + tile_sa_q_norm_eps) ** 0.5
             for j in range(TILE_EMBED_DIM):
-                tile_q_flat[off + j] = tmp_token[j] * q_inv_rms * tile_sa_q_norm_gamma[j] + pos_t[j]
+                tile_q_flat[off + j] = tmp_token[j] * q_inv_rms * tile_sa_q_norm_gamma[j]
             tile_k_norm_sq[t] = -tile_sa_gamma * k_nsq  # fused: -γ||k||² for softmax scores
         # Softmax RBF: scores = 2γ⟨q,k⟩ - γ||k||². The register competes as a
         # look-away sink; at init its V ≈ 0 so queries with no close real tile

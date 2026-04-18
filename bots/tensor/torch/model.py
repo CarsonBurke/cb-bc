@@ -2842,14 +2842,14 @@ class BuilderMLP(nn.Module):
         seq = torch.cat([lookaway, tiles], dim=1)  # (B, N+1, D)
 
         normed = self.tile_sa_norm(seq)
-        q = self.tile_sa_q_norm(self.tile_sa_q_proj(normed))
+        q = self.tile_sa_q_proj(normed)
         k = self.tile_sa_k_proj(normed)
         v = self.tile_sa_v_proj(normed)
 
         pos_weight = self.tile_sa_pos_weight.repeat(2).to(q.dtype)  # (D,)
         pos_real = self.tile_sa_susie.to(q.dtype) * pos_weight  # (N, D)
         pos_emb = F.pad(pos_real, (0, 0, 1, 0))  # (N+1, D), zero row for register
-        q = q + pos_emb
+        q = self.tile_sa_q_norm(q + pos_emb)
         k = k + pos_emb
 
         gamma = self.tile_sa_gamma.exp()
