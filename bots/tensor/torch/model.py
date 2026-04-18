@@ -3704,6 +3704,12 @@ def ppo_update(
         advantages = _normalize_advantages(advantages)
     with torch.no_grad():
         bt_mask_all, bd_mask_all, cd_causal_all = _precompute_policy_masks(obs, bt_act, bd_act)
+    # obs is only used for mask precomputation when obs_pre_all is provided.
+    # Drop both references so the (N, OBS_SIZE) rollout slab can be reclaimed
+    # before actor/critic forward allocates new activations.
+    if obs_pre_all is not None:
+        centralized_data.pop("obs", None)
+        obs = None
     full_chunk_ids, tail_chunk_ids = _split_chunk_ids(all_chunk_lens, bptt_k)
 
     # 8 minibatches per epoch: scales B_chunk with N so GPU utilization
@@ -3848,6 +3854,12 @@ def ppo_update(
             actor_stopped_early = True
             break
 
+    # Actor phase done — drop per-step tensors that the critic doesn't need so
+    # the critic forward pass starts with a clean VRAM budget.
+    del bt_mask_all, bd_mask_all, cd_causal_all
+    obs_pre_all = None
+    centralized_data.pop("obs_pre", None)
+
     # ---- Phase 2: Critic updates with random minibatches (full GPU utilization) ----
     # Always run full ppo_epochs for critic regardless of actor early stopping —
     # critic has its own loss landscape and benefits from more updates.
@@ -3960,8 +3972,8 @@ def ppo_update(
         mean_temperature = sum_temperature / n_temperature
         std_temperature = (sum_temperature_sq / n_temperature - mean_temperature.square()).clamp_min(0.0).sqrt()
     else:
-        mean_temperature = torch.ones(N_ACTION_TEMPERATURES, device=obs.device)
-        std_temperature = torch.zeros(N_ACTION_TEMPERATURES, device=obs.device)
+        mean_temperature = torch.ones(N_ACTION_TEMPERATURES, device=dev)
+        std_temperature = torch.zeros(N_ACTION_TEMPERATURES, device=dev)
 
     # Single GPU→CPU sync for all accumulated scalars
     with torch.no_grad():
@@ -4697,6 +4709,12 @@ def train_on_trajectories(
         data["step_actor_latent"] = _normalize_actor_latent_dim(
             model._latent_from_obs_pre(obs_pre, h).detach(),
         )
+    # obs_pre is fed to _latent_from_obs_pre under bf16 autocast during the
+    # actor PPO update anyway, so storing the persistent (N, OBS_PREFIX_SIZE)
+    # buffer in bf16 halves its VRAM footprint with no downstream precision
+    # change. Keep fp32 on CPU to preserve behavioural parity there.
+    if _USE_BF16 and obs_pre.is_cuda and obs_pre.dtype == torch.float32:
+        obs_pre = obs_pre.to(torch.bfloat16)
     if profile is not None:
         profile["critic_latent_s"] = time.perf_counter() - t_phase
 
@@ -4727,10 +4745,19 @@ def train_on_trajectories(
     bptt_chunks = _build_bptt_chunks(data["ep_boundaries"], bptt_k)
     old_log_probs = data["old_log_probs"]
 
+    # Hand obs / obs_pre ownership to the ppo_update call via the shared data
+    # dict and drop every outer reference so ppo_update can free them mid-run.
+    data["obs"] = obs
+    data["obs_pre"] = obs_pre
+    reward_std = data["rewards"].std()
+    n_steps = data["n_steps"]
+    obs = None
+    obs_pre = None
+
     with trace_scope(trace, "train.ppo_update"):
         stats = ppo_update(
             model, optimizer,
-            obs, h, obs_pre, data["bt"], data["bd"], data["cd"], data["brt"], data["md"],
+            data["obs"], h, data["obs_pre"], data["bt"], data["bd"], data["cd"], data["brt"], data["md"],
             old_log_probs, advantages, returns,
             old_values=values,
             centralized_data=data,
@@ -4741,9 +4768,15 @@ def train_on_trajectories(
             freeze_critic=freeze_critic,
             **ppo_kwargs,
         )
-    del obs_pre
-    stats["n_steps"] = data["n_steps"]
-    stats["reward_raw_std"] = data["rewards"].std().item()
+    # Release large critic staging buffers — these are pinned CPU slabs (and a
+    # GPU scratch area) that otherwise live until the next PPO update GCs the
+    # dict.
+    data.pop("critic_obs_cpu", None)
+    data.pop("critic_mask_cpu", None)
+    data.pop("critic_input_staging", None)
+    data.pop("step_actor_latent", None)
+    stats["n_steps"] = n_steps
+    stats["reward_raw_std"] = reward_std.item()
     return stats
 
 
