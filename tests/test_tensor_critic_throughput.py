@@ -215,12 +215,13 @@ def test_critic_global_layout_initializes_padded_unit_rope_to_identity():
     )
 
     invalid_queries = ~layout.valid_unit_mask
-    assert layout.unit_rope_cos is not None
-    assert layout.unit_rope_sin is not None
-    unit_rope_cos = layout.unit_rope_cos
-    unit_rope_sin = layout.unit_rope_sin
-    assert torch.equal(unit_rope_cos[invalid_queries], torch.ones_like(unit_rope_cos[invalid_queries]))
-    assert torch.equal(unit_rope_sin[invalid_queries], torch.zeros_like(unit_rope_sin[invalid_queries]))
+    # Unit rope lives in the tail of full_rope_cos/sin; padded unit positions
+    # must stay at the RoPE identity (cos=1, sin=0) so invariants downstream
+    # — and the -inf attention bias that masks them — line up correctly.
+    unit_cos = layout.full_rope_cos[:, layout.unit_start:]
+    unit_sin = layout.full_rope_sin[:, layout.unit_start:]
+    assert torch.equal(unit_cos[invalid_queries], torch.ones_like(unit_cos[invalid_queries]))
+    assert torch.equal(unit_sin[invalid_queries], torch.zeros_like(unit_sin[invalid_queries]))
 
 
 def test_critic_global_sa_applies_attn_output_norm_to_global_cls_tokens(monkeypatch):
@@ -294,8 +295,16 @@ def test_critic_global_layout_keeps_shared_rope_prefix_round_independent():
         n_rounds=2,
     )
 
-    assert layout.shared_rope_cos.shape[0] == layout.unit_start
-    assert layout.shared_rope_sin.shape == layout.shared_rope_cos.shape
+    # Shared prefix RoPE must be identical across rounds so the merged
+    # apply_rotary_2d call doesn't introduce round-dependent drift on
+    # patch/scalar/CLS positions.
+    prefix_cos = layout.full_rope_cos[:, :layout.unit_start]
+    prefix_sin = layout.full_rope_sin[:, :layout.unit_start]
+    assert prefix_cos.shape[0] == layout.n_rounds
+    assert prefix_cos.shape[1] == layout.unit_start
+    for r in range(1, layout.n_rounds):
+        assert torch.equal(prefix_cos[r], prefix_cos[0])
+        assert torch.equal(prefix_sin[r], prefix_sin[0])
 
 
 def test_critic_round_batch_plan_respects_step_target_and_round_cap(monkeypatch):

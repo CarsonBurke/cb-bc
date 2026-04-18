@@ -959,10 +959,12 @@ class CriticGlobalLayout:
     local_pos: torch.Tensor
     valid_unit_mask: torch.Tensor
     unit_attn_bias: torch.Tensor | None  # float additive mask for mem-efficient SDPA
-    shared_rope_cos: torch.Tensor
-    shared_rope_sin: torch.Tensor
-    unit_rope_cos: torch.Tensor | None
-    unit_rope_sin: torch.Tensor | None
+    # Full-length RoPE covering all token positions so RoPE can be applied once
+    # to the whole Q/K tensor instead of via in-place slice assignments.
+    # Shape: (unit_start, hd_half) when there are no units, else
+    # (n_rounds, total_tokens, hd_half).
+    full_rope_cos: torch.Tensor
+    full_rope_sin: torch.Tensor
 
 
 class CriticTileEmbed(nn.Module):
@@ -1130,16 +1132,18 @@ class CriticGlobalSA(nn.Module):
         special_cos = self._special_token_cos
         special_sin = self._special_token_sin
 
+        shared_rope_cos = torch.empty((unit_start, patch_rope_cos.shape[-1]), device=device, dtype=rope_dtype)
+        shared_rope_sin = torch.empty_like(shared_rope_cos)
+        shared_rope_cos[:n_patches] = patch_rope_cos
+        shared_rope_sin[:n_patches] = patch_rope_sin
+        shared_rope_cos[n_patches:unit_start] = special_cos
+        shared_rope_sin[n_patches:unit_start] = special_sin
+
         if total_units == 0:
             total_tokens = unit_start
-            shared_rope_cos = torch.empty((total_tokens, patch_rope_cos.shape[-1]), device=device, dtype=rope_dtype)
-            shared_rope_sin = torch.empty_like(shared_rope_cos)
-            shared_rope_cos[:n_patches] = patch_rope_cos
-            shared_rope_sin[:n_patches] = patch_rope_sin
-            shared_rope_cos[n_patches:unit_start] = special_cos
-            shared_rope_sin[n_patches:unit_start] = special_sin
             empty = torch.zeros(0, dtype=torch.long, device=device)
             empty_mask = torch.zeros((n_rounds, 0), dtype=torch.bool, device=device)
+            # 2D rope; apply_rotary_2d broadcasts over the round axis.
             return CriticGlobalLayout(
                 n_rounds=n_rounds,
                 unit_start=unit_start,
@@ -1149,10 +1153,8 @@ class CriticGlobalSA(nn.Module):
                 local_pos=empty,
                 valid_unit_mask=empty_mask,
                 unit_attn_bias=None,
-                shared_rope_cos=shared_rope_cos,
-                shared_rope_sin=shared_rope_sin,
-                unit_rope_cos=None,
-                unit_rope_sin=None,
+                full_rope_cos=shared_rope_cos,
+                full_rope_sin=shared_rope_sin,
             )
 
         counts = torch.bincount(unit_round_idx, minlength=n_rounds)
@@ -1176,12 +1178,6 @@ class CriticGlobalSA(nn.Module):
             ~valid_unit_mask.unsqueeze(1).unsqueeze(2), float('-inf'),
         )
 
-        shared_rope_cos = torch.empty((unit_start, patch_rope_cos.shape[-1]), device=device, dtype=rope_dtype)
-        shared_rope_sin = torch.empty_like(shared_rope_cos)
-        shared_rope_cos[:n_patches] = patch_rope_cos
-        shared_rope_sin[:n_patches] = patch_rope_sin
-        shared_rope_cos[n_patches:unit_start] = special_cos
-        shared_rope_sin[n_patches:unit_start] = special_sin
         unit_rope_cos = torch.ones((n_rounds, max_units, patch_rope_cos.shape[-1]), device=device, dtype=rope_dtype)
         unit_rope_sin = torch.zeros_like(unit_rope_cos)
         sorted_xy = unit_xy[perm]
@@ -1190,6 +1186,18 @@ class CriticGlobalSA(nn.Module):
         u_cos, u_sin = self.rope(u_h, u_w)
         unit_rope_cos[sorted_round_idx, local_pos] = u_cos
         unit_rope_sin[sorted_round_idx, local_pos] = u_sin
+
+        # Materialize one (R, total_tokens, hd_half) rope so apply_rotary_2d
+        # runs in a single call over the full Q/K tensor — avoids in-place
+        # slice assignment on autograd tensors.
+        full_rope_cos = torch.cat(
+            [shared_rope_cos.unsqueeze(0).expand(n_rounds, -1, -1), unit_rope_cos],
+            dim=1,
+        )
+        full_rope_sin = torch.cat(
+            [shared_rope_sin.unsqueeze(0).expand(n_rounds, -1, -1), unit_rope_sin],
+            dim=1,
+        )
 
         return CriticGlobalLayout(
             n_rounds=n_rounds,
@@ -1200,10 +1208,8 @@ class CriticGlobalSA(nn.Module):
             local_pos=local_pos,
             valid_unit_mask=valid_unit_mask,
             unit_attn_bias=unit_attn_bias,
-            shared_rope_cos=shared_rope_cos,
-            shared_rope_sin=shared_rope_sin,
-            unit_rope_cos=unit_rope_cos,
-            unit_rope_sin=unit_rope_sin,
+            full_rope_cos=full_rope_cos,
+            full_rope_sin=full_rope_sin,
         )
 
     def forward(
@@ -1243,20 +1249,11 @@ class CriticGlobalSA(nn.Module):
 
         q, k, v = self.attn.project_qkv(all_tokens)
 
-        prefix_end = layout.unit_start
-        q[:, :, :prefix_end] = apply_rotary_2d(
-            q[:, :, :prefix_end], layout.shared_rope_cos, layout.shared_rope_sin,
-        )
-        k[:, :, :prefix_end] = apply_rotary_2d(
-            k[:, :, :prefix_end], layout.shared_rope_cos, layout.shared_rope_sin,
-        )
-        if layout.unit_rope_cos is not None:
-            q[:, :, prefix_end:] = apply_rotary_2d(
-                q[:, :, prefix_end:], layout.unit_rope_cos, layout.unit_rope_sin,
-            )
-            k[:, :, prefix_end:] = apply_rotary_2d(
-                k[:, :, prefix_end:], layout.unit_rope_cos, layout.unit_rope_sin,
-            )
+        # Apply 2D RoPE once over the full Q/K tensor. layout.full_rope_* spans
+        # all token positions: patches use the grid RoPE, special tokens use
+        # the identity table, and unit tokens use their per-unit 2D RoPE.
+        q = apply_rotary_2d(q, layout.full_rope_cos, layout.full_rope_sin)
+        k = apply_rotary_2d(k, layout.full_rope_cos, layout.full_rope_sin)
 
         patch_end = N
         scalar_end = N + 1
