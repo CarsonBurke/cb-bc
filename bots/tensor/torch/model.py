@@ -2747,9 +2747,15 @@ class BuilderMLP(nn.Module):
         # SuSIE additive position for tile self-attention: sinusoidal table
         # scaled by a learnable per-freq weight (tied across sin/cos).
         self.tile_sa_pos_weight = nn.Parameter(torch.full((TILE_EMBED_DIM // 2,), 0.5))
-        # Look-away register: zero-init input token prepended to the tile sequence
-        # so queries have a "safe sink" — ||q-0||² = ||q||² before projection.
-        self.tile_sa_lookaway = nn.Parameter(torch.zeros(TILE_EMBED_DIM))
+        # Look-away register: small scaled-Gaussian init so the register's
+        # softmax score isn't a free zero-centered sink. Zero-init would give
+        # ||register_k||² ≈ 0 under softmax RBF, making register score ≈ 0
+        # while real tiles score `2γ⟨q,k⟩ - γ||k||² ≈ -D` — the sink then
+        # dominates attention mass and starves downstream blocks of spatial
+        # signal. randn * D^-0.5 matches the ref's standard-softmax register init.
+        self.tile_sa_lookaway = nn.Parameter(
+            torch.randn(TILE_EMBED_DIM) * (TILE_EMBED_DIM ** -0.5)
+        )
         self.register_buffer(
             "tile_sa_susie", _make_tile_susie(TILE_GRID_N, TILE_EMBED_DIM), persistent=False
         )
