@@ -1264,22 +1264,25 @@ class CriticGlobalSA(nn.Module):
         global_tokens = all_tokens[:, scalar_end:shared_end]
         unit_tokens = all_tokens[:, shared_end:]
 
-        # Shared prefix attention: patches and CLS both query the first
-        # `shared_end` tokens with identical K/V, so merge into a single SDPA
-        # over the whole prefix. This stays FA-eligible (no mask, matched
-        # dtypes). The scalar slot's attn_out is discarded — scalar doesn't
-        # receive the attention residual (only the MLP residual below).
-        shared_attn_out = self.attn.attend(
-            q[:, :, :shared_end],
-            k[:, :, :shared_end],
-            v[:, :, :shared_end],
-            self_value=v[:, :, :shared_end],
-        )
+        # Patches query patches + scalar + CLS (no mask needed, FA-eligible)
         patch_tokens = self.attn.apply_attn_residual(
-            patch_tokens, shared_attn_out[:, :patch_end],
+            patch_tokens,
+            self.attn.attend(
+                q[:, :, :patch_end],
+                k[:, :, :shared_end],
+                v[:, :, :shared_end],
+                self_value=v[:, :, :patch_end],
+            ),
         )
+        # CLS query patches + scalar + CLS (see each other)
         global_tokens = self.attn.apply_attn_residual(
-            global_tokens, shared_attn_out[:, scalar_end:shared_end],
+            global_tokens,
+            self.attn.attend(
+                q[:, :, scalar_end:shared_end],
+                k[:, :, :shared_end],
+                v[:, :, :shared_end],
+                self_value=v[:, :, scalar_end:shared_end],
+            ),
         )
         if layout.unit_attn_bias is not None:
             unit_attn_out = self.attn.attend(
