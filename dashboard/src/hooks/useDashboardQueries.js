@@ -99,7 +99,49 @@ export function useLeagueQuery(session) {
   })
 }
 
+<<<<<<< Updated upstream
 export function useTrainReplaysQuery(session, minEp, maxEp) {
+=======
+export function useTrainStepLogQuery(session) {
+  const visible = usePageVisible()
+  const queryClient = useQueryClient()
+
+  return useQuery({
+    queryKey: ['train-step-log', session || null],
+    queryFn: async ({ signal, queryKey }) => {
+      const previous = queryClient.getQueryData(queryKey)
+      const after = previous?.total || 0
+      const params = new URLSearchParams()
+      if (session) params.set('session', session)
+      if (after > 0) params.set('after', String(after))
+      const qs = params.toString() ? `?${params}` : ''
+      const payload = await fetchJsonApi(`/api/train-step-log${qs}`, { signal })
+      const newSteps = payload.steps || []
+      const serverTotal = payload.total ?? (after + newSteps.length)
+
+      if (!previous || after === 0) {
+        return {
+          steps: newSteps,
+          total: serverTotal,
+        }
+      }
+
+      if (newSteps.length === 0 && serverTotal === previous.total) {
+        return previous
+      }
+
+      return {
+        steps: previous.steps.concat(newSteps),
+        total: serverTotal,
+      }
+    },
+    refetchInterval: hiddenAwareInterval(visible, TRAINING_POLL_MS),
+    staleTime: 0,
+  })
+}
+
+export function useTrainReplaysQuery(session) {
+>>>>>>> Stashed changes
   const visible = usePageVisible()
 
   return useQuery({
@@ -117,6 +159,7 @@ export function useTrainReplaysQuery(session, minEp, maxEp) {
   })
 }
 
+<<<<<<< Updated upstream
 export function useGameLogEpisodesQuery(session, minEp, maxEp) {
   const visible = usePageVisible()
 
@@ -127,6 +170,16 @@ export function useGameLogEpisodesQuery(session, minEp, maxEp) {
       if (session) params.set('session', session)
       if (minEp != null) params.set('min_ep', String(minEp))
       if (maxEp != null) params.set('max_ep', String(maxEp))
+=======
+export function useGameLogEpisodesQuery(session) {
+  const visible = usePageVisible()
+
+  return useQuery({
+    queryKey: ['game-log-episodes', session || null],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams()
+      if (session) params.set('session', session)
+>>>>>>> Stashed changes
       const qs = params.toString() ? `?${params}` : ''
       return fetchJsonApi(`/api/game-log-episodes${qs}`, { signal })
     },
@@ -153,6 +206,7 @@ export function useGameLogForEpisodeQuery(session, episode) {
   })
 }
 
+<<<<<<< Updated upstream
 export function useGameLogRangedQuery(session, minEp, maxEp) {
   const visible = usePageVisible()
 
@@ -171,6 +225,8 @@ export function useGameLogRangedQuery(session, minEp, maxEp) {
   })
 }
 
+=======
+>>>>>>> Stashed changes
 export function useGameLogQuery(session) {
   const visible = usePageVisible()
   const queryClient = useQueryClient()

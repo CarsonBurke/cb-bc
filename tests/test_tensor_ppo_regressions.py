@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from bots.tensor.torch.model import GAMMA, LAMBDA
 import torch
 import torch.nn.functional as F
 
@@ -17,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(TORCH_DIR) not in sys.path:
     sys.path.insert(0, str(TORCH_DIR))
 
+import train_batched
 from model import (
     ACTOR_LATENT_DIM,
     BRIDGE_BUILD_TYPE,
@@ -24,10 +26,16 @@ from model import (
     CentralizedCritic,
     CriticAttentionBlock,
     CONVEYOR_BUILD_TYPES,
+    DEVICE,
     GLOBAL_MAP_CHANNELS,
     GLOBAL_SCALAR_DIM,
     H_DIM,
     HARVESTER_BUILD_TYPE,
+<<<<<<< Updated upstream
+=======
+    EPS_MIN,
+    N_BRIDGE_TARGETS,
+>>>>>>> Stashed changes
     NUM_BUCKETS,
     OBS_SIZE,
     RMSNorm,
@@ -40,8 +48,10 @@ from model import (
     _OBS_SCALE,
     _OBS_TI,
     _build_bptt_chunks,
+    _build_centralized_critic_data,
     _compute_gae,
     _make_bucket_centers,
+<<<<<<< Updated upstream
     _normalize_advantages,
     _normalize_actor_latent_dim,
     _parameter_golf_ortho_init,
@@ -55,9 +65,28 @@ from model import (
     _split_chunk_ids,
     action_log_prob_and_entropy,
     apply_rotary_2d,
+=======
+    _masked_ppo_actor_terms,
+    _normalize_actor_latent_dim,
+    _parse_trajectories,
+    _precompute_policy_masks,
+    _recurrent_actor_pass,
+    _recurrent_logprob_pass,
+    _load_critic_round_batch,
+    ppo_update,
+    _unimix_logits,
+    _sequential_logprobs,
+    _split_chunk_ids,
+    action_log_prob_and_entropy,
+    get_centralized_critic,
+    load_centralized_critic_checkpoint,
+    reset_centralized_critic,
+    save_centralized_critic_checkpoint,
+>>>>>>> Stashed changes
     compute_action_masks,
     bd_has_ore,
     conveyor_dir_mask,
+    deterministic_policy_actions,
     decode_value,
     distributional_value_loss,
     exclusive_self_attention,
@@ -66,6 +95,7 @@ from model import (
     symexp,
     symlog,
     value_target_probs,
+    GraphedInference,
 )
 from normuon import (
     SingleDeviceNorMuonWithAuxAdam,
@@ -108,7 +138,11 @@ def _manual_rollout_episode(
     for local_step in range(length):
         step_idx = offset + local_step
         obs = _make_obs(step_idx).unsqueeze(0).to(device)
+<<<<<<< Updated upstream
         bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_next = model(obs, h_prev)
+=======
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = model(obs, h_prev)
+>>>>>>> Stashed changes
 
         bt_mask, bd_mask = compute_action_masks(obs)
         cd_mask = conveyor_dir_mask(device, 1)
@@ -121,15 +155,29 @@ def _manual_rollout_episode(
         if not has_ore:
             bt_mask[:, HARVESTER_BUILD_TYPE] = False
 
-        if local_step % 3 == 0 and bool(bt_mask[0, HARVESTER_BUILD_TYPE]):
+        if local_step % 4 == 0 and bool(bt_mask[0, HARVESTER_BUILD_TYPE]):
             bt_act = HARVESTER_BUILD_TYPE
+<<<<<<< Updated upstream
         elif local_step % 3 == 1 and bool(bt_mask[0, CONVEYOR_BUILD_TYPES[0]]):
             bt_act = CONVEYOR_BUILD_TYPES[0]
+=======
+            bd_act = int(harv_bd_mask[0].float().argmax().item())
+        elif local_step % 4 == 1 and bool(bt_mask[0, CONVEYOR_BUILD_TYPES[0]]):
+            bt_act = CONVEYOR_BUILD_TYPES[0]
+            bd_act = int(bd_mask[0].float().argmax().item())
+        elif local_step % 4 == 2 and bool(bt_mask[0, BRIDGE_BUILD_TYPE]):
+            bt_act = BRIDGE_BUILD_TYPE
+            bd_act = int(bd_mask[0].float().argmax().item())
+>>>>>>> Stashed changes
         else:
             bt_act = 0
 
         cd_act = step_idx % 4
+<<<<<<< Updated upstream
         brt_act = step_idx % 28
+=======
+        brt_act = step_idx % N_BRIDGE_TARGETS
+>>>>>>> Stashed changes
         md_act = (step_idx * 2) % 9
 
         bt_act_t = torch.tensor([bt_act], device=device, dtype=torch.long)
@@ -141,6 +189,7 @@ def _manual_rollout_episode(
         bd_l = bd_l.masked_fill(~bd_mask, -1e9)
         cd_l = cd_l.masked_fill(~cd_mask, -1e9)
 
+<<<<<<< Updated upstream
         bt_lp, _ = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask, head_temperature[:, 0])
         bd_lp, _ = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask, head_temperature[:, 1])
         cd_lp, _ = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, head_temperature[:, 2])
@@ -149,6 +198,17 @@ def _manual_rollout_episode(
         cd_causal = 1.0 if bt_act in CONVEYOR_BUILD_TYPES else 0.0
         brt_causal = 1.0 if bt_act == BRIDGE_BUILD_TYPE else 0.0
         total_lp = bd_lp + bt_lp + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
+=======
+        bt_lp, _ = action_log_prob_and_entropy(bt_l, bt_act_t, bt_mask, eps[:, 0])
+        bd_lp, _ = action_log_prob_and_entropy(bd_l, bd_act_t, bd_mask, eps[:, 1])
+        cd_lp, _ = action_log_prob_and_entropy(cd_l, cd_act_t, cd_mask, eps[:, 2])
+        brt_lp, _ = action_log_prob_and_entropy(brt_l, brt_act_t, eps=eps[:, 3])
+        md_lp, _ = action_log_prob_and_entropy(md_l, md_act_t, eps=eps[:, 4])
+        bd_causal = 1.0 if bt_act != 0 else 0.0
+        cd_causal = 1.0 if bt_act in CONVEYOR_BUILD_TYPES else 0.0
+        brt_causal = 1.0 if bt_act == BRIDGE_BUILD_TYPE else 0.0
+        total_lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
+>>>>>>> Stashed changes
 
         obs_list.append(obs.squeeze(0).cpu())
         h_list.append(h_prev.squeeze(0).cpu())
@@ -213,6 +273,128 @@ class TestLogProbRecomputation:
 
         assert torch.allclose(recomputed, manual_lp, atol=1e-5, rtol=1e-5)
 
+    def test_ppo_update_keeps_rollout_old_log_probs_fixed_across_epochs(self, monkeypatch):
+        import model as model_mod
+
+        torch.manual_seed(0)
+        model = BuilderMLP().to(DEVICE)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        ep = _manual_rollout_episode(model.eval(), 2, offset=0)
+        obs = torch.stack(ep[0]).to(DEVICE)
+        h = torch.stack(ep[1]).to(DEVICE)
+        bt = torch.tensor(ep[2], dtype=torch.long, device=DEVICE)
+        bd = torch.tensor(ep[3], dtype=torch.long, device=DEVICE)
+        cd = torch.tensor(ep[4], dtype=torch.long, device=DEVICE)
+        brt = torch.tensor(ep[5], dtype=torch.long, device=DEVICE)
+        md = torch.tensor(ep[6], dtype=torch.long, device=DEVICE)
+        old_log_probs = torch.tensor(ep[7], dtype=torch.float32, device=DEVICE)
+        advantages = torch.zeros(2, dtype=torch.float32, device=DEVICE)
+        returns = torch.zeros(2, dtype=torch.float32, device=DEVICE)
+        old_values = torch.zeros(2, dtype=torch.float32, device=DEVICE)
+
+        class DummyCritic(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = torch.nn.Parameter(torch.zeros(NUM_BUCKETS, device=DEVICE))
+                self.register_buffer("bucket_centers", _make_bucket_centers())
+
+            def encode_map(self, g_obs, g_mask):
+                del g_mask
+                return torch.zeros(g_obs.shape[0], 64, device=g_obs.device)
+
+            def unit_value_logits(self, feat, g_scalars, round_idx, unit_xy, unit_ctx, actor_latent=None):
+                del feat, g_scalars, unit_xy, unit_ctx, actor_latent
+                bsz = round_idx.shape[0]
+                logits = self.bias.unsqueeze(0).expand(bsz, -1)
+                values = logits[:, 0] * 0.0
+                return values, logits
+
+        dummy_critic = DummyCritic()
+        dummy_opt = torch.optim.Adam(dummy_critic.parameters(), lr=1e-3)
+
+        def fail_if_recomputed(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("ppo_update must not recompute old_log_probs")
+
+        def zero_value_loss(logits, newvalue, target, bucket_centers, **kwargs):
+            del logits, target, bucket_centers, kwargs
+            return newvalue * 0.0
+
+        monkeypatch.setattr(model_mod, "_sequential_logprobs", fail_if_recomputed)
+        monkeypatch.setattr(model_mod, "get_centralized_critic", lambda: (dummy_critic, dummy_opt))
+        monkeypatch.setattr(model_mod, "distributional_value_loss", zero_value_loss)
+
+        centralized_data = {
+            "step_round_idx": torch.zeros(2, dtype=torch.long, device=DEVICE),
+            "step_unit_xy": torch.zeros(2, 2, dtype=torch.long, device=DEVICE),
+            "step_unit_ctx": torch.zeros(2, UNIT_CONTEXT_DIM, dtype=torch.float32, device=DEVICE),
+            "step_actor_latent": torch.zeros(2, ACTOR_LATENT_DIM, dtype=torch.float32, device=DEVICE),
+            "global_states": [torch.zeros(GLOBAL_MAP_CHANNELS, 1, 1, dtype=torch.float32)],
+            "global_sizes": torch.tensor([[1, 1]], dtype=torch.int16),
+            "global_scalars": torch.zeros(1, GLOBAL_SCALAR_DIM, dtype=torch.float32),
+        }
+
+        stats = ppo_update(
+            model,
+            optimizer,
+            obs,
+            h,
+            bt,
+            bd,
+            cd,
+            brt,
+            md,
+            old_log_probs,
+            advantages,
+            returns,
+            centralized_data,
+            old_values=old_values,
+            ep_boundaries=[(0, 2)],
+            ppo_epochs=2,
+            minibatch_size=2,
+            bptt_k=2,
+        )
+
+        assert stats["n_updates"] == 2
+
+    def test_parse_trajectories_preserves_actor_decision_tick(self):
+        torch.manual_seed(123)
+        model = BuilderMLP().to(DEVICE).eval()
+        ep = _manual_rollout_episode(model, 4, offset=20)
+        traj = [[
+            {
+                "obs": step_obs.tolist(),
+                "h_prev": step_h.tolist(),
+                "bt": bt,
+                "bd": bd,
+                "cd": cd,
+                "brt": brt,
+                "md": md,
+                "old_lp": old_lp,
+            }
+            for step_obs, step_h, bt, bd, cd, brt, md, old_lp in zip(*ep)
+        ]]
+
+        parsed = _parse_trajectories(traj)
+        assert parsed is not None
+
+        recomputed = _sequential_logprobs(
+            model,
+            parsed["obs"],
+            parsed["h"],
+            parsed["bt"],
+            parsed["bd"],
+            parsed["cd"],
+            parsed["brt"],
+            parsed["md"],
+            _build_bptt_chunks(parsed["ep_boundaries"], bptt_k=4),
+            bptt_k=4,
+            batch_size=8,
+        ).cpu()
+
+        expected = torch.tensor(ep[7], dtype=torch.float32)
+        assert torch.allclose(recomputed, expected, atol=1e-5, rtol=1e-5)
+
     def test_single_step_episode_log_prob(self):
         """A single-step episode should still produce valid recomputed log probs."""
         torch.manual_seed(42)
@@ -236,38 +418,50 @@ class TestLogProbRecomputation:
 
         assert torch.allclose(recomputed, manual_lp, atol=1e-5)
 
-    def test_causal_masking_zeroes_bd_cd_for_no_build(self):
-        """When bt_act=0 (no build), bd and cd log probs must not contribute."""
+    def test_causal_masking_zeroes_bd_cd_brt_for_no_build(self):
+        """When bt_act=0 (no build), bd, cd, and brt log probs must not contribute."""
         torch.manual_seed(7)
-        logits = torch.randn(1, 12)  # build type logits
+        logits = torch.randn(1, 13)
         bd_logits = torch.randn(1, 9)
         cd_logits = torch.randn(1, 4)
+        brt_logits = torch.randn(1, N_BRIDGE_TARGETS)
         md_logits = torch.randn(1, 9)
 
         bt_act = torch.tensor([0])  # no build
         bd_act = torch.tensor([3])
         cd_act = torch.tensor([1])
+        brt_act = torch.tensor([5])
         md_act = torch.tensor([2])
 
         bt_lp, _ = action_log_prob_and_entropy(logits, bt_act)
         bd_lp, _ = action_log_prob_and_entropy(bd_logits, bd_act)
         cd_lp, _ = action_log_prob_and_entropy(cd_logits, cd_act)
+        brt_lp, _ = action_log_prob_and_entropy(brt_logits, brt_act)
         md_lp, _ = action_log_prob_and_entropy(md_logits, md_act)
 
+<<<<<<< Updated upstream
         # With no build: bd always included (upstream), cd zeroed
         cd_causal = 0.0  # bt_act not in CONVEYOR_BUILD_TYPES
         total = bd_lp + bt_lp + cd_lp * cd_causal + md_lp
+=======
+        bd_causal = 0.0
+        cd_causal = 0.0
+        brt_causal = 0.0
+        total = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
+>>>>>>> Stashed changes
 
         assert total.item() == pytest.approx((bd_lp + bt_lp + md_lp).item(), abs=1e-7)
 
     def test_causal_masking_includes_bd_for_harvester(self):
-        """For harvester build, bd contributes but cd does not."""
+        """For harvester build, bd contributes but cd and brt do not."""
         torch.manual_seed(7)
-        logits = torch.randn(1, 12)
+        logits = torch.randn(1, 13)
         bd_logits = torch.randn(1, 9)
         cd_logits = torch.randn(1, 4)
+        brt_logits = torch.randn(1, N_BRIDGE_TARGETS)
         md_logits = torch.randn(1, 9)
 
+<<<<<<< Updated upstream
         bt_act_val = HARVESTER_BUILD_TYPE  # =1
         bt_act = torch.tensor([bt_act_val])
         bd_act = torch.tensor([3])
@@ -294,19 +488,87 @@ class TestLogProbRecomputation:
 
         bt_act_val = CONVEYOR_BUILD_TYPES[0]  # conveyor
         bt_act = torch.tensor([bt_act_val])
+=======
+        bt_act = torch.tensor([HARVESTER_BUILD_TYPE])
+>>>>>>> Stashed changes
         bd_act = torch.tensor([3])
         cd_act = torch.tensor([1])
+        brt_act = torch.tensor([5])
         md_act = torch.tensor([2])
 
         bt_lp, _ = action_log_prob_and_entropy(logits, bt_act)
         bd_lp, _ = action_log_prob_and_entropy(bd_logits, bd_act)
         cd_lp, _ = action_log_prob_and_entropy(cd_logits, cd_act)
+        brt_lp, _ = action_log_prob_and_entropy(brt_logits, brt_act)
         md_lp, _ = action_log_prob_and_entropy(md_logits, md_act)
 
+<<<<<<< Updated upstream
         cd_causal = 1.0  # conveyor type
         total = bd_lp + bt_lp + cd_lp * cd_causal + md_lp
+=======
+        bd_causal = 1.0
+        cd_causal = 0.0
+        brt_causal = 0.0
+        total = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
+
+        assert total.item() == pytest.approx((bt_lp + bd_lp + md_lp).item(), abs=1e-7)
+
+    def test_causal_masking_includes_bd_cd_for_conveyor(self):
+        """For conveyor build, bd and cd contribute but brt does not."""
+        torch.manual_seed(7)
+        logits = torch.randn(1, 13)
+        bd_logits = torch.randn(1, 9)
+        cd_logits = torch.randn(1, 4)
+        brt_logits = torch.randn(1, N_BRIDGE_TARGETS)
+        md_logits = torch.randn(1, 9)
+
+        bt_act = torch.tensor([CONVEYOR_BUILD_TYPES[0]])
+        bd_act = torch.tensor([3])
+        cd_act = torch.tensor([1])
+        brt_act = torch.tensor([5])
+        md_act = torch.tensor([2])
+
+        bt_lp, _ = action_log_prob_and_entropy(logits, bt_act)
+        bd_lp, _ = action_log_prob_and_entropy(bd_logits, bd_act)
+        cd_lp, _ = action_log_prob_and_entropy(cd_logits, cd_act)
+        brt_lp, _ = action_log_prob_and_entropy(brt_logits, brt_act)
+        md_lp, _ = action_log_prob_and_entropy(md_logits, md_act)
+
+        bd_causal = 1.0
+        cd_causal = 1.0
+        brt_causal = 0.0
+        total = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
+>>>>>>> Stashed changes
 
         assert total.item() == pytest.approx((bd_lp + bt_lp + cd_lp + md_lp).item(), abs=1e-7)
+
+    def test_causal_masking_includes_bd_brt_for_bridge(self):
+        """For bridge build, bd and brt contribute but cd does not."""
+        torch.manual_seed(7)
+        logits = torch.randn(1, 13)
+        bd_logits = torch.randn(1, 9)
+        cd_logits = torch.randn(1, 4)
+        brt_logits = torch.randn(1, N_BRIDGE_TARGETS)
+        md_logits = torch.randn(1, 9)
+
+        bt_act = torch.tensor([BRIDGE_BUILD_TYPE])
+        bd_act = torch.tensor([3])
+        cd_act = torch.tensor([1])
+        brt_act = torch.tensor([5])
+        md_act = torch.tensor([2])
+
+        bt_lp, _ = action_log_prob_and_entropy(logits, bt_act)
+        bd_lp, _ = action_log_prob_and_entropy(bd_logits, bd_act)
+        cd_lp, _ = action_log_prob_and_entropy(cd_logits, cd_act)
+        brt_lp, _ = action_log_prob_and_entropy(brt_logits, brt_act)
+        md_lp, _ = action_log_prob_and_entropy(md_logits, md_act)
+
+        bd_causal = 1.0
+        cd_causal = 0.0
+        brt_causal = 1.0
+        total = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + brt_lp * brt_causal + md_lp
+
+        assert total.item() == pytest.approx((bt_lp + bd_lp + brt_lp + md_lp).item(), abs=1e-7)
 
 
 # =====================================================================
@@ -525,7 +787,7 @@ class TestGAE:
         rewards = torch.zeros(1900)
         values = torch.full((1900,), 5.0)
         advantages, returns = _compute_gae(
-            rewards, values, [(0, 1900)], gamma=0.99, gae_lambda=1.0,
+            rewards, values, [(0, 1900)], gamma=GAMMA, gae_lambda=1.0,
         )
         assert advantages[-1].item() == pytest.approx(-5.0)
         assert returns[-1].item() == pytest.approx(0.0)
@@ -535,7 +797,7 @@ class TestGAE:
         rewards = torch.tensor([3.0])
         values = torch.tensor([1.0])
         advantages, returns = _compute_gae(
-            rewards, values, [(0, 1)], gamma=0.99, gae_lambda=0.95,
+            rewards, values, [(0, 1)], gamma=GAMMA, gae_lambda=LAMBDA,
         )
         # Terminal: delta = r + 0 - v = 3 - 1 = 2
         assert advantages[0].item() == pytest.approx(2.0)
@@ -545,7 +807,7 @@ class TestGAE:
         """Manually verify GAE for a 2-step episode."""
         rewards = torch.tensor([1.0, 2.0])
         values = torch.tensor([0.5, 1.0])
-        gamma, lam = 0.99, 0.95
+        gamma, lam = GAMMA, LAMBDA
 
         advantages, returns = _compute_gae(
             rewards, values, [(0, 2)], gamma=gamma, gae_lambda=lam,
@@ -568,7 +830,7 @@ class TestGAE:
         rewards = torch.tensor([5.0, 5.0])
         values = torch.tensor([2.0, 2.0])
         adv_multi, ret_multi = _compute_gae(
-            rewards, values, [(0, 1), (1, 2)], gamma=0.99, gae_lambda=0.95,
+            rewards, values, [(0, 1), (1, 2)], gamma=GAMMA, gae_lambda=LAMBDA,
         )
         # Each should be identical
         assert adv_multi[0].item() == pytest.approx(adv_multi[1].item())
@@ -576,7 +838,7 @@ class TestGAE:
 
         # Compare to single episode
         adv_single, ret_single = _compute_gae(
-            rewards[:1], values[:1], [(0, 1)], gamma=0.99, gae_lambda=0.95,
+            rewards[:1], values[:1], [(0, 1)], gamma=GAMMA, gae_lambda=LAMBDA,
         )
         assert adv_multi[0].item() == pytest.approx(adv_single[0].item())
 
@@ -586,7 +848,7 @@ class TestGAE:
         rewards = torch.tensor([0.0, 0.0])
         values = torch.tensor([0.0, 1000.0])
         adv, _ = _compute_gae(
-            rewards, values, [(0, 1), (1, 2)], gamma=0.99, gae_lambda=0.95,
+            rewards, values, [(0, 1), (1, 2)], gamma=GAMMA, gae_lambda=LAMBDA,
         )
         # ep1 advantage: delta = 0 + 0 - 0 = 0 (should NOT bootstrap from v=1000)
         assert adv[0].item() == pytest.approx(0.0)
@@ -598,7 +860,7 @@ class TestGAE:
         rewards = torch.tensor([1.0, 2.0, 3.0])
         values = torch.tensor([0.5, 1.0, 1.5])
         adv, ret = _compute_gae(
-            rewards, values, [(0, 3)], gamma=0.0, gae_lambda=0.95,
+            rewards, values, [(0, 3)], gamma=0.0, gae_lambda=LAMBDA,
         )
         expected_adv = rewards - values
         assert torch.allclose(adv, expected_adv, atol=1e-5)
@@ -734,6 +996,22 @@ class TestPPORatioProperties:
         # clamp(1.5, 0.8, 1.28) = 1.28, pg2 = -1.28
         assert loss.item() == pytest.approx(-1.28, abs=1e-6)
 
+    def test_masked_tail_terms_raise_on_invalid_infinite_logratio(self):
+        logratio = torch.tensor([[0.1, float("inf")]])
+        adv = torch.tensor([[1.0, 0.0]])
+        ent = torch.tensor([[0.2, 0.5]])
+        valid_mask = torch.tensor([[True, False]])
+
+        with pytest.raises(RuntimeError, match="tail logratio is non-finite"):
+            _masked_ppo_actor_terms(
+                logratio,
+                adv,
+                ent,
+                valid_mask,
+                clip_eps=0.2,
+                clip_eps_higher=0.28,
+            )
+
 
 # =====================================================================
 # Soft cross-entropy
@@ -854,6 +1132,16 @@ def test_entropy_gradient_does_not_flow_into_temperature_when_detached():
 # =====================================================================
 
 class TestCentralizedCritic:
+    def test_map_encoder_stays_fp32_even_when_bf16_enabled(self, monkeypatch):
+        import model as model_mod
+
+        monkeypatch.setattr(model_mod, "_USE_BF16", True)
+        critic = model_mod.CentralizedCritic()
+
+        for module in (critic.stem, critic.down_a, critic.stage_a, critic.down_b, critic.stage_b):
+            dtypes = {param.dtype for param in module.parameters()}
+            assert dtypes == {torch.float32}
+
     def test_critic_forward_output_shape(self):
         """Critic forward should return one value per unit."""
         torch.manual_seed(0)
@@ -869,6 +1157,14 @@ class TestCentralizedCritic:
 
         values = critic(map_tensor, valid_mask, scalars, unit_xy, unit_ctx, actor_latent)
         assert values.shape == (B,)
+
+    def test_encode_map_returns_round_summaries(self):
+        """encode_map should return one shared summary vector per round."""
+        critic = CentralizedCritic()
+        map_tensor = torch.randn(4, GLOBAL_MAP_CHANNELS, 10, 10)
+        valid_mask = torch.ones(4, 1, 10, 10)
+        feat = critic.encode_map(map_tensor, valid_mask)
+        assert feat.shape == (4, 64)
 
     def test_unit_value_logits_returns_values_and_logits(self):
         """unit_value_logits should return matching value/logits pair."""
@@ -895,8 +1191,36 @@ class TestCentralizedCritic:
         expected = decode_value(logits, critic.bucket_centers)
         assert torch.allclose(values, expected, atol=1e-5)
 
+<<<<<<< Updated upstream
     def test_critic_starts_with_zero_logits(self):
         """Critic value head starts at zero logits by design for stable bootstrapping."""
+=======
+    def test_unit_xy_no_longer_changes_values_directly(self):
+        """The whole-map summary critic should ignore direct unit_xy indexing."""
+        torch.manual_seed(0)
+        critic = CentralizedCritic().eval()
+        map_tensor = torch.randn(1, GLOBAL_MAP_CHANNELS, 10, 10)
+        valid_mask = torch.ones(1, 1, 10, 10)
+        feat = critic.encode_map(map_tensor, valid_mask)
+        scalars = torch.randn(1, GLOBAL_SCALAR_DIM)
+        round_idx = torch.zeros(3, dtype=torch.long)
+        unit_xy_a = torch.tensor([[1, 1], [5, 5], [9, 0]])
+        unit_xy_b = torch.tensor([[9, 9], [0, 0], [2, 7]])
+        unit_ctx = torch.randn(3, UNIT_CONTEXT_DIM)
+        actor_latent = torch.randn(3, ACTOR_LATENT_DIM)
+
+        values_a, logits_a = critic.unit_value_logits(
+            feat, scalars, round_idx, unit_xy_a, unit_ctx, actor_latent,
+        )
+        values_b, logits_b = critic.unit_value_logits(
+            feat, scalars, round_idx, unit_xy_b, unit_ctx, actor_latent,
+        )
+        assert torch.allclose(values_a, values_b, atol=1e-6)
+        assert torch.allclose(logits_a, logits_b, atol=1e-6)
+
+    def test_critic_starts_with_nonuniform_logits(self):
+        """Dreamer4 create_mlp uses standard linear init, not zero logits."""
+>>>>>>> Stashed changes
         torch.manual_seed(0)
         critic = CentralizedCritic().eval()
         R = 2
@@ -1150,6 +1474,7 @@ class TestCentralizedCritic:
         assert not torch.allclose(feat_a.patches, feat_b.patches, atol=1e-3), \
             "Different maps should produce different encoded features"
 
+<<<<<<< Updated upstream
     def test_unit_value_logits_are_order_equivariant_within_round(self):
         """Reordering unit tokens should only reorder outputs, not change them."""
         torch.manual_seed(0)
@@ -1183,6 +1508,53 @@ class TestCentralizedCritic:
 
         assert torch.allclose(values_a, values_b[inv_perm], atol=1e-5)
         assert torch.allclose(logits_a, logits_b[inv_perm], atol=1e-5)
+=======
+    def test_load_centralized_critic_checkpoint_accepts_standalone_state_dict(self, tmp_path):
+        torch.manual_seed(0)
+        source = CentralizedCritic()
+        ckpt = tmp_path / "critic_pretrained.pt"
+        torch.save(source.state_dict(), ckpt)
+
+        reset_centralized_critic()
+        assert load_centralized_critic_checkpoint(ckpt)
+        loaded, _opt = get_centralized_critic()
+
+        source_state = source.state_dict()
+        loaded_state = loaded.state_dict()
+        assert source_state.keys() == loaded_state.keys()
+        for key in source_state:
+            assert torch.equal(source_state[key].cpu(), loaded_state[key].cpu()), key
+
+        reset_centralized_critic()
+
+    def test_save_centralized_critic_checkpoint_accepts_direct_pt_path(self, tmp_path):
+        reset_centralized_critic()
+        _critic, _opt = get_centralized_critic()
+        ckpt = tmp_path / "critic_sidecarless.pt"
+        saved = save_centralized_critic_checkpoint(ckpt)
+        assert saved == ckpt
+        assert ckpt.exists()
+        payload = torch.load(ckpt, map_location="cpu")
+        assert isinstance(payload, dict)
+        assert "critic" in payload
+        assert "optimizer" in payload
+        reset_centralized_critic()
+
+    def test_load_centralized_critic_checkpoint_rejects_non_pt_path(self, tmp_path):
+        bad = tmp_path / "weights.json"
+        bad.write_text("{}")
+        reset_centralized_critic()
+        assert not load_centralized_critic_checkpoint(bad)
+        reset_centralized_critic()
+
+    def test_save_centralized_critic_checkpoint_rejects_non_pt_path(self, tmp_path):
+        reset_centralized_critic()
+        _critic, _opt = get_centralized_critic()
+        bad = tmp_path / "weights.json"
+        with pytest.raises(ValueError, match="critic checkpoints must use a \\.pt path"):
+            save_centralized_critic_checkpoint(bad)
+        reset_centralized_critic()
+>>>>>>> Stashed changes
 
 
 # =====================================================================
@@ -1250,6 +1622,7 @@ class TestTemperatureScaledLogProbs:
         assert probs[0, 3].item() == pytest.approx(0.0, abs=1e-12)
         assert probs[0, mask[0]].tolist() == pytest.approx(expected_valid.tolist(), abs=1e-7)
 
+<<<<<<< Updated upstream
     def test_higher_temperature_flattens_distribution(self):
         """Higher temperature should move mass away from the argmax action."""
         logits = torch.tensor([[3.0, 1.0, -1.0]])
@@ -1257,6 +1630,13 @@ class TestTemperatureScaledLogProbs:
         hot = _temperature_scaled_log_probs(logits, temperature=2.0).exp()
         assert hot[0, 0].item() < cold[0, 0].item()
         assert hot[0, 2].item() > cold[0, 2].item()
+=======
+    def test_unimix_provides_entropy_floor(self):
+        """Even peaked logits should have nonzero entropy from unimix."""
+        logits = torch.tensor([[-100.0, 100.0, -100.0]])
+        _, entropy = action_log_prob_and_entropy(logits, torch.tensor([1]))
+        assert entropy.item() > 0.0
+>>>>>>> Stashed changes
 
     def test_masked_temperature_logprob_backward_stays_finite(self):
         """Masked-out zero-prob actions must not create NaN gradients in backward."""
@@ -1271,6 +1651,265 @@ class TestTemperatureScaledLogProbs:
         assert torch.isfinite(logits.grad).all()
         assert logits.grad[0, 1].item() == pytest.approx(0.0, abs=1e-12)
         assert logits.grad[0, 3].item() == pytest.approx(0.0, abs=1e-12)
+
+
+class TestDeterministicPolicyActions:
+    def test_zero_noise_decode_keeps_bridge_target_and_ignores_eps(self):
+        obs = _make_obs(0).unsqueeze(0)
+        bt_l = torch.full((1, 13), -10.0)
+        bt_l[0, BRIDGE_BUILD_TYPE] = 10.0
+        bd_l = torch.full((1, 9), -10.0)
+        bd_l[0, 3] = 8.0
+        cd_l = torch.full((1, 4), -10.0)
+        cd_l[0, 2] = 7.0
+        brt_l = torch.full((1, N_BRIDGE_TARGETS), -10.0)
+        brt_l[0, 5] = 9.0
+        md_l = torch.full((1, 9), -10.0)
+        md_l[0, 4] = 6.0
+        eps = torch.full((1, 5), LAMBDA)
+
+        bt_act, bd_act, cd_act, brt_act, md_act, log_prob = deterministic_policy_actions(
+            obs,
+            bt_l,
+            bd_l,
+            cd_l,
+            brt_l,
+            md_l,
+            eps,
+            zero_noise=True,
+            return_log_prob=True,
+        )
+
+        assert bt_act.item() == BRIDGE_BUILD_TYPE
+        assert bd_act.item() == 3
+        assert cd_act.item() == 2
+        assert brt_act.item() == 5
+        assert md_act.item() == 4
+        assert torch.isfinite(log_prob).all()
+
+    @pytest.mark.skipif(DEVICE.type != "cuda", reason="CUDA graph inference only runs on CUDA")
+    def test_graphed_deterministic_inference_matches_helper(self):
+        torch.manual_seed(0)
+        model = BuilderMLP().to(DEVICE).eval()
+        graph = GraphedInference(
+            model,
+            max_batch=4,
+            temperature=1.0,
+            deterministic=True,
+            zero_noise=True,
+            return_log_prob=False,
+        )
+        graph.capture()
+
+        packed = torch.zeros(3, OBS_SIZE + H_DIM, device=DEVICE)
+        for i in range(3):
+            packed[i, :OBS_SIZE] = _make_obs(i).to(DEVICE)
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, _ = model.infer_packed(packed)
+        exp_bt, exp_bd, exp_cd, exp_brt, exp_md, _ = deterministic_policy_actions(
+            packed[:, :OBS_SIZE],
+            bt_l,
+            bd_l,
+            cd_l,
+            brt_l,
+            md_l,
+            eps,
+            temperature=1.0,
+            zero_noise=True,
+            return_log_prob=False,
+        )
+
+        got_bt, got_bd, got_cd, got_brt, got_md, _lp, _h = graph(packed)
+
+        assert torch.equal(got_bt, exp_bt)
+        assert torch.equal(got_bd, exp_bd)
+        assert torch.equal(got_cd, exp_cd)
+        assert torch.equal(got_brt, exp_brt)
+        assert torch.equal(got_md, exp_md)
+
+
+class TestOpponentModelLoading:
+    def test_cached_opponent_model_raises_when_load_fails(self, monkeypatch, tmp_path):
+        weight_path = tmp_path / "broken_opp.json"
+        weight_path.write_text("{}")
+        train_batched._opp_model_cache.clear()
+
+        def fake_load_weights(self, path):
+            return False
+
+        monkeypatch.setattr(train_batched.BuilderMLP, "load_weights", fake_load_weights)
+
+        with pytest.raises(RuntimeError, match="Failed to load opponent weights"):
+            train_batched._get_cached_opponent_model(str(weight_path), None)
+
+
+class TestCentralizedCriticRoundLoader:
+    def test_load_critic_round_batch_streams_selected_rounds_only(self):
+        round0 = torch.arange(GLOBAL_MAP_CHANNELS * 2 * 2, dtype=torch.float32).reshape(GLOBAL_MAP_CHANNELS, 2, 2)
+        round1 = torch.full((GLOBAL_MAP_CHANNELS, 1, 1), 7.0, dtype=torch.float32)
+        data = {
+            "global_states": [round0, round1],
+            "global_sizes": torch.tensor([[2, 2], [1, 1]], dtype=torch.int16),
+            "global_scalars": torch.tensor(
+                [[1.0] * GLOBAL_SCALAR_DIM, [2.0] * GLOBAL_SCALAR_DIM],
+                dtype=torch.float32,
+            ),
+        }
+
+        obs, mask, scalars = _load_critic_round_batch(
+            data,
+            torch.tensor([1, 0], dtype=torch.long, device=DEVICE),
+        )
+
+        assert obs.shape == (2, GLOBAL_MAP_CHANNELS, 2, 2)
+        assert mask.shape == (2, 1, 2, 2)
+        assert scalars.shape == (2, GLOBAL_SCALAR_DIM)
+        assert torch.allclose(obs[0, :, :1, :1].float().cpu(), round1)
+        assert torch.allclose(obs[1].float().cpu(), round0)
+        assert mask[0, 0, 0, 0].item() == pytest.approx(1.0)
+        assert mask[0, 0, 1, 1].item() == pytest.approx(0.0)
+        assert scalars[0, 0].item() == pytest.approx(2.0)
+        assert scalars[1, 0].item() == pytest.approx(1.0)
+
+    def test_build_data_supports_file_backed_round_buffers(self, tmp_path):
+        n_turns = 2
+        map_w = 2
+        map_h = 2
+        state0 = torch.arange(GLOBAL_MAP_CHANNELS * map_h * map_w, dtype=torch.float32)
+        state1 = state0 + 1000
+        states = torch.cat([state0, state1]).contiguous()
+        scalars = torch.arange(n_turns * GLOBAL_SCALAR_DIM, dtype=torch.float32).reshape(n_turns, GLOBAL_SCALAR_DIM)
+
+        states_path = tmp_path / "states.bin"
+        scalars_path = tmp_path / "scalars.bin"
+        states_path.write_bytes(bytes(states.view(torch.uint8).reshape(-1).tolist()))
+        scalars_path.write_bytes(bytes(scalars.view(torch.uint8).reshape(-1).tolist()))
+
+        obs_t = torch.zeros(2, OBS_SIZE, dtype=torch.float32)
+        round_idx_t = torch.tensor([0, 1], dtype=torch.long)
+        data = _build_centralized_critic_data(
+            obs_t,
+            round_idx_t,
+            [{
+                "states_path": str(states_path),
+                "scalars_path": str(scalars_path),
+                "state_stride": GLOBAL_MAP_CHANNELS * map_h * map_w,
+                "map_w": map_w,
+                "map_h": map_h,
+                "n_turns": n_turns,
+                "n_channels": GLOBAL_MAP_CHANNELS,
+                "n_scalars": GLOBAL_SCALAR_DIM,
+            }],
+            [(0, 2)],
+            2,
+            traj_game_map=[0],
+        )
+        try:
+            round_ids = data["step_round_idx"].flip(0)
+            obs, mask, got_scalars = _load_critic_round_batch(
+                data,
+                round_ids,
+            )
+            assert torch.allclose(
+                obs[0, :, :map_h, :map_w].float().cpu(),
+                state1.reshape(GLOBAL_MAP_CHANNELS, map_h, map_w),
+                atol=4.0,
+                rtol=0.0,
+            )
+            assert torch.allclose(
+                obs[1, :, :map_h, :map_w].float().cpu(),
+                state0.reshape(GLOBAL_MAP_CHANNELS, map_h, map_w),
+                atol=1e-4,
+                rtol=0.0,
+            )
+            assert torch.equal(got_scalars.float().cpu(), torch.stack([scalars[1], scalars[0]]))
+            assert mask[:, :, :map_h, :map_w].sum().item() == pytest.approx(2 * map_w * map_h)
+        finally:
+            for resource in data.get("global_backing_resources", []):
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+
+    def test_build_data_round_lookup_never_looks_ahead(self):
+        map_w = 2
+        map_h = 1
+
+        def _state_fill(value: float) -> torch.Tensor:
+            return torch.full((GLOBAL_MAP_CHANNELS, map_h, map_w), value, dtype=torch.float32)
+
+        def _state_bytes(value: float) -> bytes:
+            return bytes(_state_fill(value).view(torch.uint8).reshape(-1).tolist())
+
+        def _scalar_fill(value: float) -> list[float]:
+            row = [0.0] * GLOBAL_SCALAR_DIM
+            row[0] = value
+            return row
+
+        obs_t = torch.zeros(6, OBS_SIZE, dtype=torch.float32)
+        round_idx_t = torch.tensor([0, 1, 4, 6, 9, 10], dtype=torch.long)
+        data = _build_centralized_critic_data(
+            obs_t,
+            round_idx_t,
+            [{
+                "states": {
+                    2: _state_bytes(2.0),
+                    5: _state_bytes(5.0),
+                    10: _state_bytes(10.0),
+                },
+                "scalars": {
+                    2: _scalar_fill(2.0),
+                    5: _scalar_fill(5.0),
+                    10: _scalar_fill(10.0),
+                },
+                "map_w": map_w,
+                "map_h": map_h,
+            }],
+            [(0, 6)],
+            6,
+            traj_game_map=[0],
+        )
+
+        obs, mask, scalars = _load_critic_round_batch(data, data["step_round_idx"])
+
+        # Rounds 0-1 have no historical replay state, so they fall back to zero.
+        assert torch.equal(
+            scalars[:, 0].float().cpu(),
+            torch.tensor([0.0, 0.0, 2.0, 5.0, 5.0, 10.0], dtype=torch.float32),
+        )
+        assert torch.allclose(obs[2, :, :map_h, :map_w].float().cpu(), _state_fill(2.0))
+        assert torch.allclose(obs[3, :, :map_h, :map_w].float().cpu(), _state_fill(5.0))
+        assert torch.allclose(obs[4, :, :map_h, :map_w].float().cpu(), _state_fill(5.0))
+        assert torch.allclose(obs[5, :, :map_h, :map_w].float().cpu(), _state_fill(10.0))
+        assert mask[0, :, :map_h, :map_w].sum().item() == pytest.approx(1.0)
+        assert mask[1, :, :map_h, :map_w].sum().item() == pytest.approx(1.0)
+        assert mask[2:, :, :map_h, :map_w].sum().item() == pytest.approx(4 * map_w * map_h)
+
+
+class TestTrajectoryParsing:
+    def test_parse_trajectories_accepts_compact_bytes_obs_and_hidden(self):
+        obs0 = torch.arange(OBS_SIZE, dtype=torch.float32)
+        obs1 = obs0 + 1.0
+        h0 = torch.arange(H_DIM, dtype=torch.float32)
+        h1 = h0 + 2.0
+        traj = [
+            (bytes(obs0.view(torch.uint8).reshape(-1).tolist()),
+             bytes(h0.view(torch.uint8).reshape(-1).tolist()),
+             1, 2, 3, 4, 0.0, 0, 0.0, 0.0, 0.0, 0.0, -0.2),
+            (bytes(obs1.view(torch.uint8).reshape(-1).tolist()),
+             bytes(h1.view(torch.uint8).reshape(-1).tolist()),
+             2, 3, 1, 4, 0.0, 0, 0.0, 0.0, 0.0, 0.0, -0.1),
+        ]
+
+        data = _parse_trajectories([traj])
+
+        assert data is not None
+        assert data["n_steps"] == 2
+        assert torch.allclose(data["obs"][0].float().cpu(), obs0)
+        assert torch.allclose(data["obs"][1].float().cpu(), obs1)
+        assert torch.allclose(data["h"][0].float().cpu(), h0)
+        assert torch.allclose(data["h"][1].float().cpu(), h1)
+        assert data["bt"].tolist() == [1, 2]
+        assert data["bd"].tolist() == [2, 3]
 
 
 # =====================================================================
@@ -1295,7 +1934,11 @@ class TestRecurrentPassConsistency:
         md = torch.tensor(ep[6], dtype=torch.long, device=device)
         h0 = torch.stack(ep[1][:1]).to(device)
 
+<<<<<<< Updated upstream
         bt_mask, bd_mask, cd_causal = _precompute_policy_masks(obs, bt, bd)
+=======
+        bt_mask, bd_mask, bd_causal, cd_causal, brt_causal = _precompute_policy_masks(obs, bt)
+>>>>>>> Stashed changes
 
         # Reshape for recurrent pass: (B=1, K=6, ...)
         obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
@@ -1307,13 +1950,21 @@ class TestRecurrentPassConsistency:
         bt_m = bt_mask.unsqueeze(0)
         bd_m = bd_mask.unsqueeze(0)
         cd_c = cd_causal.unsqueeze(0)
+        brt_c = brt_causal.unsqueeze(0)
 
         with torch.no_grad():
             lp_only = _recurrent_logprob_pass(
+<<<<<<< Updated upstream
                 model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, cd_c,
             )
             lp_actor, ent, _eps = _recurrent_actor_pass(
                 model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, cd_c,
+=======
+                model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, bd_c, cd_c, brt_c,
+            )
+            lp_actor, ent, _eps = _recurrent_actor_pass(
+                model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, bd_c, cd_c, brt_c,
+>>>>>>> Stashed changes
             )
 
         assert torch.allclose(lp_only, lp_actor, atol=1e-5), \
@@ -1333,19 +1984,84 @@ class TestRecurrentPassConsistency:
         md = torch.tensor(ep[6], dtype=torch.long, device=device)
         h0 = torch.stack(ep[1][:1]).to(device)
 
+<<<<<<< Updated upstream
         bt_mask, bd_mask, cd_causal = _precompute_policy_masks(obs, bt, bd)
+=======
+        bt_mask, bd_mask, bd_causal, cd_causal, brt_causal = _precompute_policy_masks(obs, bt)
+>>>>>>> Stashed changes
         obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
 
         with torch.no_grad():
             _, ent, _eps = _recurrent_actor_pass(
                 model, obs_pre, h0,
+<<<<<<< Updated upstream
                 bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0),
                 brt.unsqueeze(0), md.unsqueeze(0),
                 bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
                 cd_causal.unsqueeze(0),
+=======
+                bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0), brt.unsqueeze(0), md.unsqueeze(0),
+                bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
+                bd_causal.unsqueeze(0), cd_causal.unsqueeze(0), brt_causal.unsqueeze(0),
+>>>>>>> Stashed changes
             )
 
         assert (ent >= -1e-6).all(), f"Negative entropy found: {ent.min()}"
+
+    def test_noncausal_invalid_bd_action_is_ignored(self):
+        torch.manual_seed(0)
+        model = BuilderMLP().eval()
+        device = next(model.parameters()).device
+
+        obs = _make_obs(0).unsqueeze(0).to(device)
+        obs[0, _MASK_BD_TILES[0] * TILE_FEATURES + 0] = 1.0
+        bt = torch.tensor([0], dtype=torch.long, device=device)
+        bd = torch.tensor([0], dtype=torch.long, device=device)
+        cd = torch.tensor([3], dtype=torch.long, device=device)
+        brt = torch.tensor([7], dtype=torch.long, device=device)
+        md = torch.tensor([4], dtype=torch.long, device=device)
+        h0 = torch.zeros(1, H_DIM, device=device)
+
+        bt_mask, bd_mask, bd_causal, cd_causal, brt_causal = _precompute_policy_masks(obs, bt)
+        assert not bool(bd_mask[0, 0])
+        assert bd_causal[0].item() == 0.0
+
+        obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
+        with torch.no_grad():
+            lp_only = _recurrent_logprob_pass(
+                model,
+                obs_pre,
+                h0,
+                bt.unsqueeze(0),
+                bd.unsqueeze(0),
+                cd.unsqueeze(0),
+                brt.unsqueeze(0),
+                md.unsqueeze(0),
+                bt_mask.unsqueeze(0),
+                bd_mask.unsqueeze(0),
+                bd_causal.unsqueeze(0),
+                cd_causal.unsqueeze(0),
+                brt_causal.unsqueeze(0),
+            )
+            lp_actor, ent, _eps = _recurrent_actor_pass(
+                model,
+                obs_pre,
+                h0,
+                bt.unsqueeze(0),
+                bd.unsqueeze(0),
+                cd.unsqueeze(0),
+                brt.unsqueeze(0),
+                md.unsqueeze(0),
+                bt_mask.unsqueeze(0),
+                bd_mask.unsqueeze(0),
+                bd_causal.unsqueeze(0),
+                cd_causal.unsqueeze(0),
+                brt_causal.unsqueeze(0),
+            )
+
+        assert torch.isfinite(lp_only).all()
+        assert torch.isfinite(lp_actor).all()
+        assert torch.isfinite(ent).all()
 
 
 # =====================================================================
@@ -1357,21 +2073,47 @@ class TestPrecomputePolicyMasks:
         """cd_causal should be 0 when bt_act is not a conveyor type."""
         obs = _make_obs(0).unsqueeze(0)
         bt = torch.tensor([0])
+<<<<<<< Updated upstream
         _, _, cd_causal = _precompute_policy_masks(obs, bt, torch.tensor([0]))
+=======
+        _, _, bd_causal, cd_causal, brt_causal = _precompute_policy_masks(obs, bt)
+        assert bd_causal[0].item() == 0.0
+>>>>>>> Stashed changes
         assert cd_causal[0].item() == 0.0
+        assert brt_causal[0].item() == 0.0
 
     def test_cd_causal_zero_for_harvester(self):
         obs = _make_obs(0).unsqueeze(0)
         bt = torch.tensor([HARVESTER_BUILD_TYPE])
+<<<<<<< Updated upstream
         _, _, cd_causal = _precompute_policy_masks(obs, bt, torch.tensor([0]))
+=======
+        _, _, bd_causal, cd_causal, brt_causal = _precompute_policy_masks(obs, bt)
+        assert bd_causal[0].item() == 1.0
+>>>>>>> Stashed changes
         assert cd_causal[0].item() == 0.0  # harvester is not conveyor
+        assert brt_causal[0].item() == 0.0
 
     def test_cd_causal_one_for_conveyor(self):
         obs = _make_obs(0).unsqueeze(0)
         for cbt in CONVEYOR_BUILD_TYPES:
             bt = torch.tensor([cbt])
+<<<<<<< Updated upstream
             _, _, cd_causal = _precompute_policy_masks(obs, bt, torch.tensor([0]))
+=======
+            _, _, bd_causal, cd_causal, brt_causal = _precompute_policy_masks(obs, bt)
+            assert bd_causal[0].item() == 1.0, f"bd_causal should be 1 for conveyor type {cbt}"
+>>>>>>> Stashed changes
             assert cd_causal[0].item() == 1.0, f"cd_causal should be 1 for conveyor type {cbt}"
+            assert brt_causal[0].item() == 0.0
+
+    def test_brt_causal_one_for_bridge(self):
+        obs = _make_obs(0).unsqueeze(0)
+        bt = torch.tensor([BRIDGE_BUILD_TYPE])
+        _, _, bd_causal, cd_causal, brt_causal = _precompute_policy_masks(obs, bt)
+        assert bd_causal[0].item() == 1.0
+        assert cd_causal[0].item() == 0.0
+        assert brt_causal[0].item() == 1.0
 
 
 # =====================================================================
@@ -1456,15 +2198,25 @@ class TestActorGradientFlow:
         old_lps = torch.tensor(ep[7], dtype=torch.float32, device=device)
         h0 = torch.zeros(1, H_DIM, device=device)
 
+<<<<<<< Updated upstream
         bt_mask, bd_mask, cd_causal = _precompute_policy_masks(obs, bt, bd)
+=======
+        bt_mask, bd_mask, bd_causal, cd_causal, brt_causal = _precompute_policy_masks(obs, bt)
+>>>>>>> Stashed changes
         obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
 
         new_lps, ent, _eps = _recurrent_actor_pass(
             model, obs_pre, h0,
+<<<<<<< Updated upstream
             bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0),
             brt.unsqueeze(0), md.unsqueeze(0),
             bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
             cd_causal.unsqueeze(0),
+=======
+            bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0), brt.unsqueeze(0), md.unsqueeze(0),
+            bt_mask.unsqueeze(0), bd_mask.unsqueeze(0),
+            bd_causal.unsqueeze(0), cd_causal.unsqueeze(0), brt_causal.unsqueeze(0),
+>>>>>>> Stashed changes
         )
         new_lps = new_lps.squeeze(0)
         ent = ent.squeeze(0)
@@ -1503,3 +2255,80 @@ class TestActorGradientFlow:
 
         assert old_lps.grad is None or (old_lps.grad == 0).all(), \
             "Gradients leaked through old_log_probs"
+
+
+class TestMuCenterPolicyHeads:
+    """Verify mu-centering projection keeps policy head weights centered."""
+
+    def test_weights_centered_after_projection(self):
+        torch.manual_seed(42)
+        model = BuilderMLP()
+        # Artificially drift weights away from center
+        with torch.no_grad():
+            for head in (model.head_build_type, model.head_build_dir,
+                         model.head_conv_dir, model.head_bridge_target,
+                         model.head_move_dir):
+                head.weight.add_(torch.randn(1, head.weight.shape[1]) * 5.0)
+                head.bias.add_(3.0)
+
+        model.mu_center_policy_heads()
+
+        for name, head in [
+            ("build_type", model.head_build_type),
+            ("build_dir", model.head_build_dir),
+            ("conv_dir", model.head_conv_dir),
+            ("bridge_target", model.head_bridge_target),
+            ("move_dir", model.head_move_dir),
+        ]:
+            assert head.weight.mean(dim=0).abs().max() < 1e-5, \
+                f"{name} weight rows not centered"
+            assert abs(head.bias.mean().item()) < 1e-5, \
+                f"{name} bias not centered"
+
+    def test_softmax_output_unchanged(self):
+        """Mu-centering must not change the model's output distribution."""
+        torch.manual_seed(7)
+        model = BuilderMLP()
+        model.eval()
+        obs = torch.randn(4, OBS_SIZE)
+        h = torch.zeros(4, H_DIM)
+
+        with torch.no_grad():
+            bt1, bd1, cd1, brt1, md1, eps1, _ = model(obs, h)
+            probs_before = [F.softmax(l, dim=-1) for l in (bt1, bd1, cd1, brt1, md1)]
+
+        # Drift weights then center
+        with torch.no_grad():
+            for head in (model.head_build_type, model.head_build_dir,
+                         model.head_conv_dir, model.head_bridge_target,
+                         model.head_move_dir):
+                head.weight.add_(torch.randn(1, head.weight.shape[1]) * 10.0)
+                head.bias.add_(7.0)
+        model.mu_center_policy_heads()
+
+        # Clear cached fused params
+        if hasattr(model, '_cached_head_w'):
+            del model._cached_head_w
+            del model._cached_head_b
+
+        with torch.no_grad():
+            bt2, bd2, cd2, brt2, md2, eps2, _ = model(obs, h)
+            probs_after = [F.softmax(l, dim=-1) for l in (bt2, bd2, cd2, brt2, md2)]
+
+        for i, (p_before, p_after) in enumerate(zip(probs_before, probs_after)):
+            assert torch.allclose(p_before, p_after, atol=1e-5), \
+                f"Head {i}: softmax changed after mu-centering a uniform shift"
+
+    def test_does_not_center_non_policy_heads(self):
+        """Logit scale and recurrent heads should be untouched."""
+        torch.manual_seed(0)
+        model = BuilderMLP()
+        gate_w_before = model.head_h_gate.weight.clone()
+        cand_w_before = model.head_h_cand.weight.clone()
+        scale_w_before = model.head_logit_scale.weight.clone()
+
+        model.mu_center_policy_heads()
+
+        assert torch.equal(model.head_h_gate.weight, gate_w_before)
+        assert torch.equal(model.head_h_cand.weight, cand_w_before)
+        assert torch.equal(model.head_logit_scale.weight, scale_w_before)

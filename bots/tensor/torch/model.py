@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+<<<<<<< Updated upstream
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
+=======
+from contextlib import nullcontext
+>>>>>>> Stashed changes
 import gc
 import json
+import mmap
 import os
 from enum import Enum
 from operator import attrgetter
@@ -79,13 +84,30 @@ from model_constants import (
 )
 HIDDEN = HIDDEN_SIZES
 TEACHER_HIDDEN = [128, 128, 128, 64]
+<<<<<<< Updated upstream
 ACTOR_LATENT_DIM = MODEL_ACTOR_LATENT_DIM
+=======
+H_DIM = 24
+INPUT_SIZE = OBS_SIZE + H_DIM
+TILE_EMBED_DIM = 8
+TILE_INPUT_DIM = TILE_FEATURES + 2  # 21: raw features + (dx/2, dy/2)
+TILE_GRID_N = 5 * 5  # 25 tiles in the 5x5 local grid
+COMPRESS_DIM = 80  # tile compress output dim (spatial pooling)
+TRUNK_INPUT_SIZE = COMPRESS_DIM + GLOBAL_FEATURES + POS_EMBED_DIM + H_DIM  # 119
+OBS_PREFIX_SIZE = TRUNK_INPUT_SIZE - H_DIM
+ACTOR_LATENT_DIM = max(HIDDEN[-1], TEACHER_HIDDEN[-1])
+>>>>>>> Stashed changes
 N_BUILD = 13
 N_DIR = 9
 N_CONV_DIR = 4  # cardinal only: N, W, E, S (indices 1, 3, 5, 7 in DIR_MAP_9)
 N_BRIDGE_TARGETS = 28  # offsets (dx,dy) with 0 < dx²+dy² ≤ 9
+<<<<<<< Updated upstream
 N_ACTION_TEMPERATURES = 5  # per-head temperatures: bt, bd, cd, brt, md
 ACTOR_RMSNORM_LAYERS = tuple(RMSNORM_LAYERS)
+=======
+N_LOGIT_SCALE = 5  # per-head eps: bt, bd, cd, brt, md
+ACTOR_RMSNORM_LAYERS = (True, True)
+>>>>>>> Stashed changes
 assert ACTOR_RMSNORM_LAYERS[0], "First layer RMSNorm must be True (encoder always uses RMSNorm; inference MLP respects this flag)"
 HARVESTER_BUILD_TYPE = 1
 BRIDGE_BUILD_TYPE = 12
@@ -122,6 +144,7 @@ INITIAL_BUILD_TYPE_BIAS = [
     -2.0,  # sentinel
     -2.0,  # breach
     0.7,   # splitter
+<<<<<<< Updated upstream
     -2.0,  # armoured_conveyor
     -2.0,  # barrier
     -2.0,  # foundry
@@ -132,6 +155,20 @@ class RewardMode(Enum):
     OUTCOME = "outcome"   # terminal win/loss only
     INCOME = "income"     # resource delivered to core per round
     FLOW = "flow"         # weighted conveyor hops toward core per round
+=======
+    0.0,   # armoured_conveyor
+    -0.3,  # barrier
+    -0.7,  # foundry
+    -0.5,  # launcher
+    -0.5,  # bridge
+]
+REWARD_BUILD_CREDIT = 20.0  # scale for replay-derived dense flow reward
+REWARD_MODE = "terminal"  # "terminal" = win/loss only; "dense" = flow-based n_working
+TERMINAL_WIN_REWARD = 10.0
+TERMINAL_LOSS_REWARD = -10.0
+GAMMA = 0.995 # GAE
+LAMBDA = 0.99 # GAE
+>>>>>>> Stashed changes
 
 REWARD_MODE = RewardMode.FLOW
 REWARD_INCOME_SCALE = 2.5 # since each "resource" is worth 10
@@ -150,12 +187,18 @@ CRITIC_VALUE_MODE = CriticValueMode.GHL
 
 # ---- Gaussian Histogram Loss (GHL) value prediction with symlog/symexp ----
 NUM_BUCKETS = 255
+<<<<<<< Updated upstream
 # symlog range — covers symexp(±9) ≈ ±8103
 BUCKET_LOW = -9.0
 BUCKET_HIGH = 9.0
 # GHL sigma in symlog space, expressed as a multiple of bin width.
 _GHL_SIGMA_RATIO = 0.5
 _SQRT2 = math.sqrt(2.0)
+=======
+# symlog range, ~420 in raw
+BUCKET_LOW = -6
+BUCKET_HIGH = 6
+>>>>>>> Stashed changes
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -221,6 +264,23 @@ def win_probability(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
     Args:
         logits: (..., NUM_BUCKETS) raw critic logits.
         bins: (NUM_BUCKETS,) bin centers in symlog space.
+
+    Returns:
+        (...,) win probability in [0, 1].
+    """
+    values = decode_value(logits, bins)
+    return ((values - TERMINAL_LOSS_REWARD) / (TERMINAL_WIN_REWARD - TERMINAL_LOSS_REWARD)).clamp(0, 1)
+
+
+def win_probability(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+    """Win confidence from critic logits via linear rescale of decoded value.
+
+    The critic predicts discounted returns in [-10, +10] (terminal reward range).
+    We decode to a scalar and rescale: -10 → 0%, +10 → 100%.
+
+    Args:
+        logits: (..., NUM_BUCKETS) raw critic logits.
+        bins: (NUM_BUCKETS,) bin centers in original value space.
 
     Returns:
         (...,) win probability in [0, 1].
@@ -600,9 +660,13 @@ GLOBAL_MAP_MAX_H = 50
 GLOBAL_MAP_CHANNELS = 23
 GLOBAL_SCALAR_DIM = 19  # 12 base + own_working_harv, Δti_collected, Δax_collected, Δcore_hp, Δworking_harv, flow_reward, delivery_reward
 UNIT_CONTEXT_DIM = 7  # x_norm, y_norm, core_dx, core_dy, ecore_dx, ecore_dy, unit_age
+<<<<<<< Updated upstream
 CRITIC_BATCHES_PER_EPOCH = 8
 _NCU_CRITIC_BATCH_INDEX = int(os.environ.get("CB_NCU_CRITIC_BATCH_INDEX", "-1"))
 _NCU_CRITIC_EPOCH_INDEX = int(os.environ.get("CB_NCU_CRITIC_EPOCH_INDEX", "0"))
+=======
+CENTRALIZED_CNN_CHUNK = 2048
+>>>>>>> Stashed changes
 CRITIC_SUMMARY_DIM = 64
 CRITIC_STAGE_A_DIM = 64
 CRITIC_STAGE_B_DIM = 96
@@ -2500,7 +2564,11 @@ class GraphedInference:
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
             with torch.no_grad():
+<<<<<<< Updated upstream
                 bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, s_h = self._model.infer_packed(self._static_input)
+=======
+                bt_l, bd_l, cd_l, brt_l, md_l, eps, s_h = self._model.infer_packed(self._static_input)
+>>>>>>> Stashed changes
                 obs = self._static_input[:, :OBS_SIZE]
 
                 ti = obs[:, _OBS_TI] * 500.0
@@ -2539,6 +2607,7 @@ class GraphedInference:
 
                 bt_l.masked_fill_(~bt_m, -1e9)
                 cd_l.masked_fill_(~cd_mask, -1e9)
+<<<<<<< Updated upstream
                 bt_l = _temperature_scaled_log_probs(
                     bt_l,
                     bt_m,
@@ -2553,10 +2622,36 @@ class GraphedInference:
                     brt_l,
                     temperature=head_temperature[:, 3] * self._temperature,
                 )
+=======
+
+                # Apply external temperature scaling for Gumbel-max sampling
+                _T = self._temperature
+                if _T != 1.0:
+                    bt_l = bt_l / _T
+                    cd_l = cd_l / _T
+
+                bt_l = _unimix_logits(bt_l, bt_m, eps[:, 0])
+                cd_l = _unimix_logits(cd_l, cd_mask, eps[:, 2])
+                brt_l = _unimix_logits(brt_l, eps=eps[:, 3])
+>>>>>>> Stashed changes
 
                 static_g_bt.exponential_()
                 s_bt_act = (bt_l - static_g_bt.log_()).argmax(dim=-1)
 
+<<<<<<< Updated upstream
+=======
+                harv_rows = s_bt_act == HARVESTER_BUILD_TYPE
+                bd_m_final = torch.where(harv_rows.unsqueeze(1), harv_bd_m, bd_m)
+                bd_l.masked_fill_(~bd_m_final, -1e9)
+                if _T != 1.0:
+                    bd_l = bd_l / _T
+                    md_l = md_l / _T
+
+                bd_l = _unimix_logits(bd_l, bd_m_final, eps[:, 1])
+                md_l = _unimix_logits(md_l, eps=eps[:, 4])
+
+                static_g_bd.exponential_()
+>>>>>>> Stashed changes
                 static_g_cd.exponential_()
                 static_g_brt.exponential_()
                 static_g_md.exponential_()
@@ -2577,6 +2672,7 @@ class GraphedInference:
                         (s_bt_act == CONVEYOR_BUILD_TYPES[0])
                         | (s_bt_act == CONVEYOR_BUILD_TYPES[1])
                         | (s_bt_act == CONVEYOR_BUILD_TYPES[2])
+<<<<<<< Updated upstream
                     )
                     brt_causal = s_bt_act == BRIDGE_BUILD_TYPE
                     s_lp = _compose_action_log_prob(
@@ -2588,6 +2684,11 @@ class GraphedInference:
                         cd_causal=cd_causal,
                         brt_causal=brt_causal,
                     )
+=======
+                    ).float()
+                    brt_causal = (s_bt_act == BRIDGE_BUILD_TYPE).float()
+                    s_lp = s_bt_lp + s_bd_lp * bd_causal + s_cd_lp * cd_causal + s_md_lp
+>>>>>>> Stashed changes
 
         self._s_bt_act = s_bt_act
         self._s_bd_act = s_bd_act
@@ -2598,6 +2699,7 @@ class GraphedInference:
         self._s_h = s_h
 
     @torch.no_grad()
+<<<<<<< Updated upstream
     def policy_heads(
         self,
         trunk_in: torch.Tensor,
@@ -2635,10 +2737,16 @@ class GraphedInference:
     ):
         """Run graphed inference. Returns (bt, bd, cd, brt, md, lp, h_next) sliced to B."""
         B = trunk_in.shape[0]
+=======
+    def __call__(self, trunk_in: torch.Tensor):
+        """Run graphed inference. Returns (bt, bd, cd, brt, md, lp, h_next) sliced to B."""
+        B = trunk_in.shape[0]
+>>>>>>> Stashed changes
         if self._graph is not None:
             self._static_input[:B].copy_(trunk_in)
             if B < self.max_batch:
                 self._static_input[B:].zero_()
+<<<<<<< Updated upstream
             with trace_scope(trace, f"{scope_prefix}.forward"):
                 self._graph.replay()
             if not self._graph_sampling:
@@ -2662,12 +2770,16 @@ class GraphedInference:
                         temperature=self._temperature,
                         return_log_prob=self._return_log_prob,
                     )
+=======
+            self._graph.replay()
+>>>>>>> Stashed changes
             return (
                 self._s_bt_act[:B], self._s_bd_act[:B], self._s_cd_act[:B],
                 self._s_brt_act[:B], self._s_md_act[:B],
                 self._s_lp[:B] if self._s_lp is not None else None,
                 self._s_h[:B],
             )
+<<<<<<< Updated upstream
         obs = trunk_in[:, :OBS_SIZE]
         bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_next = self.policy_heads(
             trunk_in,
@@ -2687,6 +2799,39 @@ class GraphedInference:
                 temperature=self._temperature,
                 return_log_prob=self._return_log_prob,
             )
+=======
+        # Ungraphed fallback
+        obs = trunk_in[:, :OBS_SIZE]
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next = self._model.infer_packed(trunk_in)
+        bt_m, bd_m = compute_action_masks(obs)
+        cd_m = conveyor_dir_mask(obs.device, B)
+        harv_bd_m = compute_harvester_build_dir_mask(obs, bd_m)
+        bt_m[:, HARVESTER_BUILD_TYPE] &= harv_bd_m.any(dim=1)
+        bt_l = _unimix_logits(bt_l, bt_m, eps[:, 0])
+        bt_act = (bt_l - torch.empty_like(bt_l).exponential_().log_()).argmax(dim=-1)
+        harv_rows = bt_act == HARVESTER_BUILD_TYPE
+        bd_m_final = torch.where(harv_rows.unsqueeze(1), harv_bd_m, bd_m)
+        bd_l = _unimix_logits(bd_l, bd_m_final, eps[:, 1])
+        cd_l = _unimix_logits(cd_l, cd_m, eps[:, 2])
+        brt_l = _unimix_logits(brt_l, eps=eps[:, 3])
+        md_l = _unimix_logits(md_l, eps=eps[:, 4])
+        bd_act = (bd_l - torch.empty_like(bd_l).exponential_().log_()).argmax(dim=-1)
+        cd_act = (cd_l - torch.empty_like(cd_l).exponential_().log_()).argmax(dim=-1)
+        brt_act = (brt_l - torch.empty_like(brt_l).exponential_().log_()).argmax(dim=-1)
+        md_act = (md_l - torch.empty_like(md_l).exponential_().log_()).argmax(dim=-1)
+        lp = None
+        if self._return_log_prob:
+            bt_lp = bt_l.gather(1, bt_act.unsqueeze(1)).squeeze(1)
+            bd_lp = bd_l.gather(1, bd_act.unsqueeze(1)).squeeze(1)
+            cd_lp = cd_l.gather(1, cd_act.unsqueeze(1)).squeeze(1)
+            brt_lp = brt_l.gather(1, brt_act.unsqueeze(1)).squeeze(1)
+            md_lp = md_l.gather(1, md_act.unsqueeze(1)).squeeze(1)
+            bd_causal = (bt_act != 0).float()
+            cd_causal = ((bt_act == CONVEYOR_BUILD_TYPES[0]) | (bt_act == CONVEYOR_BUILD_TYPES[1]) | (bt_act == CONVEYOR_BUILD_TYPES[2])).float()
+            brt_causal = (bt_act == BRIDGE_BUILD_TYPE).float()
+            lp = bt_lp + bd_lp * bd_causal + cd_lp * cd_causal + md_lp
+        return bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next
+>>>>>>> Stashed changes
 
     @property
     def captured(self) -> bool:
@@ -2775,6 +2920,7 @@ class BuilderMLP(nn.Module):
             scale_proj=True,
         )
 
+<<<<<<< Updated upstream
         latent_ffn_hidden = self._actor_latent_dim * 2
         self.latent_ffn_norm = RMSNorm(self._actor_latent_dim)
         self.latent_ffn_out_norm = RMSNorm(self._actor_latent_dim)
@@ -2795,6 +2941,17 @@ class BuilderMLP(nn.Module):
         self.head_h_cand = _ortho_init(nn.Linear(self._recurrent_input_dim, H_DIM), std=0.01)
 
         self.register_buffer("_tile_dxdy", _TILE_DXDY.clone())
+=======
+        # Policy heads: small std for near-uniform initial policy
+        self.head_build_type = _ortho_init(nn.Linear(prev, N_BUILD), std=0.01)
+        self.head_build_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
+        self.head_conv_dir = _ortho_init(nn.Linear(prev, N_CONV_DIR), std=0.01)
+        self.head_bridge_target = _ortho_init(nn.Linear(prev, N_BRIDGE_TARGETS), std=0.01)
+        self.head_move_dir = _ortho_init(nn.Linear(prev, N_DIR), std=0.01)
+        self.head_logit_scale = _ortho_init(nn.Linear(prev, N_LOGIT_SCALE), std=0.01)
+        self.head_h_gate = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wz: update gate
+        self.head_h_cand = _ortho_init(nn.Linear(prev, H_DIM), std=0.01)  # Wh: candidate
+>>>>>>> Stashed changes
 
         with torch.no_grad():
             trunc_normal_(self.actor_cls, std=0.02)
@@ -2925,6 +3082,7 @@ class BuilderMLP(nn.Module):
 
     def _project_policy_heads(
         self,
+<<<<<<< Updated upstream
         latent: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.training:
@@ -2961,10 +3119,44 @@ class BuilderMLP(nn.Module):
                     self.head_bridge_target.bias,
                     self.head_move_dir.bias,
                     self.head_temperature.bias,
+=======
+        h: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project latent to policy heads and per-head learned eps."""
+        # Fuse head matmuls into one kernel launch
+        # Cache fused weights in eval mode (inference hot path)
+        if self.training:
+            combined_w = torch.cat([
+                self.head_build_type.weight, self.head_build_dir.weight,
+                self.head_conv_dir.weight, self.head_bridge_target.weight,
+                self.head_move_dir.weight, self.head_logit_scale.weight,
+                self.head_h_gate.weight, self.head_h_cand.weight,
+            ], dim=0)
+            combined_b = torch.cat([
+                self.head_build_type.bias, self.head_build_dir.bias,
+                self.head_conv_dir.bias, self.head_bridge_target.bias,
+                self.head_move_dir.bias, self.head_logit_scale.bias,
+                self.head_h_gate.bias, self.head_h_cand.bias,
+            ])
+        else:
+            if not hasattr(self, '_cached_head_w') or self._cached_head_w is None:
+                self._cached_head_w = torch.cat([
+                    self.head_build_type.weight, self.head_build_dir.weight,
+                    self.head_conv_dir.weight, self.head_bridge_target.weight,
+                    self.head_move_dir.weight, self.head_logit_scale.weight,
+                    self.head_h_gate.weight, self.head_h_cand.weight,
+                ], dim=0)
+                self._cached_head_b = torch.cat([
+                    self.head_build_type.bias, self.head_build_dir.bias,
+                    self.head_conv_dir.bias, self.head_bridge_target.bias,
+                    self.head_move_dir.bias, self.head_logit_scale.bias,
+                    self.head_h_gate.bias, self.head_h_cand.bias,
+>>>>>>> Stashed changes
                 ])
             combined_w = self._cached_action_head_w
             combined_b = self._cached_action_head_b
 
+<<<<<<< Updated upstream
         combined = F.linear(latent, combined_w, combined_b)
         bt_l, bd_l, cd_l, brt_l, md_l, temp_raw = combined.split(
             [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, N_ACTION_TEMPERATURES],
@@ -2973,6 +3165,17 @@ class BuilderMLP(nn.Module):
         log_temp = torch.sigmoid(temp_raw) * (math.log(TEMP_MAX) - math.log(TEMP_MIN)) + math.log(TEMP_MIN)
         head_temperature = log_temp.exp()
         return bt_l, bd_l, cd_l, brt_l, md_l, head_temperature
+=======
+        combined = F.linear(h, combined_w, combined_b)
+        bt_l, bd_l, cd_l, brt_l, md_l, eps_raw, h_gate, h_cand = combined.split(
+            [N_BUILD, N_DIR, N_CONV_DIR, N_BRIDGE_TARGETS, N_DIR, N_LOGIT_SCALE, H_DIM, H_DIM],
+            dim=-1,
+        )
+        # Per-head learned eps: sigmoid → [EPS_MIN, EPS_MAX]
+        # eps_raw is (B, 5) — one per head: bt, bd, cd, brt, md
+        eps = torch.sigmoid(eps_raw) * (EPS_MAX - EPS_MIN) + EPS_MIN
+        return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand
+>>>>>>> Stashed changes
 
     def _project_recurrent_heads(
         self,
@@ -2992,10 +3195,17 @@ class BuilderMLP(nn.Module):
 
     def forward(self, x, h_prev):
         obs_pre = self._obs_encoder_pre(x)
+<<<<<<< Updated upstream
         bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
         z = torch.sigmoid(h_gate)
         h_next = (1.0 - z) * h_prev + z * h_cand
         return bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_next
+=======
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
+        z = torch.sigmoid(h_gate)
+        h_next = (1.0 - z) * h_prev + z * h_cand
+        return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next
+>>>>>>> Stashed changes
 
     @torch.no_grad()
     def mu_center_policy_heads(self) -> None:
@@ -3023,6 +3233,7 @@ class BuilderMLP(nn.Module):
         obs = packed[:, :OBS_SIZE]
         h_prev = packed[:, OBS_SIZE:]
         obs_pre = self._obs_encoder_pre(obs)
+<<<<<<< Updated upstream
         bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
         z = torch.sigmoid(h_gate)
         h_next = (1.0 - z) * h_prev + z * h_cand
@@ -3071,6 +3282,24 @@ class BuilderMLP(nn.Module):
             ("param", self.tile_sa_pos_weight),
             ("param", self.tile_sa_lookaway),
             ("norm", self.tile_sa_q_norm),
+=======
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = self._forward_from_obs_pre(obs_pre, h_prev)
+        z = torch.sigmoid(h_gate)
+        h_next = (1.0 - z) * h_prev + z * h_cand
+        return bt_l, bd_l, cd_l, brt_l, md_l, eps, h_next
+
+    def _policy_state_modules(self) -> list[nn.Module]:
+        """Policy modules only in tensor_lib serialization order (critic excluded)."""
+        tile_modules = [self.tile_linear, self.tile_conv, self.tile_pointwise, self.tile_rms]
+        compress_modules = [m for m in self.tile_compress if isinstance(m, (nn.Linear, RMSNorm))]
+        enc_modules = [m for m in self.encoder if isinstance(m, (nn.Linear, RMSNorm))]
+        actor_modules = [m for m in self.actor_trunk if isinstance(m, (nn.Linear, RMSNorm))]
+        return tile_modules + compress_modules + enc_modules + actor_modules + [
+            self.head_build_type, self.head_build_dir, self.head_conv_dir,
+            self.head_bridge_target, self.head_move_dir,
+            self.head_logit_scale,
+            self.head_h_gate, self.head_h_cand,
+>>>>>>> Stashed changes
         ]
 
     def export_weights(self) -> list[list[float]]:
@@ -3401,6 +3630,7 @@ def _recurrent_logprob_pass(
     log_probs = torch.empty(B, K_max, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
+<<<<<<< Updated upstream
     step_fn = _get_logprob_step_fn()
     with autocast_context(_get_actor_cuda_config()):
         for t in range(K_max):
@@ -3409,6 +3639,23 @@ def _recurrent_logprob_pass(
                 bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
                 bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
             )
+=======
+    for t in range(K_max):
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
+        z = torch.sigmoid(h_gate)
+        h_t = (1.0 - z) * h_t + z * h_cand
+
+        bt_l = bt_l.masked_fill(~bt_mask[:, t], -1e9)
+        bd_l = bd_l.masked_fill(~bd_mask[:, t], -1e9)
+        cd_l = cd_l.masked_fill(~cd_mask, -1e9)
+
+        bt_lp = _unimix_logits(bt_l, bt_mask[:, t], eps[:, 0]).gather(1, bt_act[:, t].unsqueeze(1)).squeeze(1)
+        bd_lp = _unimix_logits(bd_l, bd_mask[:, t], eps[:, 1]).gather(1, bd_act[:, t].unsqueeze(1)).squeeze(1)
+        cd_lp = _unimix_logits(cd_l, cd_mask, eps[:, 2]).gather(1, cd_act[:, t].unsqueeze(1)).squeeze(1)
+        brt_lp = _unimix_logits(brt_l, eps=eps[:, 3]).gather(1, brt_act[:, t].unsqueeze(1)).squeeze(1)
+        md_lp = _unimix_logits(md_l, eps=eps[:, 4]).gather(1, md_act[:, t].unsqueeze(1)).squeeze(1)
+        log_probs[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
+>>>>>>> Stashed changes
 
     return log_probs
 
@@ -3532,6 +3779,7 @@ def _recurrent_actor_pass(
     all_temperatures = torch.empty(B, K_max, N_ACTION_TEMPERATURES, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
+<<<<<<< Updated upstream
     step_fn = _get_actor_step_fn()
     with autocast_context(_get_actor_cuda_config()):
         for t in range(K_max):
@@ -3542,6 +3790,29 @@ def _recurrent_actor_pass(
             )
 
     return new_lps, entropies, all_temperatures
+=======
+    for t in range(K_max):
+        bt_l, bd_l, cd_l, brt_l, md_l, eps, h_gate, h_cand = model._forward_from_obs_pre(obs_pre[:, t], h_t)
+        z = torch.sigmoid(h_gate)
+        h_t = (1.0 - z) * h_t + z * h_cand
+
+        bt_l = bt_l.masked_fill(~bt_mask[:, t], -1e9)
+        bd_l = bd_l.masked_fill(~bd_mask[:, t], -1e9)
+        cd_l = cd_l.masked_fill(~cd_mask, -1e9)
+
+        bt_lp, bt_ent = action_log_prob_and_entropy(bt_l, bt_act[:, t], bt_mask[:, t], eps[:, 0])
+        bd_lp, bd_ent = action_log_prob_and_entropy(bd_l, bd_act[:, t], bd_mask[:, t], eps[:, 1])
+        cd_lp, cd_ent = action_log_prob_and_entropy(cd_l, cd_act[:, t], cd_mask, eps[:, 2])
+        brt_lp, brt_ent = action_log_prob_and_entropy(brt_l, brt_act[:, t], eps=eps[:, 3])
+        md_lp, md_ent = action_log_prob_and_entropy(md_l, md_act[:, t], eps=eps[:, 4])
+        brt_causal = (bt_act[:, t] == BRIDGE_BUILD_TYPE).float()
+
+        new_lps[:, t] = bt_lp + bd_lp * bd_causal[:, t] + cd_lp * cd_causal[:, t] + md_lp
+        entropies[:, t] = bt_ent + bd_ent * bd_causal[:, t] + cd_ent * cd_causal[:, t] + md_ent
+        all_eps[:, t] = eps
+
+    return new_lps, entropies, all_eps
+>>>>>>> Stashed changes
 
 
 def _sequential_logprobs(
@@ -3658,7 +3929,10 @@ def ppo_update(
     trace=None,
     bptt_chunks: list[tuple[int, int]] | None = None,
     freeze_critic: bool = False,
+<<<<<<< Updated upstream
     use_pmpo: bool = False,
+=======
+>>>>>>> Stashed changes
 ) -> dict[str, float]:
     """PPO update with truncated BPTT for recurrent hidden state.
 
@@ -3757,6 +4031,7 @@ def ppo_update(
                     idx_grid = (chunk_starts.unsqueeze(1) + t_range).clamp(max=N - 1)
                     flat_idx = idx_grid.reshape(-1)
 
+<<<<<<< Updated upstream
                     if obs_pre_all is None:
                         all_obs_pre = model._obs_encoder_pre(obs[flat_idx]).reshape(B, K_max, -1)
                     else:
@@ -3788,6 +4063,38 @@ def ppo_update(
                     )
                     if profile is not None:
                         profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
+=======
+                all_obs_pre = model._obs_encoder_pre(obs[flat_idx]).reshape(B, K_max, -1)
+                all_bt = bt_act[flat_idx].reshape(B, K_max)
+                all_bd = bd_act[flat_idx].reshape(B, K_max)
+                all_cd = cd_act[flat_idx].reshape(B, K_max)
+                all_brt = brt_act[flat_idx].reshape(B, K_max)
+                all_md = md_act[flat_idx].reshape(B, K_max)
+                all_old_lp = old_log_probs[flat_idx].reshape(B, K_max)
+                all_adv = advantages[flat_idx].reshape(B, K_max)
+                all_bt_mask = bt_mask_all[flat_idx].reshape(B, K_max, -1)
+                all_bd_mask = bd_mask_all[flat_idx].reshape(B, K_max, -1)
+                all_bd_causal = bd_causal_all[flat_idx].reshape(B, K_max)
+                all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
+
+                t_phase = time.perf_counter() if profile is not None else 0.0
+                new_lps, entropies, batch_eps = _recurrent_actor_pass(
+                    model,
+                    all_obs_pre,
+                    h[chunk_starts].detach(),
+                    all_bt,
+                    all_bd,
+                    all_cd,
+                    all_brt,
+                    all_md,
+                    all_bt_mask,
+                    all_bd_mask,
+                    all_bd_causal,
+                    all_cd_causal,
+                )
+                if profile is not None:
+                    profile["ppo_forward_s"] = profile.get("ppo_forward_s", 0.0) + (time.perf_counter() - t_phase)
+>>>>>>> Stashed changes
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     valid_mask = t_range < chunk_lens.unsqueeze(1)
@@ -3863,6 +4170,7 @@ def ppo_update(
     # Always run full ppo_epochs for critic regardless of actor early stopping —
     # critic has its own loss landscape and benefits from more updates.
     n_critic_updates = 0
+<<<<<<< Updated upstream
     critic_epochs = 0 if freeze_critic else ppo_epochs
     if critic_epochs > 0:
         critic, critic_opt = get_centralized_critic()
@@ -3870,6 +4178,13 @@ def ppo_update(
         critic_cuda_cfg = _get_critic_cuda_config()
         critic.train()
         critic_minibatch_size = _resolve_critic_minibatch_size(N)
+=======
+    critic_epochs = 0 if freeze_critic else (actor_epochs_ran if actor_stopped_early else ppo_epochs)
+    for epoch in range(critic_epochs):
+        perm = torch.randperm(N, device=obs.device)
+        for start in range(0, N, minibatch_size):
+            idx = perm[start:start + minibatch_size]
+>>>>>>> Stashed changes
 
         step_round_idx = centralized_data["step_round_idx"]
 
@@ -4054,7 +4369,11 @@ def _parse_trajectories(
     bt_t = torch.empty(N, dtype=torch.long)
     bd_t = torch.empty(N, dtype=torch.long)
     cd_t = torch.empty(N, dtype=torch.long)
+<<<<<<< Updated upstream
     brt_t = torch.empty(N, dtype=torch.long)
+=======
+    brt_t = torch.zeros(N, dtype=torch.long)
+>>>>>>> Stashed changes
     md_t = torch.empty(N, dtype=torch.long)
     lp_t = torch.empty(N, dtype=torch.float32)
     rw_t = torch.empty(N, dtype=torch.float32)
@@ -4074,6 +4393,7 @@ def _parse_trajectories(
                 ep_boundaries.append((start, end))
                 continue
 
+<<<<<<< Updated upstream
             if not all(isinstance(step, TrajectoryStep) for step in traj):
                 bad_type = type(next(step for step in traj if not isinstance(step, TrajectoryStep))).__name__
                 raise TypeError(f"Expected TrajectoryStep in trajectory, got {bad_type}")
@@ -4098,6 +4418,104 @@ def _parse_trajectories(
                 rw_t[start:end] = torch.as_tensor(rws, dtype=torch.float32)
             else:
                 rw_t[start:end] = 0.0
+=======
+            step0 = traj[0]
+            if isinstance(step0, (list, tuple)) and all(isinstance(step, (list, tuple)) for step in traj):
+                obs0 = step0[0]
+                h0 = step0[1]
+                if isinstance(obs0, (bytes, bytearray, memoryview)) and isinstance(h0, (bytes, bytearray, memoryview)):
+                    obs_blob = b"".join(bytes(step[0]) for step in traj)
+                    h_blob = b"".join(bytes(step[1]) for step in traj)
+                    obs_t[start:end] = torch.frombuffer(
+                        memoryview(obs_blob), dtype=torch.float32,
+                    ).reshape(traj_len, OBS_SIZE)
+                    h_t[start:end] = torch.frombuffer(
+                        memoryview(h_blob), dtype=torch.float32,
+                    ).reshape(traj_len, H_DIM)
+                else:
+                    obs_t[start:end] = torch.as_tensor([step[0] for step in traj], dtype=torch.float32)
+                    h_t[start:end] = torch.as_tensor([step[1] for step in traj], dtype=torch.float32)
+                lengths = [len(step) for step in traj]
+                bt_t[start:end] = torch.as_tensor([step[2] for step in traj], dtype=torch.long)
+                bd_t[start:end] = torch.as_tensor([step[3] for step in traj], dtype=torch.long)
+
+                if all(n > 12 for n in lengths):
+                    cd_t[start:end] = torch.as_tensor([step[4] for step in traj], dtype=torch.long)
+                    md_t[start:end] = torch.as_tensor([step[5] for step in traj], dtype=torch.long)
+                    n_working_t = torch.as_tensor([step[7] if len(step) > 7 else 0 for step in traj], dtype=torch.float32)
+                    dmg_t = torch.as_tensor([step[11] if len(step) > 11 else 0.0 for step in traj], dtype=torch.float32)
+                    lp_t[start:end] = torch.as_tensor([step[12] if len(step) > 12 else 0.0 for step in traj], dtype=torch.float32)
+                    own_dmg_t = torch.as_tensor([step[21] if len(step) > 21 else 0.0 for step in traj], dtype=torch.float32)
+                    if all(n > 22 for n in lengths):
+                        brt_t[start:end] = torch.as_tensor([step[22] for step in traj], dtype=torch.long)
+                else:
+                    cd_t[start:end] = torch.as_tensor([step[3] for step in traj], dtype=torch.long)
+                    md_t[start:end] = torch.as_tensor([step[4] for step in traj], dtype=torch.long)
+                    n_working_t = torch.as_tensor([step[6] if len(step) > 6 else 0 for step in traj], dtype=torch.float32)
+                    dmg_t = torch.as_tensor([step[10] if len(step) > 10 else 0.0 for step in traj], dtype=torch.float32)
+                    lp_t[start:end] = torch.as_tensor([step[11] if len(step) > 11 else 0.0 for step in traj], dtype=torch.float32)
+                    own_dmg_t = torch.zeros(traj_len, dtype=torch.float32)
+            elif isinstance(step0, dict) and all(isinstance(step, dict) for step in traj):
+                obs_t[start:end] = torch.as_tensor([step["obs"] for step in traj], dtype=torch.float32)
+                h_t[start:end] = torch.as_tensor([step["h_prev"] for step in traj], dtype=torch.float32)
+                bt_t[start:end] = torch.as_tensor([step["bt"] for step in traj], dtype=torch.long)
+                bd_t[start:end] = torch.as_tensor([step["bd"] for step in traj], dtype=torch.long)
+                cd_t[start:end] = torch.as_tensor([step.get("cd", step["bd"]) for step in traj], dtype=torch.long)
+                brt_t[start:end] = torch.as_tensor([step.get("brt", 0) for step in traj], dtype=torch.long)
+                md_t[start:end] = torch.as_tensor([step["md"] for step in traj], dtype=torch.long)
+                n_working_t = torch.as_tensor(
+                    [step.get("n_working", 0) for step in traj],
+                    dtype=torch.float32,
+                )
+                dmg_t = torch.as_tensor([step.get("dmg", 0.0) for step in traj], dtype=torch.float32)
+                own_dmg_t = torch.as_tensor([step.get("own_dmg", 0.0) for step in traj], dtype=torch.float32)
+                lp_t[start:end] = torch.as_tensor([step.get("old_lp", 0.0) for step in traj], dtype=torch.float32)
+            else:
+                for offset, step in enumerate(traj):
+                    i = start + offset
+                    if isinstance(step, (list, tuple)):
+                        n = len(step)
+                        obs_t[i] = torch.as_tensor(step[0], dtype=torch.float32)
+                        h_t[i] = torch.as_tensor(step[1], dtype=torch.float32)
+                        bt_t[i] = step[2]
+                        bd_t[i] = step[3]
+                        if n > 12:
+                            cd_t[i] = step[4]
+                            md_t[i] = step[5]
+                            n_working = step[7] if n > 7 else 0
+                            dmg = step[11] if n > 11 else 0.0
+                            lp_t[i] = step[12] if n > 12 else 0.0
+                            own_dmg = step[21] if n > 21 else 0.0
+                            if n > 22:
+                                brt_t[i] = step[22]
+                        else:
+                            cd_t[i] = step[3]
+                            md_t[i] = step[4]
+                            n_working = step[6] if n > 6 else 0
+                            dmg = step[10] if n > 10 else 0.0
+                            lp_t[i] = step[11] if n > 11 else 0.0
+                            own_dmg = 0.0
+                    else:
+                        obs_t[i] = torch.as_tensor(step["obs"], dtype=torch.float32)
+                        h_t[i] = torch.as_tensor(step["h_prev"], dtype=torch.float32)
+                        bt_t[i] = step["bt"]
+                        bd_t[i] = step["bd"]
+                        cd_t[i] = step.get("cd", step["bd"])
+                        brt_t[i] = step.get("brt", 0)
+                        md_t[i] = step["md"]
+                        n_working = step.get("n_working", 0)
+                        dmg = step.get("dmg", 0)
+                        own_dmg = step.get("own_dmg", 0)
+                        lp_t[i] = step.get("old_lp", 0)
+                    rw_t[i] = n_working * REWARD_BUILD_CREDIT
+                step_game_t[start:end] = game_idx
+                idx = end
+                ep_boundaries.append((start, end))
+                continue
+
+            rw_t[start:end] = n_working_t * REWARD_BUILD_CREDIT
+            step_game_t[start:end] = game_idx
+>>>>>>> Stashed changes
             idx = end
             ep_boundaries.append((start, end))
     finally:
@@ -4137,6 +4555,7 @@ def _parse_trajectories(
         rw_t = rw_t.pin_memory()
     _nb = _pin  # non_blocking only safe with pinned memory
     result = {
+<<<<<<< Updated upstream
         "obs": obs_t.to(DEVICE, non_blocking=_nb),
         "h": h_t.to(DEVICE, non_blocking=_nb),
         "bt": bt_t.to(DEVICE, non_blocking=_nb),
@@ -4146,6 +4565,17 @@ def _parse_trajectories(
         "md": md_t.to(DEVICE, non_blocking=_nb),
         "old_log_probs": lp_t.to(DEVICE, non_blocking=_nb),
         "rewards": rw_t.to(DEVICE, non_blocking=_nb),
+=======
+        "obs": obs_t.to(DEVICE),
+        "h": h_t.to(DEVICE),
+        "bt": bt_t.to(DEVICE),
+        "bd": bd_t.to(DEVICE),
+        "cd": cd_t.to(DEVICE),
+        "brt": brt_t.to(DEVICE),
+        "md": md_t.to(DEVICE),
+        "old_log_probs": lp_t.to(DEVICE),
+        "rewards": rw_t.to(DEVICE),
+>>>>>>> Stashed changes
         "ep_boundaries": ep_boundaries,
         "n_steps": N,
     }
@@ -4226,8 +4656,32 @@ def _build_centralized_critic_data(
         if cached is None:
             gs_map_w = gs.get("map_w", max_w)
             gs_map_h = gs.get("map_h", max_h)
+<<<<<<< Updated upstream
             states_buf = load_torch_replay_buffer(gs, STATE_BUFFER)
             scalars_buf_raw = load_torch_replay_buffer(gs, SCALAR_BUFFER)
+=======
+            states_buf = gs.get("states_buf")
+            if states_buf is None and gs.get("states_path"):
+                try:
+                    states_buf = Path(gs["states_path"]).read_bytes()
+                except OSError:
+                    pass
+            scalars_buf_raw = gs.get("scalars_buf")
+            if scalars_buf_raw is None and gs.get("scalars_path"):
+                try:
+                    scalars_buf_raw = Path(gs["scalars_path"]).read_bytes()
+                except OSError:
+                    pass
+            transfer_buf = gs.get("transfer_events_buf")
+            if transfer_buf is None and gs.get("transfer_events_path"):
+                try:
+                    transfer_buf = Path(gs["transfer_events_path"]).read_bytes()
+                except OSError:
+                    pass
+            gs["states_buf"] = states_buf
+            gs["scalars_buf"] = scalars_buf_raw
+            gs["transfer_events_buf"] = transfer_buf
+>>>>>>> Stashed changes
 
             if states_buf is not None:
                 import struct
@@ -4742,6 +5196,7 @@ def train_on_trajectories(
 
     bptt_k = int(ppo_kwargs.get("bptt_k", BPTT_K))
     bptt_chunks = _build_bptt_chunks(data["ep_boundaries"], bptt_k)
+<<<<<<< Updated upstream
     old_log_probs = data["old_log_probs"]
 
     # Hand obs / obs_pre ownership to the ppo_update call via the shared data
@@ -4776,6 +5231,31 @@ def train_on_trajectories(
     data.pop("step_actor_latent", None)
     stats["n_steps"] = n_steps
     stats["reward_raw_std"] = reward_std.item()
+=======
+    with torch.no_grad():
+        data["old_log_probs"] = _sequential_logprobs(
+            model, obs, h,
+            data["bt"], data["bd"], data["cd"], data["brt"], data["md"],
+            bptt_chunks,
+            bptt_k=bptt_k,
+        )
+    if profile is not None:
+        profile["recompute_lp_s"] = time.perf_counter() - t_phase
+
+    stats = ppo_update(
+        model, optimizer,
+        obs, h, data["bt"], data["bd"], data["cd"], data["brt"], data["md"],
+        data["old_log_probs"], advantages, returns,
+        old_values=values,
+        centralized_data=data,
+        ep_boundaries=data["ep_boundaries"],
+        bptt_chunks=bptt_chunks,
+        profile=ppo_profile,
+        **ppo_kwargs,
+    )
+    stats["n_steps"] = data["n_steps"]
+    stats["reward_raw_std"] = data["rewards"].std().item()
+>>>>>>> Stashed changes
     return stats
 
 
@@ -4801,9 +5281,15 @@ def distill(
     # Get teacher logits (no grad needed)
     t_bt, t_bd, t_cd, t_md = [], [], [], []
     with torch.no_grad():
+<<<<<<< Updated upstream
         for i in range(0, N, 4096):
             packed = torch.cat([obs[i:i + 4096], h[i:i + 4096]], dim=-1)
             bt_l, bd_l, cd_l, _brt_l, md_l, _head_temperature, _ = teacher.infer_packed(packed)
+=======
+        for i in range(0, N, 8192):
+            packed = torch.cat([obs[i:i + 8192], h[i:i + 8192]], dim=-1)
+            bt_l, bd_l, cd_l, _brt_l, md_l, _eps, _ = teacher.infer_packed(packed)
+>>>>>>> Stashed changes
             t_bt.append(bt_l)
             t_bd.append(bd_l)
             t_cd.append(cd_l)

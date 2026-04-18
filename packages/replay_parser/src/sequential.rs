@@ -1,8 +1,8 @@
 //! Sequential behavioral-cloning extraction from replays.
 //!
 //! Processes a replay turn-by-turn, emitting one observation+action sample per
-//! builder bot per turn. Observations are encoded from pre-turn state; actions
-//! are merged from all events in the turn.
+//! builder bot per turn. Within each turn, events are processed incrementally
+//! so that each bot's observation reflects state changes from earlier bots.
 
 use std::collections::HashMap;
 
@@ -168,7 +168,7 @@ fn encode_local_obs(
     prev_own_ax_collected: i32,
     pos_buildings: &HashMap<(i32, i32), i32>,
     pos_bots: &HashMap<(i32, i32), i32>,
-    n_team_buildings: i32,
+    scale_milli: i32,
 ) {
     let bx = bot.x;
     let by = bot.y;
@@ -236,16 +236,25 @@ fn encode_local_obs(
     let g = BC_GLOBAL_OBS_START;
     let own = &player_res[team_idx];
     obs[g] = turn_idx as f32 / 2000.0;
-    obs[g + 1] = bx as f32 / map_w.max(1) as f32;
-    obs[g + 2] = by as f32 / map_h.max(1) as f32;
+    let cc = core_center[team_idx];
+    obs[g + 1] = (bx - cc.0) as f32 / map_w.max(1) as f32;
+    obs[g + 2] = (by - cc.1) as f32 / map_h.max(1) as f32;
     obs[g + 3] = own.titanium as f32 / 500.0;
     obs[g + 4] = own.axionite as f32 / 500.0;
-    let scale_pct = 100.0 + 5.0 * n_team_buildings as f32;
+    let scale_pct = (1000 + scale_milli) as f32 / 10.0;
     obs[g + 5] = scale_pct / 500.0;
 
+<<<<<<< Updated upstream
     let cc = core_center[team_idx];
     obs[g + 6] = (cc.0 - bx) as f32;
     obs[g + 7] = (cc.1 - by) as f32;
+=======
+    let cdx = cc.0 - bx;
+    let cdy = cc.1 - by;
+    let cmax = cdx.abs().max(cdy.abs()).max(1);
+    obs[g + 6] = cdx as f32 / cmax as f32;
+    obs[g + 7] = cdy as f32 / cmax as f32;
+>>>>>>> Stashed changes
 
     let ec = core_center[enemy_idx];
     obs[g + 8] = (ec.0 - bx) as f32;
@@ -256,15 +265,24 @@ fn encode_local_obs(
     obs[g + 12] = (own.axionite_collected - prev_own_ax_collected) as f32 / 500.0;
     obs[g + 13] = (core_hp[team_idx] - core_hp[enemy_idx]) as f32 / 500.0;
     obs[g + 14] = spawn_round as f32 / 2000.0;
+<<<<<<< Updated upstream
     obs[g + 15] = 1.0; // core_known (always true in replay data)
     obs[g + 16] = 1.0; // ecore_known (always true in replay data)
     obs[g + 17] = map_w as f32 / 50.0;
     obs[g + 18] = map_h as f32 / 50.0;
+=======
+
+    // Positional embedding (8) — core-relative to match bot encoding
+    sinusoidal_pos_embed(
+        bx - cc.0,
+        by - cc.1,
+        &mut obs[g + BC_GLOBAL_FEATURES..g + BC_GLOBAL_FEATURES + BC_POS_EMBED_DIM],
+    );
+>>>>>>> Stashed changes
 }
 
 // ── Per-turn pending action ──────────────────────────────────────────────
 
-#[derive(Default)]
 struct PendingBotAction {
     build_type: u8,
     build_dir: u8,
@@ -274,30 +292,255 @@ struct PendingBotAction {
     has_action: bool,
 }
 
-struct DeferredMove {
+impl Default for PendingBotAction {
+    fn default() -> Self {
+        Self {
+            build_type: 0,
+            build_dir: 4,
+            conv_dir: 0,
+            bridge_target: 0,
+            move_dir: 4,
+            has_action: false,
+        }
+    }
+}
+
+// ── Incremental state mutation helpers ──────────────────────────────────
+
+/// Apply a single entity placement to the world state.
+#[inline]
+fn apply_place(
+    ent: Entity,
+    entities: &mut HashMap<i32, Entity>,
+    pos_buildings: &mut HashMap<(i32, i32), i32>,
+    pos_bots: &mut HashMap<(i32, i32), i32>,
+    harv_positions: &mut HashMap<(i32, i32), i32>,
+    scale_milli: &mut i32,
+    team: u8,
+) {
+    let eid = ent.id;
+    if ent.kind == EntityKind::BuilderBot {
+        pos_bots.insert((ent.x, ent.y), eid);
+    } else if ent.kind != EntityKind::Marker {
+        if ent.kind == EntityKind::Harvester {
+            harv_positions.insert((ent.x, ent.y), eid);
+        }
+        pos_buildings.insert((ent.x, ent.y), eid);
+        if ent.team == team {
+            *scale_milli += ent.kind.scale_milli();
+        }
+    }
+    entities.insert(eid, ent);
+}
+
+/// Apply a single entity removal to the world state.
+#[inline]
+fn apply_remove(
+    id: i32,
+    entities: &mut HashMap<i32, Entity>,
+    pos_buildings: &mut HashMap<(i32, i32), i32>,
+    pos_bots: &mut HashMap<(i32, i32), i32>,
+    harv_positions: &mut HashMap<(i32, i32), i32>,
+    scale_milli: &mut i32,
+    team: u8,
+) {
+    if let Some(ent) = entities.remove(&id) {
+        if ent.kind == EntityKind::Harvester {
+            harv_positions.remove(&(ent.x, ent.y));
+        }
+        if ent.kind == EntityKind::BuilderBot {
+            pos_bots.remove(&(ent.x, ent.y));
+        } else if ent.kind != EntityKind::Marker && ent.kind != EntityKind::Core {
+            pos_buildings.remove(&(ent.x, ent.y));
+            if ent.team == team {
+                *scale_milli -= ent.kind.scale_milli();
+            }
+        }
+    }
+}
+
+/// Apply a bot move to the world state.
+#[inline]
+fn apply_move(
     id: i32,
     to_x: i32,
     to_y: i32,
+    entities: &mut HashMap<i32, Entity>,
+    pos_bots: &mut HashMap<(i32, i32), i32>,
+    harv_positions: &mut HashMap<(i32, i32), i32>,
+) {
+    if let Some(ent) = entities.get_mut(&id) {
+        let old_pos = (ent.x, ent.y);
+        ent.x = to_x;
+        ent.y = to_y;
+        if ent.kind == EntityKind::Harvester {
+            harv_positions.remove(&old_pos);
+            harv_positions.insert((to_x, to_y), id);
+        }
+        if ent.kind == EntityKind::BuilderBot {
+            pos_bots.remove(&old_pos);
+            pos_bots.insert((to_x, to_y), id);
+        }
+    }
 }
-struct DeferredPlace {
-    ent: Entity,
+
+/// Apply an HP change to the world state.
+#[inline]
+fn apply_hp(id: i32, delta: i32, entities: &mut HashMap<i32, Entity>, core_hp: &mut [i32; 2]) {
+    if let Some(ent) = entities.get_mut(&id) {
+        ent.hp += delta;
+        if ent.kind == EntityKind::Core {
+            core_hp[ent.team as usize] = ent.hp;
+        }
+    }
 }
-struct DeferredRemove {
-    id: i32,
+
+/// Apply a cooldown change.
+#[inline]
+fn apply_cooldown(id: i32, field: u8, value: i32, entities: &mut HashMap<i32, Entity>) {
+    if let Some(ent) = entities.get_mut(&id) {
+        if field == 0 {
+            ent.action_cooldown = value;
+        } else {
+            ent.move_cooldown = value;
+        }
+    }
 }
-struct DeferredHp {
-    id: i32,
-    delta: i32,
+
+/// Apply resource distribution.
+fn apply_distribute(
+    moves: &[(Pos, Pos)],
+    entities: &mut HashMap<i32, Entity>,
+    harv_positions: &HashMap<(i32, i32), i32>,
+    pos_buildings: &HashMap<(i32, i32), i32>,
+) {
+    for (from, to) in moves {
+        if let Some(&eid) = harv_positions.get(&(from.x, from.y)) {
+            if let Some(ent) = entities.get_mut(&eid) {
+                ent.cooldown = 3;
+            }
+        }
+        let mut moved_res = 1u8;
+        if let Some(&src_id) = pos_buildings.get(&(from.x, from.y)) {
+            if let Some(src) = entities.get_mut(&src_id) {
+                if src.kind.is_storing() {
+                    moved_res = if src.stored > 0 { src.stored } else { 1 };
+                    if src.kind != EntityKind::Harvester {
+                        src.stored = 0;
+                    }
+                }
+            }
+        }
+        if let Some(&dst_id) = pos_buildings.get(&(to.x, to.y)) {
+            if let Some(dst) = entities.get_mut(&dst_id) {
+                if dst.kind.is_storing() {
+                    dst.stored = moved_res;
+                }
+            }
+        }
+    }
 }
-struct DeferredCooldown {
-    id: i32,
-    field: u8,
-    value: i32,
+
+// ── Deferred events that apply at turn end (not per-bot) ────────────────
+
+struct DeferredTurnEnd {
+    distributes: Vec<Vec<(Pos, Pos)>>,
+    player_res: Option<(Option<PlayerRes>, Option<PlayerRes>)>,
+}
+
+// ── Buffered per-bot-group mutations ────────────────────────────────────
+
+struct BotGroupMutations {
+    moves: Vec<(i32, i32, i32)>,    // (id, to_x, to_y)
+    places: Vec<Entity>,
+    removes: Vec<i32>,
+    hp_changes: Vec<(i32, i32)>,    // (id, delta)
+    cooldowns: Vec<(i32, u8, i32)>, // (id, field, value)
+}
+
+impl BotGroupMutations {
+    fn new() -> Self {
+        Self {
+            moves: Vec::new(),
+            places: Vec::new(),
+            removes: Vec::new(),
+            hp_changes: Vec::new(),
+            cooldowns: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.moves.clear();
+        self.places.clear();
+        self.removes.clear();
+        self.hp_changes.clear();
+        self.cooldowns.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.moves.is_empty()
+            && self.places.is_empty()
+            && self.removes.is_empty()
+            && self.hp_changes.is_empty()
+            && self.cooldowns.is_empty()
+    }
+}
+
+/// Flush buffered mutations into the world state.
+#[allow(clippy::too_many_arguments)]
+fn flush_mutations(
+    buf: &mut BotGroupMutations,
+    entities: &mut HashMap<i32, Entity>,
+    pos_buildings: &mut HashMap<(i32, i32), i32>,
+    pos_bots: &mut HashMap<(i32, i32), i32>,
+    harv_positions: &mut HashMap<(i32, i32), i32>,
+    scale_milli: &mut i32,
+    core_hp: &mut [i32; 2],
+    team: u8,
+) {
+    for &(id, to_x, to_y) in &buf.moves {
+        apply_move(id, to_x, to_y, entities, pos_bots, harv_positions);
+    }
+    for ent in buf.places.drain(..) {
+        apply_place(
+            ent,
+            entities,
+            pos_buildings,
+            pos_bots,
+            harv_positions,
+            scale_milli,
+            team,
+        );
+    }
+    for &id in &buf.removes {
+        apply_remove(
+            id,
+            entities,
+            pos_buildings,
+            pos_bots,
+            harv_positions,
+            scale_milli,
+            team,
+        );
+    }
+    for &(id, delta) in &buf.hp_changes {
+        apply_hp(id, delta, entities, core_hp);
+    }
+    for &(id, field, value) in &buf.cooldowns {
+        apply_cooldown(id, field, value, entities);
+    }
+    buf.clear();
 }
 
 // ── Main sequential processor ────────────────────────────────────────────
 
 /// Process replay sequentially, emitting one merged BC sample per bot per turn.
+///
+/// Within each turn, state mutations are applied incrementally between bot
+/// groups so that each bot's observation reflects changes from earlier bots.
+/// Bot group boundaries are detected via SetActionCooldown events — the game
+/// engine emits events in per-bot groups:
+///   [BotOutput] SetActionCooldown PlaceEntity [MoveBuilderBot SetMoveCooldown]
 pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
     let top = decode_fields(data, 0, data.len());
     let map = get_submsg(&top, 1, data)
@@ -338,7 +581,7 @@ pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
     // Maintain position-indexed lookups incrementally across turns
     let mut pos_buildings: HashMap<(i32, i32), i32> = HashMap::new();
     let mut pos_bots: HashMap<(i32, i32), i32> = HashMap::new();
-    let mut n_team_buildings: i32 = 0;
+    let mut scale_milli: i32 = 0;
     for ent in entities.values() {
         match ent.kind {
             EntityKind::BuilderBot => {
@@ -351,11 +594,14 @@ pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
             _ => {
                 pos_buildings.insert((ent.x, ent.y), ent.id);
                 if ent.team == team {
-                    n_team_buildings += 1;
+                    scale_milli += ent.kind.scale_milli();
                 }
             }
         }
     }
+
+    // Reusable buffer for per-bot-group mutations
+    let mut group_buf = BotGroupMutations::new();
 
     for (turn_idx, turn_data) in turns.iter().enumerate() {
         for ent in entities.values_mut() {
@@ -364,89 +610,214 @@ pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
             }
         }
 
-        // Phase 1: Collect events into pending actions
-        let mut pending: HashMap<i32, PendingBotAction> = HashMap::new();
-        let mut deferred_moves: Vec<DeferredMove> = Vec::new();
-        let mut deferred_places: Vec<DeferredPlace> = Vec::new();
-        let mut deferred_removes: Vec<DeferredRemove> = Vec::new();
-        let mut deferred_hp: Vec<DeferredHp> = Vec::new();
-        let mut deferred_cooldowns: Vec<DeferredCooldown> = Vec::new();
-        let mut deferred_res: Option<(Option<PlayerRes>, Option<PlayerRes>)> = None;
-        let mut deferred_distributes: Vec<Vec<(Pos, Pos)>> = Vec::new();
-
         let turn_fields = decode_fields(turn_data, 0, turn_data.len());
         let updates = get_repeated_submsg(&turn_fields, 1, turn_data);
 
+        // Per-bot state within this turn
+        let mut current_bot_id: Option<i32> = None;
+        let mut current_bot_action = PendingBotAction::default();
+        let mut current_bot_obs_start: Option<usize> = None;
+        let mut turn_end = DeferredTurnEnd {
+            distributes: Vec::new(),
+            player_res: None,
+        };
+
+        // Process events sequentially, flushing mutations between bot groups
         for update_data in &updates {
             if let Some(event) = decode_update(update_data) {
                 match event {
-                    UpdateEvent::MoveBuilderBot { id, to } => {
-                        if let Some(bot) = entities.get(&id) {
-                            if bot.kind == EntityKind::BuilderBot && bot.team == team {
-                                let dx = to.x - bot.x;
-                                let dy = to.y - bot.y;
-                                let pa = pending.entry(id).or_default();
-                                pa.move_dir = dxdy_to_dir9(dx, dy);
-                                pa.has_action = true;
-                            }
-                        }
-                        deferred_moves.push(DeferredMove {
-                            id,
-                            to_x: to.x,
-                            to_y: to.y,
-                        });
-                    }
-                    UpdateEvent::PlaceEntity(ent) => {
-                        if ent.kind == EntityKind::BuilderBot {
-                            spawn_rounds.insert(ent.id, turn_idx as i32);
-                            deferred_places.push(DeferredPlace { ent });
-                        } else {
-                            // Find adjacent builder on our team
-                            let mut builder_id: Option<i32> = None;
-                            const SEARCH_ORDER: [(i32, i32); 9] = [
-                                (0, 0),
-                                (-1, -1),
-                                (0, -1),
-                                (1, -1),
-                                (-1, 0),
-                                (1, 0),
-                                (-1, 1),
-                                (0, 1),
-                                (1, 1),
-                            ];
-                            for &(dx, dy) in &SEARCH_ORDER {
-                                let bx = ent.x + dx;
-                                let by = ent.y + dy;
-                                if let Some(&bid) = pos_bots.get(&(bx, by)) {
-                                    if let Some(b) = entities.get(&bid) {
-                                        if b.team == team
-                                            && b.kind == EntityKind::BuilderBot
-                                        {
-                                            builder_id = Some(bid);
-                                            break;
-                                        }
-                                    }
+                    UpdateEvent::SetActionCooldown { id, value } => {
+                        // Check if this starts a new friendly builder group
+                        let is_friendly_builder = entities
+                            .get(&id)
+                            .map(|e| e.team == team && e.kind == EntityKind::BuilderBot)
+                            .unwrap_or(false);
+
+                        if is_friendly_builder {
+                            // Emit previous bot's sample if any
+                            if let Some(bot_id) = current_bot_id.take() {
+                                if current_bot_action.has_action {
+                                    bc_actions.push(current_bot_action.build_type);
+                                    bc_actions.push(if current_bot_action.build_type > 0 {
+                                        current_bot_action.build_dir
+                                    } else {
+                                        4
+                                    });
+                                    bc_actions.push(current_bot_action.conv_dir);
+                                    bc_actions.push(current_bot_action.bridge_target);
+                                    bc_actions.push(current_bot_action.move_dir);
+                                    bc_turns.push(turn_idx as u32);
+                                    bc_bot_ids.push(bot_id);
+                                    n_samples += 1;
+                                } else if let Some(start) = current_bot_obs_start.take() {
+                                    // No action — discard the pre-allocated obs
+                                    bc_obs.truncate(start);
                                 }
                             }
 
-                            if let Some(bid) = builder_id {
-                                if let Some(builder) = entities.get(&bid) {
-                                    let bdx = ent.x - builder.x;
-                                    let bdy = ent.y - builder.y;
-                                    let pa = pending.entry(bid).or_default();
-                                    pa.build_type = build_action_idx(ent.kind);
-                                    pa.build_dir = dxdy_to_dir9(bdx, bdy);
-                                    pa.conv_dir = if matches!(
-                                        ent.kind,
-                                        EntityKind::Conveyor
-                                            | EntityKind::Splitter
-                                            | EntityKind::ArmouredConveyor
-                                    ) {
-                                        proto_dir_to_conv4(ent.direction)
-                                    } else {
-                                        0
-                                    };
-                                    pa.bridge_target = if ent.kind == EntityKind::Bridge {
+                            // Flush previous bot group's mutations so new bot
+                            // sees up-to-date state
+                            if !group_buf.is_empty() {
+                                flush_mutations(
+                                    &mut group_buf,
+                                    &mut entities,
+                                    &mut pos_buildings,
+                                    &mut pos_bots,
+                                    &mut harv_positions,
+                                    &mut scale_milli,
+                                    &mut core_hp,
+                                    team,
+                                );
+                            }
+
+                            // Encode this bot's observation from current state
+                            let sr = spawn_rounds.get(&id).copied().unwrap_or(0);
+                            let obs_start = bc_obs.len();
+                            bc_obs.resize(obs_start + BC_OBS_SIZE, 0.0);
+                            if let Some(bot) = entities.get(&id) {
+                                encode_local_obs(
+                                    &mut bc_obs[obs_start..],
+                                    bot,
+                                    &entities,
+                                    &map.env_grid,
+                                    map_w,
+                                    map_h,
+                                    team,
+                                    &player_res,
+                                    &core_center,
+                                    &core_hp,
+                                    turn_idx,
+                                    sr,
+                                    prev_own_ti,
+                                    prev_own_ax,
+                                    &pos_buildings,
+                                    &pos_bots,
+                                    scale_milli,
+                                );
+                            }
+
+                            current_bot_id = Some(id);
+                            current_bot_action = PendingBotAction::default();
+                            current_bot_obs_start = Some(obs_start);
+                        }
+
+                        // Buffer the cooldown mutation
+                        group_buf.cooldowns.push((id, 0, value));
+                    }
+
+                    UpdateEvent::MoveBuilderBot { id, to } => {
+                        // Extract bot info before any mutable borrows
+                        let bot_info = entities.get(&id).map(|b| (b.kind, b.team, b.x, b.y));
+
+                        if let Some((EntityKind::BuilderBot, t, bx, by)) = bot_info {
+                            if t == team {
+                                if current_bot_id == Some(id) {
+                                    let dx = to.x - bx;
+                                    let dy = to.y - by;
+                                    current_bot_action.move_dir = dxdy_to_dir9(dx, dy);
+                                    current_bot_action.has_action = true;
+                                } else {
+                                    // Builder that had no SetActionCooldown —
+                                    // move-only action. Flush previous group,
+                                    // encode obs, start new group.
+                                    if let Some(prev_id) = current_bot_id.take() {
+                                        if current_bot_action.has_action {
+                                            bc_actions.push(current_bot_action.build_type);
+                                            bc_actions.push(if current_bot_action.build_type > 0 {
+                                                current_bot_action.build_dir
+                                            } else {
+                                                4
+                                            });
+                                            bc_actions.push(current_bot_action.conv_dir);
+                                            bc_actions.push(current_bot_action.bridge_target);
+                                            bc_actions.push(current_bot_action.move_dir);
+                                            bc_turns.push(turn_idx as u32);
+                                            bc_bot_ids.push(prev_id);
+                                            n_samples += 1;
+                                        } else if let Some(start) = current_bot_obs_start.take() {
+                                            bc_obs.truncate(start);
+                                        }
+                                    }
+
+                                    if !group_buf.is_empty() {
+                                        flush_mutations(
+                                            &mut group_buf,
+                                            &mut entities,
+                                            &mut pos_buildings,
+                                            &mut pos_bots,
+                                            &mut harv_positions,
+                                            &mut scale_milli,
+                                            &mut core_hp,
+                                            team,
+                                        );
+                                    }
+
+                                    let dx = to.x - bx;
+                                    let dy = to.y - by;
+
+                                    let sr = spawn_rounds.get(&id).copied().unwrap_or(0);
+                                    let obs_start = bc_obs.len();
+                                    bc_obs.resize(obs_start + BC_OBS_SIZE, 0.0);
+                                    if let Some(bot) = entities.get(&id) {
+                                        encode_local_obs(
+                                            &mut bc_obs[obs_start..],
+                                            bot,
+                                            &entities,
+                                            &map.env_grid,
+                                            map_w,
+                                            map_h,
+                                            team,
+                                            &player_res,
+                                            &core_center,
+                                            &core_hp,
+                                            turn_idx,
+                                            sr,
+                                            prev_own_ti,
+                                            prev_own_ax,
+                                            &pos_buildings,
+                                            &pos_bots,
+                                            scale_milli,
+                                        );
+                                    }
+
+                                    current_bot_id = Some(id);
+                                    current_bot_action = PendingBotAction::default();
+                                    current_bot_action.move_dir = dxdy_to_dir9(dx, dy);
+                                    current_bot_action.has_action = true;
+                                    current_bot_obs_start = Some(obs_start);
+                                }
+                            }
+                        }
+                        group_buf.moves.push((id, to.x, to.y));
+                    }
+
+                    UpdateEvent::PlaceEntity(ent) => {
+                        if ent.kind == EntityKind::BuilderBot {
+                            spawn_rounds.insert(ent.id, turn_idx as i32);
+                        } else if ent.team == team
+                            && ent.kind != EntityKind::Marker
+                            && build_action_idx(ent.kind) > 0
+                        {
+                            // Friendly building — attribute to current bot
+                            if let (Some(_bid), Some(builder)) =
+                                (current_bot_id, entities.get(&current_bot_id.unwrap_or(-1)))
+                            {
+                                let bdx = ent.x - builder.x;
+                                let bdy = ent.y - builder.y;
+                                current_bot_action.build_type = build_action_idx(ent.kind);
+                                current_bot_action.build_dir = dxdy_to_dir9(bdx, bdy);
+                                current_bot_action.conv_dir = if matches!(
+                                    ent.kind,
+                                    EntityKind::Conveyor
+                                        | EntityKind::Splitter
+                                        | EntityKind::ArmouredConveyor
+                                ) {
+                                    proto_dir_to_conv4(ent.direction)
+                                } else {
+                                    0
+                                };
+                                current_bot_action.bridge_target =
+                                    if ent.kind == EntityKind::Bridge {
                                         bridge_target_to_idx(
                                             ent.target_x - ent.x,
                                             ent.target_y - ent.y,
@@ -454,43 +825,32 @@ pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
                                     } else {
                                         0
                                     };
-                                    pa.has_action = true;
-                                }
+                                current_bot_action.has_action = true;
                             }
-
-                            deferred_places.push(DeferredPlace { ent });
                         }
+                        group_buf.places.push(ent);
                     }
+
                     UpdateEvent::RemoveEntity { id } => {
-                        deferred_removes.push(DeferredRemove { id });
+                        group_buf.removes.push(id);
                     }
                     UpdateEvent::UpdateHp { id, delta } => {
-                        deferred_hp.push(DeferredHp { id, delta });
-                    }
-                    UpdateEvent::SetActionCooldown { id, value } => {
-                        deferred_cooldowns.push(DeferredCooldown {
-                            id,
-                            field: 0,
-                            value,
-                        });
+                        group_buf.hp_changes.push((id, delta));
                     }
                     UpdateEvent::SetMoveCooldown { id, value } => {
-                        deferred_cooldowns.push(DeferredCooldown {
-                            id,
-                            field: 1,
-                            value,
-                        });
+                        group_buf.cooldowns.push((id, 1, value));
                     }
                     UpdateEvent::DistributeResources(moves) => {
-                        deferred_distributes.push(moves);
+                        turn_end.distributes.push(moves);
                     }
                     UpdateEvent::UpdatePlayers { a, b } => {
-                        deferred_res = Some((a, b));
+                        turn_end.player_res = Some((a, b));
                     }
                 }
             }
         }
 
+<<<<<<< Updated upstream
         // Phase 2: Emit samples from pre-turn state
         for (&bot_id, pa) in &pending {
             if !pa.has_action {
@@ -524,104 +884,47 @@ pub fn process_replay_sequential(data: &[u8], team: u8) -> BCSamples {
                 bc_actions.push(pa.conv_dir);
                 bc_actions.push(pa.bridge_target);
                 bc_actions.push(pa.move_dir);
+=======
+        // Emit final bot's sample
+        if let Some(bot_id) = current_bot_id.take() {
+            if current_bot_action.has_action {
+                bc_actions.push(current_bot_action.build_type);
+                bc_actions.push(if current_bot_action.build_type > 0 {
+                    current_bot_action.build_dir
+                } else {
+                    4
+                });
+                bc_actions.push(current_bot_action.conv_dir);
+                bc_actions.push(current_bot_action.bridge_target);
+                bc_actions.push(current_bot_action.move_dir);
+>>>>>>> Stashed changes
                 bc_turns.push(turn_idx as u32);
                 bc_bot_ids.push(bot_id);
                 n_samples += 1;
+            } else if let Some(start) = current_bot_obs_start.take() {
+                bc_obs.truncate(start);
             }
         }
 
-        // Phase 3: Apply deferred mutations
-        for dm in &deferred_moves {
-            if let Some(ent) = entities.get_mut(&dm.id) {
-                let old_pos = (ent.x, ent.y);
-                ent.x = dm.to_x;
-                ent.y = dm.to_y;
-                if ent.kind == EntityKind::Harvester {
-                    harv_positions.remove(&old_pos);
-                    harv_positions.insert((dm.to_x, dm.to_y), dm.id);
-                }
-                if ent.kind == EntityKind::BuilderBot {
-                    pos_bots.remove(&old_pos);
-                    pos_bots.insert((dm.to_x, dm.to_y), dm.id);
-                }
-            }
+        // Flush remaining bot group mutations
+        if !group_buf.is_empty() {
+            flush_mutations(
+                &mut group_buf,
+                &mut entities,
+                &mut pos_buildings,
+                &mut pos_bots,
+                &mut harv_positions,
+                &mut scale_milli,
+                &mut core_hp,
+                team,
+            );
         }
-        for dp in deferred_places {
-            let eid = dp.ent.id;
-            if dp.ent.kind == EntityKind::BuilderBot {
-                pos_bots.insert((dp.ent.x, dp.ent.y), eid);
-            } else {
-                if dp.ent.kind == EntityKind::Harvester {
-                    harv_positions.insert((dp.ent.x, dp.ent.y), eid);
-                }
-                pos_buildings.insert((dp.ent.x, dp.ent.y), eid);
-                if dp.ent.team == team && dp.ent.kind != EntityKind::Core {
-                    n_team_buildings += 1;
-                }
-            }
-            entities.insert(eid, dp.ent);
+
+        // Apply turn-end events
+        for moves in &turn_end.distributes {
+            apply_distribute(moves, &mut entities, &harv_positions, &pos_buildings);
         }
-        for dr in &deferred_removes {
-            if let Some(ent) = entities.remove(&dr.id) {
-                if ent.kind == EntityKind::Harvester {
-                    harv_positions.remove(&(ent.x, ent.y));
-                }
-                if ent.kind == EntityKind::BuilderBot {
-                    pos_bots.remove(&(ent.x, ent.y));
-                } else if ent.kind != EntityKind::Marker && ent.kind != EntityKind::Core {
-                    pos_buildings.remove(&(ent.x, ent.y));
-                    if ent.team == team {
-                        n_team_buildings -= 1;
-                    }
-                }
-            }
-        }
-        for dh in &deferred_hp {
-            if let Some(ent) = entities.get_mut(&dh.id) {
-                ent.hp += dh.delta;
-                if ent.kind == EntityKind::Core {
-                    core_hp[ent.team as usize] = ent.hp;
-                }
-            }
-        }
-        for dc in &deferred_cooldowns {
-            if let Some(ent) = entities.get_mut(&dc.id) {
-                if dc.field == 0 {
-                    ent.action_cooldown = dc.value;
-                } else {
-                    ent.move_cooldown = dc.value;
-                }
-            }
-        }
-        for moves in &deferred_distributes {
-            for (from, to) in moves {
-                if let Some(&eid) = harv_positions.get(&(from.x, from.y)) {
-                    if let Some(ent) = entities.get_mut(&eid) {
-                        ent.cooldown = 3;
-                    }
-                }
-                let mut moved_res = 1u8;
-                // pos_buildings covers all storing entities (harvesters, conveyors, etc.)
-                if let Some(&src_id) = pos_buildings.get(&(from.x, from.y)) {
-                    if let Some(src) = entities.get_mut(&src_id) {
-                        if src.kind.is_storing() {
-                            moved_res = if src.stored > 0 { src.stored } else { 1 };
-                            if src.kind != EntityKind::Harvester {
-                                src.stored = 0;
-                            }
-                        }
-                    }
-                }
-                if let Some(&dst_id) = pos_buildings.get(&(to.x, to.y)) {
-                    if let Some(dst) = entities.get_mut(&dst_id) {
-                        if dst.kind.is_storing() {
-                            dst.stored = moved_res;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some((a, b)) = deferred_res {
+        if let Some((a, b)) = turn_end.player_res {
             if let Some(res) = a {
                 player_res[0] = res;
             }

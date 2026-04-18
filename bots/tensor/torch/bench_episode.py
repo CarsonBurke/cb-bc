@@ -62,7 +62,8 @@ def _benchmark_batched(args) -> dict:
     session_name = args.session or f"bench_batched_{_default_session_name()}"
     sess = _init_session(session_name)
     session_dir = Path(sess["dir"])
-    weight_path = str(sess["weight_path"])
+    actor_weight_path = str(sess["actor_weight_path"])
+    critic_weight_path = str(sess["critic_weight_path"])
     replay_dir = sess["replay_dir"]
     maps = [f.name for f in (PROJECT_ROOT / "maps").glob("*.map26")]
 
@@ -72,6 +73,7 @@ def _benchmark_batched(args) -> dict:
     setup_start = time.perf_counter()
     hidden = TEACHER_HIDDEN if args.teacher else None
     model = BuilderMLP(hidden=hidden).to(DEVICE)
+<<<<<<< Updated upstream
     session_weight_path = Path(sess["weight_path"])
     if args.teacher:
         if not session_weight_path.exists():
@@ -88,6 +90,14 @@ def _benchmark_batched(args) -> dict:
     critic_source_path = session_weight_path if session_weight_path.exists() else actor_source_path
     load_centralized_critic_checkpoint(critic_source_path, lr=args.lr)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+=======
+    _load_model_compat(model, actor_weight_path, WEIGHT_PATH)
+    reset_centralized_critic()
+    if not load_centralized_critic_checkpoint(critic_weight_path, lr=args.lr):
+        raise SystemExit(f"Could not load critic weights from {critic_weight_path}")
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
+>>>>>>> Stashed changes
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()
     setup_s = time.perf_counter() - setup_start
@@ -109,7 +119,7 @@ def _benchmark_batched(args) -> dict:
 
     # --- Build game list (matches train_batched episode loop) ---
     save_start = time.perf_counter()
-    model.save_weights(weight_path)
+    model.save_weights(actor_weight_path)
     save_weights_s = time.perf_counter() - save_start
 
     all_opp_paths = []
@@ -144,8 +154,14 @@ def _benchmark_batched(args) -> dict:
         traj_game_map=traj_game_map if all_global_states else None,
         game_winners=all_winners,
     )
+<<<<<<< Updated upstream
     model.save_weights(weight_path)
     save_centralized_critic_checkpoint(weight_path)
+=======
+    model.save_weights(actor_weight_path)
+    save_centralized_critic_checkpoint(critic_weight_path)
+    scheduler.step()
+>>>>>>> Stashed changes
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()
     train_total_s = time.perf_counter() - train_start

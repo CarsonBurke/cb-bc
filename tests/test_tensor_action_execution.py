@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import math
+from array import array
 from pathlib import Path
 import sys
 
@@ -22,11 +24,16 @@ def _load_module(name: str, rel_path: str):
 
 
 tensor_main = _load_module("tensor_inference_main_for_action_tests", "bots/tensor_inference/main.py")
+<<<<<<< Updated upstream
 shared_mod = _load_module("tensor_shared_for_action_tests", "bots/tensor/shared.py")
 INFER_DIR = ROOT / "bots" / "tensor_inference"
 if str(INFER_DIR) not in sys.path:
     sys.path.insert(0, str(INFER_DIR))
 from tensor_lib.actor import _l2_normalize
+=======
+tensor_proxy_opp = _load_module("tensor_proxy_opp_for_action_tests", "bots/tensor_proxy_opp/main.py")
+tensor_shared = _load_module("tensor_shared_for_action_tests", "bots/tensor/shared.py")
+>>>>>>> Stashed changes
 
 
 Direction = tensor_main.Direction
@@ -247,6 +254,7 @@ def test_execute_move_builds_roads_and_uses_fallback():
     assert ct.move_calls == [Direction.NORTHEAST]
 
 
+<<<<<<< Updated upstream
 def _empty_obs():
     obs = [0.0] * shared_mod.INPUT_SIZE
     g = shared_mod.GRID_SIZE * shared_mod.GRID_SIZE * shared_mod.TILE_FEATURES
@@ -310,3 +318,206 @@ def test_actor_l2_normalize_matches_torch_clamped_norm_behavior():
 
     assert normalized[0] == pytest.approx(1e-2)
     assert normalized[1] == pytest.approx(0.0)
+=======
+def test_unimix_sampler_can_select_non_argmax(monkeypatch):
+    monkeypatch.setattr(tensor_main.random, "random", lambda: 0.99)
+
+    idx, log_prob = tensor_main._sample_unimix(
+        [30.0, -30.0, -30.0],
+        [True, True, True],
+        eps=0.6,
+    )
+
+    assert idx in (1, 2)
+    assert log_prob < 0.0
+
+
+def test_opponent_proxy_uses_shared_execute_helpers(monkeypatch):
+    calls = {}
+
+    def fake_execute_build(ct, action, build_dir, conv_dir, my_team, bridge_target_idx):
+        calls["build"] = (action, build_dir, conv_dir, my_team, bridge_target_idx)
+        return 0.0, 0.0, (0, 0, 0, 0, 0, 0, 0, 0)
+
+    def fake_execute_move(ct, move_dir):
+        calls["move"] = move_dir
+
+    class FakeProxyController:
+        def __init__(self):
+            self.team = 1
+
+        def get_current_round(self):
+            return 0
+
+        def get_team(self, eid=None):
+            return self.team
+
+        def get_global_resources(self):
+            return 0, 0
+
+    monkeypatch.setattr(tensor_proxy_opp, "execute_build", fake_execute_build)
+    monkeypatch.setattr(tensor_proxy_opp, "execute_move", fake_execute_move)
+    monkeypatch.setattr(tensor_proxy_opp, "_get_pipes", lambda: (1, 2))
+    monkeypatch.setattr(tensor_proxy_opp, "_send_obs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        tensor_proxy_opp,
+        "_recv_action",
+        lambda fd: (2, 1, 3, 5, 4, array("f", [0.0] * tensor_proxy_opp.H_DIM)),
+    )
+
+    player = tensor_proxy_opp.Player()
+    player.my_team = 1
+    player.core_center = object()
+    player._encode_state_buf = lambda ct: array("f", [0.0] * tensor_proxy_opp.INPUT_SIZE)
+
+    ct = FakeProxyController()
+    player._run_builder(ct)
+
+    assert calls["build"] == (
+        tensor_proxy_opp.BUILD_ACTIONS[2],
+        tensor_proxy_opp.DIR_MAP_9[1],
+        tensor_proxy_opp.CONV_DIR_4[3],
+        1,
+        5,
+    )
+    assert calls["move"] == tensor_proxy_opp.DIR_MAP_9[4]
+
+
+def test_mirror_obs_to_team_a_frame_rotates_tiles_and_globals():
+    obs = array("f", [0.0] * tensor_shared.INPUT_SIZE)
+    for tile in range(tensor_shared.GRID_SIZE * tensor_shared.GRID_SIZE):
+        base = tile * tensor_shared.TILE_FEATURES
+        obs[base] = float(tile + 1)
+        obs[base + 13] = float(tile + 0.25)
+        obs[base + 14] = float(-(tile + 0.5))
+
+    g = tensor_shared._GLOBAL_OBS_START
+    obs[g + 1] = 0.2
+    obs[g + 2] = 0.3
+    obs[g + 6] = 0.4
+    obs[g + 7] = -0.5
+    obs[g + 8] = 0.6
+    obs[g + 9] = -0.7
+
+    pos_encoder = tensor_shared.SinusoidalPositionEmbedding(tensor_shared.POS_EMBED_DIM)
+    tensor_shared.mirror_obs_to_team_a_frame(
+        obs,
+        map_width=10,
+        map_height=12,
+        pos_x=2,
+        pos_y=3,
+        pos_encoder=pos_encoder,
+    )
+
+    src_tile = tensor_shared.GRID_SIZE * tensor_shared.GRID_SIZE - 1
+    src_base = src_tile * tensor_shared.TILE_FEATURES
+    assert obs[0] == float(src_tile + 1)
+    assert obs[13] == -float(src_tile + 0.25)
+    assert obs[14] == float(src_tile + 0.5)
+    assert math.isclose(obs[g + 1], 0.7, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(obs[g + 2], 8.0 / 12.0, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(obs[g + 6], -0.4, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(obs[g + 7], 0.5, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(obs[g + 8], -0.6, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(obs[g + 9], 0.7, rel_tol=0.0, abs_tol=1e-6)
+
+    pos_start = g + tensor_shared.GLOBAL_FEATURES
+    expected_pos = pos_encoder.encode(7, 8)
+    for i, expected in enumerate(expected_pos):
+        assert math.isclose(obs[pos_start + i], expected, rel_tol=0.0, abs_tol=1e-6)
+
+
+def test_opponent_proxy_passes_actions_unchanged(monkeypatch):
+    """Opponent proxy no longer mirrors — obs encoding is core-relative and team-symmetric."""
+    calls = {}
+
+    def fake_execute_build(ct, action, build_dir, conv_dir, my_team, bridge_target_idx):
+        calls["build"] = (action, build_dir, conv_dir, my_team, bridge_target_idx)
+        return 0.0, 0.0, (0, 0, 0, 0, 0, 0, 0, 0)
+
+    def fake_execute_move(ct, move_dir):
+        calls["move"] = move_dir
+
+    class FakeProxyController:
+        def __init__(self):
+            self.team = 2
+            self.pos = Position(2, 3)
+
+        def get_current_round(self):
+            return 0
+
+        def get_team(self, eid=None):
+            return self.team
+
+        def get_global_resources(self):
+            return 0, 0
+
+        def get_position(self, eid=None):
+            return self.pos
+
+        def get_map_width(self):
+            return 10
+
+        def get_map_height(self):
+            return 12
+
+    monkeypatch.setattr(tensor_proxy_opp, "execute_build", fake_execute_build)
+    monkeypatch.setattr(tensor_proxy_opp, "execute_move", fake_execute_move)
+    monkeypatch.setattr(tensor_proxy_opp, "_get_pipes", lambda: (1, 2))
+    monkeypatch.setattr(tensor_proxy_opp, "_send_obs", lambda _fd, obs, _h: None)
+    monkeypatch.setattr(
+        tensor_proxy_opp,
+        "_recv_action",
+        lambda fd: (2, 1, 0, 5, 3, array("f", [0.0] * tensor_proxy_opp.H_DIM)),
+    )
+
+    player = tensor_proxy_opp.Player()
+    player.my_team = 2
+    player.core_center = object()
+    player._encode_state_buf = lambda ct: array("f", [0.0] * tensor_proxy_opp.INPUT_SIZE)
+
+    ct = FakeProxyController()
+    player._run_builder(ct)
+
+    # Actions passed through without mirroring
+    assert calls["build"] == (
+        tensor_proxy_opp.BUILD_ACTIONS[2],
+        tensor_proxy_opp.DIR_MAP_9[1],
+        tensor_proxy_opp.CONV_DIR_4[0],
+        2,
+        5,
+    )
+    assert calls["move"] == tensor_proxy_opp.DIR_MAP_9[3]
+
+
+def test_shared_game_state_is_scoped_per_team():
+    tensor_shared.GameState.reset()
+
+    class FakeSharedController:
+        def __init__(self, team, enemy_hp):
+            self.team = team
+            self.enemy_hp = enemy_hp
+
+        def get_team(self, eid=None):
+            if eid is None:
+                return self.team
+            return 2 if self.team == 1 else 1
+
+        def get_current_round(self):
+            return 0
+
+        def get_nearby_entities(self):
+            return [1]
+
+        def get_entity_type(self, eid):
+            return tensor_shared.EntityType.CORE
+
+        def get_hp(self, eid):
+            return self.enemy_hp
+
+    tensor_shared.scan_enemy_core_dmg(FakeSharedController(team=1, enemy_hp=490.0))
+    tensor_shared.scan_enemy_core_dmg(FakeSharedController(team=2, enemy_hp=500.0))
+
+    assert tensor_shared.GameState.enemy_core_dmg_for(1) == 10.0
+    assert tensor_shared.GameState.enemy_core_dmg_for(2) == 0.0
+>>>>>>> Stashed changes

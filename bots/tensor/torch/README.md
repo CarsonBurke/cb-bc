@@ -28,10 +28,41 @@ tensor_inference/          ← deploy bot (stdlib-only MLP, bundled weights)
 ```bash
 python bots/tensor/torch/train_batched.py
 python bots/tensor/torch/train_batched.py --dummy-episodes 10
+python bots/tensor/torch/full_train.py --session <name>
 python bots/tensor/torch/bench_episode.py --json
 python bots/tensor/torch/bench_episode.py --dummy-opponent --json
 python bots/tensor/torch/distill.py --session <session_name>
 ```
+
+## Full Training
+
+Use [`full_train.py`](full_train.py) for the normal end-to-end pipeline:
+
+1. actor BC pretraining
+2. critic pretraining using the actor-BC checkpoint for replay actor latents
+3. PPO fine-tuning using both pretrained checkpoints as initialization
+
+Example:
+
+```bash
+python bots/tensor/torch/full_train.py \
+  --session full_run_a \
+  --actor-epochs 2 \
+  --critic-epochs 1 \
+  --ppo-episodes 100
+```
+
+Dry-run the exact command handoff first:
+
+```bash
+python bots/tensor/torch/full_train.py --session full_run_a --dry-run
+```
+
+Notes:
+
+- PPO still uses the pretrained actor and critic weights as initialization, exactly as before.
+- Standalone critic pretraining now expects `--actor-weights`; the intended direction is to pretrain the actor first, then pretrain the critic against that actor's latent space.
+- The pretrain scripts default to the fast path: pinned CPU staging, batched transfers, `torch.compile` on CUDA, and mixed precision where the codepath supports it. Only use `--actor-no-compile` or `--critic-no-compile` when debugging.
 
 ## Exporting Weights
 

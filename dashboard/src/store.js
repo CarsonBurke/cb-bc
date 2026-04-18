@@ -169,3 +169,25 @@ export const cardBandsAtom = (id) => atom(
     try { localStorage.setItem(BANDS_KEY, JSON.stringify(state)) } catch { return undefined }
   },
 )
+
+// Persisted card legend toggle: { [cardId]: boolean }
+const LEGEND_KEY = 'dashboard-card-legend'
+
+function loadLegend() {
+  try {
+    return JSON.parse(localStorage.getItem(LEGEND_KEY)) || {}
+  } catch {
+    return {}
+  }
+}
+
+export const cardLegendStateAtom = atom(loadLegend())
+
+export const cardLegendAtom = (id) => atom(
+  (get) => !!get(cardLegendStateAtom)[id],
+  (get, set, next) => {
+    const state = { ...get(cardLegendStateAtom), [id]: next }
+    set(cardLegendStateAtom, state)
+    try { localStorage.setItem(LEGEND_KEY, JSON.stringify(state)) } catch { return undefined }
+  },
+)

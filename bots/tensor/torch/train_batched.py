@@ -174,6 +174,13 @@ from training_utils import League, _init_session, _default_session_name, jsonl_a
 
 # Shared collector protocol constants
 _OBS_FLOATS = OBS_SIZE + H_DIM
+<<<<<<< Updated upstream
+=======
+_OBS_FLOAT_BYTES = _OBS_FLOATS * 4
+_ACT_HEAD = struct.Struct('=iiiii')
+_H_STRUCT = struct.Struct(f'={H_DIM}f')
+_LP_STRUCT = struct.Struct('=f')
+>>>>>>> Stashed changes
 _H_BYTES = H_DIM * 4
 DEFAULT_COALESCE_MS = 0.25 if DEVICE.type == "cuda" else 0.0
 
@@ -486,6 +493,7 @@ def _load_resume_critic_checkpoint(weight_path: str | Path, *, lr: float) -> boo
     return load_centralized_critic_checkpoint(weight_path, lr=lr)
 
 
+<<<<<<< Updated upstream
 def _drain_notify(fd: int) -> int | None:
     """Drain notify bytes from a pipe. None means EOF/closed."""
     token = os.read(fd, 4096)
@@ -502,6 +510,16 @@ def _tensor_byte_view(tensor: torch.Tensor, *, n_bytes: int | None = None) -> me
         raise ValueError("tensor byte views require contiguous tensors")
     size = tensor.numel() * tensor.element_size() if n_bytes is None else int(n_bytes)
     return memoryview((_ctypes.c_char * size).from_address(tensor.data_ptr()))
+=======
+def _pipe_write_action_a(fd, bt, bd, cd, brt, md, h_next_bytes, old_lp):
+    """Write fixed-size action packet for training bot (A)."""
+    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, brt, md), h_next_bytes, _LP_STRUCT.pack(old_lp)))
+
+
+def _pipe_write_action_b(fd, bt, bd, cd, brt, md, h_next_bytes):
+    """Write fixed-size action packet for opponent bot (B)."""
+    os.writev(fd, (_ACT_HEAD.pack(bt, bd, cd, brt, md), h_next_bytes))
+>>>>>>> Stashed changes
 
 
 def _dummy_indices(device: torch.device):
@@ -809,18 +827,34 @@ def collect_games_batched(
                 )
             results[game_idx] = _load_worker_result(proc_info["result_path"])
             processes.pop(game_idx, None)
+<<<<<<< Updated upstream
             _close_game_collector(game_idx)
+=======
+
+    # Capture CUDA graph before launching workers to avoid interference
+    # with pipe I/O and the selector.
+    model.eval()
+    _max_a_batch = n_games * 4
+    graphed_a = GraphedInference(model, max_batch=_max_a_batch)
+    graphed_a.capture()
+
+    while pending_indices and len(processes) < max_workers:
+        _launch_game(pending_indices.pop(0))
+>>>>>>> Stashed changes
 
     # Inference server loop — disable cyclic GC to avoid pauses from
     # the collector scanning the many live pipe buffers and tensor temporaries.
     gc_was_enabled = gc.isenabled()
     gc.disable()
+<<<<<<< Updated upstream
 
     model.eval()
     _max_a_batch = n_games * 4
     # Side-A rollout depends on exact behavior log-probs for PPO, so only the
     # actor forward pass is graphed; masks/sampling/log-prob stay eager.
     graphed_a = GraphedInference(model, max_batch=_max_a_batch, graph_sampling=False)
+=======
+>>>>>>> Stashed changes
     total_inferences = 0
     actor_graph_disabled = False
     _use_pinned = DEVICE.type == "cuda"
@@ -947,6 +981,7 @@ def collect_games_batched(
                     dt = time.perf_counter() - t_phase
                     profile["h2d_a_s"] = profile.get("h2d_a_s", 0.0) + dt
 
+<<<<<<< Updated upstream
                 obs_cpu = batch_obs
                 t_infer = time.perf_counter() if profile is not None else 0.0
                 while True:
@@ -1070,6 +1105,29 @@ def collect_games_batched(
                             conv_prox_gate=0,
                             conv_prox_paid=0,
                         )
+=======
+                t_phase = time.perf_counter() if profile is not None else 0.0
+                bt_act, bd_act, cd_act, brt_act, md_act, lp, h_next = graphed_a(all_t)
+                results_cpu = torch.stack([
+                    bt_act.float(), bd_act.float(), cd_act.float(), brt_act.float(), md_act.float(), lp,
+                ]).cpu()
+                h_cpu = h_next.cpu().contiguous()
+                if profile is not None:
+                    dt = time.perf_counter() - t_phase
+                    profile["d2h_a_s"] = profile.get("d2h_a_s", 0.0) + dt
+                    profile["infer_a_s"] = profile.get("infer_a_s", 0.0) + dt
+
+            t_phase = time.perf_counter() if profile is not None else 0.0
+            h_view = memoryview((_ctypes.c_char * (n_a * _H_BYTES)).from_address(h_cpu.data_ptr()))
+            for i, (game_idx, _) in enumerate(pending_a):
+                try:
+                    h_start = i * _H_BYTES
+                    _pipe_write_action_a(
+                        act_fds[(game_idx, "a")],
+                        int(results_cpu[0, i]), int(results_cpu[1, i]), int(results_cpu[2, i]),
+                        int(results_cpu[3, i]), int(results_cpu[4, i]),
+                        h_view[h_start:h_start + _H_BYTES], float(results_cpu[5, i]),
+>>>>>>> Stashed changes
                     )
                     collector = active_collectors.get(game_idx)
                     if collector is None:
@@ -1122,12 +1180,20 @@ def collect_games_batched(
                         if collector is None:
                             continue
                         try:
+<<<<<<< Updated upstream
                             collector.sides["b"].write_response(
                                 int(bt_act[i]),
                                 int(bd_act[i]),
                                 int(cd_act[i]),
                                 int(brt_act[i]),
                                 int(md_act[i]),
+=======
+                            _pipe_write_action_b(
+                                act_fds[(game_idx, "b")],
+                                int(bt_act[i]), int(bd_act[i]), int(cd_act[i]),
+                                int(brt_act[i]), int(md_act[i]),
+                                _ZERO_H_BYTES,
+>>>>>>> Stashed changes
                             )
                             os.write(collector.resp_write_fds["b"], b"\x01")
                         except OSError:
@@ -1155,6 +1221,7 @@ def collect_games_batched(
                     t_phase = time.perf_counter() if profile is not None else 0.0
                     if opp_g is not None and n_b <= opp_g.max_batch:
                         # CUDA-graphed path: forward + mask + sample in one graph replay
+<<<<<<< Updated upstream
                         bt_act, bd_act, cd_act, brt_act, md_act, _, h_next = opp_g(opp_all_t)
                         if _use_pinned and n_b <= _max_a_batch:
                             _pin_results[:5, :n_b].copy_(torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]), non_blocking=True)
@@ -1165,12 +1232,22 @@ def collect_games_batched(
                     else:
                         # Fallback: ungraphed inference
                         bt_l, bd_l, cd_l, _brt_l, md_l, head_temperature, h_next = opp_m.infer_packed(opp_all_t)
+=======
+                        bt_act, bd_act, cd_act, brt_act, md_act, _, h_next = opp_g(all_t)
+                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
+                        h_cpu = h_next.cpu().contiguous()
+                    else:
+                        # Fallback: ungraphed inference
+                        obs_t = all_t[:, :OBS_SIZE]
+                        bt_l, bd_l, cd_l, _brt_l, md_l, _eps, h_next = opp_m.infer_packed(all_t)
+>>>>>>> Stashed changes
                         if profile is not None:
                             dt = time.perf_counter() - t_phase
                             profile["forward_b_s"] = profile.get("forward_b_s", 0.0) + dt
                             profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
 
                         t_phase = time.perf_counter() if profile is not None else 0.0
+<<<<<<< Updated upstream
                         obs_t_cpu = batch_obs
                         bt_l_cpu = bt_l.float().cpu()
                         bd_l_cpu = bd_l.float().cpu()
@@ -1212,6 +1289,20 @@ def collect_games_batched(
                             return_log_prob=False,
                         )
                         acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act])
+=======
+                        bt_m, bd_m = compute_action_masks(obs_t)
+                        cd_m = conveyor_dir_mask(obs_t.device, obs_t.shape[0])
+                        bt_l.masked_fill_(~bt_m, -1e9)
+                        cd_l.masked_fill_(~cd_m, -1e9)
+                        bt_act, _ = sample_logits_gumbel(bt_l, _OPP_GRAPH_TEMP, mask=bt_m, return_log_prob=False)
+                        bd_l.masked_fill_(~bd_m, -1e9)
+                        bd_act, _ = sample_logits_gumbel(bd_l, _OPP_GRAPH_TEMP, mask=bd_m, return_log_prob=False)
+                        cd_act, _ = sample_logits_gumbel(cd_l, _OPP_GRAPH_TEMP, mask=cd_m, return_log_prob=False)
+                        brt_act, _ = sample_logits_gumbel(_brt_l, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        md_act, _ = sample_logits_gumbel(md_l, _OPP_GRAPH_TEMP, return_log_prob=False)
+                        acts_cpu = torch.stack([bt_act, bd_act, cd_act, brt_act, md_act]).cpu()
+                        h_cpu = h_next.cpu().contiguous()
+>>>>>>> Stashed changes
                     if profile is not None:
                         dt = time.perf_counter() - t_phase
                         profile["infer_b_s"] = profile.get("infer_b_s", 0.0) + dt
@@ -1223,12 +1314,21 @@ def collect_games_batched(
                     if collector is None:
                         continue
                     try:
+<<<<<<< Updated upstream
                         collector.sides["b"].write_response(
                             int(acts_cpu[0, i]),
                             int(acts_cpu[1, i]),
                             int(acts_cpu[2, i]),
                             int(acts_cpu[3, i]),
                             int(acts_cpu[4, i]),
+=======
+                        h_start = i * _H_BYTES
+                        _pipe_write_action_b(
+                            act_fds[(game_idx, "b")],
+                            int(acts_cpu[0, i]), int(acts_cpu[1, i]), int(acts_cpu[2, i]),
+                            int(acts_cpu[3, i]), int(acts_cpu[4, i]),
+                            h_view[h_start:h_start + _H_BYTES],
+>>>>>>> Stashed changes
                         )
                         os.write(collector.resp_write_fds["b"], b"\x01")
                     except OSError:
@@ -1288,6 +1388,7 @@ def collect_games_batched(
     per_opp_winners = {}
     for i, result in enumerate(results):
         oid = opp_ids[i]
+<<<<<<< Updated upstream
         if result is None:
             raise RuntimeError(f"missing worker result for game {i}")
         trajectories_by_unit = actor_trajectories.get(i)
@@ -1317,6 +1418,34 @@ def collect_games_batched(
         if max_training_turns is not None:
             game_trajs = _truncate_trajectories_to_turn_limit(game_trajs, max_training_turns)
             gstates = _truncate_global_states_to_turn_limit(gstates, max_training_turns)
+=======
+        if isinstance(result, tuple) and len(result) == 6:
+            log_path, working, w, gstates = result[:4]
+        elif isinstance(result, tuple) and len(result) >= 4:
+            log_path, working, w, gstates = result[:4]
+        elif isinstance(result, tuple) and len(result) == 3:
+            log_path, working, w = result
+            gstates = None
+        elif isinstance(result, tuple) and len(result) == 2:
+            log_path, working = result
+            w, gstates = None, None
+        else:
+            log_path, working, w, gstates = None, None, None, None
+        if log_path is None:
+            print(f"  Game {i}: log_path=None, result type={type(result).__name__}, len={len(result) if isinstance(result, tuple) else 'n/a'}", flush=True)
+            per_opp_winners.setdefault(oid, []).append(None)
+            continue
+        game_trajs = _read_trajectory_file(log_path)
+        # Dense flow reward: use replay-derived productive transfer totals for
+        # each round. Always call augment to zero out stale n_working values.
+        flow_rewards: dict[int, float] = {}
+        if gstates and (gstates.get("transfer_events_buf") or gstates.get("transfer_events_path")):
+            try:
+                flow_rewards = compute_dense_flow_rewards(gstates)
+            except Exception as e:
+                print(f"  Flow reward augmentation error: {e}")
+        game_trajs = augment_trajectories_with_flow_rewards(game_trajs, flow_rewards)
+>>>>>>> Stashed changes
         n_before = len(trajectories)
         trajectories.extend(game_trajs)
         # Map each new trajectory to this game's global state index
@@ -1452,6 +1581,7 @@ def main():
     parser.add_argument("--opponents", type=int, default=3)
     parser.add_argument("--games-per-opp", type=int, default=2)
     parser.add_argument("--dummy-episodes", type=int, default=0, help="Use only scripted dummy opponents for the first N episodes")
+<<<<<<< Updated upstream
     parser.add_argument("--league-size", type=int, default=6)
     parser.add_argument("--checkpoint-every", type=int, default=1)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -1462,6 +1592,12 @@ def main():
         default=0,
         help="Actor PPO minibatch size (default: max(N//16, 8192) for GPU saturation)",
     )
+=======
+    parser.add_argument("--league-size", type=int, default=20)
+    parser.add_argument("--checkpoint-every", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--critic-lr", type=float, default=0, help="Critic learning rate (default: same as --lr)")
+>>>>>>> Stashed changes
     parser.add_argument("--teacher", action="store_true", help="Train large teacher, distill to student")
     parser.add_argument("--distill-epochs", type=int, default=20, help="Distillation epochs")
     parser.add_argument("--distill-lr", type=float, default=1e-3, help="Distillation learning rate")
@@ -1474,6 +1610,7 @@ def main():
     )
     parser.add_argument("--session", type=str, default="")
     parser.add_argument("--init-weights", type=str, default="", help="Initialize actor from a checkpoint")
+<<<<<<< Updated upstream
     parser.add_argument(
         "--critic-init-weights",
         type=str,
@@ -1496,6 +1633,10 @@ def main():
     parser.add_argument("--profile-stack", action="store_true", help="Record Python stacks in end-to-end profiler output")
     parser.add_argument("--benchmark-seed", type=int, default=None, help="Use a deterministic local RNG for map and game-seed assignment")
     parser.add_argument("--benchmark-maps", type=str, default="", help="Optional comma-separated map filenames for deterministic benchmark runs")
+=======
+    parser.add_argument("--critic-init-weights", type=str, default="", help="Initialize critic from a .pt checkpoint")
+    parser.add_argument("--freeze-critic", action="store_true", help="Skip critic updates during PPO (actor-only training)")
+>>>>>>> Stashed changes
     parser.add_argument("--resume", action="store_true", help="Resume a prior session from saved trainer state")
     parser.add_argument("--worker-result", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--worker-collector-fds", type=str, default="", help=argparse.SUPPRESS)
@@ -1528,7 +1669,10 @@ def main():
         )
 
     maps = [f.name for f in (PROJECT_ROOT / "maps").glob("*.map26")]
+<<<<<<< Updated upstream
     benchmark_maps = _resolve_benchmark_maps(maps, args.benchmark_maps)
+=======
+>>>>>>> Stashed changes
     league = League(sess["league_dir"], args.league_size)
 
     hidden = TEACHER_HIDDEN if args.teacher else None
@@ -1537,16 +1681,28 @@ def main():
     reset_centralized_critic()
     _critic_lr = args.critic_lr if args.critic_lr > 0 else args.lr
     if args.resume:
+<<<<<<< Updated upstream
         if not model.load_weights(weight_path):
             raise SystemExit(f"Could not load actor weights from {weight_path}")
         _load_resume_critic_checkpoint(weight_path, lr=_critic_lr)
+=======
+        model.load_weights(weight_path)
+        load_centralized_critic_checkpoint(weight_path, lr=args.lr)
+>>>>>>> Stashed changes
     elif args.init_weights:
         if not model.load_weights(args.init_weights):
             raise SystemExit(f"Could not load actor weights from {args.init_weights}")
         print(f"Initialized actor from {args.init_weights}")
+<<<<<<< Updated upstream
     _deferred_critic_path = args.critic_init_weights or None
     optimizer = make_normuon_optimizer(model, lr=args.lr, weight_decay=0.0)
     _kl_ema = KL_TARGET
+=======
+    _critic_lr = args.critic_lr if args.critic_lr > 0 else args.lr
+    _deferred_critic_path = args.critic_init_weights or None
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes)
+>>>>>>> Stashed changes
 
     start_episode = 0
     elapsed_offset = 0.0
@@ -1676,6 +1832,7 @@ def main():
         t_collect = time.time() - t0
 
         t1 = time.time()
+<<<<<<< Updated upstream
         if _deferred_critic_path is not None:
             with trace_scope(episode_trace, "episode.load_critic_init"):
                 if not _load_critic_init_weights(_deferred_critic_path, lr=_critic_lr):
@@ -1707,6 +1864,25 @@ def main():
             new_lr = max(ACTOR_LR_MIN, min(ACTOR_LR_MAX, optimizer.param_groups[0]["lr"] * lr_scale))
             for pg in optimizer.param_groups:
                 pg["lr"] = new_lr
+=======
+        if _deferred_critic_path:
+            if not load_centralized_critic_checkpoint(_deferred_critic_path, lr=_critic_lr):
+                raise SystemExit(f"Could not load critic from {_deferred_critic_path}")
+            print(f"Loaded critic from {_deferred_critic_path}")
+            _deferred_critic_path = None
+        model.train()
+        stats = train_on_trajectories(
+            model, optimizer, all_trajs,
+            global_states_list=all_global_states,
+            traj_game_map=traj_game_map if all_global_states else None,
+            game_winners=all_winners,
+            target_kl=0.03,
+            freeze_critic=args.freeze_critic,
+        )
+        model.save_weights(weight_path)
+        save_centralized_critic_checkpoint(weight_path)
+        scheduler.step()
+>>>>>>> Stashed changes
         t_train = time.time() - t1
 
         if (ep + 1) % args.checkpoint_every == 0 or ep == 0:

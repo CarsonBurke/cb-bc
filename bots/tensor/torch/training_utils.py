@@ -137,8 +137,14 @@ class League:
             # Write migrated matches as JSONL
             matches = data.get("matches", [])
             if matches:
+<<<<<<< Updated upstream
                 for m in matches:
                     jsonl_append(self.matches_jsonl, m)
+=======
+                with open(self.matches_jsonl, "a") as f:
+                    for m in matches:
+                        f.write(json.dumps(m) + "\n")
+>>>>>>> Stashed changes
             self.save()
             old_json.unlink()
         elif self.models_json.exists():
@@ -272,9 +278,16 @@ class League:
         a["elo"] = _ts_elo(new_a)
         b["elo"] = _ts_elo(new_b)
 
+<<<<<<< Updated upstream
         jsonl_append(self.matches_jsonl, {
             "a": model_a_id, "b": model_b_id, "winner": winner, "timestamp": time.time(),
         })
+=======
+        with open(self.matches_jsonl, "a") as f:
+            f.write(json.dumps({
+                "a": model_a_id, "b": model_b_id, "winner": winner, "timestamp": time.time(),
+            }) + "\n")
+>>>>>>> Stashed changes
 
     def get_rankings(self) -> list[dict]:
         return sorted(self.models, key=lambda m: m["elo"], reverse=True)

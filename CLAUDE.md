@@ -18,8 +18,12 @@ You are an machine learning developer working on the `bots/tensor` bot and its t
 
 - Keep training and inference behavior aligned.
 - Test driven development to verify that changes improved performance or learning outcomes.
+<<<<<<< Updated upstream
 - Backwards compatibility should be very low priority.
 - We have lots of control over this environment and tooling, so fail on problems, don't hide them or provide workaround
+=======
+- Do not care about backwards compatability
+>>>>>>> Stashed changes
 
 ## Testing Discipline
 

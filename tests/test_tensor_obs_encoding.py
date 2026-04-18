@@ -275,8 +275,6 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
             features.extend((0.0, 0.0))
 
     rnd = ct.get_current_round() / 2000.0
-    x_norm = pos.x / max(ct.get_map_width(), 1)
-    y_norm = pos.y / max(ct.get_map_height(), 1)
     ti, ax = ct.get_global_resources()
     scale = ct.get_scale_percent() / 500.0
 
@@ -314,6 +312,14 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
         ecore_dy = float(player.enemy_core.y - pos.y)
         ecore_known = 1.0
 
+    # Core-relative position (team-symmetric, after entity scan discovers core)
+    if player.core_center is not None:
+        x_norm = (pos.x - player.core_center.x) / max(ct.get_map_width(), 1)
+        y_norm = (pos.y - player.core_center.y) / max(ct.get_map_height(), 1)
+    else:
+        x_norm = 0.0
+        y_norm = 0.0
+
     ti_delta, ax_delta = 0.0, 0.0
     if player._prev_collected is not None:
         prev_ti, prev_ax = player._prev_collected
@@ -331,6 +337,14 @@ def _reference_obs(player, ct: FakeController) -> list[float]:
         w / 50.0, h / 50.0,
         tensor_main.Player._working_harv_count / 20.0,
     ))
+<<<<<<< Updated upstream
+=======
+    # Core-relative positional embedding (team-symmetric)
+    if player.core_center is not None:
+        features.extend(player.pos_encoder.encode(pos.x - player.core_center.x, pos.y - player.core_center.y))
+    else:
+        features.extend(player.pos_encoder.encode(0, 0))
+>>>>>>> Stashed changes
     return features
 
 
@@ -384,6 +398,7 @@ def test_obs_encodes_expected_tiles_and_globals():
 
     global_idx = tensor_main._GLOBAL_OBS_START
     globals_slice = obs[global_idx:global_idx + tensor_main.GLOBAL_FEATURES]
+<<<<<<< Updated upstream
     ref = _reference_obs(_make_player(), ct)
     assert globals_slice == ref[tensor_main._GLOBAL_OBS_START:]
 
@@ -417,3 +432,27 @@ def test_actor_model_round_trips_on_valid_obs():
 
     for key, expected in before.items():
         assert after[key] == pytest.approx(expected, abs=1e-12)
+=======
+    # Core at (8,10), unit at (10,10): x_rel=2/30, y_rel=0/30
+    assert globals_slice == [
+        0.4,
+        2.0 / 30.0,  # core-relative x
+        0.0,          # core-relative y
+        0.4,
+        0.1,
+        0.3,
+        -1.0,
+        0.0,
+        1.0,
+        0.4,
+        0.1,
+        0.1,
+        0.06,
+        0.1,
+        0.06,
+    ]
+
+    # Core-relative pos embed: encode(10-8, 10-10) = encode(2, 0)
+    pos_embed = player.pos_encoder.encode(ct.pos.x - 8, ct.pos.y - 10)
+    assert obs[-tensor_main.POS_EMBED_DIM:] == list(pos_embed)
+>>>>>>> Stashed changes

@@ -19,7 +19,11 @@ from shared import (
     INPUT_SIZE, HIDDEN_SIZES, H_DIM,
     DIRECTIONS, BUILD_ACTIONS, DIR_MAP_9, CONV_DIR_4, DIR_DXY, BUILD_COSTS,
     _CONV_DIR_MASK,
+<<<<<<< Updated upstream
     GameState,
+=======
+    SinusoidalPositionEmbedding, GameState,
+>>>>>>> Stashed changes
     discover_ore, scan_enemy_core_dmg, scan_own_core_dmg,
     encode_state_into,
     execute_build, execute_move,
@@ -28,8 +32,21 @@ from shared_collector import CollectorClient
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
+<<<<<<< Updated upstream
 _collector = None
 _unit_id_counter = 1
+=======
+# Struct-based binary IPC protocol
+_OBS_FLOATS = INPUT_SIZE + H_DIM
+_OBS_BYTES = _OBS_FLOATS * 4
+_ACT_HEAD = struct.Struct('=iiiii')
+_ACT_INTS = 5  # bt, bd, cd, brt, md
+_ACT_B_FLOATS = H_DIM  # h_next only (no log_prob for opponent)
+_ACT_B_SIZE = _ACT_INTS * 4 + _ACT_B_FLOATS * 4
+_H_BYTES = H_DIM * 4
+
+_opened_pipes = {}
+>>>>>>> Stashed changes
 
 
 def _get_collector():
@@ -39,11 +56,46 @@ def _get_collector():
     return _collector
 
 
+<<<<<<< Updated upstream
 def _next_unit_id() -> int:
     global _unit_id_counter
     unit_id = _unit_id_counter
     _unit_id_counter += 1
     return unit_id
+=======
+def _read_exact(fd, n):
+    data = bytearray(n)
+    view = memoryview(data)
+    used = 0
+    while used < n:
+        chunk = os.read(fd, n - used)
+        if not chunk:
+            return None
+        end = used + len(chunk)
+        view[used:end] = chunk
+        used = end
+    return data
+
+
+def _send_obs(obs_wfd, obs, h_prev):
+    os.writev(
+        obs_wfd,
+        (
+            memoryview(obs).cast("B"),
+            memoryview(h_prev).cast("B"),
+        ),
+    )
+
+
+def _recv_action(act_rfd):
+    data = _read_exact(act_rfd, _ACT_B_SIZE)
+    if data is None:
+        return None
+    bt, bd, cd, brt, md = _ACT_HEAD.unpack_from(data, 0)
+    h_next = array("f")
+    h_next.frombytes(data[_ACT_INTS * 4:_ACT_INTS * 4 + _H_BYTES])
+    return bt, bd, cd, brt, md, h_next
+>>>>>>> Stashed changes
 
 
 class Player:
@@ -101,6 +153,28 @@ class Player:
             raise RuntimeError("tensor_proxy_opp collector transport closed")
         build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx = result
 
+<<<<<<< Updated upstream
+=======
+        if obs_wfd is not None:
+            _send_obs(obs_wfd, obs, self.h_prev)
+            result = _recv_action(act_rfd)
+            if result is not None:
+                build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, h_next = result
+                self.h_prev = h_next
+            else:
+                build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
+                build_dir_idx = random.randint(0, 8)
+                conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
+                bridge_target_idx = 0
+                move_dir_idx = random.randint(0, 8)
+        else:
+            build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
+            build_dir_idx = random.randint(0, 8)
+            conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
+            bridge_target_idx = 0
+            move_dir_idx = random.randint(0, 8)
+
+>>>>>>> Stashed changes
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = CONV_DIR_4[conv_dir_idx]

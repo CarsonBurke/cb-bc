@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
+<<<<<<< Updated upstream
 from model import REWARD_INCOME_SCALE, REWARD_FLOW_SCALE
 try:
     from trajectory_schema import TrajectoryStep
@@ -78,6 +80,11 @@ def compute_dense_delivery_rewards(
         if d > 0.5:  # threshold at 0.5 to absorb float rounding
             rewards[rnd] = round(d)
     return rewards
+=======
+# Obs feature indices
+_OBS_GLOBAL_START = 5 * 5 * 19  # GRID_SIZE^2 * TILE_FEATURES = 475
+_OBS_ROUND_BYTE_OFFSET = _OBS_GLOBAL_START * 4  # byte offset for float32 obs
+>>>>>>> Stashed changes
 
 
 def compute_dense_flow_rewards(
@@ -92,6 +99,14 @@ def compute_dense_flow_rewards(
 
     Requires transfer_events buffer. Raises if missing.
     """
+<<<<<<< Updated upstream
+=======
+    buf = global_states.get("transfer_events_buf", b"")
+    if not buf:
+        transfer_path = global_states.get("transfer_events_path")
+        if transfer_path:
+            buf = Path(transfer_path).read_bytes()
+>>>>>>> Stashed changes
     n_turns = global_states.get("n_turns", 0)
     if n_turns == 0:
         return {}
@@ -131,8 +146,25 @@ def augment_trajectories_with_flow_rewards(
     """
     for traj in trajectories:
         for i, step in enumerate(traj):
+<<<<<<< Updated upstream
             if not isinstance(step, TrajectoryStep):
                 raise TypeError(f"Expected TrajectoryStep, got {type(step).__name__}")
             traj[i] = step.with_reward(rewards.get(step.round_idx, 0.0))
+=======
+            if not isinstance(step, (list, tuple)) or len(step) < 7:
+                continue
+            if isinstance(step, tuple):
+                step = list(step)
+                traj[i] = step
+            obs = step[0]
+            if isinstance(obs, (bytes, bytearray, memoryview)):
+                rnd_val = struct.unpack_from('<f', obs, _OBS_ROUND_BYTE_OFFSET)[0]
+            else:
+                rnd_val = obs[_OBS_GLOBAL_START]
+            rnd = int(round(rnd_val * 2000.0))
+            rnd = max(0, min(rnd, 1999))
+            slot = 7 if len(step) > 12 else 6  # n_working slot
+            step[slot] = rewards.get(rnd, 0.0)
+>>>>>>> Stashed changes
 
     return trajectories

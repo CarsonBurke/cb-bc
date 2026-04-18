@@ -44,18 +44,18 @@ def main():
     args = parser.parse_args()
 
     sess = _init_session(args.session)
-    weight_path = str(sess["weight_path"])
+    actor_weight_path = str(sess["actor_weight_path"])
     replay_dir = sess["replay_dir"]
     maps = [f.name for f in (PROJECT_ROOT / "maps").glob("*.map26")]
 
     # Load teacher
     teacher = BuilderMLP(hidden=TEACHER_HIDDEN).to(DEVICE)
-    if not teacher.load_weights(weight_path):
-        print(f"Could not load teacher weights from {weight_path}")
+    if not teacher.load_weights(actor_weight_path):
+        print(f"Could not load teacher weights from {actor_weight_path}")
         return
     teacher.eval()
     n_teacher = sum(p.numel() for p in teacher.parameters())
-    print(f"Teacher: {n_teacher:,} params loaded from {weight_path}")
+    print(f"Teacher: {n_teacher:,} params loaded from {actor_weight_path}")
 
     # Create student
     student = BuilderMLP().to(DEVICE)

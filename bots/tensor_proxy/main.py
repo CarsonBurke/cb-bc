@@ -25,16 +25,35 @@ from shared_collector import CollectorClient
 
 from cambc import Controller, Direction, EntityType, Environment, Position
 
+<<<<<<< Updated upstream
 _collector = None
 _unit_id_counter = 1
 _FALLBACK_BUILD_DIR_ORDER = (1, 5, 7, 3, 2, 8, 6, 0)
 _FALLBACK_MOVE_DIR_ORDER = (1, 5, 7, 3, 2, 8, 6, 0)
+=======
+_TRAIN_LOG = os.environ.get("TENSOR_TRAIN_LOG")
+
+# Struct-based binary IPC protocol
+_OBS_FLOATS = INPUT_SIZE + H_DIM  # obs + h_prev
+_OBS_BYTES = _OBS_FLOATS * 4
+_ACT_HEAD = struct.Struct('=iiiii')
+_ACT_INTS = 5  # bt, bd, cd, brt, md
+_ACT_FLOATS = H_DIM + 1  # h_next + old_lp
+_ACT_SIZE = _ACT_INTS * 4 + _ACT_FLOATS * 4
+_H_BYTES = H_DIM * 4
+_LP_STRUCT = struct.Struct('=f')
+
+# Pipe connections opened lazily per-player
+_opened_pipes = {}
+_live_log_players = set()
+>>>>>>> Stashed changes
 
 
 def _training_turn_cap() -> int | None:
     raw = os.environ.get("TENSOR_TRAIN_MAX_TURNS", "").strip()
     if not raw:
         return None
+<<<<<<< Updated upstream
     try:
         value = int(raw)
     except ValueError as exc:
@@ -93,6 +112,13 @@ def _next_unit_id() -> int:
     unit_id = _unit_id_counter
     _unit_id_counter += 1
     return unit_id
+=======
+    bt, bd, cd, brt, md = _ACT_HEAD.unpack_from(data, 0)
+    h_next = array("f")
+    h_next.frombytes(data[_ACT_INTS * 4:_ACT_INTS * 4 + _H_BYTES])
+    old_lp = _LP_STRUCT.unpack_from(data, _ACT_INTS * 4 + _H_BYTES)[0]
+    return bt, bd, cd, brt, md, 0.0, h_next, old_lp
+>>>>>>> Stashed changes
 
 
 class Player:
@@ -157,6 +183,7 @@ class Player:
 
         obs = self._encode_state_buf(ct)
 
+<<<<<<< Updated upstream
         collector = _get_collector()
         if collector is None:
             raise RuntimeError("tensor_proxy missing actor collector transport")
@@ -165,19 +192,50 @@ class Player:
             raise RuntimeError("tensor_proxy actor collector transport closed")
         self._has_collected_step = True
         build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx = result
+=======
+        obs_wfd, act_rfd = _get_pipes()
+        h_in = self.h_prev
+
+        if obs_wfd is not None:
+            _send_obs(obs_wfd, obs, h_in)
+            result = _recv_action(act_rfd)
+            if result is not None:
+                build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx, value, h_next, old_log_prob = result
+                self.h_prev = h_next
+            else:
+                build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
+                build_dir_idx = random.randint(0, 8)
+                conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
+                bridge_target_idx = 0
+                move_dir_idx = random.randint(0, 8)
+                value, old_log_prob = 0.0, 0.0
+        else:
+            build_type_idx = random.randint(0, len(BUILD_ACTIONS) - 1)
+            build_dir_idx = random.randint(0, 8)
+            conv_dir_idx = random.choice([i for i, ok in enumerate(_CONV_DIR_MASK) if ok])
+            bridge_target_idx = 0
+            move_dir_idx = random.randint(0, 8)
+            value, old_log_prob = 0.0, 0.0
+>>>>>>> Stashed changes
 
         build_action = BUILD_ACTIONS[build_type_idx]
         build_dir = DIR_MAP_9[build_dir_idx]
         conv_dir = CONV_DIR_4[conv_dir_idx]
         _harv_aux, _conv_aux, dbg = execute_build(ct, build_action, build_dir, conv_dir, self.my_team, bridge_target_idx)
+<<<<<<< Updated upstream
         self._dbg_flags = (
             dbg[0] | (dbg[1] << 1) | (dbg[2] << 2) | (dbg[3] << 3)
             | (dbg[4] << 4) | (dbg[5] << 5) | (dbg[6] << 6) | (dbg[7] << 7)
         )
+=======
+        harv_reward = 0.0
+        conv_reward = 0.0
+>>>>>>> Stashed changes
 
         move_dir = DIR_MAP_9[move_dir_idx]
         execute_move(ct, move_dir)
 
+<<<<<<< Updated upstream
     def _run_builder_fallback(self, ct, round_idx: int) -> None:
         obs = self._encode_state_buf(ct)
         if (
@@ -214,6 +272,24 @@ class Player:
             | (dbg[4] << 4) | (dbg[5] << 5) | (dbg[6] << 6) | (dbg[7] << 7)
         )
         execute_move(ct, DIR_MAP_9[move_dir_idx])
+=======
+        ti_after, ax_after = ct.get_global_resources()
+        self._prev_resources = (ti_after, ax_after)
+
+        if self._train_log is not None:
+            self._train_log.append((
+                obs.tobytes(), h_in.tobytes(),
+                build_type_idx, build_dir_idx, conv_dir_idx, move_dir_idx,
+                value, 0, conv_reward, ti_after,
+                harv_reward, GameState.enemy_core_dmg, old_log_prob,
+                dbg[0], dbg[1], dbg[2], dbg[3],
+                dbg[4], dbg[5], dbg[6], dbg[7],
+                GameState.own_core_dmg,
+                bridge_target_idx,
+            ))
+            if ct.get_current_round() >= 1999:
+                self._flush_log()
+>>>>>>> Stashed changes
 
     def _find_core(self, ct):
         if self.my_team is None:

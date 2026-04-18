@@ -230,9 +230,6 @@ class Tensor:
 
     # ---- Activations ----
 
-    def relu(self) -> Tensor:
-        return Tensor([x if x > 0.0 else 0.0 for x in self.data], self.shape)
-
     def tanh(self) -> Tensor:
         return Tensor([math.tanh(x) for x in self.data], self.shape)
 
