@@ -1823,8 +1823,23 @@ def _coerce_replay_buffer(buf):
 def _load_critic_round_batch(
     centralized_data: dict,
     round_ids: torch.Tensor,
+    *,
+    round_ids_cpu: torch.Tensor | None = None,
+    batch_shape: tuple[int, int] | None = None,
+    staging_slot: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fetch one round batch, staging from CPU to GPU only as needed."""
+    """Fetch one round batch, staging from CPU to GPU only as needed.
+
+    ``round_ids_cpu`` and ``batch_shape`` are optional hot-path hoists: when
+    callers (e.g. the PPO critic loop) have already materialized the CPU ids
+    and max (w, h) for this batch at plan-build time, pass them in to avoid
+    per-batch device sync and Python work on sizes.
+
+    ``staging_slot`` selects which buffer of an optional ping-pong pool
+    (``centralized_data['critic_input_staging_pool']``) to write into. This
+    lets the PPO critic loop overlap H2D copies for batch k+1 on a side
+    stream with compute for batch k on the default stream.
+    """
     ids = round_ids.long()
     if "gpu_obs" in centralized_data:
         return (
@@ -1838,17 +1853,20 @@ def _load_critic_round_batch(
     scalars_cpu = centralized_data["global_scalars"]
 
     if DEVICE.type != "cuda":
-        ids_cpu = ids.cpu()
+        ids_cpu = round_ids_cpu if round_ids_cpu is not None else ids.cpu()
         return (
             obs_cpu.index_select(0, ids_cpu),
             mask_cpu.index_select(0, ids_cpu),
             scalars_cpu.index_select(0, ids_cpu),
         )
 
-    ids_cpu = ids.cpu()
-    sizes = centralized_data["global_sizes"].index_select(0, ids_cpu)
-    batch_w = int(sizes[:, 0].max().item())
-    batch_h = int(sizes[:, 1].max().item())
+    ids_cpu = round_ids_cpu if round_ids_cpu is not None else ids.cpu()
+    if batch_shape is not None:
+        batch_w, batch_h = batch_shape
+    else:
+        sizes = centralized_data["global_sizes"].index_select(0, ids_cpu)
+        batch_w = int(sizes[:, 0].max().item())
+        batch_h = int(sizes[:, 1].max().item())
     n_rounds = int(ids_cpu.numel())
 
     def _contiguous_range(sel: torch.Tensor) -> tuple[int, int] | None:
@@ -1874,7 +1892,11 @@ def _load_critic_round_batch(
         scalars_src = scalars_cpu.index_select(0, ids_cpu)
 
     gpu_dtype = torch.bfloat16 if _USE_BF16 else torch.float32
-    staging = centralized_data.get("critic_input_staging")
+    pool = centralized_data.get("critic_input_staging_pool")
+    if pool is not None:
+        staging = pool[staging_slot]
+    else:
+        staging = centralized_data.get("critic_input_staging")
     if (
         staging is None
         or staging.capacity_rounds < n_rounds
@@ -1905,7 +1927,10 @@ def _load_critic_round_batch(
             capacity_h=batch_h,
             capacity_w=batch_w,
         )
-        centralized_data["critic_input_staging"] = staging
+        if pool is not None:
+            pool[staging_slot] = staging
+        else:
+            centralized_data["critic_input_staging"] = staging
 
     obs_dst = staging.obs[:n_rounds, :, :batch_h, :batch_w]
     mask_dst = staging.mask[:n_rounds, :, :batch_h, :batch_w]
@@ -1988,9 +2013,11 @@ class RoundMajorPack:
 @dataclass(slots=True)
 class CriticEpochPlan:
     round_ids: torch.Tensor
+    round_ids_cpu: torch.Tensor
     round_offsets: torch.Tensor
     round_offsets_cpu: list[int]
     batch_ranges: list[tuple[int, int]]
+    batch_shapes_cpu: list[tuple[int, int]]
     local_round_idx_by_batch: list[torch.Tensor]
     packed_xy: torch.Tensor
     packed_unit_float: torch.Tensor
@@ -2183,6 +2210,34 @@ def _pack_round_major_tensors(
     )
 
 
+def _compute_batch_shapes_cpu(
+    batch_ranges: list[tuple[int, int]],
+    round_ids_cpu: torch.Tensor,
+    global_sizes: torch.Tensor,
+) -> list[tuple[int, int]]:
+    """Precompute per-batch max (width, height) from CPU sizes.
+
+    Hoists the `sizes.max().item()` calls out of `_load_critic_round_batch`'s
+    per-batch hot path so the critic inner loop avoids per-call Python work on
+    sizes data. Resolved entirely on CPU — no device sync.
+    """
+    if not global_sizes.is_cpu or not round_ids_cpu.is_cpu:
+        raise ValueError(
+            "_compute_batch_shapes_cpu requires CPU tensors for global_sizes "
+            f"(got device={global_sizes.device}) and round_ids_cpu (got "
+            f"device={round_ids_cpu.device})"
+        )
+    shapes: list[tuple[int, int]] = []
+    for r_start, r_end in batch_ranges:
+        rs = round_ids_cpu[r_start:r_end]
+        if rs.numel() == 0:
+            shapes.append((0, 0))
+            continue
+        sz = global_sizes.index_select(0, rs)
+        shapes.append((int(sz[:, 0].max()), int(sz[:, 1].max())))
+    return shapes
+
+
 def _build_critic_epoch_plan(
     step_round_idx: torch.Tensor,
     step_unit_xy: torch.Tensor,
@@ -2193,8 +2248,14 @@ def _build_critic_epoch_plan(
     target_steps: int,
     positive_mask: torch.Tensor | None = None,
     max_rounds: int | None = None,
+    global_sizes: torch.Tensor | None = None,
 ) -> CriticEpochPlan:
-    """Build one critic epoch plan with round-major packed step tensors."""
+    """Build one critic epoch plan with round-major packed step tensors.
+
+    If ``global_sizes`` is provided (a CPU tensor of per-round (w, h)), the
+    plan also carries pre-computed per-batch max shapes so the inner critic
+    loop avoids per-batch sync on round dimensions.
+    """
     if positive_mask is None:
         perm, _, _, batch_ranges = _critic_round_batch_plan(
             step_round_idx,
@@ -2220,11 +2281,18 @@ def _build_critic_epoch_plan(
                 torch.arange(n_rounds, device=step_round_idx.device),
                 chunk_round_counts,
             ))
+        round_ids_cpu = packed.round_ids.cpu()
+        batch_shapes_cpu = (
+            _compute_batch_shapes_cpu(batch_ranges, round_ids_cpu, global_sizes)
+            if global_sizes is not None else []
+        )
         return CriticEpochPlan(
             round_ids=packed.round_ids,
+            round_ids_cpu=round_ids_cpu,
             round_offsets=packed.round_offsets,
             round_offsets_cpu=packed.round_offsets_cpu,
             batch_ranges=batch_ranges,
+            batch_shapes_cpu=batch_shapes_cpu,
             local_round_idx_by_batch=local_round_idx_by_batch,
             packed_xy=packed.tensors[0],
             packed_unit_float=packed.tensors[1],
@@ -2269,11 +2337,18 @@ def _build_critic_epoch_plan(
         ))
         round_cursor = next_cursor
 
+    round_ids_cpu = ordered_round_ids.cpu()
+    batch_shapes_cpu = (
+        _compute_batch_shapes_cpu(batch_ranges, round_ids_cpu, global_sizes)
+        if global_sizes is not None else []
+    )
     return CriticEpochPlan(
         round_ids=ordered_round_ids,
+        round_ids_cpu=round_ids_cpu,
         round_offsets=round_offsets,
         round_offsets_cpu=round_offsets.tolist(),
         batch_ranges=batch_ranges,
+        batch_shapes_cpu=batch_shapes_cpu,
         local_round_idx_by_batch=local_round_idx_by_batch,
         packed_xy=packed.tensors[0].index_select(0, take_positions),
         packed_unit_float=packed.tensors[1].index_select(0, take_positions),
@@ -3460,6 +3535,10 @@ def _get_logprob_step_fn() -> Callable:
     """Get the (possibly compiled) logprob recurrent step function."""
     global _compiled_logprob_step
     if _compiled_logprob_step is None:
+        # Default compile mode only: reduce-overhead caches a cudagraph per
+        # input shape and retains its capture memory in a persistent pool.
+        # Tail chunks and trailing partial minibatches produce multiple shapes
+        # across episodes, so that mode leaks memory here.
         _compiled_logprob_step = maybe_compile(
             _logprob_recurrent_step,
             _get_actor_cuda_config(),
@@ -3594,6 +3673,10 @@ def _get_actor_step_fn() -> Callable:
     """Get the (possibly compiled) actor recurrent step function."""
     global _compiled_actor_step
     if _compiled_actor_step is None:
+        # Default compile mode only: reduce-overhead's cudagraph pool grows
+        # unboundedly when shapes vary across episodes (trailing partial
+        # minibatches + tail BPTT chunks each produce distinct B). Shape
+        # specialization without cudagraphs still generates fused kernels.
         _compiled_actor_step = maybe_compile(
             _actor_recurrent_step,
             _get_actor_cuda_config(),
@@ -4001,92 +4084,192 @@ def ppo_update(
         _ctx_dim = centralized_data["step_unit_ctx"].shape[1]
         old_values_safe = old_values if old_values is not None else returns
         step_rv = torch.stack([returns, old_values_safe], dim=1)
+        global_sizes_cpu = centralized_data.get("global_sizes")
 
-        for epoch in range(critic_epochs):
-            with trace_scope(trace, "ppo.critic_epoch_plan"):
-                epoch_plan = _build_critic_epoch_plan(
-                    step_round_idx,
-                    step_unit_xy,
-                    step_unit_float,
-                    step_rv,
-                    step_actions,
-                    target_steps=critic_minibatch_size,
-                    positive_mask=positive_reward_mask,
+        # Double-buffered H2D prefetch: batch k+1's staging copies run on a
+        # side stream while the default stream runs batch k's compute. Slots
+        # are ping-ponged so the prefetch never writes a buffer the default
+        # stream is still reading. VRAM cost is one extra CriticInputStaging
+        # (~a few MB at typical map sizes).
+        #
+        # `copy_done` / `compute_done` events persist across epochs. Each
+        # batch's compute records `compute_done[slot]` at the end; the next
+        # prefetch into that slot (possibly in a later epoch) waits on that
+        # record before clobbering the staging buffer.
+        use_prefetch = DEVICE.type == "cuda"
+        prefetch_stream = torch.cuda.Stream() if use_prefetch else None
+        centralized_data["critic_input_staging_pool"] = [None, None]
+        copy_done = [torch.cuda.Event() for _ in range(2)] if use_prefetch else [None, None]
+        compute_done = [torch.cuda.Event() for _ in range(2)] if use_prefetch else [None, None]
+        slot_filled = [False, False]
+
+        def _issue_prefetch(epoch_plan_: CriticEpochPlan, batch_idx: int) -> dict:
+            slot = batch_idx % 2
+            round_start, round_end = epoch_plan_.batch_ranges[batch_idx]
+            step_lo = epoch_plan_.round_offsets_cpu[round_start]
+            step_hi = epoch_plan_.round_offsets_cpu[round_end]
+            c_rounds = epoch_plan_.round_ids[round_start:round_end]
+            c_rounds_cpu = epoch_plan_.round_ids_cpu[round_start:round_end]
+            batch_shape = (
+                epoch_plan_.batch_shapes_cpu[batch_idx]
+                if epoch_plan_.batch_shapes_cpu else None
+            )
+            if use_prefetch:
+                # Don't clobber a slot the default stream is still reading.
+                if slot_filled[slot]:
+                    prefetch_stream.wait_event(compute_done[slot])
+                with torch.cuda.stream(prefetch_stream):
+                    g_obs, g_mask, g_scalars = _load_critic_round_batch(
+                        centralized_data, c_rounds,
+                        round_ids_cpu=c_rounds_cpu,
+                        batch_shape=batch_shape,
+                        staging_slot=slot,
+                    )
+                    copy_done[slot].record()
+                slot_filled[slot] = True
+            else:
+                g_obs, g_mask, g_scalars = _load_critic_round_batch(
+                    centralized_data, c_rounds,
+                    round_ids_cpu=c_rounds_cpu,
+                    batch_shape=batch_shape,
+                    staging_slot=slot,
                 )
+            return {
+                "batch_idx": batch_idx,
+                "slot": slot,
+                "round_start": round_start,
+                "round_end": round_end,
+                "step_lo": step_lo,
+                "step_hi": step_hi,
+                "c_rounds_cpu": c_rounds_cpu,
+                "g_obs": g_obs,
+                "g_mask": g_mask,
+                "g_scalars": g_scalars,
+            }
 
-            for batch_idx, (round_start, round_end) in enumerate(epoch_plan.batch_ranges):
-                with trace_scope(trace, "ppo.critic_minibatch"):
-                    t_value = time.perf_counter() if profile is not None else 0.0
-                    critic_opt.zero_grad(set_to_none=True)
+        try:
+            for epoch in range(critic_epochs):
+                with trace_scope(trace, "ppo.critic_epoch_plan"):
+                    epoch_plan = _build_critic_epoch_plan(
+                        step_round_idx,
+                        step_unit_xy,
+                        step_unit_float,
+                        step_rv,
+                        step_actions,
+                        target_steps=critic_minibatch_size,
+                        positive_mask=positive_reward_mask,
+                        global_sizes=global_sizes_cpu,
+                    )
+
+                n_batches = len(epoch_plan.batch_ranges)
+                pending: list[dict | None] = [None, None]
+                if n_batches > 0:
+                    pending[0] = _issue_prefetch(epoch_plan, 0)
+                if n_batches > 1:
+                    pending[1] = _issue_prefetch(epoch_plan, 1)
+
+                for batch_idx in range(n_batches):
+                    ctx = pending[batch_idx % 2]
                     capture_this_batch = (
                         DEVICE.type == "cuda"
                         and _NCU_CRITIC_BATCH_INDEX >= 0
                         and epoch == _NCU_CRITIC_EPOCH_INDEX
                         and batch_idx == _NCU_CRITIC_BATCH_INDEX
                     )
-                    if capture_this_batch:
-                        torch.cuda.synchronize()
-                        torch.cuda.profiler.start()
+                    next_prefetch = batch_idx + 2
+                    # Defer the look-ahead prefetch for NCU-captured batches so
+                    # the profile window doesn't include unrelated H2D copy
+                    # kernels queued on the prefetch stream. For normal batches
+                    # we issue it up front so it overlaps with this batch's
+                    # compute on the default stream.
+                    if next_prefetch < n_batches and not capture_this_batch:
+                        pending[batch_idx % 2] = _issue_prefetch(epoch_plan, next_prefetch)
 
-                    step_lo = epoch_plan.round_offsets_cpu[round_start]
-                    step_hi = epoch_plan.round_offsets_cpu[round_end]
-                    mb_xy = epoch_plan.packed_xy[step_lo:step_hi]
-                    mb_uf = epoch_plan.packed_unit_float[step_lo:step_hi]
-                    mb_rv = epoch_plan.packed_returns_values[step_lo:step_hi]
-                    mb_actions = epoch_plan.packed_actions[step_lo:step_hi]
-                    vf_denom = max(mb_xy.shape[0], 1)
-                    c_rounds = epoch_plan.round_ids[round_start:round_end]
-                    g_obs, g_mask, g_scalars = _load_critic_round_batch(centralized_data, c_rounds)
-                    local_round_idx = epoch_plan.local_round_idx_by_batch[batch_idx]
-                    u_ctx = mb_uf[:, :_ctx_dim]
-                    u_latent = mb_uf[:, _ctx_dim:]
-                    mb_returns = mb_rv[:, 0]
-                    mb_old_values = mb_rv[:, 1]
-                    with autocast_context(critic_cuda_cfg):
-                        loss_sum, vf_loss_sum, new_values = critic_loss_step(
-                            g_obs,
-                            g_mask,
-                            g_scalars,
-                            local_round_idx,
-                            mb_xy,
-                            u_ctx,
-                            u_latent,
-                            mb_actions,
-                            mb_returns,
-                            mb_old_values,
+                    with trace_scope(trace, "ppo.critic_minibatch"):
+                        t_value = time.perf_counter() if profile is not None else 0.0
+                        critic_opt.zero_grad(set_to_none=True)
+                        if capture_this_batch:
+                            torch.cuda.synchronize()
+                            torch.cuda.profiler.start()
+
+                        step_lo = ctx["step_lo"]
+                        step_hi = ctx["step_hi"]
+                        mb_xy = epoch_plan.packed_xy[step_lo:step_hi]
+                        mb_uf = epoch_plan.packed_unit_float[step_lo:step_hi]
+                        mb_rv = epoch_plan.packed_returns_values[step_lo:step_hi]
+                        mb_actions = epoch_plan.packed_actions[step_lo:step_hi]
+                        vf_denom = max(mb_xy.shape[0], 1)
+                        c_rounds_cpu = ctx["c_rounds_cpu"]
+                        g_obs = ctx["g_obs"]
+                        g_mask = ctx["g_mask"]
+                        g_scalars = ctx["g_scalars"]
+                        # Gate default-stream compute on this slot's H2D copies.
+                        if use_prefetch:
+                            torch.cuda.current_stream().wait_event(copy_done[ctx["slot"]])
+
+                        local_round_idx = epoch_plan.local_round_idx_by_batch[batch_idx]
+                        u_ctx = mb_uf[:, :_ctx_dim]
+                        u_latent = mb_uf[:, _ctx_dim:]
+                        mb_returns = mb_rv[:, 0]
+                        mb_old_values = mb_rv[:, 1]
+                        with autocast_context(critic_cuda_cfg):
+                            loss_sum, vf_loss_sum, new_values = critic_loss_step(
+                                g_obs,
+                                g_mask,
+                                g_scalars,
+                                local_round_idx,
+                                mb_xy,
+                                u_ctx,
+                                u_latent,
+                                mb_actions,
+                                mb_returns,
+                                mb_old_values,
+                            )
+                        batch_ctx = (
+                            f"critic minibatch epoch={epoch} batch={batch_idx} "
+                            f"n_rounds={int(c_rounds_cpu.numel())} n_steps={int(mb_xy.shape[0])} "
+                            f"round_lo={int(c_rounds_cpu[0]) if c_rounds_cpu.numel() > 0 else -1} "
+                            f"round_hi={int(c_rounds_cpu[-1]) if c_rounds_cpu.numel() > 0 else -1}"
                         )
-                    batch_ctx = (
-                        f"critic minibatch epoch={epoch} batch={batch_idx} "
-                        f"n_rounds={int(c_rounds.numel())} n_steps={int(mb_xy.shape[0])} "
-                        f"round_lo={int(c_rounds[0].item()) if c_rounds.numel() > 0 else -1} "
-                        f"round_hi={int(c_rounds[-1].item()) if c_rounds.numel() > 0 else -1}"
-                    )
-                    try:
-                        _require_finite(f"{batch_ctx}.loss_sum", loss_sum.detach())
-                        _require_finite(f"{batch_ctx}.vf_loss_sum", vf_loss_sum)
-                        _require_finite(f"{batch_ctx}.new_values", new_values)
-                    except RuntimeError as e:
-                        raise RuntimeError(str(e)) from e
-                    (vf_coeff * loss_sum / vf_denom).backward()
+                        try:
+                            _require_finite(f"{batch_ctx}.loss_sum", loss_sum.detach())
+                            _require_finite(f"{batch_ctx}.vf_loss_sum", vf_loss_sum)
+                            _require_finite(f"{batch_ctx}.new_values", new_values)
+                        except RuntimeError as e:
+                            raise RuntimeError(str(e)) from e
+                        (vf_coeff * loss_sum / vf_denom).backward()
 
-                    critic_gn = torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
-                    if not torch.isfinite(critic_gn):
-                        _require_module_grads_finite(f"{batch_ctx}.critic_grads", critic)
-                        raise RuntimeError(f"non-finite {batch_ctx}.critic_grad_norm: value={critic_gn!r}")
-                    critic_opt.step()
-                    _require_module_params_finite(f"{batch_ctx}.critic_params", critic)
-                    if capture_this_batch:
-                        torch.cuda.synchronize()
-                        torch.cuda.profiler.stop()
+                        critic_gn = torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
+                        if not torch.isfinite(critic_gn):
+                            _require_module_grads_finite(f"{batch_ctx}.critic_grads", critic)
+                            raise RuntimeError(f"non-finite {batch_ctx}.critic_grad_norm: value={critic_gn!r}")
+                        critic_opt.step()
+                        _require_module_params_finite(f"{batch_ctx}.critic_params", critic)
+                        # Let the next prefetch into this slot wait on us.
+                        if use_prefetch:
+                            compute_done[ctx["slot"]].record()
+                        if capture_this_batch:
+                            torch.cuda.synchronize()
+                            torch.cuda.profiler.stop()
 
-                    with torch.no_grad():
-                        _critic_acc[0] += vf_loss_sum / vf_denom
-                        _critic_acc[1] += critic_gn
-                        _critic_acc[2] += new_values.abs().mean()
-                    n_critic_updates += 1
+                        with torch.no_grad():
+                            _critic_acc[0] += vf_loss_sum / vf_denom
+                            _critic_acc[1] += critic_gn
+                            _critic_acc[2] += new_values.abs().mean()
+                        n_critic_updates += 1
 
-                    if profile is not None:
-                        profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_value)
+                        if profile is not None:
+                            profile["ppo_value_loss_s"] = profile.get("ppo_value_loss_s", 0.0) + (time.perf_counter() - t_value)
+
+                    # NCU-captured batch: issue the deferred look-ahead prefetch
+                    # now that profiling has stopped.
+                    if capture_this_batch and next_prefetch < n_batches:
+                        pending[batch_idx % 2] = _issue_prefetch(epoch_plan, next_prefetch)
+        finally:
+            # Release the pool so callers using _load_critic_round_batch
+            # outside the PPO loop (e.g. _compute_all_values) revert to the
+            # single-buffer staging path.
+            centralized_data.pop("critic_input_staging_pool", None)
 
     if n_temperature > 0:
         mean_temperature = sum_temperature / n_temperature
