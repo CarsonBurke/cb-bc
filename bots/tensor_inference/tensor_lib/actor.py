@@ -273,10 +273,7 @@ class ActorModel:
         self.cls_ca_k_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
         self.cls_ca_v_proj = Linear(TILE_EMBED_DIM, TILE_EMBED_DIM)
 
-        self.context_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
-        self.tile_sa_q_norm = RMSNorm(TILE_EMBED_DIM)
-        self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_norm = RMSNorm(ACTOR_LATENT_DIM)
         self.context_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_ffn_out_norm = RMSNorm(TILE_EMBED_DIM)
@@ -292,6 +289,7 @@ class ActorModel:
             [0.5] * (TILE_EMBED_DIM // 2), (TILE_EMBED_DIM // 2,)
         )
         self.tile_sa_lookaway = Tensor.zeros((TILE_EMBED_DIM,))
+        self.tile_sa_q_gain = Tensor([1.5], (1,))
         self.cls_ca_tau = Tensor.zeros((ACTOR_CLS_TOKENS,))
         self.context_resid_mix = Tensor(
             [1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM,
@@ -387,9 +385,7 @@ class ActorModel:
         params.append(self.cls_tokens)
         params.append(self.context_tau)
         for layer in (
-            self.context_ca_norm,
             self.tile_sa_norm,
-            self.cls_ca_norm,
             self.latent_norm,
             self.head_build_type,
             self.head_build_dir,
@@ -419,7 +415,7 @@ class ActorModel:
         params.append(self.cls_resid_mix)
         params.append(self.tile_sa_pos_weight)
         params.append(self.tile_sa_lookaway)
-        params.extend(self.tile_sa_q_norm.parameters())
+        params.append(self.tile_sa_q_gain)
         return params
 
     def train(self, mode: bool = True) -> None:
@@ -581,10 +577,7 @@ class ActorModel:
             "cls_ca_q_proj": _linear_rows(self.cls_ca_q_proj),
             "cls_ca_k_proj": _linear_rows(self.cls_ca_k_proj),
             "cls_ca_v_proj": _linear_rows(self.cls_ca_v_proj),
-            "context_ca_norm": (list(self.context_ca_norm.gamma.data), self.context_ca_norm.eps),
             "tile_sa_norm": (tile_sa_norm_gamma, self.tile_sa_norm.eps),
-            "tile_sa_q_norm": (list(self.tile_sa_q_norm.gamma.data), self.tile_sa_q_norm.eps),
-            "cls_ca_norm": (list(self.cls_ca_norm.gamma.data), self.cls_ca_norm.eps),
             "latent_norm": (list(self.latent_norm.gamma.data), self.latent_norm.eps),
             "context_ca_input_norm": (list(self.context_ca_input_norm.gamma.data), self.context_ca_input_norm.eps),
             "tile_ffn_out_norm": (list(self.tile_ffn_out_norm.gamma.data), self.tile_ffn_out_norm.eps),
@@ -616,6 +609,7 @@ class ActorModel:
             "tile_sa_register_k": register_k,
             "tile_sa_register_v": register_v,
             "tile_sa_neg_g_register_k_norm_sq": neg_g_register_k_norm_sq,
+            "tile_sa_q_gain": self.tile_sa_q_gain.data[0],
         }
         return cache
 
@@ -634,10 +628,7 @@ class ActorModel:
         cls_q_rows, cls_q_bias = cache["cls_ca_q_proj"]
         cls_k_rows, cls_k_bias = cache["cls_ca_k_proj"]
         cls_v_rows, cls_v_bias = cache["cls_ca_v_proj"]
-        context_norm_gamma, context_norm_eps = cache["context_ca_norm"]
         _tile_norm_gamma, tile_norm_eps = cache["tile_sa_norm"]
-        tile_sa_q_norm_gamma, tile_sa_q_norm_eps = cache["tile_sa_q_norm"]
-        cls_norm_gamma, cls_norm_eps = cache["cls_ca_norm"]
         latent_norm_gamma, latent_norm_eps = cache["latent_norm"]
         context_in_norm_gamma, context_in_norm_eps = cache["context_ca_input_norm"]
         tile_ffn_out_norm_gamma, tile_ffn_out_norm_eps = cache["tile_ffn_out_norm"]
@@ -648,6 +639,7 @@ class ActorModel:
         cls_tokens_flat = cache["cls_tokens"]
         context_tau = cache["context_tau"]
         tile_sa_gamma = cache["tile_sa_gamma"]
+        tile_sa_q_gain = cache["tile_sa_q_gain"]
         cls_ca_tau = cache["cls_ca_tau"]
         context_resid_mix_cur, context_resid_mix_anchor = cache["context_resid_mix"]
         cls_resid_mix_cur, cls_resid_mix_anchor = cache["cls_resid_mix"]
@@ -755,7 +747,7 @@ class ActorModel:
                 encoded_flat[off + j] = x
                 mean_sq += x * x
             inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + tile_norm_eps) ** 0.5
-            # Pre-norm QKV projection, SuSIE add on Q/K, Q-norm on Q (post-position).
+            # Pre-norm QKV projection, SuSIE add on Q/K, stateless RMS on Q (post-position).
             pos_t = tile_sa_pos_list[t]
             k_nsq = 0.0
             q_mean_sq = 0.0
@@ -769,9 +761,10 @@ class ActorModel:
                 q_mean_sq += q_pre * q_pre
                 k_nsq += k_val * k_val
                 tile_v_cols[j][t] = v_val
-            q_inv_rms = 1.0 / (q_mean_sq / TILE_EMBED_DIM + tile_sa_q_norm_eps) ** 0.5
+            q_inv_rms = 1.0 / (q_mean_sq / TILE_EMBED_DIM + 1e-6) ** 0.5
+            q_scale = q_inv_rms * tile_sa_q_gain
             for j in range(TILE_EMBED_DIM):
-                tile_q_flat[off + j] = tmp_token[j] * q_inv_rms * tile_sa_q_norm_gamma[j]
+                tile_q_flat[off + j] = tmp_token[j] * q_scale
             tile_k_norm_sq[t] = -tile_sa_gamma * k_nsq  # fused: -γ||k||² for softmax scores
         # Softmax RBF: scores = 2γ⟨q,k⟩ - γ||k||². The register competes as a
         # look-away sink; at init its V ≈ 0 so queries with no close real tile
@@ -793,11 +786,21 @@ class ActorModel:
                 attn_scores[k] = w
                 z += w
             inv_z = 1.0 / z
+            # XSA: attn_out - (attn_out · v̂) v̂, using self-V of this tile.
+            # Equivalent to subtracting (attn_out · v) / max(‖v‖², 1e-12) · v.
+            v_self = tile_v[i]
+            v_norm_sq = 0.0
+            ao_dot_v = 0.0
             for j in range(TILE_EMBED_DIM):
-                enriched_flat[off + j] = (
-                    encoded_flat[off + j]
-                    + (reg_w * register_v[j] + _DOT(attn_scores, tile_v_cols[j])) * inv_z
-                )
+                ao = (reg_w * register_v[j] + _DOT(attn_scores, tile_v_cols[j])) * inv_z
+                tmp_token[j] = ao
+                vj = v_self[j]
+                v_norm_sq += vj * vj
+                ao_dot_v += ao * vj
+            denom = v_norm_sq if v_norm_sq > 1e-12 else 1e-12
+            c = ao_dot_v / denom
+            for j in range(TILE_EMBED_DIM):
+                enriched_flat[off + j] = encoded_flat[off + j] + tmp_token[j] - c * v_self[j]
 
         # Tile FFN: pre-norm MLP followed by output-norm branch before residual add.
         tile_ffn_hidden = TILE_EMBED_DIM * 2
@@ -891,14 +894,8 @@ class ActorModel:
                 n_ctx_chunks,
                 TILE_EMBED_DIM,
             )
-            mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                x = update[j]
-                tmp_token[j] = x
-                mean_sq += x * x
-            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + context_norm_eps) ** 0.5
-            for j in range(TILE_EMBED_DIM):
-                x = token[j] + tmp_token[j] * inv_rms * context_norm_gamma[j]
+                x = token[j] + update[j]
                 if x >= 0.0:
                     token[j] = x / (1.0 + _EXP(-x))
                 else:
@@ -956,14 +953,8 @@ class ActorModel:
                 TILE_GRID_N,
                 TILE_EMBED_DIM,
             )
-            mean_sq = 0.0
             for j in range(TILE_EMBED_DIM):
-                x = update[j]
-                tmp_token[j] = x
-                mean_sq += x * x
-            inv_rms = 1.0 / (mean_sq / TILE_EMBED_DIM + cls_norm_eps) ** 0.5
-            for j in range(TILE_EMBED_DIM):
-                x = token[j] + tmp_token[j] * inv_rms * cls_norm_gamma[j]
+                x = token[j] + update[j]
                 if x >= 0.0:
                     token[j] = x / (1.0 + _EXP(-x))
                 else:
@@ -1037,7 +1028,7 @@ class ActorModel:
         """Deterministic compatibility padding for old exported actor schemas."""
         pad: list[list[float]] = []
 
-        if state_len <= 43:
+        if state_len <= 41:
             pad.append([0.0] * len(self.cls_ca_tau.data))
             pad.append([1.0] * len(self.latent_ffn_norm.gamma.data))
             pad.append([0.0] * len(self.latent_ffn_up.weight.data))
@@ -1045,14 +1036,14 @@ class ActorModel:
             pad.append([0.0] * len(self.latent_ffn_down.weight.data))
             pad.append([0.0] * len(self.latent_ffn_down.bias.data))
 
-        if state_len <= 49:
+        if state_len <= 47:
             pad.append([1.0] * len(self.tile_ffn_norm.gamma.data))
             pad.append([0.0] * len(self.tile_ffn_up.weight.data))
             pad.append([0.0] * len(self.tile_ffn_up.bias.data))
             pad.append([0.0] * len(self.tile_ffn_down.weight.data))
             pad.append([0.0] * len(self.tile_ffn_down.bias.data))
 
-        if state_len <= 54:
+        if state_len <= 52:
             for norm in (
                 self.context_ca_input_norm,
                 self.tile_ffn_out_norm,
@@ -1061,15 +1052,15 @@ class ActorModel:
             ):
                 pad.append([1.0] * len(norm.gamma.data))
 
-        if state_len <= 58:
+        if state_len <= 56:
             pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
             pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
 
-        if state_len <= 60:
+        if state_len <= 58:
             pad.append([0.5] * (TILE_EMBED_DIM // 2))  # tile_sa_pos_weight
             pad.append([0.0] * TILE_EMBED_DIM)          # tile_sa_lookaway
 
-        if state_len <= 62:
-            pad.append([1.0] * len(self.tile_sa_q_norm.gamma.data))  # tile_sa_q_norm
+        if state_len <= 60:
+            pad.append([1.5])  # tile_sa_q_gain
 
         return pad

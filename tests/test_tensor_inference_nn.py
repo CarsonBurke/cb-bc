@@ -258,7 +258,6 @@ def test_actor_load_weights_accepts_legacy_state_dict_schema(tmp_path):
         "cls_resid_mix",
         "tile_sa_pos_weight",
         "tile_sa_lookaway",
-        "tile_sa_q_norm.weight",
     }
     legacy_state = {k: v.clone() for k, v in full_state.items() if k not in legacy_keys}
     ckpt_path = tmp_path / "legacy_actor_state.pkl"

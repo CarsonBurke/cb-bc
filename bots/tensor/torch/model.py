@@ -2731,10 +2731,7 @@ class BuilderMLP(nn.Module):
         self.cls_ca_k_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
         self.cls_ca_v_proj = _parameter_golf_ortho_init(nn.Linear(TILE_EMBED_DIM, TILE_EMBED_DIM))
 
-        self.context_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_sa_norm = RMSNorm(TILE_EMBED_DIM)
-        self.tile_sa_q_norm = RMSNorm(TILE_EMBED_DIM)
-        self.cls_ca_norm = RMSNorm(TILE_EMBED_DIM)
         self.latent_norm = RMSNorm(self._actor_latent_dim)
         self.context_ca_input_norm = RMSNorm(TILE_EMBED_DIM)
         self.tile_ffn_out_norm = RMSNorm(TILE_EMBED_DIM)
@@ -2746,15 +2743,15 @@ class BuilderMLP(nn.Module):
         # SuSIE additive position for tile self-attention: sinusoidal table
         # scaled by a learnable per-freq weight (tied across sin/cos).
         self.tile_sa_pos_weight = nn.Parameter(torch.full((TILE_EMBED_DIM // 2,), 0.5))
-        # Look-away register: small scaled-Gaussian init so the register's
-        # softmax score isn't a free zero-centered sink. Zero-init would give
-        # ||register_k||² ≈ 0 under softmax RBF, making register score ≈ 0
-        # while real tiles score `2γ⟨q,k⟩ - γ||k||² ≈ -D` — the sink then
-        # dominates attention mass and starves downstream blocks of spatial
-        # signal. randn * D^-0.5 matches the ref's standard-softmax register init.
-        self.tile_sa_lookaway = nn.Parameter(
-            torch.randn(TILE_EMBED_DIM) * (TILE_EMBED_DIM ** -0.5)
-        )
+        # Look-away register: zero input gives a calibrated softmax-RBF sink
+        # at score = -γ‖q‖², matching the ref's RBF branch comment "RBF
+        # requires proper distance centering". Works because γ=1/√D keeps the
+        # softmax soft enough that real tiles still get most attention mass.
+        self.tile_sa_lookaway = nn.Parameter(torch.zeros(TILE_EMBED_DIM))
+        # Learnable scalar gain on Q after stateless RMSNorm — restores the
+        # attention-temperature knob. Init 1.5 matches the parameter-golf
+        # rbf_qnorm reference config.
+        self.tile_sa_q_gain = nn.Parameter(torch.tensor(1.5))
         self.register_buffer(
             "tile_sa_susie", _make_tile_susie(TILE_GRID_N, TILE_EMBED_DIM), persistent=False
         )
@@ -2825,17 +2822,18 @@ class BuilderMLP(nn.Module):
         attn_out = F.scaled_dot_product_attention(
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
         ).squeeze(1)
-        return F.silu(cls + self.context_ca_norm(attn_out))
+        return F.silu(cls + attn_out)
 
     def _tile_self_attention(self, tiles: torch.Tensor) -> torch.Tensor:
         """Peri-LN softmax RBF SA with SuSIE position and a look-away register.
 
         Weights are softmax(2γ⟨q,k⟩ - γ‖k‖²) — equivalent to softmax(-γ‖q-k‖²)
         since softmax is translation-invariant and cancels the ‖q‖² constant.
-        Position is additive SuSIE sinusoids on q and k. A zero-initialized
-        register token is prepended so the softmax has a competing "look-away"
-        sink: queries with no nearby real tile concentrate weight on the
-        register, whose projected V is near zero at init.
+        Position is additive SuSIE sinusoids on q and k. Q-norm is applied
+        AFTER the SuSIE add (matches ref) so Q has unit RMS at the dot-product
+        site even with additive positions. A zero-initialized register token
+        is prepended; γ=1/√D keeps the softmax soft enough that it doesn't
+        dominate, while still serving as a calibrated -γ‖q‖² distance sink.
         """
         B, N, D = tiles.shape
         lookaway = self.tile_sa_lookaway.view(1, 1, D).expand(B, 1, D)
@@ -2849,7 +2847,11 @@ class BuilderMLP(nn.Module):
         pos_weight = self.tile_sa_pos_weight.repeat(2).to(q.dtype)  # (D,)
         pos_real = self.tile_sa_susie.to(q.dtype) * pos_weight  # (N, D)
         pos_emb = F.pad(pos_real, (0, 0, 1, 0))  # (N+1, D), zero row for register
-        q = self.tile_sa_q_norm(q + pos_emb)
+        q = q + pos_emb
+        # Stateless RMS normalization on Q, then a learnable scalar gain —
+        # matches parameter-golf rbf_qnorm ref (init 1.5).
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-6)
+        q = q * self.tile_sa_q_gain.to(q.dtype)
         k = k + pos_emb
 
         gamma = self.tile_sa_gamma.exp()
@@ -2861,8 +2863,10 @@ class BuilderMLP(nn.Module):
         attn_out = torch.matmul(weights, v)  # (B, N+1, D)
         attn_out = attn_out[:, 1:, :]  # drop register output
 
-        # Softmax already bounds attn_out to the convex hull of V, so no
-        # post-norm needed — the residual stream stays well-scaled.
+        # XSA: strip the self-V-aligned component so each tile only absorbs
+        # information orthogonal to what it already carries in V.
+        attn_out = exclusive_self_attention(attn_out, v[:, 1:, :])
+
         tiles = tiles + attn_out
         tiles = tiles + self.tile_ffn_out_norm(
             self.tile_ffn_down(ffn_activation(self.tile_ffn_up(self.tile_ffn_norm(tiles)))),
@@ -2883,7 +2887,7 @@ class BuilderMLP(nn.Module):
         attn_out = F.scaled_dot_product_attention(
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
         ).squeeze(1)
-        return F.silu(cls + self.cls_ca_norm(attn_out))
+        return F.silu(cls + attn_out)
 
     def _latent_ffn(self, latent: torch.Tensor) -> torch.Tensor:
         hidden = ffn_activation(self.latent_ffn_up(self.latent_ffn_norm(latent)))
@@ -3040,9 +3044,7 @@ class BuilderMLP(nn.Module):
             ("linear", self.cls_ca_v_proj),
             ("param", self.actor_cls),
             ("param", self.context_tau),
-            ("norm", self.context_ca_norm),
             ("norm", self.tile_sa_norm),
-            ("norm", self.cls_ca_norm),
             ("norm", self.latent_norm),
             ("linear", self.head_build_type),
             ("linear", self.head_build_dir),
@@ -3070,7 +3072,7 @@ class BuilderMLP(nn.Module):
             ("param", self.cls_resid_mix),
             ("param", self.tile_sa_pos_weight),
             ("param", self.tile_sa_lookaway),
-            ("norm", self.tile_sa_q_norm),
+            ("param", self.tile_sa_q_gain),
         ]
 
     def export_weights(self) -> list[list[float]]:
@@ -3135,7 +3137,7 @@ class BuilderMLP(nn.Module):
         """Deterministic compatibility padding for old inference schemas."""
         pad: list[list[float]] = []
 
-        if state_len <= 43:
+        if state_len <= 41:
             pad.append([0.0] * self.cls_ca_tau.numel())
             pad.append([1.0] * self.latent_ffn_norm.weight.numel())
             pad.append([0.0] * (self.latent_ffn_up.in_features * self.latent_ffn_up.out_features))
@@ -3143,14 +3145,14 @@ class BuilderMLP(nn.Module):
             pad.append([0.0] * (self.latent_ffn_down.in_features * self.latent_ffn_down.out_features))
             pad.append([0.0] * self.latent_ffn_down.out_features)
 
-        if state_len <= 49:
+        if state_len <= 47:
             pad.append([1.0] * self.tile_ffn_norm.weight.numel())
             pad.append([0.0] * (self.tile_ffn_up.in_features * self.tile_ffn_up.out_features))
             pad.append([0.0] * self.tile_ffn_up.out_features)
             pad.append([0.0] * (self.tile_ffn_down.in_features * self.tile_ffn_down.out_features))
             pad.append([0.0] * self.tile_ffn_down.out_features)
 
-        if state_len <= 54:
+        if state_len <= 52:
             for norm in (
                 self.context_ca_input_norm,
                 self.tile_ffn_out_norm,
@@ -3159,16 +3161,16 @@ class BuilderMLP(nn.Module):
             ):
                 pad.append([1.0] * norm.weight.numel())
 
-        if state_len <= 58:
+        if state_len <= 56:
             pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
             pad.append([1.0] * TILE_EMBED_DIM + [0.0] * TILE_EMBED_DIM)
 
-        if state_len <= 60:
+        if state_len <= 58:
             pad.append([0.5] * (TILE_EMBED_DIM // 2))  # tile_sa_pos_weight
             pad.append([0.0] * TILE_EMBED_DIM)          # tile_sa_lookaway
 
-        if state_len <= 62:
-            pad.append([1.0] * self.tile_sa_q_norm.weight.numel())  # tile_sa_q_norm
+        if state_len <= 60:
+            pad.append([1.5])  # tile_sa_q_gain
 
         return pad
 
@@ -3200,7 +3202,7 @@ class BuilderMLP(nn.Module):
             )),
             "tile_sa_pos_weight": torch.full_like(self.tile_sa_pos_weight, 0.5),
             "tile_sa_lookaway": torch.zeros_like(self.tile_sa_lookaway),
-            "tile_sa_q_norm.weight": torch.ones_like(self.tile_sa_q_norm.weight),
+            "tile_sa_q_gain": torch.full_like(self.tile_sa_q_gain, 1.5),
         }
         return defaults
 
