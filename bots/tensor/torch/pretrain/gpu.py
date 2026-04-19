@@ -66,11 +66,13 @@ def autocast_context(config: PretrainCudaConfig):
     return torch.amp.autocast("cuda", dtype=config.amp_dtype)
 
 
-def maybe_compile(module, config: PretrainCudaConfig, *, label: str):
+def maybe_compile(module, config: PretrainCudaConfig, *, label: str, mode: str | None = None):
     if not config.compile_model:
         return module
     try:
-        return torch.compile(module)
+        if mode is None:
+            return torch.compile(module)
+        return torch.compile(module, mode=mode)
     except Exception as exc:
         print(f"Warning: torch.compile disabled for {label}: {exc}")
         return module
