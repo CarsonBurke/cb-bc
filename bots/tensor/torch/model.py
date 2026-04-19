@@ -18,6 +18,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.init import trunc_normal_
 
 try:
@@ -816,15 +817,27 @@ class CriticAttentionBlock(nn.Module):
         attn_mask: torch.Tensor | None = None,
         self_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run SDPA on projected heads and return token-major outputs."""
+        """Run SDPA on projected heads and return token-major outputs.
+
+        When a float additive mask is provided (e.g. padded-unit -inf bias),
+        PyTorch's auto dispatch picks the memory-efficient backend. Force the
+        cuDNN-attention backend instead — it accepts float masks *and* runs
+        FA-class kernels with O(N) memory (vs mem-eff's O(N²) softmax buffer),
+        giving ~2× forward speed and much smaller activation footprint for the
+        backward pass.
+        """
         B, _, N_q, _ = q.shape
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            enable_gqa=self.kv_group_size > 1,
-        )
+        # cuDNN attention is CUDA-only; on CPU let auto dispatch fall through.
+        force_cudnn = attn_mask is not None and q.is_cuda
+        ctx = sdpa_kernel([SDPBackend.CUDNN_ATTENTION]) if force_cudnn else nullcontext()
+        with ctx:
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                enable_gqa=self.kv_group_size > 1,
+            )
         if self_value is not None:
             if self.kv_group_size > 1:
                 self_value = self_value.repeat_interleave(self.kv_group_size, dim=1)
