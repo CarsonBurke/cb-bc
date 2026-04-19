@@ -1323,11 +1323,13 @@ class CriticGlobalSA(nn.Module):
 class CriticUnitCLSBuilder(nn.Module):
     """Unit CLS tokens: content(actor_latent ⊕ action_emb) + sinusoidal position.
 
-    Action embeddings are concatenated with the actor latent before the content
-    projection, so the single linear learns arbitrary latent×action interactions
-    rather than a per-channel modulation. The action slice of the projection
-    weight is zero-initialised, so training starts identical to the no-action
-    baseline and the gradient decides how much action signal to admit.
+    Per-head action embeddings are concatenated with the actor latent and fed
+    through a single Linear, producing an additive contribution
+    W_latent·latent + W_act·action_emb (no multiplicative latent×action
+    interaction — downstream self-attention + MLP are what mix the two). The
+    action slice of the projection weight is zero-initialised so training
+    starts identical to the no-action baseline; the gradient opens the action
+    channel as it becomes useful.
     """
 
     _ACTION_EMB_DIM = 8
@@ -1386,7 +1388,7 @@ class CriticUnitCLSBuilder(nn.Module):
             self.action_emb_cd(actions[:, 2]),
             self.action_emb_brt(actions[:, 3]),
             self.action_emb_md(actions[:, 4]),
-        ], dim=-1)
+        ], dim=-1).to(dtype=actor_latent.dtype)
         content = self.content_proj(torch.cat([actor_latent, action_emb], dim=-1))
         angles = unit_context.unsqueeze(-1) * self.freq_bands  # (B, 7, n_freqs)
         sine_embed = torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(1)  # (B, 224)
@@ -1625,7 +1627,7 @@ class CentralizedCritic(nn.Module):
     ) -> torch.Tensor:
         """Compute per-unit marginal values. Returns (B,)."""
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
-            unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float(), actions)
+            unit_cls = self.unit_cls_builder(actor_latent, unit_context, actions)
             global_cls, unit_cls = self._run_global_sa(
                 feat, round_scalars, round_idx, unit_xy, unit_cls,
             )
@@ -1646,7 +1648,7 @@ class CentralizedCritic(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Like unit_values but also returns raw head output for training loss."""
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
-            unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float(), actions)
+            unit_cls = self.unit_cls_builder(actor_latent, unit_context, actions)
             global_cls, unit_cls = self._run_global_sa(
                 feat, round_scalars, round_idx, unit_xy, unit_cls,
             )
