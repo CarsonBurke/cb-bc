@@ -68,8 +68,9 @@ def test_compute_all_values_batches_only_sparse_unique_rounds():
             unit_xy: torch.Tensor,
             unit_ctx: torch.Tensor,
             actor_latent: torch.Tensor,
+            actions: torch.Tensor,
         ) -> torch.Tensor:
-            del feat, round_scalars, unit_xy, unit_ctx, actor_latent
+            del feat, round_scalars, unit_xy, unit_ctx, actor_latent, actions
             self.round_idx_calls.append(round_idx.detach().cpu())
             return torch.zeros(round_idx.shape[0], device=round_idx.device)
 
@@ -82,6 +83,7 @@ def test_compute_all_values_batches_only_sparse_unique_rounds():
         "step_unit_xy": torch.zeros(2, 2, dtype=torch.long, device=device),
         "step_unit_ctx": torch.zeros(2, model_mod.UNIT_CONTEXT_DIM, device=device),
         "step_actor_latent": torch.zeros(2, model_mod.ACTOR_LATENT_DIM, device=device),
+        "step_actions": torch.zeros(2, 5, dtype=torch.long, device=device),
         "n_steps": 2,
     }
 
@@ -114,8 +116,9 @@ def test_compute_all_values_reports_nonfinite_batch_value_context(monkeypatch):
             unit_xy: torch.Tensor,
             unit_ctx: torch.Tensor,
             actor_latent: torch.Tensor,
+            actions: torch.Tensor,
         ) -> torch.Tensor:
-            del feat, round_scalars, round_idx, unit_xy, unit_ctx, actor_latent
+            del feat, round_scalars, round_idx, unit_xy, unit_ctx, actor_latent, actions
             return torch.tensor([float("nan")], device=device)
 
     monkeypatch.setattr(
@@ -133,6 +136,7 @@ def test_compute_all_values_reports_nonfinite_batch_value_context(monkeypatch):
         "step_unit_xy": torch.tensor([[3, 4]], dtype=torch.long, device=device),
         "step_unit_ctx": torch.zeros(1, model_mod.UNIT_CONTEXT_DIM, device=device),
         "step_actor_latent": torch.zeros(1, model_mod.ACTOR_LATENT_DIM, device=device),
+        "step_actions": torch.zeros(1, 5, dtype=torch.long, device=device),
         "n_steps": 1,
     }
 
@@ -386,12 +390,14 @@ def test_build_critic_epoch_plan_packs_round_major_slices(monkeypatch):
     step_unit_xy = torch.tensor([[10, 0], [11, 0], [20, 0], [21, 0], [30, 0]], dtype=torch.long)
     step_unit_float = torch.tensor([[1.0], [1.1], [2.0], [2.1], [3.0]], dtype=torch.float32)
     step_rv = torch.tensor([[10.0, 100.0], [11.0, 101.0], [20.0, 200.0], [21.0, 201.0], [30.0, 300.0]])
+    step_actions = torch.zeros(5, 5, dtype=torch.long)
 
     plan = model_mod._build_critic_epoch_plan(
         step_round_idx,
         step_unit_xy,
         step_unit_float,
         step_rv,
+        step_actions,
         target_steps=3,
         max_rounds=2,
     )
@@ -422,6 +428,7 @@ def test_build_critic_epoch_plan_spreads_positive_rounds_without_splitting_round
     )
     step_unit_float = torch.arange(8, dtype=torch.float32).unsqueeze(1)
     step_rv = torch.stack([torch.arange(8, dtype=torch.float32), torch.arange(100, 108, dtype=torch.float32)], dim=1)
+    step_actions = torch.zeros(8, 5, dtype=torch.long)
     positive_mask = torch.tensor([False, False, False, False, True, True, True, True], dtype=torch.bool)
 
     plan = model_mod._build_critic_epoch_plan(
@@ -429,6 +436,7 @@ def test_build_critic_epoch_plan_spreads_positive_rounds_without_splitting_round
         step_unit_xy,
         step_unit_float,
         step_rv,
+        step_actions,
         target_steps=4,
         positive_mask=positive_mask,
     )
@@ -455,6 +463,7 @@ def test_build_critic_epoch_plan_positive_path_respects_round_cap(monkeypatch):
     )
     step_unit_float = torch.arange(8, dtype=torch.float32).unsqueeze(1)
     step_rv = torch.stack([torch.arange(8, dtype=torch.float32), torch.arange(100, 108, dtype=torch.float32)], dim=1)
+    step_actions = torch.zeros(8, 5, dtype=torch.long)
     positive_mask = torch.tensor([False, False, False, False, True, True, True, True], dtype=torch.bool)
 
     plan = model_mod._build_critic_epoch_plan(
@@ -462,6 +471,7 @@ def test_build_critic_epoch_plan_positive_path_respects_round_cap(monkeypatch):
         step_unit_xy,
         step_unit_float,
         step_rv,
+        step_actions,
         target_steps=8,
         positive_mask=positive_mask,
         max_rounds=1,

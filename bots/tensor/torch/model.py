@@ -1304,7 +1304,16 @@ class CriticGlobalSA(nn.Module):
 
 
 class CriticUnitCLSBuilder(nn.Module):
-    """Construct unit CLS tokens: content (actor latent) + position (sine embed)."""
+    """Unit CLS tokens: content(actor_latent ⊕ action_emb) + sinusoidal position.
+
+    Action embeddings are concatenated with the actor latent before the content
+    projection, so the single linear learns arbitrary latent×action interactions
+    rather than a per-channel modulation. The action slice of the projection
+    weight is zero-initialised, so training starts identical to the no-action
+    baseline and the gradient decides how much action signal to admit.
+    """
+
+    _ACTION_EMB_DIM = 8
 
     def __init__(
         self,
@@ -1314,8 +1323,16 @@ class CriticUnitCLSBuilder(nn.Module):
         n_freqs: int = 16,
     ):
         super().__init__()
+        emb_dim = self._ACTION_EMB_DIM
+        self.action_emb_bt = nn.Embedding(N_BUILD, emb_dim)
+        self.action_emb_bd = nn.Embedding(N_DIR, emb_dim)
+        self.action_emb_cd = nn.Embedding(N_CONV_DIR, emb_dim)
+        self.action_emb_brt = nn.Embedding(N_BRIDGE_TARGETS, emb_dim)
+        self.action_emb_md = nn.Embedding(N_DIR, emb_dim)
+        self._action_emb_dim = 5 * emb_dim
+
         self.content_proj = nn.Sequential(
-            nn.Linear(actor_latent_dim, out_dim, bias=False),
+            nn.Linear(actor_latent_dim + self._action_emb_dim, out_dim, bias=False),
             RMSNorm(out_dim),
             nn.SiLU(),
         )
@@ -1323,16 +1340,37 @@ class CriticUnitCLSBuilder(nn.Module):
         self.pos_proj = nn.Linear(sine_dim, out_dim, bias=False)
         freq_bands = torch.arange(1, n_freqs + 1, dtype=torch.float32) * math.pi
         self.register_buffer("freq_bands", freq_bands)
+
+        self._actor_latent_dim = actor_latent_dim
+        self._out_dim = out_dim
+
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 _parameter_golf_ortho_init(m)
+        # Zero-init the action-slice of content_proj so the builder starts
+        # identical to the no-action baseline; gradient opens the gate.
+        first_linear = self.content_proj[0]
+        with torch.no_grad():
+            first_linear.weight[:, self._actor_latent_dim:].zero_()
 
-    def forward(self, actor_latent: torch.Tensor, unit_context: torch.Tensor) -> torch.Tensor:
-        """actor_latent: (B, 64), unit_context: (B, 7) → (B, out_dim)."""
-        content = self.content_proj(actor_latent)
+    def forward(
+        self,
+        actor_latent: torch.Tensor,
+        unit_context: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        """actor_latent: (B, 64), unit_context: (B, 7), actions: (B, 5) long → (B, out_dim)."""
+        action_emb = torch.cat([
+            self.action_emb_bt(actions[:, 0]),
+            self.action_emb_bd(actions[:, 1]),
+            self.action_emb_cd(actions[:, 2]),
+            self.action_emb_brt(actions[:, 3]),
+            self.action_emb_md(actions[:, 4]),
+        ], dim=-1)
+        content = self.content_proj(torch.cat([actor_latent, action_emb], dim=-1))
         angles = unit_context.unsqueeze(-1) * self.freq_bands  # (B, 7, n_freqs)
         sine_embed = torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(1)  # (B, 224)
         position = self.pos_proj(sine_embed)
@@ -1566,10 +1604,11 @@ class CentralizedCritic(nn.Module):
         unit_xy: torch.Tensor,        # (B, 2)
         unit_context: torch.Tensor,   # (B, UNIT_CONTEXT_DIM)
         actor_latent: torch.Tensor,   # (B, ACTOR_LATENT_DIM)
+        actions: torch.Tensor,        # (B, 5) long: [bt, bd, cd, brt, md]
     ) -> torch.Tensor:
         """Compute per-unit marginal values. Returns (B,)."""
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
-            unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float())
+            unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float(), actions)
             global_cls, unit_cls = self._run_global_sa(
                 feat, round_scalars, round_idx, unit_xy, unit_cls,
             )
@@ -1586,10 +1625,11 @@ class CentralizedCritic(nn.Module):
         unit_xy: torch.Tensor,
         unit_context: torch.Tensor,
         actor_latent: torch.Tensor,
+        actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Like unit_values but also returns raw head output for training loss."""
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=_USE_BF16):
-            unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float())
+            unit_cls = self.unit_cls_builder(actor_latent.float(), unit_context.float(), actions)
             global_cls, unit_cls = self._run_global_sa(
                 feat, round_scalars, round_idx, unit_xy, unit_cls,
             )
@@ -1607,12 +1647,13 @@ class CentralizedCritic(nn.Module):
         unit_xy: torch.Tensor,
         unit_context: torch.Tensor,
         actor_latent: torch.Tensor,
+        actions: torch.Tensor,
     ) -> torch.Tensor:
         """Full forward pass (non-cached path). Returns per-unit value."""
         feat = self.encode_map(map_tensor, valid_mask)
         round_idx = torch.arange(map_tensor.shape[0], device=map_tensor.device)
         return self.unit_values(
-            feat, round_scalars, round_idx, unit_xy, unit_context, actor_latent,
+            feat, round_scalars, round_idx, unit_xy, unit_context, actor_latent, actions,
         )
 
 
@@ -1632,10 +1673,11 @@ class CriticPpoStep(nn.Module):
         unit_xy: torch.Tensor,
         unit_context: torch.Tensor,
         actor_latent: torch.Tensor,
+        actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.critic.encode_map(states, masks)
         return self.critic.unit_value_logits(
-            feat, scalars, round_idx, unit_xy, unit_context, actor_latent,
+            feat, scalars, round_idx, unit_xy, unit_context, actor_latent, actions,
         )
 
 
@@ -1655,12 +1697,13 @@ class CriticPpoLossStep(nn.Module):
         unit_xy: torch.Tensor,
         unit_context: torch.Tensor,
         actor_latent: torch.Tensor,
+        actions: torch.Tensor,
         returns: torch.Tensor,
         old_values: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feat = self.critic.encode_map(states, masks)
         values, head_out = self.critic.unit_value_logits(
-            feat, scalars, round_idx, unit_xy, unit_context, actor_latent,
+            feat, scalars, round_idx, unit_xy, unit_context, actor_latent, actions,
         )
         if self.critic.value_mode == CriticValueMode.MSE:
             pred_symlog = head_out.squeeze(-1)
@@ -1933,6 +1976,7 @@ class CriticEpochPlan:
     packed_xy: torch.Tensor
     packed_unit_float: torch.Tensor
     packed_returns_values: torch.Tensor
+    packed_actions: torch.Tensor
 
 
 @dataclass(slots=True)
@@ -2125,6 +2169,7 @@ def _build_critic_epoch_plan(
     step_unit_xy: torch.Tensor,
     step_unit_float: torch.Tensor,
     step_rv: torch.Tensor,
+    step_actions: torch.Tensor,
     *,
     target_steps: int,
     positive_mask: torch.Tensor | None = None,
@@ -2142,6 +2187,7 @@ def _build_critic_epoch_plan(
             step_unit_xy,
             step_unit_float,
             step_rv,
+            step_actions,
             perm=perm,
         )
         local_round_idx_by_batch: list[torch.Tensor] = []
@@ -2164,6 +2210,7 @@ def _build_critic_epoch_plan(
             packed_xy=packed.tensors[0],
             packed_unit_float=packed.tensors[1],
             packed_returns_values=packed.tensors[2],
+            packed_actions=packed.tensors[3],
         )
 
     packed = _pack_round_major_tensors(
@@ -2171,6 +2218,7 @@ def _build_critic_epoch_plan(
         step_unit_xy,
         step_unit_float,
         step_rv,
+        step_actions,
     )
     round_counts = packed.round_offsets[1:] - packed.round_offsets[:-1]
     round_batches = _build_critic_round_batches(
@@ -2211,6 +2259,7 @@ def _build_critic_epoch_plan(
         packed_xy=packed.tensors[0].index_select(0, take_positions),
         packed_unit_float=packed.tensors[1].index_select(0, take_positions),
         packed_returns_values=packed.tensors[2].index_select(0, take_positions),
+        packed_actions=packed.tensors[3].index_select(0, take_positions),
     )
 
 
@@ -3881,6 +3930,7 @@ def ppo_update(
             centralized_data["step_unit_ctx"],
             centralized_data["step_actor_latent"],
         ], dim=1)
+        step_actions = centralized_data["step_actions"]
         positive_reward_mask = centralized_data["rewards"] > 0
         _ctx_dim = centralized_data["step_unit_ctx"].shape[1]
         old_values_safe = old_values if old_values is not None else returns
@@ -3893,6 +3943,7 @@ def ppo_update(
                     step_unit_xy,
                     step_unit_float,
                     step_rv,
+                    step_actions,
                     target_steps=critic_minibatch_size,
                     positive_mask=positive_reward_mask,
                 )
@@ -3916,6 +3967,7 @@ def ppo_update(
                     mb_xy = epoch_plan.packed_xy[step_lo:step_hi]
                     mb_uf = epoch_plan.packed_unit_float[step_lo:step_hi]
                     mb_rv = epoch_plan.packed_returns_values[step_lo:step_hi]
+                    mb_actions = epoch_plan.packed_actions[step_lo:step_hi]
                     vf_denom = max(mb_xy.shape[0], 1)
                     c_rounds = epoch_plan.round_ids[round_start:round_end]
                     g_obs, g_mask, g_scalars = _load_critic_round_batch(centralized_data, c_rounds)
@@ -3933,6 +3985,7 @@ def ppo_update(
                             mb_xy,
                             u_ctx,
                             u_latent,
+                            mb_actions,
                             mb_returns,
                             mb_old_values,
                         )
@@ -4594,6 +4647,7 @@ def _compute_all_values(
     unit_xy = data["step_unit_xy"]        # (N, 2) long
     unit_ctx = data["step_unit_ctx"]      # (N, UNIT_CONTEXT_DIM)
     actor_latent = data["step_actor_latent"]  # (N, ACTOR_LATENT_DIM)
+    actions = data["step_actions"]        # (N, 5) long
     N = data["n_steps"]
 
     values = torch.zeros(N, device=DEVICE)
@@ -4602,8 +4656,9 @@ def _compute_all_values(
         unit_xy,
         unit_ctx,
         actor_latent,
+        actions,
     )
-    packed_xy, packed_ctx, packed_latent = packed.tensors
+    packed_xy, packed_ctx, packed_latent, packed_actions = packed.tensors
     n_unique_rounds = packed.round_ids.shape[0]
 
     round_chunk = n_unique_rounds if cnn_chunk_size is None else max(1, int(cnn_chunk_size))
@@ -4634,6 +4689,7 @@ def _compute_all_values(
             packed_xy[step_lo:step_hi],
             packed_ctx[step_lo:step_hi],
             packed_latent[step_lo:step_hi],
+            packed_actions[step_lo:step_hi],
         )
         if not torch.isfinite(batch_values).all():
             bad = (~torch.isfinite(batch_values)).nonzero(as_tuple=False)
@@ -4710,6 +4766,12 @@ def train_on_trajectories(
         data["step_actor_latent"] = _normalize_actor_latent_dim(
             model._latent_from_obs_pre(obs_pre, h).detach(),
         )
+    # Stack sampled actions into a (N, 5) long tensor so the critic can
+    # condition on what each unit actually did (not just the latent that
+    # produced the action distribution).
+    data["step_actions"] = torch.stack(
+        [data["bt"], data["bd"], data["cd"], data["brt"], data["md"]], dim=-1,
+    ).contiguous()
     # obs_pre is fed to _latent_from_obs_pre under bf16 autocast during the
     # actor PPO update anyway, so storing the persistent (N, OBS_PREFIX_SIZE)
     # buffer in bf16 halves its VRAM footprint with no downstream precision
@@ -4776,6 +4838,7 @@ def train_on_trajectories(
     data.pop("critic_mask_cpu", None)
     data.pop("critic_input_staging", None)
     data.pop("step_actor_latent", None)
+    data.pop("step_actions", None)
     stats["n_steps"] = n_steps
     stats["reward_raw_std"] = reward_std.item()
     return stats

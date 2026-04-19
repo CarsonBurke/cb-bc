@@ -82,6 +82,7 @@ def make_synthetic_data(
     unit_xy = torch.randint(0, min(MAP_H, MAP_W), (N_UNITS, 2), device=device)
     unit_ctx = torch.randn(N_UNITS, UNIT_CONTEXT_DIM, device=device)
     actor_latent = torch.randn(N_UNITS, ACTOR_LATENT_DIM, device=device)
+    actions = torch.zeros(N_UNITS, 5, dtype=torch.long, device=device)
 
     return dict(
         map_tensor=map_tensor,
@@ -91,6 +92,7 @@ def make_synthetic_data(
         unit_xy=unit_xy,
         unit_ctx=unit_ctx,
         actor_latent=actor_latent,
+        actions=actions,
     )
 
 
@@ -113,6 +115,7 @@ def bench_forward_backward(
             vals = critic.unit_values(
                 feat, data["round_scalars"], data["round_idx"],
                 data["unit_xy"], data["unit_ctx"], data["actor_latent"],
+                data["actions"],
             )
             loss = vals.sum()
         loss.backward()
@@ -134,6 +137,7 @@ def bench_forward_backward(
             vals = critic.unit_values(
                 feat, data["round_scalars"], data["round_idx"],
                 data["unit_xy"], data["unit_ctx"], data["actor_latent"],
+                data["actions"],
             )
             loss = vals.sum()
 

@@ -866,8 +866,9 @@ class TestCentralizedCritic:
         unit_xy = torch.randint(0, 10, (B, 2))
         unit_ctx = torch.randn(B, UNIT_CONTEXT_DIM)
         actor_latent = torch.randn(B, ACTOR_LATENT_DIM)
+        actions = torch.zeros(B, 5, dtype=torch.long)
 
-        values = critic(map_tensor, valid_mask, scalars, unit_xy, unit_ctx, actor_latent)
+        values = critic(map_tensor, valid_mask, scalars, unit_xy, unit_ctx, actor_latent, actions)
         assert values.shape == (B,)
 
     def test_unit_value_logits_returns_values_and_logits(self):
@@ -885,9 +886,10 @@ class TestCentralizedCritic:
         unit_xy = torch.randint(0, 8, (B, 2))
         unit_ctx = torch.randn(B, UNIT_CONTEXT_DIM)
         actor_latent = torch.randn(B, ACTOR_LATENT_DIM)
+        actions = torch.zeros(B, 5, dtype=torch.long)
 
         values, logits = critic.unit_value_logits(
-            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
+            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent, actions,
         )
         assert values.shape == (B,)
         assert logits.shape == (B, NUM_BUCKETS)
@@ -910,9 +912,10 @@ class TestCentralizedCritic:
         unit_xy = torch.randint(0, 8, (B, 2))
         unit_ctx = torch.randn(B, UNIT_CONTEXT_DIM)
         actor_latent = torch.randn(B, ACTOR_LATENT_DIM)
+        actions = torch.zeros(B, 5, dtype=torch.long)
 
         values, logits = critic.unit_value_logits(
-            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
+            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent, actions,
         )
         assert torch.allclose(logits, torch.zeros_like(logits), atol=1e-7)
         assert values.abs().max().item() <= 1e-7
@@ -929,11 +932,12 @@ class TestCentralizedCritic:
         unit_xy = torch.randint(0, 8, (B, 2))
         unit_ctx = torch.randn(B, UNIT_CONTEXT_DIM)
         actor_latent = torch.randn(B, ACTOR_LATENT_DIM)
+        actions = torch.zeros(B, 5, dtype=torch.long)
 
         feat = critic.encode_map(map_tensor, valid_mask)
         round_idx = torch.arange(B)
         values, logits = critic.unit_value_logits(
-            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
+            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent, actions,
         )
         returns = torch.tensor([1.0, -1.0], dtype=torch.float32)
         loss = distributional_value_loss(
@@ -1164,9 +1168,10 @@ class TestCentralizedCritic:
         unit_xy = torch.randint(0, 10, (round_idx.shape[0], 2))
         unit_ctx = torch.randn(round_idx.shape[0], UNIT_CONTEXT_DIM)
         actor_latent = torch.randn(round_idx.shape[0], ACTOR_LATENT_DIM)
+        actions = torch.zeros(round_idx.shape[0], 5, dtype=torch.long)
 
         values_a, logits_a = critic.unit_value_logits(
-            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
+            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent, actions,
         )
 
         perm = torch.tensor([4, 2, 6, 0, 5, 1, 3], dtype=torch.long)
@@ -1177,6 +1182,7 @@ class TestCentralizedCritic:
             unit_xy[perm],
             unit_ctx[perm],
             actor_latent[perm],
+            actions[perm],
         )
         inv_perm = torch.empty_like(perm)
         inv_perm[perm] = torch.arange(perm.numel())

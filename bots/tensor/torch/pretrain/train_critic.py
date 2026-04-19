@@ -80,10 +80,11 @@ class CriticPretrainStep(nn.Module):
         unit_xy: torch.Tensor,
         unit_ctx: torch.Tensor,
         actor_latent: torch.Tensor,
+        actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.critic.encode_map(states, masks)
         values, logits = self.critic.unit_value_logits(
-            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent,
+            feat, scalars, round_idx, unit_xy, unit_ctx, actor_latent, actions,
         )
         return values, logits
 
@@ -860,9 +861,12 @@ def train_critic(
                             opt_end = torch.cuda.Event(enable_timing=True)
                             fwd_start.record(torch.cuda.current_stream(DEVICE))
                         with autocast_context(cuda_cfg):
+                            zero_actions = torch.zeros(
+                                actor_latent.shape[0], 5, dtype=torch.long, device=actor_latent.device,
+                            )
                             pred_values, logits = train_step(
                                 states, masks, scalars, round_idx,
-                                unit_xy, unit_ctx, actor_latent,
+                                unit_xy, unit_ctx, actor_latent, zero_actions,
                             )
                             loss = soft_cross_entropy_from_logits(logits, targets).mean()
                         if fwd_end is not None:
@@ -981,9 +985,12 @@ def train_critic(
                         opt_end = torch.cuda.Event(enable_timing=True)
                         fwd_start.record(torch.cuda.current_stream(DEVICE))
                     with autocast_context(cuda_cfg):
+                        zero_actions = torch.zeros(
+                            actor_latent.shape[0], 5, dtype=torch.long, device=actor_latent.device,
+                        )
                         pred_values, logits = train_step(
                             states, masks, scalars, round_idx,
-                            unit_xy, unit_ctx, actor_latent,
+                            unit_xy, unit_ctx, actor_latent, zero_actions,
                         )
                         loss = soft_cross_entropy_from_logits(logits, targets).mean()
                     if fwd_end is not None:

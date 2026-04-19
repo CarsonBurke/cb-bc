@@ -436,13 +436,14 @@ class TestCriticPretraining:
         dummy_xy = torch.zeros(N, 2, dtype=torch.long, device=DEVICE)
         dummy_ctx = torch.zeros(N, UNIT_CONTEXT_DIM, device=DEVICE)
         dummy_lat = torch.zeros(N, ACTOR_LATENT_DIM, device=DEVICE)
+        dummy_actions = torch.zeros(N, 5, dtype=torch.long, device=DEVICE)
 
         losses = []
         for _ in range(5):
             feat = critic.encode_map(states, masks)
             round_idx = torch.arange(N, device=DEVICE)
             _vals, logits = critic.unit_value_logits(
-                feat, scalars, round_idx, dummy_xy, dummy_ctx, dummy_lat,
+                feat, scalars, round_idx, dummy_xy, dummy_ctx, dummy_lat, dummy_actions,
             )
             loss = soft_cross_entropy_from_logits(logits, targets).mean()
             opt.zero_grad()
