@@ -745,6 +745,17 @@ class CriticAttentionBlock(nn.Module):
             scale_proj=True,
         )
 
+    def _fused_qkv_weight(self) -> torch.Tensor:
+        # Fused QKV: Q/K/V share the same input `h`, so cat the three weight
+        # matrices and run a single GEMM. Saves 2 kernel launches per call;
+        # SDPA downstream is unchanged so flash-attn eligibility is preserved.
+        return torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
+
+    def _split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_dim = self.n_heads * self.head_dim
+        kv_dim = self.n_kv_heads * self.head_dim
+        return qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+
     def project_qkv(
         self,
         x: torch.Tensor,
@@ -754,9 +765,11 @@ class CriticAttentionBlock(nn.Module):
         """Project normalized tokens into Q/K/V, applying RoPE when requested."""
         B, N, _ = x.shape
         h = self.attn_input_norm(x)
-        q = self.q_proj(h).reshape(B, N, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(h).reshape(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(h).reshape(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        qkv = F.linear(h, self._fused_qkv_weight())
+        q_flat, k_flat, v_flat = self._split_qkv(qkv)
+        q = q_flat.reshape(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k_flat.reshape(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v_flat.reshape(B, N, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -781,9 +794,11 @@ class CriticAttentionBlock(nn.Module):
         """
         B, G, N, _ = x.shape
         h = self.attn_input_norm(x)
-        q = self.q_proj(h).reshape(B, G, N, self.n_heads, self.head_dim).movedim(3, 2)
-        k = self.k_proj(h).reshape(B, G, N, self.n_kv_heads, self.head_dim).movedim(3, 2)
-        v = self.v_proj(h).reshape(B, G, N, self.n_kv_heads, self.head_dim).movedim(3, 2)
+        qkv = F.linear(h, self._fused_qkv_weight())
+        q_flat, k_flat, v_flat = self._split_qkv(qkv)
+        q = q_flat.reshape(B, G, N, self.n_heads, self.head_dim).movedim(3, 2)
+        k = k_flat.reshape(B, G, N, self.n_kv_heads, self.head_dim).movedim(3, 2)
+        v = v_flat.reshape(B, G, N, self.n_kv_heads, self.head_dim).movedim(3, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -2866,8 +2881,13 @@ class BuilderMLP(nn.Module):
         # Fold per-token tau into q so SDPA uses scale=1.0 (CUDA-graph safe).
         q = F.normalize(self.context_ca_input_norm(cls), dim=-1, eps=1e-6)
         q = q * self.context_tau.exp().view(1, -1, 1)
-        k = F.normalize(self.context_k_proj(context_tokens), dim=-1, eps=1e-6)
-        v = self.context_v_proj(context_tokens)
+        # Fused K+V projection: K and V share the same input, so one matmul
+        # over the cat'd weight halves the projection kernel launches.
+        kv_w = torch.cat([self.context_k_proj.weight, self.context_v_proj.weight], dim=0)
+        kv_b = torch.cat([self.context_k_proj.bias, self.context_v_proj.bias])
+        kv = F.linear(context_tokens, kv_w, kv_b)
+        k_raw, v = kv.split(TILE_EMBED_DIM, dim=-1)
+        k = F.normalize(k_raw, dim=-1, eps=1e-6)
         attn_out = F.scaled_dot_product_attention(
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
         ).squeeze(1)
@@ -2889,9 +2909,17 @@ class BuilderMLP(nn.Module):
         seq = torch.cat([lookaway, tiles], dim=1)  # (B, N+1, D)
 
         normed = self.tile_sa_norm(seq)
-        q = self.tile_sa_q_proj(normed)
-        k = self.tile_sa_k_proj(normed)
-        v = self.tile_sa_v_proj(normed)
+        # Fused Q+K+V projection: all three share `normed` as input, so one
+        # matmul over the cat'd weight thirds saves 2 kernel launches.
+        qkv_w = torch.cat(
+            [self.tile_sa_q_proj.weight, self.tile_sa_k_proj.weight, self.tile_sa_v_proj.weight],
+            dim=0,
+        )
+        qkv_b = torch.cat(
+            [self.tile_sa_q_proj.bias, self.tile_sa_k_proj.bias, self.tile_sa_v_proj.bias],
+        )
+        qkv = F.linear(normed, qkv_w, qkv_b)
+        q, k, v = qkv.split(D, dim=-1)
 
         pos_weight = self.tile_sa_pos_weight.repeat(2).to(q.dtype)  # (D,)
         pos_real = self.tile_sa_susie.to(q.dtype) * pos_weight  # (N, D)
@@ -2931,8 +2959,12 @@ class BuilderMLP(nn.Module):
         cls = residual_mix_input(cls, cls0, self.cls_resid_mix)
         q = F.normalize(self.cls_ca_q_proj(self.cls_ca_input_norm(cls)), dim=-1, eps=1e-6)
         q = q * self.cls_ca_tau.exp().view(1, -1, 1)  # per-seed temperature
-        k = F.normalize(self.cls_ca_k_proj(tiles), dim=-1, eps=1e-6)
-        v = self.cls_ca_v_proj(tiles)
+        # Fused K+V projection over tiles — same input, one matmul.
+        kv_w = torch.cat([self.cls_ca_k_proj.weight, self.cls_ca_v_proj.weight], dim=0)
+        kv_b = torch.cat([self.cls_ca_k_proj.bias, self.cls_ca_v_proj.bias])
+        kv = F.linear(tiles, kv_w, kv_b)
+        k_raw, v = kv.split(TILE_EMBED_DIM, dim=-1)
+        k = F.normalize(k_raw, dim=-1, eps=1e-6)
         attn_out = F.scaled_dot_product_attention(
             q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), scale=1.0,
         ).squeeze(1)
