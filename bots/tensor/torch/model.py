@@ -1252,12 +1252,14 @@ class CriticGlobalSA(nn.Module):
         anchor_unit_cls: torch.Tensor,  # (B_total, dim)
         layout: CriticGlobalLayout,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split attention with cross-group visibility.
+        """Full cross-visibility attention over patches + scalar + CLS + units.
 
-        Patches query patches + scalar + CLS + units (full key set).
-        CLS query patches + scalar + CLS (see each other).
-        Units query everything (unchanged).
-        Shared MLP residual applied to all tokens.
+        Single cuDNN SDPA: every token queries every valid token. Padded-unit
+        K positions are blocked via layout.unit_attn_bias. Exposing unit state
+        to patches and CLS during refinement (they did not see units before)
+        strengthens the value readout — CLS aggregates real unit information
+        rather than only map context. The scalar slot's attn output is still
+        discarded (only the MLP residual touches scalar).
         """
         R = layout.n_rounds
         N = patches.shape[1]
@@ -1283,39 +1285,26 @@ class CriticGlobalSA(nn.Module):
         q = apply_rotary_2d(q, layout.full_rope_cos, layout.full_rope_sin)
         k = apply_rotary_2d(k, layout.full_rope_cos, layout.full_rope_sin)
 
-        patch_end = N
         scalar_end = N + 1
         shared_end = layout.unit_start
 
-        patch_tokens = all_tokens[:, :patch_end]
-        scalar_tokens = all_tokens[:, patch_end:scalar_end]
+        attn_out = self.attn.attend(
+            q, k, v,
+            attn_mask=layout.unit_attn_bias,
+            self_value=v,
+        )
+
+        patch_tokens = all_tokens[:, :N]
+        scalar_tokens = all_tokens[:, N:scalar_end]
         global_tokens = all_tokens[:, scalar_end:shared_end]
         unit_tokens = all_tokens[:, shared_end:]
 
-        # Shared prefix attention: patches and CLS both query the first
-        # `shared_end` tokens with identical K/V, so merge into a single SDPA
-        # over the whole prefix. This stays FA-eligible (no mask, matched
-        # dtypes). The scalar slot's attn_out is discarded — scalar doesn't
-        # receive the attention residual (only the MLP residual below).
-        shared_attn_out = self.attn.attend(
-            q[:, :, :shared_end],
-            k[:, :, :shared_end],
-            v[:, :, :shared_end],
-            self_value=v[:, :, :shared_end],
-        )
-        patch_tokens = self.attn.apply_attn_residual(
-            patch_tokens, shared_attn_out[:, :patch_end],
-        )
+        patch_tokens = self.attn.apply_attn_residual(patch_tokens, attn_out[:, :N])
         global_tokens = self.attn.apply_attn_residual(
-            global_tokens, shared_attn_out[:, scalar_end:shared_end],
+            global_tokens, attn_out[:, scalar_end:shared_end],
         )
         if layout.unit_attn_bias is not None:
-            unit_attn_out = self.attn.attend(
-                q[:, :, shared_end:], k, v,
-                attn_mask=layout.unit_attn_bias,
-                self_value=v[:, :, shared_end:],
-            )
-            unit_attn_out = unit_attn_out * layout.valid_unit_mask.unsqueeze(-1).to(dtype=unit_attn_out.dtype)
+            unit_attn_out = attn_out[:, shared_end:] * layout.valid_unit_mask.unsqueeze(-1).to(dtype=attn_out.dtype)
             unit_tokens = self.attn.apply_attn_residual(unit_tokens, unit_attn_out)
 
         all_tokens = torch.cat([patch_tokens, scalar_tokens, global_tokens, unit_tokens], dim=1)
