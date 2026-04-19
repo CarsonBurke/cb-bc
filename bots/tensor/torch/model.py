@@ -2350,6 +2350,71 @@ def _normalize_advantages(advantages: torch.Tensor) -> torch.Tensor:
     return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
 
+def _normalize_advantages_per_group(
+    advantages: torch.Tensor,
+    group_id: torch.Tensor,
+    min_group_size: int = 8,
+) -> torch.Tensor:
+    """Normalize advantages within each group (e.g. per game).
+
+    Groups with fewer than ``min_group_size`` transitions fall back to the
+    mean/std of large-group transitions only — falling back to stats over the
+    *whole* batch would drag in the cross-group variance that per-group norm
+    is meant to cancel, creating inconsistent gradient scale between small and
+    large groups. For shared-reward groups this cancels the reward component
+    from the advantage, leaving the per-unit value-function residual at unit
+    scale.
+
+    All reductions run in fp32 regardless of input dtype: bf16 loses the
+    variance (catastrophic cancellation in ``E[x²] - E[x]²``) and saturates
+    integer counts above 256, both of which silently explode the divisor.
+    """
+    if group_id.numel() != advantages.numel():
+        raise ValueError(
+            f"group_id shape {tuple(group_id.shape)} does not match "
+            f"advantages shape {tuple(advantages.shape)}"
+        )
+    if group_id.device != advantages.device:
+        raise ValueError(
+            f"group_id device {group_id.device} != advantages device {advantages.device}"
+        )
+    in_dtype = advantages.dtype
+    dev = advantages.device
+    adv_f = advantages.to(torch.float32)
+    uniq, inv = torch.unique(group_id, return_inverse=True)
+    G = uniq.numel()
+    ones_f = torch.ones_like(adv_f)
+    counts = torch.zeros(G, dtype=torch.float32, device=dev).scatter_add_(0, inv, ones_f)
+    sums = torch.zeros(G, dtype=torch.float32, device=dev).scatter_add_(0, inv, adv_f)
+    safe_counts = counts.clamp_min(1.0)
+    means = sums / safe_counts
+    # Two-pass variance in fp32 — keeps numerical error bounded by O(σ · eps)
+    # instead of O(μ² · eps) that a one-pass E[x²] − E[x]² suffers from.
+    centered = adv_f - means[inv]
+    sq_sums = torch.zeros(G, dtype=torch.float32, device=dev).scatter_add_(0, inv, centered * centered)
+    variance = (sq_sums / safe_counts).clamp_min(0.0)
+    stds = torch.sqrt(variance + 1e-8)
+
+    per_row_count = counts[inv]
+    use_group = per_row_count >= float(min_group_size)
+
+    # Fallback stats computed over LARGE-group transitions only; if there are
+    # no large groups, degenerate to whole-batch stats.
+    if use_group.any():
+        fb_src = adv_f[use_group]
+        g_mean = fb_src.mean()
+        g_std = fb_src.std(unbiased=False) + 1e-8
+    else:
+        g_mean = adv_f.mean()
+        g_std = adv_f.std(unbiased=False) + 1e-8
+
+    eff_mean = torch.where(use_group, means[inv], g_mean.expand_as(adv_f))
+    eff_std = torch.where(use_group, stds[inv], g_std.expand_as(adv_f))
+
+    out = (adv_f - eff_mean) / eff_std
+    return out.to(in_dtype)
+
+
 def _policy_weight_from_advantages(
     advantages: torch.Tensor,
     *,
@@ -3757,6 +3822,8 @@ def ppo_update(
     bptt_chunks: list[tuple[int, int]] | None = None,
     freeze_critic: bool = False,
     use_pmpo: bool = False,
+    group_id: torch.Tensor | None = None,
+    group_min_size: int = 8,
 ) -> dict[str, float]:
     """PPO update with truncated BPTT for recurrent hidden state.
 
@@ -3803,7 +3870,12 @@ def ppo_update(
     # PMPO uses sign-weighted policy updates, so advantage normalization
     # should be disabled on that path.
     if not use_pmpo:
-        advantages = _normalize_advantages(advantages)
+        if group_id is not None:
+            advantages = _normalize_advantages_per_group(
+                advantages, group_id, min_group_size=group_min_size,
+            )
+        else:
+            advantages = _normalize_advantages(advantages)
     with torch.no_grad():
         bt_mask_all, bd_mask_all, cd_causal_all = _precompute_policy_masks(obs, bt_act, bd_act)
     # obs is only used for mask precomputation when obs_pre_all is provided.
@@ -4880,6 +4952,22 @@ def train_on_trajectories(
     bptt_chunks = _build_bptt_chunks(data["ep_boundaries"], bptt_k)
     old_log_probs = data["old_log_probs"]
 
+    # Per-game group ids for intra-group advantage normalization. Cancels the
+    # shared per-round team reward out of the advantage (since mean reward is
+    # constant within a game) so the residual per-unit V-differential isn't
+    # crushed by cross-game win/loss variance.
+    group_id_t: torch.Tensor | None = None
+    if traj_game_map is not None and len(traj_game_map) == len(data["ep_boundaries"]):
+        group_id_cpu = torch.zeros(N, dtype=torch.long)
+        for traj_i, (start, end) in enumerate(data["ep_boundaries"]):
+            if end > start:
+                group_id_cpu[start:end] = int(traj_game_map[traj_i])
+        if advantages.device.type == "cuda":
+            group_id_cpu = group_id_cpu.pin_memory()
+            group_id_t = group_id_cpu.to(advantages.device, non_blocking=True)
+        else:
+            group_id_t = group_id_cpu.to(advantages.device)
+
     # Hand obs / obs_pre ownership to the ppo_update call via the shared data
     # dict and drop every outer reference so ppo_update can free them mid-run.
     data["obs"] = obs
@@ -4901,6 +4989,7 @@ def train_on_trajectories(
             profile=ppo_profile,
             trace=trace,
             freeze_critic=freeze_critic,
+            group_id=group_id_t,
             **ppo_kwargs,
         )
     # Release large critic staging buffers — these are pinned CPU slabs (and a

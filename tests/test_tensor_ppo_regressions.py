@@ -43,6 +43,7 @@ from model import (
     _compute_gae,
     _make_bucket_centers,
     _normalize_advantages,
+    _normalize_advantages_per_group,
     _normalize_actor_latent_dim,
     _parameter_golf_ortho_init,
     _policy_weight_from_advantages,
@@ -1220,6 +1221,129 @@ class TestAdvantageNormalization:
         adv = torch.tensor([-3.0, -0.2, 0.0, 0.7, 5.0])
         weights = _policy_weight_from_advantages(adv, use_pmpo=False)
         assert torch.equal(weights, adv)
+
+
+class TestPerGroupAdvantageNormalization:
+    def test_zero_mean_unit_var_within_each_group(self):
+        torch.manual_seed(0)
+        g1 = torch.randn(32) * 3.0 + 10.0
+        g2 = torch.randn(32) * 0.5 - 4.0
+        adv = torch.cat([g1, g2])
+        gid = torch.cat([torch.zeros(32, dtype=torch.long), torch.ones(32, dtype=torch.long)])
+        out = _normalize_advantages_per_group(adv, gid, min_group_size=8)
+        for g in (0, 1):
+            sel = gid == g
+            assert out[sel].mean().abs().item() < 1e-5
+            assert abs(out[sel].std(unbiased=False).item() - 1.0) < 1e-3
+
+    def test_shared_reward_component_cancels(self):
+        """For transitions sharing a scalar reward, per-group norm must retain
+        the per-unit V-differential while the shared reward cancels out."""
+        # Simulate A_i = G - V(s_i): G shared within group, V varies per unit.
+        V = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        G_a, G_b = 100.0, -50.0
+        adv_a = G_a - V
+        adv_b = G_b - V
+        adv = torch.cat([adv_a, adv_b])
+        gid = torch.cat([torch.zeros(8, dtype=torch.long), torch.ones(8, dtype=torch.long)])
+        out = _normalize_advantages_per_group(adv, gid, min_group_size=8)
+        # After per-group norm, both groups should produce the SAME normalized
+        # advantages (the G term cancels). Highest-V unit has the lowest
+        # normalized advantage in its group.
+        out_a, out_b = out[:8], out[8:]
+        assert torch.allclose(out_a, out_b, atol=1e-5)
+        assert out_a.argmin().item() == V.argmax().item()
+        assert out_a.argmax().item() == V.argmin().item()
+
+    def test_global_norm_crushes_per_unit_differential(self):
+        """Without per-group norm, a big shared-reward swing between groups
+        crushes the per-unit signal; per-group norm must restore it."""
+        V = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        adv_win = 100.0 - V    # team won this game, big positive
+        adv_loss = -100.0 - V  # team lost this game, big negative
+        adv = torch.cat([adv_win, adv_loss])
+        gid = torch.cat([torch.zeros(8, dtype=torch.long), torch.ones(8, dtype=torch.long)])
+
+        global_norm = _normalize_advantages(adv)
+        per_group = _normalize_advantages_per_group(adv, gid, min_group_size=8)
+
+        # Within the winning group, the spread of per-unit advantages after
+        # global norm is dominated by cross-game variance, so the per-unit
+        # range collapses relative to the per-group regime.
+        gw_global = global_norm[:8].max() - global_norm[:8].min()
+        gw_per_group = per_group[:8].max() - per_group[:8].min()
+        assert gw_per_group.item() > 10.0 * gw_global.item()
+
+    def test_small_group_falls_back_when_no_large_groups(self):
+        """When no group meets the threshold, fallback degenerates to
+        whole-batch stats so no transition produces NaN or 0."""
+        adv = torch.tensor([5.0, 5.0, 5.0, -5.0, -5.0, -5.0, 100.0])
+        gid = torch.tensor([0, 0, 0, 1, 1, 1, 2], dtype=torch.long)
+        out = _normalize_advantages_per_group(adv, gid, min_group_size=4)
+        assert torch.isfinite(out).all()
+        expected = (adv[6] - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+        assert abs(out[6].item() - expected.item()) < 1e-5
+
+    def test_constant_within_group_no_nan(self):
+        adv = torch.tensor([3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0])
+        gid = torch.zeros(8, dtype=torch.long)
+        out = _normalize_advantages_per_group(adv, gid, min_group_size=4)
+        assert not torch.isnan(out).any()
+        assert out.abs().max().item() < 1e-3
+
+    def test_bf16_large_mean_small_variance_stable(self):
+        """bf16 advantages with large mean relative to std must not explode
+        after normalization — reductions run in fp32 internally."""
+        torch.manual_seed(0)
+        adv_fp32 = torch.randn(128) * 3.0 + 100.0
+        adv_bf16 = adv_fp32.to(torch.bfloat16)
+        gid = torch.zeros(128, dtype=torch.long)
+        out = _normalize_advantages_per_group(adv_bf16, gid, min_group_size=8)
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out.float()).all()
+        # Post-normalization spread should still be ~O(1), not ~O(1e4).
+        assert out.float().abs().max().item() < 20.0
+
+    def test_bf16_counts_dont_saturate_on_large_group(self):
+        """Internal counts must be fp32, not bf16 (which saturates above 256)."""
+        adv = torch.zeros(512, dtype=torch.bfloat16)
+        adv[0] = 1.0
+        adv[-1] = -1.0
+        gid = torch.zeros(512, dtype=torch.long)
+        out = _normalize_advantages_per_group(adv, gid, min_group_size=8)
+        # If counts saturated at 256 instead of 512, the divisor would be
+        # halved and the output scale would be off. Mean-zero invariant must
+        # hold exactly regardless of group size.
+        assert abs(out.float().mean().item()) < 1e-2
+
+    def test_fallback_excludes_small_group_outliers(self):
+        """Small-group fallback stats must be computed over large groups only,
+        so a small-group outlier doesn't inflate the fallback denominator."""
+        # Large group: 16 mild values centered on 0.
+        big = torch.linspace(-1.0, 1.0, 16)
+        # Small group: 2 wild outliers that would dominate whole-batch std.
+        small = torch.tensor([1000.0, -1000.0])
+        adv = torch.cat([big, small])
+        gid = torch.cat([torch.zeros(16, dtype=torch.long), torch.ones(2, dtype=torch.long)])
+        out = _normalize_advantages_per_group(adv, gid, min_group_size=8)
+        # The small-group transitions are normalized with the large-group std
+        # (~0.6), so they should end up at ~±1600σ, not ~±1σ (which would be
+        # the whole-batch std case).
+        assert out[16].item() > 500.0
+        assert out[17].item() < -500.0
+
+    def test_device_mismatch_raises(self):
+        adv = torch.zeros(8)
+        gid = torch.zeros(8, dtype=torch.long)
+        if torch.cuda.is_available():
+            with pytest.raises(ValueError, match="device"):
+                _normalize_advantages_per_group(adv, gid.cuda(), min_group_size=4)
+
+    def test_shape_mismatch_raises(self):
+        adv = torch.zeros(8)
+        gid = torch.zeros(7, dtype=torch.long)
+        with pytest.raises(ValueError, match="shape"):
+            _normalize_advantages_per_group(adv, gid, min_group_size=4)
 
 
 # =====================================================================
