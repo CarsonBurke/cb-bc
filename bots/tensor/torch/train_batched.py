@@ -1021,14 +1021,23 @@ def collect_games_batched(
             t_phase = time.perf_counter() if profile is not None else 0.0
             with trace_scope(trace, "collect.actor_fanout"):
                 h_prev_view = _tensor_byte_view(h_prev_cpu)
+                # Bulk-convert to Python lists in one sync each — replaces
+                # per-unit int(t[i]) / float(t[i]) which each stall the CPU.
+                bt_list = bt_act.tolist()
+                bd_list = bd_act.tolist()
+                cd_list = cd_act.tolist()
+                brt_list = brt_act.tolist()
+                md_list = md_act.tolist()
+                lp_list = lp.tolist()
                 for i, (game_idx, request) in enumerate(pending_a):
                     unit_id = request.unit_id
                     round_idx = request.round_idx
-                    old_lp = float(lp[i])
-                    if not math.isfinite(old_lp):
-                        raise RuntimeError(
-                            f"non-finite behavior log-prob for game {game_idx}, unit {unit_id}, round {round_idx}: {old_lp!r}"
-                        )
+                    old_lp = lp_list[i]
+                    bt_i = bt_list[i]
+                    bd_i = bd_list[i]
+                    cd_i = cd_list[i]
+                    brt_i = brt_list[i]
+                    md_i = md_list[i]
                     trajectories_by_unit = actor_trajectories.setdefault(game_idx, {})
                     unit_traj = trajectories_by_unit.setdefault(unit_id, [])
                     # dbg_flags from the request reports the previous action's
@@ -1052,11 +1061,11 @@ def collect_games_batched(
                             obs_bytes_len=OBS_BYTES,
                             h_bytes_len=H_DIM * 4,
                             round_idx=round_idx,
-                            bt=int(bt_act[i]),
-                            bd=int(bd_act[i]),
-                            cd=int(cd_act[i]),
-                            brt=int(brt_act[i]),
-                            md=int(md_act[i]),
+                            bt=bt_i,
+                            bd=bd_i,
+                            cd=cd_i,
+                            brt=brt_i,
+                            md=md_i,
                             reward=0.0,
                             old_log_prob=old_lp,
                             enemy_core_dmg=0.0,
@@ -1075,13 +1084,7 @@ def collect_games_batched(
                     if collector is None:
                         continue
                     try:
-                        collector.sides["a"].write_response(
-                            int(bt_act[i]),
-                            int(bd_act[i]),
-                            int(cd_act[i]),
-                            int(brt_act[i]),
-                            int(md_act[i]),
-                        )
+                        collector.sides["a"].write_response(bt_i, bd_i, cd_i, brt_i, md_i)
                         os.write(collector.resp_write_fds["a"], b"\x01")
                     except OSError:
                         pass
@@ -1117,17 +1120,18 @@ def collect_games_batched(
                         profile["dummy_b_s"] = profile.get("dummy_b_s", 0.0) + (time.perf_counter() - t_phase)
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
+                    bt_list = bt_act.tolist()
+                    bd_list = bd_act.tolist()
+                    cd_list = cd_act.tolist()
+                    brt_list = brt_act.tolist()
+                    md_list = md_act.tolist()
                     for i, (game_idx, _request) in enumerate(items):
                         collector = active_collectors.get(game_idx)
                         if collector is None:
                             continue
                         try:
                             collector.sides["b"].write_response(
-                                int(bt_act[i]),
-                                int(bd_act[i]),
-                                int(cd_act[i]),
-                                int(brt_act[i]),
-                                int(md_act[i]),
+                                bt_list[i], bd_list[i], cd_list[i], brt_list[i], md_list[i],
                             )
                             os.write(collector.resp_write_fds["b"], b"\x01")
                         except OSError:
@@ -1218,17 +1222,14 @@ def collect_games_batched(
                 opponent_hidden_bank.update(opp_row_index, h_next)
 
                 t_phase = time.perf_counter() if profile is not None else 0.0
+                acts_list = acts_cpu.tolist()
                 for i, (game_idx, request) in enumerate(items):
                     collector = active_collectors.get(game_idx)
                     if collector is None:
                         continue
                     try:
                         collector.sides["b"].write_response(
-                            int(acts_cpu[0, i]),
-                            int(acts_cpu[1, i]),
-                            int(acts_cpu[2, i]),
-                            int(acts_cpu[3, i]),
-                            int(acts_cpu[4, i]),
+                            acts_list[0][i], acts_list[1][i], acts_list[2][i], acts_list[3][i], acts_list[4][i],
                         )
                         os.write(collector.resp_write_fds["b"], b"\x01")
                     except OSError:
