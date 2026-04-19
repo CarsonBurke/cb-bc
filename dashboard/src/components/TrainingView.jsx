@@ -528,6 +528,18 @@ const TempStdChart = memo(function TempStdChart() {
   return <LogitScaleChart series={TEMP_STD_SERIES} />
 })
 
+const ENTROPY_HEAD_SERIES = [
+  { key: 'entropy_bt', label: 'Build Type', color: '#f38ba8' },
+  { key: 'entropy_bd', label: 'Build Dir', color: '#89b4fa' },
+  { key: 'entropy_cd', label: 'Conv Dir', color: '#f9e2af' },
+  { key: 'entropy_brt', label: 'Bridge Target', color: '#cba6f7' },
+  { key: 'entropy_md', label: 'Move Dir', color: '#a6e3a1' },
+]
+
+const HeadEntropyChart = memo(function HeadEntropyChart() {
+  return <LogitScaleChart series={ENTROPY_HEAD_SERIES} />
+})
+
 const LOSS_SERIES = [
   { key: 'pi_loss', label: 'Policy Loss', color: '#f38ba8' },
   { key: 'vf_loss', label: 'Value Loss', color: '#f9e2af' },
@@ -1157,6 +1169,7 @@ const TRAINING_CARDS = {
   'train-elo':              { title: 'League ELO',          render: () => <LeagueEloCard /> },
   'train-loss-chart':       { title: 'Loss',                defaultOpen: false, hasEma: true, render: () => <LossChart /> },
   'train-entropy':          { title: 'Entropy',             defaultOpen: false, hasEma: true, render: () => <EntropyChart /> },
+  'train-entropy-heads':    { title: 'Entropy per Head',    defaultOpen: false, hasEma: true, hasLegend: true, render: () => <HeadEntropyChart /> },
   'train-ev':               { title: 'Explained Variance',  hasEma: true, render: () => <ExplVarChart /> },
   'train-kl':               { title: 'Approx KL',           defaultOpen: false, hasEma: true, render: () => <KLChart /> },
   'train-clip':             { title: 'Clip Fraction',       defaultOpen: false, hasEma: true, render: () => <ClipChart /> },

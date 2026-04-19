@@ -1318,7 +1318,7 @@ class TestRecurrentPassConsistency:
             lp_only = _recurrent_logprob_pass(
                 model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, cd_c,
             )
-            lp_actor, ent, _eps = _recurrent_actor_pass(
+            lp_actor, ent, _head_ents, _head_w, _eps = _recurrent_actor_pass(
                 model, obs_pre, h0, bt_a, bd_a, cd_a, brt_a, md_a, bt_m, bd_m, cd_c,
             )
 
@@ -1343,7 +1343,7 @@ class TestRecurrentPassConsistency:
         obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
 
         with torch.no_grad():
-            _, ent, _eps = _recurrent_actor_pass(
+            _, ent, _head_ents, _head_w, _eps = _recurrent_actor_pass(
                 model, obs_pre, h0,
                 bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0),
                 brt.unsqueeze(0), md.unsqueeze(0),
@@ -1465,7 +1465,7 @@ class TestActorGradientFlow:
         bt_mask, bd_mask, cd_causal = _precompute_policy_masks(obs, bt, bd)
         obs_pre = model._obs_encoder_pre(obs).unsqueeze(0)
 
-        new_lps, ent, _eps = _recurrent_actor_pass(
+        new_lps, ent, _head_ents, _head_w, _eps = _recurrent_actor_pass(
             model, obs_pre, h0,
             bt.unsqueeze(0), bd.unsqueeze(0), cd.unsqueeze(0),
             brt.unsqueeze(0), md.unsqueeze(0),

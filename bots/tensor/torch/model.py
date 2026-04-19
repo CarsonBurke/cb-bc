@@ -3509,8 +3509,13 @@ def _actor_recurrent_step(
     bd_mask_t: torch.Tensor,
     cd_mask: torch.Tensor,
     cd_causal_t: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One recurrent timestep: forward → GRU update → log-probs + entropy."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One recurrent timestep: forward → GRU update → log-probs + entropy.
+
+    Returns (new_lp, ent, head_ents_raw, head_weights, head_temperature, h_new)
+    where head_ents_raw[:, i] is the raw categorical entropy of head i and
+    head_weights[:, i] is the causal indicator for that head (1 for non-causal).
+    """
     bt_l, bd_l, cd_l, brt_l, md_l, head_temperature, h_gate, h_cand = model._forward_from_obs_pre(obs_pre_t, h_t)
     z = torch.sigmoid(h_gate)
     h_new = (1.0 - z) * h_t + z * h_cand
@@ -3556,14 +3561,14 @@ def _actor_recurrent_step(
         brt_causal=brt_causal,
     )
 
-    ent = (
-        bt_ent
-        + bd_ent
-        + cd_ent * cd_causal_t
-        + brt_ent * brt_causal
-        + md_ent
+    head_ents_raw = torch.stack([bt_ent, bd_ent, cd_ent, brt_ent, md_ent], dim=-1)
+    ones = torch.ones_like(bt_ent)
+    head_weights = torch.stack(
+        [ones, ones, cd_causal_t.to(bt_ent.dtype), brt_causal.to(bt_ent.dtype), ones],
+        dim=-1,
     )
-    return new_lp, ent, head_temperature, h_new
+    ent = (head_ents_raw * head_weights).sum(dim=-1)
+    return new_lp, ent, head_ents_raw, head_weights, head_temperature, h_new
 
 
 _compiled_actor_step: Callable | None = None
@@ -3605,26 +3610,36 @@ def _recurrent_actor_pass(
     bt_mask: torch.Tensor,
     bd_mask: torch.Tensor,
     cd_causal: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sequential recurrent pass that returns log-probs, entropies, and per-head temperatures."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sequential recurrent pass that returns log-probs, entropies, per-head
+    entropy breakdowns, per-head causal weights, and per-head temperatures."""
     B, K_max, _ = obs_pre.shape
     dev = obs_pre.device
     h_t = h0
     new_lps = torch.empty(B, K_max, device=dev)
     entropies = torch.empty(B, K_max, device=dev)
+    head_ents = torch.empty(B, K_max, N_ACTION_TEMPERATURES, device=dev)
+    head_weights = torch.empty(B, K_max, N_ACTION_TEMPERATURES, device=dev)
     all_temperatures = torch.empty(B, K_max, N_ACTION_TEMPERATURES, device=dev)
     cd_mask = conveyor_dir_mask(dev, B)
 
     step_fn = _get_actor_step_fn()
     with autocast_context(_get_actor_cuda_config()):
         for t in range(K_max):
-            new_lps[:, t], entropies[:, t], all_temperatures[:, t], h_t = step_fn(
+            (
+                new_lps[:, t],
+                entropies[:, t],
+                head_ents[:, t],
+                head_weights[:, t],
+                all_temperatures[:, t],
+                h_t,
+            ) = step_fn(
                 model, obs_pre[:, t], h_t,
                 bt_act[:, t], bd_act[:, t], cd_act[:, t], brt_act[:, t], md_act[:, t],
                 bt_mask[:, t], bd_mask[:, t], cd_mask, cd_causal[:, t],
             )
 
-    return new_lps, entropies, all_temperatures
+    return new_lps, entropies, head_ents, head_weights, all_temperatures
 
 
 def _sequential_logprobs(
@@ -3754,6 +3769,11 @@ def ppo_update(
     # Layout: [pi_loss, ent_loss, actor_gn, kl, clip_frac]
     _actor_acc = torch.zeros(5, device=dev)
     _critic_acc = torch.zeros(3, device=dev)  # [vf_loss, critic_gn, critic_delta]
+    # Per-head entropy telemetry: weighted sum and weight denom, indexed as
+    # [bt, bd, cd, brt, md]. Weights embed the causal gates (cd_causal,
+    # brt_causal) so "dead bridge head" can't hide behind non-bridge samples.
+    head_ent_sum = torch.zeros(N_ACTION_TEMPERATURES, device=dev)
+    head_ent_denom = torch.zeros(N_ACTION_TEMPERATURES, device=dev)
     sum_temperature = torch.zeros(N_ACTION_TEMPERATURES, device=dev)
     sum_temperature_sq = torch.zeros(N_ACTION_TEMPERATURES, device=dev)
     n_temperature = 0
@@ -3825,6 +3845,7 @@ def ppo_update(
 
         def _run_actor_group(chunk_ids: torch.Tensor, *, full_length: bool) -> None:
             nonlocal _epoch_kl_acc, n_mb, n_updates, sum_temperature, sum_temperature_sq, n_temperature
+            nonlocal head_ent_sum, head_ent_denom
             for cb_start in range(0, chunk_ids.shape[0], B_chunk):
                 with trace_scope(trace, "ppo.actor_minibatch"):
                     batch_ids = chunk_ids[cb_start:cb_start + B_chunk]
@@ -3856,7 +3877,13 @@ def ppo_update(
                     all_cd_causal = cd_causal_all[flat_idx].reshape(B, K_max)
 
                     t_phase = time.perf_counter() if profile is not None else 0.0
-                    new_lps, entropies, batch_temperature = _recurrent_actor_pass(
+                    (
+                        new_lps,
+                        entropies,
+                        batch_head_ents,
+                        batch_head_weights,
+                        batch_temperature,
+                    ) = _recurrent_actor_pass(
                         model,
                         all_obs_pre,
                         h[chunk_starts].detach(),
@@ -3916,6 +3943,9 @@ def ppo_update(
                         _actor_acc[0] += pi_loss
                         _actor_acc[1] += ent_loss
                         _actor_acc[2] += actor_gn
+                        eff_head_w = batch_head_weights * valid_mask.unsqueeze(-1)
+                        head_ent_sum += (batch_head_ents * eff_head_w).sum(dim=(0, 1))
+                        head_ent_denom += eff_head_w.sum(dim=(0, 1))
                     n_updates += 1
 
                     with torch.no_grad():
@@ -4076,8 +4106,13 @@ def ppo_update(
             oob_frac, bucket_lo_orig.float(), bucket_hi_orig.float(),
             ev_var_y, ev_var_res,
         ])
+        mean_head_ent = head_ent_sum / head_ent_denom.clamp_min(1.0)
         # Batch all .item() calls into one contiguous CPU transfer
-        _all_scalars = torch.cat([_actor_acc, _critic_acc, _diag, mean_temperature, std_temperature]).cpu()
+        _all_scalars = torch.cat([
+            _actor_acc, _critic_acc, _diag,
+            mean_temperature, std_temperature,
+            mean_head_ent,
+        ]).cpu()
     # Unpack after single sync
     _a = _all_scalars
     _na = max(n_updates, 1)
@@ -4109,6 +4144,11 @@ def ppo_update(
         "temp_cd_std": _a[23].item(),
         "temp_brt_std": _a[24].item(),
         "temp_md_std": _a[25].item(),
+        "entropy_bt": _a[26].item(),
+        "entropy_bd": _a[27].item(),
+        "entropy_cd": _a[28].item(),
+        "entropy_brt": _a[29].item(),
+        "entropy_md": _a[30].item(),
     }
 
 

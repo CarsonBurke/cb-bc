@@ -778,8 +778,10 @@ def test_ppo_update_reuses_cached_obs_pre_for_actor_minibatches(monkeypatch):
         captured_obs_pre.append(obs_pre.detach().cpu())
         new_lps = obs_pre[..., 0] * model.scale
         entropies = torch.zeros_like(new_lps)
+        head_ents = torch.zeros(*new_lps.shape, model_mod.N_ACTION_TEMPERATURES, device=new_lps.device)
+        head_weights = torch.ones(*new_lps.shape, model_mod.N_ACTION_TEMPERATURES, device=new_lps.device)
         head_temperature = torch.ones(*new_lps.shape, model_mod.N_ACTION_TEMPERATURES, device=new_lps.device)
-        return new_lps, entropies, head_temperature
+        return new_lps, entropies, head_ents, head_weights, head_temperature
 
     monkeypatch.setattr(model_mod, "_recurrent_actor_pass", fake_recurrent_actor_pass)
 
