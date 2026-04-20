@@ -28,7 +28,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _TORCH_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_TORCH_DIR))
+_TENSOR_DIR = _TORCH_DIR.parent
+for _p in (_TORCH_DIR, _TENSOR_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from model import (
     BPTT_K,
