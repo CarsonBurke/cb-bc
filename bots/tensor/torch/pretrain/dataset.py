@@ -139,6 +139,7 @@ def _critic_winloss_targets(
     base_value: float,
     gamma: float = GAMMA,
     resources_collected_deltas: torch.Tensor | None = None,
+    reward_mode: RewardMode | None = None,
 ) -> torch.Tensor:
     """Discounted returns for critic pretraining: resource income + terminal.
 
@@ -149,10 +150,11 @@ def _critic_winloss_targets(
     if n_turns <= 0:
         return torch.zeros(0, dtype=torch.float32)
 
+    mode = reward_mode if reward_mode is not None else REWARD_MODE
     rewards = torch.zeros(n_turns, dtype=torch.float32)
-    if REWARD_MODE == RewardMode.INCOME and resources_collected_deltas is not None and resources_collected_deltas.shape[0] >= n_turns:
+    if mode == RewardMode.INCOME and resources_collected_deltas is not None and resources_collected_deltas.shape[0] >= n_turns:
         rewards = resources_collected_deltas[:n_turns].float() * REWARD_INCOME_SCALE
-    if REWARD_MODE == RewardMode.OUTCOME:
+    if mode == RewardMode.OUTCOME:
         rewards[-1] += float(base_value)
 
     # Reverse-scan for discounted returns
@@ -626,9 +628,11 @@ class CriticBCDataset:
         index_path: str | Path | None = None,
         min_rating: float = 0.0,
         cache_size: int = 256,
+        reward_mode: RewardMode | None = None,
     ):
         self.replay_dir = Path(replay_dir)
         self.cache_dir = _cache_dir(self.replay_dir)
+        self.reward_mode = reward_mode if reward_mode is not None else REWARD_MODE
 
         if index_path is None:
             entries = _auto_index(self.replay_dir, min_rating)
@@ -765,6 +769,7 @@ class CriticBCDataset:
                 full_turns,
                 base_value=base_value,
                 resources_collected_deltas=rc_deltas,
+                reward_mode=self.reward_mode,
             )
             step_targets = round_targets.index_select(0, step_rounds.to(torch.long))
             entry = {

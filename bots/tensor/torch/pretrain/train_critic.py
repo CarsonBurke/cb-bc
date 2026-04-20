@@ -38,6 +38,7 @@ from model import (
     CentralizedCritic,
     DEVICE, GLOBAL_MAP_CHANNELS, GLOBAL_MAP_MAX_W, GLOBAL_MAP_MAX_H,
     GLOBAL_SCALAR_DIM, H_DIM, OBS_PREFIX_SIZE, UNIT_CONTEXT_DIM,
+    RewardMode,
     soft_cross_entropy_from_logits,
     value_target_probs,
     _make_bucket_centers, _normalize_actor_latent_dim,
@@ -1095,6 +1096,13 @@ def main():
     parser.add_argument("--replay-dir", type=str, default=str(DEFAULT_REPLAY_DIR))
     parser.add_argument("--index-path", type=str, default="")
     parser.add_argument("--min-rating", type=float, default=1500.0)
+    parser.add_argument(
+        "--reward-mode",
+        type=str,
+        choices=[m.value for m in RewardMode],
+        default=None,
+        help="Override critic target reward mode (defaults to model.REWARD_MODE).",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--games-per-batch", type=int, default=240)
@@ -1132,6 +1140,7 @@ def main():
     log_path = session_dir / "train_log.jsonl"
     game_log_path = session_dir / "game_log.jsonl"
     weights_path = session_dir / "critic_weights.pt"
+    reward_mode = RewardMode(args.reward_mode) if args.reward_mode else None
     config = {
         "mode": "critic_pretrain", "lr": args.lr, "epochs": args.epochs,
         "min_rating": args.min_rating,
@@ -1141,6 +1150,7 @@ def main():
         "step_log_every": args.step_log_every,
         "session": session_name,
         "actor_weights": args.actor_weights,
+        "reward_mode": (reward_mode.value if reward_mode is not None else None),
     }
     jsonl_init(log_path, config=config)
     jsonl_init(game_log_path)
@@ -1158,7 +1168,14 @@ def main():
 
     t0 = time.time()
     index_path = args.index_path or None
-    dataset = CriticBCDataset(replay_dir, index_path=index_path, min_rating=args.min_rating)
+    dataset = CriticBCDataset(
+        replay_dir,
+        index_path=index_path,
+        min_rating=args.min_rating,
+        reward_mode=reward_mode,
+    )
+    if reward_mode is not None:
+        print(f"Critic target reward mode: {reward_mode.value}")
     print(f"Loaded {dataset.total_turns} turns from {dataset.n_games} games in {time.time()-t0:.1f}s")
 
     critic = CentralizedCritic().to(DEVICE)
