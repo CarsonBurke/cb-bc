@@ -461,8 +461,9 @@ def precompute_all_actor_latents(
 
     n_computed += _flush_pending()
 
-    # Restore cache eviction and flush to fit limit
-    dataset._cache_size = old_cache_size
+    # Restore cache eviction, but keep at least all game-sides so the
+    # precomputed step_actor_latent isn't evicted (it only lives in-memory).
+    dataset._cache_size = max(old_cache_size, len(games)) if old_cache_size > 0 else 0
     with dataset._cache_lock:
         while dataset._cache_size > 0 and len(dataset._cache_order) > dataset._cache_size:
             evict = dataset._cache_order.popleft()
