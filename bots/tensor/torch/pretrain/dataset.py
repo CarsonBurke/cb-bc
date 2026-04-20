@@ -49,6 +49,7 @@ from model import (
     _OBS_GLOBAL_START,
     _OBS_SPAWN_ROUND,
 )
+from model_constants import OBS_SIZE as _OBS_SIZE_CURRENT
 
 
 def _file_signature(path: str | Path) -> tuple[int, int]:
@@ -183,6 +184,15 @@ def _decode_sequential_replay(
     raw_obs = torch.frombuffer(
         bytearray(data["obs"]), dtype=torch.float32,
     ).reshape(n, obs_size).clone()
+    # Older replays may predate a GLOBAL_FEATURES bump — zero-pad trailing globals
+    # so the current actor encoder can consume them.
+    if raw_obs.shape[1] < _OBS_SIZE_CURRENT:
+        pad = torch.zeros(n, _OBS_SIZE_CURRENT - raw_obs.shape[1], dtype=torch.float32)
+        raw_obs = torch.cat([raw_obs, pad], dim=1)
+    elif raw_obs.shape[1] > _OBS_SIZE_CURRENT:
+        raise RuntimeError(
+            f"Replay obs_size={raw_obs.shape[1]} exceeds current OBS_SIZE={_OBS_SIZE_CURRENT}"
+        )
     act_raw = bytearray(data["actions"])
     act_stride = len(act_raw) // n
     raw_actions = torch.tensor(
