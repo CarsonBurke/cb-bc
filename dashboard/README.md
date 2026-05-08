@@ -1,12 +1,34 @@
-# React + Vite
+# Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The dashboard now runs with a real Node backend instead of Vite-only middleware.
 
-Currently, two official plugins are available:
+## Scripts
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- `npm run dev`
+  Starts the backend on `http://127.0.0.1:5173` and the Vite frontend on the default Vite port.
+- `npm run dev:api`
+  Starts only the backend server.
+- `npm run dev:web`
+  Starts only the Vite frontend.
+- `npm run build`
+  Builds the frontend assets into `dist/`.
+- `npm run preview`
+  Serves the built frontend plus all dashboard APIs from the backend server.
 
-## Expanding the ESLint configuration
+## Backend responsibilities
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+The backend serves:
+
+- dashboard overview and per-round history APIs
+- training session, replay, league, and log APIs
+- the bundled Cambridge Battlecode visualiser under `/viewer/`
+- built frontend assets during preview
+
+## Frontend responsibilities
+
+The frontend now:
+
+- fetches lean overview and per-round payloads instead of bundling `ablations/history.json`
+- code-splits major routes
+- only mounts card contents when cards are open
+- uses visibility-aware polling for live training views

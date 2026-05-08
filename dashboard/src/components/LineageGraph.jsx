@@ -1,77 +1,100 @@
-import { useState } from 'react'
-import { DATA, botColor, getAllBots, getLatestRound } from '../data'
+import { useMemo, useState } from 'react'
+import { botColor } from '../data'
 
-export default function LineageGraph() {
-  const lineage = DATA.lineage || {}
-  const nodes = Object.keys(lineage)
+function eloColor(elo, minElo, maxElo) {
+  if (elo == null || maxElo === minElo) return '#f9e2af'
+  const t = (elo - minElo) / (maxElo - minElo)
+  // red(f38ba8) → yellow(f9e2af) → green(a6e3a1)
+  if (t < 0.5) {
+    const s = t * 2
+    const r = Math.round(0xf3 + (0xf9 - 0xf3) * s)
+    const g = Math.round(0x8b + (0xe2 - 0x8b) * s)
+    const b = Math.round(0xa8 + (0xaf - 0xa8) * s)
+    return `rgb(${r},${g},${b})`
+  }
+  const s = (t - 0.5) * 2
+  const r = Math.round(0xf9 + (0xa6 - 0xf9) * s)
+  const g = Math.round(0xe2 + (0xe3 - 0xe2) * s)
+  const b = Math.round(0xaf + (0xa1 - 0xaf) * s)
+  return `rgb(${r},${g},${b})`
+}
+
+export default function LineageGraph({ lineage, allBots, latestBots }) {
+  const nodes = useMemo(() => Object.keys(lineage || {}), [lineage])
   const [hovered, setHovered] = useState(null)
 
+  const { positions, minX, width, height } = useMemo(() => {
+    if (!nodes.length) {
+      return { positions: {}, minX: 0, width: 320, height: 200 }
+    }
+
+    const children = {}
+    const roots = []
+    nodes.forEach((node) => {
+      const parent = lineage[node]?.parent
+      if (!parent || !lineage[parent]) roots.push(node)
+      else {
+        children[parent] = children[parent] || []
+        children[parent].push(node)
+      }
+    })
+
+    const positions = {}
+    let xCounter = 0
+    const xSpacing = 140
+    const ySpacing = 90
+
+    function layout(node, depth) {
+      const kids = (children[node] || []).sort()
+      if (!kids.length) {
+        positions[node] = { x: xCounter * xSpacing, y: depth * ySpacing }
+        xCounter += 1
+      } else {
+        kids.forEach((child) => layout(child, depth + 1))
+        positions[node] = {
+          x: (positions[kids[0]].x + positions[kids[kids.length - 1]].x) / 2,
+          y: depth * ySpacing,
+        }
+      }
+    }
+
+    roots.sort().forEach((root) => layout(root, 0))
+
+    let maxX = -Infinity, localMinX = Infinity, maxY = -Infinity
+    for (const p of Object.values(positions)) {
+      if (p.x > maxX) maxX = p.x
+      if (p.x < localMinX) localMinX = p.x
+      if (p.y > maxY) maxY = p.y
+    }
+    const margin = 70
+    const minX = localMinX - margin
+    const width = maxX - minX + margin + 160
+    const height = maxY + margin * 2
+
+    return { positions, minX, width, height }
+  }, [lineage, nodes])
+
+  const { minElo, maxElo } = useMemo(() => {
+    let min = 1000, max = 1000
+    const values = Object.values(latestBots || {})
+    for (const v of values) {
+      if (v == null) continue
+      if (v < min) min = v
+      if (v > max) max = v
+    }
+    return { minElo: min, maxElo: max }
+  }, [latestBots])
+  const botIndex = useMemo(
+    () => new Map(allBots.map((name, index) => [name, index])),
+    [allBots],
+  )
+
   if (!nodes.length) return <p className="text-overlay0 text-sm">No lineage data.</p>
-
-  const children = {}
-  const roots = []
-  nodes.forEach(n => {
-    const p = lineage[n]?.parent
-    if (!p || !lineage[p]) roots.push(n)
-    else { children[p] = children[p] || []; children[p].push(n) }
-  })
-
-  const positions = {}
-  let xCounter = 0
-  const xSpacing = 140
-  const ySpacing = 90
-
-  function layout(node, depth) {
-    const kids = (children[node] || []).sort()
-    if (!kids.length) {
-      positions[node] = { x: xCounter * xSpacing, y: depth * ySpacing }
-      xCounter++
-    } else {
-      kids.forEach(k => layout(k, depth + 1))
-      const fx = positions[kids[0]].x
-      const lx = positions[kids[kids.length - 1]].x
-      positions[node] = { x: (fx + lx) / 2, y: depth * ySpacing }
-    }
-  }
-  roots.sort().forEach(r => layout(r, 0))
-
-  const allBots = getAllBots()
-  const latest = getLatestRound()
-
-  const elos = latest ? Object.values(latest.bots).map(b => b.elo) : []
-  const minElo = Math.min(...elos, 1000)
-  const maxElo = Math.max(...elos, 1000)
-
-  function eloColor(elo) {
-    if (elo == null || maxElo === minElo) return '#f9e2af'
-    const t = (elo - minElo) / (maxElo - minElo)
-    // red(f38ba8) → yellow(f9e2af) → green(a6e3a1)
-    if (t < 0.5) {
-      const s = t * 2
-      const r = Math.round(0xf3 + (0xf9 - 0xf3) * s)
-      const g = Math.round(0x8b + (0xe2 - 0x8b) * s)
-      const b = Math.round(0xa8 + (0xaf - 0xa8) * s)
-      return `rgb(${r},${g},${b})`
-    } else {
-      const s = (t - 0.5) * 2
-      const r = Math.round(0xf9 + (0xa6 - 0xf9) * s)
-      const g = Math.round(0xe2 + (0xe3 - 0xe2) * s)
-      const b = Math.round(0xaf + (0xa1 - 0xaf) * s)
-      return `rgb(${r},${g},${b})`
-    }
-  }
-
-  const allX = Object.values(positions).map(p => p.x)
-  const allY = Object.values(positions).map(p => p.y)
-  const margin = 70
-  const minX = Math.min(...allX) - margin
-  const width = Math.max(...allX) - minX + margin + 160
-  const height = Math.max(...allY) + margin * 2
 
   return (
     <div className="overflow-auto">
       <svg
-        viewBox={`${minX} ${-margin} ${width} ${height}`}
+        viewBox={`${minX} -70 ${width} ${height}`}
         style={{ height: Math.max(height, 200), width: '100%' }}
         className="overflow-visible"
       >
@@ -95,8 +118,8 @@ export default function LineageGraph() {
           if (!positions[n]) return null
           const { x, y } = positions[n]
           const cl = lineage[n]?.changelog || ''
-          const elo = latest?.bots[n]?.elo
-          const ci = allBots.indexOf(n)
+          const elo = latestBots?.[n]
+          const ci = botIndex.get(n)
           const color = ci >= 0 ? botColor(ci) : '#a6e3a1'
           const isHovered = hovered === n
 
@@ -119,7 +142,7 @@ export default function LineageGraph() {
               />
               <text x={18} y={4} fill="#cdd6f4" fontSize={13} fontWeight={600}>{n}</text>
               {elo != null && (
-                <text x={18} y={18} fill={eloColor(elo)} fontSize={11} fontWeight={600}>
+                <text x={18} y={18} fill={eloColor(elo, minElo, maxElo)} fontSize={11} fontWeight={600}>
                   ELO {elo}
                 </text>
               )}

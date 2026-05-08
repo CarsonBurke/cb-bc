@@ -1,15 +1,13 @@
-import { useMemo, useRef, createContext, useContext } from 'react'
+import { useMemo, useRef } from 'react'
 import { useAtom } from 'jotai'
 import { cardOpenAtom, cardSizeAtom, cardEmaAtom, cardBandsAtom } from '../store'
+import { CardSettingsCtx } from './CardSettingsContext'
 
 const SIZES = ['sm', 'md', 'lg', 'xl']
 const SIZE_LABELS = { sm: 'S', md: 'M', lg: 'L', xl: 'XL' }
 const SIZE_HEIGHTS = { sm: 150, md: null, lg: 450, xl: 780 }
 
-const CardSettingsCtx = createContext({ ema: false, bands: false })
-export function useCardSettings() { return useContext(CardSettingsCtx) }
-
-export default function Card({ title, subtitle, children, className = '', defaultOpen = true, id, dragHandleProps, hasEma }) {
+export default function Card({ title, subtitle, children, className = '', defaultOpen = true, id, dragHandleProps, hasEma, renderContent }) {
   const cardId = id || title || 'untitled'
   const openAtom = useMemo(() => cardOpenAtom(cardId, defaultOpen), [cardId, defaultOpen])
   const sizeAtom = useMemo(() => cardSizeAtom(cardId), [cardId])
@@ -19,6 +17,7 @@ export default function Card({ title, subtitle, children, className = '', defaul
   const [size, setSize] = useAtom(sizeAtom)
   const [ema, setEma] = useAtom(emaAtom)
   const [bands, setBands] = useAtom(bandsAtom)
+  const settingsValue = useMemo(() => ({ ema, bands }), [ema, bands])
   const didDrag = useRef(false)
 
   const headerDragProps = dragHandleProps ? {
@@ -123,22 +122,20 @@ export default function Card({ title, subtitle, children, className = '', defaul
           )}
         </div>
       )}
-      <div
-        className={`transition-all duration-150 ease-out overflow-hidden ${
-          open ? 'max-h-[2000px] opacity-100' : 'max-h-0 opacity-0'
-        }`}
-      >
-        <CardSettingsCtx.Provider value={{ ema, bands }}>
-          <div
-            className={`${title ? 'px-5 pt-4 pb-5' : 'p-5'} ${
-              SIZE_HEIGHTS[size] ? 'flex flex-col overflow-hidden [&>div]:flex-1 [&>div]:min-h-0 [&>div]:max-h-none' : ''
-            }`}
-            style={SIZE_HEIGHTS[size] ? { height: SIZE_HEIGHTS[size] + 'px' } : undefined}
-          >
-            {children}
-          </div>
-        </CardSettingsCtx.Provider>
-      </div>
+      {open && (
+        <div className="overflow-hidden">
+          <CardSettingsCtx.Provider value={settingsValue}>
+            <div
+              className={`${title ? 'px-5 pt-4 pb-5' : 'p-5'} ${
+                SIZE_HEIGHTS[size] ? 'flex flex-col overflow-hidden [&>div]:flex-1 [&>div]:min-h-0 [&>div]:max-h-none' : ''
+              }`}
+              style={SIZE_HEIGHTS[size] ? { height: SIZE_HEIGHTS[size] + 'px' } : undefined}
+            >
+              {renderContent ? renderContent() : children}
+            </div>
+          </CardSettingsCtx.Provider>
+        </div>
+      )}
     </div>
   )
 }

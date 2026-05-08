@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Benchmark a single training episode with timing breakdowns.
 
-Default workload exercises the batched path with multiple concurrent games so
-batching behavior is measurable. The benchmark uses the real collection and PPO
-paths rather than a synthetic microbench.
+Reuses the real collection and PPO paths from train_batched so the benchmark
+always matches production behavior.
 
 Examples:
     python bots/tensor/torch/bench_episode.py
-    python bots/tensor/torch/bench_episode.py --opponents 1 --games-per-opp 1
     python bots/tensor/torch/bench_episode.py --opponents 2 --games-per-opp 2
-    python bots/tensor/torch/bench_episode.py --json
+    python bots/tensor/torch/bench_episode.py --dummy-opponent --json
 """
 
 from __future__ import annotations
@@ -17,8 +15,6 @@ from __future__ import annotations
 import argparse
 import ast  # noqa: F401 - engine exec expects ast in sys.modules
 import json
-import os
-import pickle
 import random
 import shutil
 import time
@@ -36,46 +32,10 @@ def _print_breakdown(title: str, rows: list[tuple[str, float]], total: float) ->
         print(f"  {label:<24} {_fmt(seconds):>9}  {pct:5.1f}%")
 
 
-def _maybe_cleanup(path: Path, keep: bool) -> None:
-    if not keep:
-        shutil.rmtree(path, ignore_errors=True)
-
-
 def _label_from_key(key: str) -> str:
     if key.endswith("_s"):
         key = key[:-2]
     return key.replace("_", " ")
-
-
-def _load_weight_state(path: str | Path):
-    path = Path(path)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        pass
-    try:
-        with open(path, "rb") as f:
-            return pickle.load(f)
-    except Exception:
-        return None
-
-
-def _load_model_compat(model, *paths: str | Path) -> bool:
-    for path in paths:
-        data = _load_weight_state(path)
-        if data is None:
-            continue
-        try:
-            if isinstance(data, dict):
-                model.load_state_dict(data, strict=False)
-            else:
-                model.import_weights(data)
-            return True
-        except Exception:
-            continue
-    return False
 
 
 def _benchmark_batched(args) -> dict:
@@ -87,6 +47,7 @@ def _benchmark_batched(args) -> dict:
         League,
         PROJECT_ROOT,
         TEACHER_HIDDEN,
+        TRAIN_MAX_TURNS,
         WEIGHT_PATH,
         _default_session_name,
         _init_session,
@@ -107,20 +68,33 @@ def _benchmark_batched(args) -> dict:
 
     total_start = time.perf_counter()
 
+    # --- Setup (matches train_batched main loop) ---
     setup_start = time.perf_counter()
     hidden = TEACHER_HIDDEN if args.teacher else None
     model = BuilderMLP(hidden=hidden).to(DEVICE)
-    _load_model_compat(model, weight_path, WEIGHT_PATH)
+    session_weight_path = Path(sess["weight_path"])
+    if args.teacher:
+        if not session_weight_path.exists():
+            raise RuntimeError(
+                "Teacher benchmark requires an existing session checkpoint at "
+                f"{session_weight_path}; deploy weights at {WEIGHT_PATH} are student-format."
+            )
+        actor_source_path = session_weight_path
+    else:
+        actor_source_path = session_weight_path if session_weight_path.exists() else Path(WEIGHT_PATH)
+    if not model.load_weights(actor_source_path):
+        raise RuntimeError(f"Could not load benchmark weights from {actor_source_path}")
     reset_centralized_critic()
-    load_centralized_critic_checkpoint(weight_path, lr=args.lr)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
+    critic_source_path = session_weight_path if session_weight_path.exists() else actor_source_path
+    load_centralized_critic_checkpoint(critic_source_path, lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()
     setup_s = time.perf_counter() - setup_start
 
+    # --- League + opponent selection (matches train_batched main loop) ---
     seed_start = time.perf_counter()
-    league = League(sess["league_dir"], sess["league_json"], args.league_size)
+    league = League(sess["league_dir"], args.league_size)
     if not league.models:
         ckpt = str(league.league_dir / "gen_0.pkl")
         model.save_weights(ckpt)
@@ -133,45 +107,38 @@ def _benchmark_batched(args) -> dict:
             raise RuntimeError("Could not seed an opponent for the benchmark.")
     seed_s = time.perf_counter() - seed_start
 
+    # --- Build game list (matches train_batched episode loop) ---
     save_start = time.perf_counter()
     model.save_weights(weight_path)
     save_weights_s = time.perf_counter() - save_start
 
-    if not args.dummy_opponent and len(opponents) < args.opponents:
-        base = opponents[:]
-        while len(opponents) < args.opponents:
-            opponents.append(base[len(opponents) % len(base)])
-    opponents = sorted(opponents[:args.opponents], key=lambda opp: opp["path"])
-    opp_paths = []
-    opp_ids = []
+    all_opp_paths = []
+    all_opp_ids = []
     for opp in opponents:
-        repeat = args.games_per_opp * (args.opponents if args.dummy_opponent else 1)
-        for _ in range(repeat):
-            opp_paths.append(opp["path"])
-            opp_ids.append(opp["id"])
+        games_per_opp = args.games_per_opp * (max(args.opponents, 1) if args.dummy_opponent else 1)
+        for _ in range(games_per_opp):
+            all_opp_paths.append(opp["path"])
+            all_opp_ids.append(opp["id"])
 
+    # --- Collection (identical call to train_batched) ---
     collection_profile: dict[str, float] = {}
-    all_trajs, all_winners, per_opp_winners, all_global_states, traj_game_map, _game_origin = collect_games_batched(
-        model,
-        opp_paths,
-        opp_ids,
-        maps,
-        1,
-        replay_dir,
+    all_trajs, all_winners, per_opp_winners, all_global_states, traj_game_map, _game_origin, _game_delivery_totals, _game_specs = collect_games_batched(
+        model, all_opp_paths, all_opp_ids, maps,
+        1, replay_dir,
         opp_hidden=hidden,
         coalesce_ms=args.coalesce_ms,
+        max_training_turns=TRAIN_MAX_TURNS,
         profile=collection_profile,
     )
     if not all_trajs:
         raise RuntimeError("Benchmark game produced no trajectories.")
 
+    # --- Training (identical call to train_batched) ---
     train_profile: dict[str, float] = {}
     train_start = time.perf_counter()
     model.train()
     stats = train_on_trajectories(
-        model,
-        optimizer,
-        all_trajs,
+        model, optimizer, all_trajs,
         profile=train_profile,
         global_states_list=all_global_states,
         traj_game_map=traj_game_map if all_global_states else None,
@@ -179,7 +146,6 @@ def _benchmark_batched(args) -> dict:
     )
     model.save_weights(weight_path)
     save_centralized_critic_checkpoint(weight_path)
-    scheduler.step()
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()
     train_total_s = time.perf_counter() - train_start
@@ -205,7 +171,7 @@ def _benchmark_batched(args) -> dict:
         "device": str(DEVICE),
         "teacher": bool(args.teacher),
         "dummy_opponent": bool(args.dummy_opponent),
-        "games": len(opp_paths),
+        "games": len(all_opp_paths),
         "wins": sum(1 for w in all_winners if w == "a"),
         "losses": sum(1 for w in all_winners if w == "b"),
         "trajectories": len(all_trajs),
@@ -224,7 +190,8 @@ def _benchmark_batched(args) -> dict:
         "ppo_stats": stats,
     }
 
-    _maybe_cleanup(session_dir, args.keep_session)
+    if not args.keep_session:
+        shutil.rmtree(session_dir, ignore_errors=True)
     return result
 
 
@@ -251,7 +218,7 @@ def main() -> None:
         return
 
     total = result["total_s"]
-    print(f"Mode: {result['mode']}")
+    print(f"\nMode: {result['mode']}")
     print(f"Device: {result['device']}")
     print(f"Session: {result['session']}")
     print(

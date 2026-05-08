@@ -1,24 +1,8 @@
-import { useState, useEffect, useRef } from 'react'
+import { useEffect, useMemo } from 'react'
 import { useAtom } from 'jotai'
 import { modePersistAtom, trainSessionPersistAtom } from '../store'
-import { formatDate, relativeTime } from '../data'
-
-function useTrainSessions() {
-  const [sessions, setSessions] = useState([])
-  const timer = useRef(null)
-  function refresh() {
-    fetch('/api/train-sessions')
-      .then(r => r.json())
-      .then(setSessions)
-      .catch(() => {})
-  }
-  useEffect(() => {
-    refresh()
-    timer.current = setInterval(refresh, 10000)
-    return () => clearInterval(timer.current)
-  }, [])
-  return sessions
-}
+import { relativeTime } from '../data'
+import { useTrainSessionsQuery } from '../hooks/useDashboardQueries'
 
 function formatSessionDate(ts) {
   if (!ts) return ''
@@ -28,8 +12,9 @@ function formatSessionDate(ts) {
 export default function Sidebar({ rounds, currentView, onSelect }) {
   const [mode, setMode] = useAtom(modePersistAtom)
   const [activeSession, setActiveSession] = useAtom(trainSessionPersistAtom)
-  const sessions = useTrainSessions()
-  const reversed = [...rounds].reverse()
+  const sessionsQuery = useTrainSessionsQuery()
+  const sessions = useMemo(() => sessionsQuery.data || [], [sessionsQuery.data])
+  const reversed = useMemo(() => [...rounds].reverse(), [rounds])
 
   // Auto-select most recent session if none selected
   useEffect(() => {
@@ -73,7 +58,7 @@ export default function Sidebar({ rounds, currentView, onSelect }) {
                 active={currentView === r.round_id}
                 onClick={() => onSelect(r.round_id)}
                 title={`Round ${r.round_id}`}
-                meta={`${relativeTime(r.timestamp)} · ${Object.keys(r.bots).length} bots`}
+                meta={`${relativeTime(r.timestamp)} · ${r.bot_count} bots`}
               />
             ))}
           </>

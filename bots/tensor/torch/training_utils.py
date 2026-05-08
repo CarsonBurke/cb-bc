@@ -12,7 +12,47 @@ from pathlib import Path
 
 import trueskill
 
+try:
+    from trajectory_schema import TrajectoryStep, validate_trajectory_step
+    from shared import H_DIM, INPUT_SIZE
+except ImportError:
+    from bots.tensor.trajectory_schema import TrajectoryStep, validate_trajectory_step
+    from bots.tensor.shared import H_DIM, INPUT_SIZE
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+
+# ---- JSONL utilities ----
+
+def _sanitize_for_json(obj):
+    """Replace NaN/Infinity floats with None so json.dumps produces valid JSON."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
+def jsonl_line(obj: dict) -> str:
+    """Serialize a dict to a single JSONL line (with trailing newline), sanitizing NaN/Infinity."""
+    return json.dumps(_sanitize_for_json(obj), separators=(",", ":")) + "\n"
+
+
+def jsonl_append(path: Path, obj: dict) -> None:
+    """Append a single JSON object as a line to a JSONL file."""
+    with open(path, "a") as f:
+        f.write(jsonl_line(obj))
+
+
+def jsonl_init(path: Path, config: dict | None = None) -> None:
+    """Initialize a JSONL file. If config is provided, writes it as the first line."""
+    with open(path, "w") as f:
+        if config is not None:
+            f.write(jsonl_line({"config": config}))
 SESSIONS_DIR = PROJECT_ROOT / "bots" / "tensor" / "sessions"
 WEIGHT_PATH = PROJECT_ROOT / "bots" / "tensor_inference" / "weights.json"
 
@@ -40,16 +80,26 @@ def _init_session(name: str) -> dict:
     league_dir.mkdir(exist_ok=True)
     replay_dir = d / "replays"
     replay_dir.mkdir(exist_ok=True)
+    actor_weight_path = d / "weights.pkl"
+    critic_weight_path = d / "weights.critic.pt"
     meta_path = d / "meta.json"
     if not meta_path.exists():
         with open(meta_path, "w") as f:
-            json.dump({"name": name, "created": time.time(), "mode": "self-play"}, f)
+            json.dump({
+                "name": name,
+                "created": time.time(),
+                "mode": "self-play",
+                "actor_weight_path": str(actor_weight_path),
+                "critic_weight_path": str(critic_weight_path),
+            }, f)
     return {
         "dir": d,
         "league_dir": league_dir,
-        "league_json": league_dir / "league.json",
-        "weight_path": d / "weights.pkl",
+        "actor_weight_path": actor_weight_path,
+        "critic_weight_path": critic_weight_path,
+        "weight_path": actor_weight_path,
         "log_path": d / "train_log.jsonl",
+        "game_log_path": d / "game_log.jsonl",
         "replay_dir": replay_dir,
     }
 
@@ -71,23 +121,35 @@ def _ts_elo(rating: trueskill.Rating) -> float:
 
 
 class League:
-    def __init__(self, league_dir: Path, league_json: Path, max_size: int = 20):
+    def __init__(self, league_dir: Path, max_size: int = 20):
         self.max_size = max_size
         self.league_dir = league_dir
-        self.league_json = league_json
+        self.models_json = league_dir / "models.json"
+        self.matches_jsonl = league_dir / "matches.jsonl"
         league_dir.mkdir(parents=True, exist_ok=True)
-        if league_json.exists():
-            with open(league_json) as f:
+
+        # Migrate from old league.json if present
+        old_json = league_dir / "league.json"
+        if old_json.exists() and not self.models_json.exists():
+            with open(old_json) as f:
                 data = json.load(f)
             self.models = data.get("models", [])
-            self.match_history = data.get("matches", [])
+            # Write migrated matches as JSONL
+            matches = data.get("matches", [])
+            if matches:
+                for m in matches:
+                    jsonl_append(self.matches_jsonl, m)
+            self.save()
+            old_json.unlink()
+        elif self.models_json.exists():
+            with open(self.models_json) as f:
+                self.models = json.load(f)
         else:
             self.models = []
-            self.match_history = []
 
     def save(self):
-        with open(self.league_json, "w") as f:
-            json.dump({"models": self.models, "matches": self.match_history}, f, indent=2)
+        with open(self.models_json, "w") as f:
+            json.dump(self.models, f, indent=2)
 
     def add_model(self, weights: list[list[float]], gen: int) -> dict:
         path = str(self.league_dir / f"gen_{gen}.pkl")
@@ -134,37 +196,37 @@ class League:
 
         Prefers opponents close in skill (small |mu_a - mu_b|) and those with
         high uncertainty (large sigma), since games against them are most
-        informative.  Falls back to uniform if the league has <=2 models.
+        informative. Excludes the latest model when any earlier checkpoint
+        exists, but falls back to self-play bootstrap for a one-model league.
         """
         if not self.models:
             return []
-        if len(self.models) <= 2:
-            return random.sample(self.models, min(k, len(self.models)))
 
         # Current model is the latest gen
         latest = max(self.models, key=lambda m: m["gen"])
+        candidates = [m for m in self.models if m["id"] != latest["id"]]
+        if not candidates:
+            return [latest] if k > 0 else []
+        if len(candidates) == 1:
+            return candidates[:min(k, 1)]
         latest_mu = latest["mu"]
 
         weights = []
-        for m in self.models:
-            if m["id"] == latest["id"]:
-                # Don't play against yourself
-                weights.append(0.0)
-            else:
-                # Prefer close skill + high uncertainty opponents
-                skill_diff = abs(m["mu"] - latest_mu)
-                closeness = math.exp(-skill_diff / 10.0)
-                uncertainty = m["sigma"] / TS_ENV.sigma
-                weights.append(closeness + 0.5 * uncertainty + 0.1)  # floor avoids starvation
+        for m in candidates:
+            # Prefer close skill + high uncertainty opponents
+            skill_diff = abs(m["mu"] - latest_mu)
+            closeness = math.exp(-skill_diff / 10.0)
+            uncertainty = m["sigma"] / TS_ENV.sigma
+            weights.append(closeness + 0.5 * uncertainty + 0.1)  # floor avoids starvation
 
         total = sum(weights)
         if total == 0:
-            return random.sample(self.models, min(k, len(self.models)))
+            return random.sample(candidates, min(k, len(candidates)))
 
         # Weighted sampling without replacement
-        pool = list(range(len(self.models)))
+        pool = list(range(len(candidates)))
         selected = []
-        for _ in range(min(k, len(self.models) - 1)):
+        for _ in range(min(k, len(candidates))):
             if not pool:
                 break
             probs = [weights[i] for i in pool]
@@ -179,12 +241,14 @@ class League:
                 if r <= cumulative:
                     chosen_idx = idx
                     break
-            selected.append(self.models[chosen_idx])
+            selected.append(candidates[chosen_idx])
             pool.remove(chosen_idx)
 
         return selected
 
     def update_elo(self, model_a_id: str, model_b_id: str, winner: str | None):
+        if model_a_id == model_b_id:
+            return
         a = next((m for m in self.models if m["id"] == model_a_id), None)
         b = next((m for m in self.models if m["id"] == model_b_id), None)
         if not a or not b:
@@ -208,7 +272,7 @@ class League:
         a["elo"] = _ts_elo(new_a)
         b["elo"] = _ts_elo(new_b)
 
-        self.match_history.append({
+        jsonl_append(self.matches_jsonl, {
             "a": model_a_id, "b": model_b_id, "winner": winner, "timestamp": time.time(),
         })
 
@@ -221,20 +285,33 @@ class League:
 
 # ---- Trajectory I/O ----
 
-def _read_trajectory_file(path: str | None) -> list[list]:
-    """Read all pickle chunks from a trajectory file (one per builder)."""
-    if not path or not os.path.exists(path):
-        return []
-    trajs = []
-    try:
-        with open(path, "rb") as f:
-            while True:
-                try:
-                    traj = pickle.load(f)
-                    if traj:
-                        trajs.append(traj)
-                except EOFError:
-                    break
-    except Exception:
-        pass
+def _read_trajectory_file(path: str | None) -> list[list[TrajectoryStep]]:
+    """Read and validate all rollout trajectories from a worker log."""
+    if not path:
+        raise ValueError("trajectory path is required")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"trajectory log missing: {path}")
+    trajs: list[list[TrajectoryStep]] = []
+    with open(path, "rb") as f:
+        while True:
+            try:
+                traj = pickle.load(f)
+            except EOFError:
+                break
+            if not isinstance(traj, list):
+                raise TypeError(f"trajectory chunk must be list, got {type(traj).__name__}")
+            if not traj:
+                continue
+            validated: list[TrajectoryStep] = []
+            for step in traj:
+                validated.append(
+                    validate_trajectory_step(
+                        step,
+                        obs_bytes_len=INPUT_SIZE * 4,
+                        h_bytes_len=H_DIM * 4,
+                    )
+                )
+            trajs.append(validated)
+    if not trajs:
+        raise RuntimeError(f"trajectory log contained no trajectories: {path}")
     return trajs

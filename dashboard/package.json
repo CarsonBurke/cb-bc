@@ -4,12 +4,15 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node server/dev.js",
+    "dev:web": "vite",
+    "dev:api": "node server/index.js",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "node server/index.js"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.95.0",
     "babel-plugin-react-compiler": "^1.0.0",
     "chart.js": "^4.5.1",
     "date-fns": "^4.1.0",

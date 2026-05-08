@@ -15,7 +15,7 @@ class SinusoidalPositionEmbedding:
     First half encodes x, second half encodes y.
     """
 
-    __slots__ = ("d_model", "freqs", "_quarter")
+    __slots__ = ("d_model", "freqs", "_quarter", "_cache")
 
     def __init__(self, d_model: int, base: float = 10000.0):
         self.d_model = d_model
@@ -25,9 +25,15 @@ class SinusoidalPositionEmbedding:
             1.0 / (base ** (2.0 * i / d_model))
             for i in range(self._quarter)
         ]
+        self._cache: dict[tuple[int, int], tuple[float, ...]] = {}
 
-    def encode(self, x: int, y: int) -> list[float]:
+    def encode(self, x: int, y: int) -> tuple[float, ...]:
         """Encode a single (x, y) position -> d_model floats."""
+        key = (x, y)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+
         q = self._quarter
         freqs = self.freqs
         vec = [0.0] * self.d_model
@@ -45,7 +51,9 @@ class SinusoidalPositionEmbedding:
             vec[half + 2 * i] = math.sin(angle)
             vec[half + 2 * i + 1] = math.cos(angle)
 
-        return vec
+        cached = tuple(vec)
+        self._cache[key] = cached
+        return cached
 
     def encode_batch(self, positions: list[tuple[int, int]]) -> Tensor:
         """Encode multiple positions -> (N, d_model) tensor."""

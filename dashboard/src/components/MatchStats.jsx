@@ -1,18 +1,8 @@
+import { useMemo } from 'react'
 import { Line } from 'react-chartjs-2'
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Filler,
-  Tooltip,
-  Legend,
-} from 'chart.js'
 import { CHART_THEME } from '../data'
 import { Table, Th, Td, Thead, Tr } from './Table'
-
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip, Legend)
+import '../chartjs'
 
 const CHART_OPTS = {
   responsive: true,
@@ -32,22 +22,41 @@ const CHART_OPTS = {
   },
 }
 
-function mergeRounds(snapsA, snapsB) {
-  return [...new Set([...(snapsA || []).map(s => s.round), ...(snapsB || []).map(s => s.round)])].sort((a, b) => a - b)
+const TEAM_FIELDS = [
+  'titanium', 'axionite',
+  'cumulative_income_ti', 'cumulative_income_ax',
+  'cumulative_spent_ti',
+  'in_transit_ti', 'in_transit_ax',
+  'mined_ore', 'unmined_ore',
+  'core_hp', 'scale_percent',
+]
+
+function buildTeamSeries(snaps, rounds) {
+  const byRound = new Map()
+  for (const s of snaps) byRound.set(s.round, s)
+
+  const series = {}
+  for (const f of TEAM_FIELDS) series[f] = new Array(rounds.length)
+  const total_units = new Array(rounds.length)
+
+  for (let i = 0; i < rounds.length; i++) {
+    const s = byRound.get(rounds[i])
+    if (s) {
+      for (const f of TEAM_FIELDS) series[f][i] = s[f] ?? null
+      let sum = 0
+      const own = s.own_units
+      if (own) for (const k in own) sum += own[k]
+      total_units[i] = sum
+    } else {
+      for (const f of TEAM_FIELDS) series[f][i] = null
+      total_units[i] = null
+    }
+  }
+  series.total_units = total_units
+  return series
 }
 
-function lookupField(snaps, field, rounds) {
-  const map = Object.fromEntries((snaps || []).map(s => [s.round, s[field]]))
-  return rounds.map(r => map[r] ?? null)
-}
-
-function TimelineChart({ teamA, teamB, botA, botB, datasets: datasetsFn, title }) {
-  const snapsA = teamA?.snapshots || []
-  const snapsB = teamB?.snapshots || []
-  const rounds = mergeRounds(snapsA, snapsB)
-  const labels = rounds.map(r => `${r}`)
-  const datasets = datasetsFn(snapsA, snapsB, rounds)
-
+function TimelineChart({ title, labels, datasets }) {
   return (
     <div>
       <h5 className="text-[12px] text-overlay0 font-medium mb-2">{title}</h5>
@@ -119,90 +128,79 @@ const B1 = '#f38ba8'
 const B2 = '#f9e2af'
 
 export default function MatchStats({ stats, botA, botB }) {
+  const team_a = stats?.team_a || null
+  const team_b = stats?.team_b || null
+
+  const charts = useMemo(() => {
+    const snapsA = team_a?.snapshots || []
+    const snapsB = team_b?.snapshots || []
+    const roundSet = new Set()
+    for (const s of snapsA) roundSet.add(s.round)
+    for (const s of snapsB) roundSet.add(s.round)
+    const rounds = [...roundSet].sort((a, b) => a - b)
+    const labels = rounds.map(String)
+
+    const a = buildTeamSeries(snapsA, rounds)
+    const b = buildTeamSeries(snapsB, rounds)
+
+    return {
+      labels,
+      resources: [
+        { label: `${botA} Ti`, data: a.titanium, borderColor: A1, backgroundColor: A1 + '22', tension: 0.3, borderWidth: 2, pointRadius: 2, fill: true },
+        { label: `${botB} Ti`, data: b.titanium, borderColor: B1, backgroundColor: B1 + '22', tension: 0.3, borderWidth: 2, pointRadius: 2, fill: true },
+        { label: `${botA} Ax`, data: a.axionite, borderColor: A2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+        { label: `${botB} Ax`, data: b.axionite, borderColor: B2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+      ],
+      income: [
+        { label: `${botA} Ti`, data: a.cumulative_income_ti, borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botB} Ti`, data: b.cumulative_income_ti, borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botA} Ax`, data: a.cumulative_income_ax, borderColor: A2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+        { label: `${botB} Ax`, data: b.cumulative_income_ax, borderColor: B2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+      ],
+      spending: [
+        { label: `${botA} Ti`, data: a.cumulative_spent_ti, borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botB} Ti`, data: b.cumulative_spent_ti, borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+      ],
+      transit: [
+        { label: `${botA} Ti`, data: a.in_transit_ti, borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botB} Ti`, data: b.in_transit_ti, borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botA} Ax`, data: a.in_transit_ax, borderColor: A2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+        { label: `${botB} Ax`, data: b.in_transit_ax, borderColor: B2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+      ],
+      ore: [
+        { label: `${botA} mined`, data: a.mined_ore, borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botA} unmined`, data: a.unmined_ore, borderColor: A1, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+        { label: `${botB} mined`, data: b.mined_ore, borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botB} unmined`, data: b.unmined_ore, borderColor: B1, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+      ],
+      units: [
+        { label: `${botA}`, data: a.total_units, borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botB}`, data: b.total_units, borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+      ],
+      coreHp: [
+        { label: `${botA}`, data: a.core_hp, borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botB}`, data: b.core_hp, borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+      ],
+      scale: [
+        { label: `${botA}`, data: a.scale_percent, borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+        { label: `${botB}`, data: b.scale_percent, borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+      ],
+    }
+  }, [team_a, team_b, botA, botB])
+
   if (!stats) return null
-  const { team_a, team_b } = stats
 
   return (
     <div className="space-y-5 mt-3">
       <StatSummary teamA={team_a} teamB={team_b} botA={botA} botB={botB} />
-
-      <TimelineChart teamA={team_a} teamB={team_b} botA={botA} botB={botB}
-        title="Resources at Core"
-        datasets={(a, b, rounds) => [
-          { label: `${botA} Ti`, data: lookupField(a, 'titanium', rounds), borderColor: A1, backgroundColor: A1 + '22', tension: 0.3, borderWidth: 2, pointRadius: 2, fill: true },
-          { label: `${botB} Ti`, data: lookupField(b, 'titanium', rounds), borderColor: B1, backgroundColor: B1 + '22', tension: 0.3, borderWidth: 2, pointRadius: 2, fill: true },
-          { label: `${botA} Ax`, data: lookupField(a, 'axionite', rounds), borderColor: A2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-          { label: `${botB} Ax`, data: lookupField(b, 'axionite', rounds), borderColor: B2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-        ]}
-      />
-
-      <TimelineChart teamA={team_a} teamB={team_b} botA={botA} botB={botB}
-        title="Cumulative Income (Delivered to Core)"
-        datasets={(a, b, rounds) => [
-          { label: `${botA} Ti`, data: lookupField(a, 'cumulative_income_ti', rounds), borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botB} Ti`, data: lookupField(b, 'cumulative_income_ti', rounds), borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botA} Ax`, data: lookupField(a, 'cumulative_income_ax', rounds), borderColor: A2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-          { label: `${botB} Ax`, data: lookupField(b, 'cumulative_income_ax', rounds), borderColor: B2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-        ]}
-      />
-
-      <TimelineChart teamA={team_a} teamB={team_b} botA={botA} botB={botB}
-        title="Cumulative Spending"
-        datasets={(a, b, rounds) => [
-          { label: `${botA} Ti`, data: lookupField(a, 'cumulative_spent_ti', rounds), borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botB} Ti`, data: lookupField(b, 'cumulative_spent_ti', rounds), borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-        ]}
-      />
-
-      <TimelineChart teamA={team_a} teamB={team_b} botA={botA} botB={botB}
-        title="Resources In Transit"
-        datasets={(a, b, rounds) => [
-          { label: `${botA} Ti`, data: lookupField(a, 'in_transit_ti', rounds), borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botB} Ti`, data: lookupField(b, 'in_transit_ti', rounds), borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botA} Ax`, data: lookupField(a, 'in_transit_ax', rounds), borderColor: A2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-          { label: `${botB} Ax`, data: lookupField(b, 'in_transit_ax', rounds), borderColor: B2, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-        ]}
-      />
-
-      <TimelineChart teamA={team_a} teamB={team_b} botA={botA} botB={botB}
-        title="Ore Utilization (Visible)"
-        datasets={(a, b, rounds) => [
-          { label: `${botA} mined`, data: lookupField(a, 'mined_ore', rounds), borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botA} unmined`, data: lookupField(a, 'unmined_ore', rounds), borderColor: A1, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-          { label: `${botB} mined`, data: lookupField(b, 'mined_ore', rounds), borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botB} unmined`, data: lookupField(b, 'unmined_ore', rounds), borderColor: B1, borderDash: [4, 2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-        ]}
-      />
-
-      <TimelineChart teamA={team_a} teamB={team_b} botA={botA} botB={botB}
-        title="Total Units (Visible)"
-        datasets={(a, b, rounds) => {
-          function totalUnits(snaps) {
-            const map = Object.fromEntries(snaps.map(s => [s.round, Object.values(s.own_units || {}).reduce((sum, v) => sum + v, 0)]))
-            return rounds.map(r => map[r] ?? null)
-          }
-          return [
-            { label: `${botA}`, data: totalUnits(a), borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-            { label: `${botB}`, data: totalUnits(b), borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          ]
-        }}
-      />
-
-      <TimelineChart teamA={team_a} teamB={team_b} botA={botA} botB={botB}
-        title="Core HP"
-        datasets={(a, b, rounds) => [
-          { label: `${botA}`, data: lookupField(a, 'core_hp', rounds), borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botB}`, data: lookupField(b, 'core_hp', rounds), borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-        ]}
-      />
-
-      <TimelineChart teamA={team_a} teamB={team_b} botA={botA} botB={botB}
-        title="Cost Scale %"
-        datasets={(a, b, rounds) => [
-          { label: `${botA}`, data: lookupField(a, 'scale_percent', rounds), borderColor: A1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-          { label: `${botB}`, data: lookupField(b, 'scale_percent', rounds), borderColor: B1, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-        ]}
-      />
+      <TimelineChart title="Resources at Core" labels={charts.labels} datasets={charts.resources} />
+      <TimelineChart title="Cumulative Income (Delivered to Core)" labels={charts.labels} datasets={charts.income} />
+      <TimelineChart title="Cumulative Spending" labels={charts.labels} datasets={charts.spending} />
+      <TimelineChart title="Resources In Transit" labels={charts.labels} datasets={charts.transit} />
+      <TimelineChart title="Ore Utilization (Visible)" labels={charts.labels} datasets={charts.ore} />
+      <TimelineChart title="Total Units (Visible)" labels={charts.labels} datasets={charts.units} />
+      <TimelineChart title="Core HP" labels={charts.labels} datasets={charts.coreHp} />
+      <TimelineChart title="Cost Scale %" labels={charts.labels} datasets={charts.scale} />
     </div>
   )
 }

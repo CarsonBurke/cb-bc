@@ -3,20 +3,32 @@
 # No tensor_lib dependency — stdlib only.
 
 import math
+import os
 import random
+import sys
 
-from cambc import Controller, Direction, EntityType, Environment, Position
+from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position, ResourceType
+
+# Keep actor architecture constants sourced from the deploy model constants.
+_INFERENCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tensor_inference")
+if _INFERENCE_DIR not in sys.path:
+    sys.path.insert(0, _INFERENCE_DIR)
+from model_constants import (
+    ACTOR_CLS_TOKENS,
+    ACTOR_CONTEXT_CHUNKS,
+    ACTOR_LATENT_DIM,
+    COMPRESS_DIM,
+    GLOBAL_FEATURES,
+    GRID_HALF,
+    GRID_SIZE,
+    HIDDEN_SIZES,
+    H_DIM,
+    INPUT_SIZE,
+    RMSNORM_LAYERS,
+    TILE_FEATURES,
+)
 
 # -- Layout constants --
-GRID_SIZE = 5
-GRID_HALF = GRID_SIZE // 2
-TILE_FEATURES = 17
-GLOBAL_FEATURES = 15
-POS_EMBED_DIM = 8
-INPUT_SIZE = GRID_SIZE * GRID_SIZE * TILE_FEATURES + GLOBAL_FEATURES + POS_EMBED_DIM
-HIDDEN_SIZES = [64, 64, 48, 48]
-H_DIM = 16
-RMSNORM_LAYERS = [True, True, True, True]
 
 DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
 
@@ -33,6 +45,7 @@ BUILD_ACTIONS = [
     "barrier",
     "foundry",
     "launcher",
+    "bridge",
 ]
 
 DIR_MAP_9 = [
@@ -46,7 +59,8 @@ DIR_MAP_9 = [
     Direction.SOUTH,
     Direction.SOUTHEAST,
 ]
-_CONV_DIR_MASK = [d != Direction.CENTRE for d in DIR_MAP_9]
+CONV_DIR_4 = [Direction.NORTH, Direction.WEST, Direction.EAST, Direction.SOUTH]
+_CONV_DIR_MASK = [True, True, True, True]  # all 4 cardinal dirs always valid
 _HARVESTER_BUILD_TYPE = 1
 
 ENV_IDX = {
@@ -63,15 +77,15 @@ BLD_IDX = {
     EntityType.SPLITTER: 3,
     EntityType.ROAD: 4,
     EntityType.BARRIER: 5,
-    EntityType.BRIDGE: 5,
-    EntityType.FOUNDRY: 5,
-    EntityType.GUNNER: 6,
-    EntityType.SENTINEL: 6,
-    EntityType.BREACH: 6,
-    EntityType.LAUNCHER: 6,
-    EntityType.CORE: 7,
+    EntityType.BRIDGE: 6,
+    EntityType.FOUNDRY: 7,
+    EntityType.GUNNER: 8,
+    EntityType.SENTINEL: 8,
+    EntityType.BREACH: 8,
+    EntityType.LAUNCHER: 8,
+    EntityType.CORE: 9,
 }
-N_BLD_TYPES = 8
+N_BLD_TYPES = 10
 
 DIR_DXY = {
     Direction.NORTHWEST: (-1, -1),
@@ -85,19 +99,31 @@ DIR_DXY = {
     Direction.SOUTHEAST: (1, 1),
 }
 
+# Base build costs (titanium, axionite) indexed by BUILD_ACTIONS, derived from GameConstants
+_GC = GameConstants
 BUILD_COSTS = (
-    (0, 0),      # none
-    (80, 0),     # harvester
-    (3, 0),      # conveyor
-    (1, 0),      # road
-    (10, 0),     # gunner
-    (15, 0),     # sentinel
-    (30, 10),    # breach
-    (6, 0),      # splitter
-    (10, 5),     # armoured_conveyor
-    (3, 0),      # barrier
-    (120, 0),    # foundry
-    (20, 0),     # launcher
+    (0, 0),                           # none
+    _GC.HARVESTER_BASE_COST,          # harvester
+    _GC.CONVEYOR_BASE_COST,           # conveyor
+    _GC.ROAD_BASE_COST,               # road
+    _GC.GUNNER_BASE_COST,             # gunner
+    _GC.SENTINEL_BASE_COST,           # sentinel
+    _GC.BREACH_BASE_COST,             # breach
+    _GC.SPLITTER_BASE_COST,           # splitter
+    _GC.ARMOURED_CONVEYOR_BASE_COST,  # armoured_conveyor
+    _GC.BARRIER_BASE_COST,            # barrier
+    _GC.FOUNDRY_BASE_COST,            # foundry
+    _GC.LAUNCHER_BASE_COST,           # launcher
+    _GC.BRIDGE_BASE_COST,             # bridge
+)
+
+# Bridge target offsets: all (dx, dy) with 0 < dx²+dy² ≤ 9, row-major order.
+# Matches the sequential index from replay_parser's bridge_target_to_idx.
+BRIDGE_OFFSETS = tuple(
+    (dx, dy)
+    for dy in range(-3, 4)
+    for dx in range(-3, 4)
+    if 0 < dx * dx + dy * dy <= 9
 )
 
 _BUILD_DIR_TILE_INDICES = tuple(
@@ -108,42 +134,11 @@ _BUILD_DIR_TILE_INDICES = tuple(
 _GLOBAL_OBS_START = GRID_SIZE * GRID_SIZE * TILE_FEATURES
 
 _ZERO_TILE = (0.0,) * TILE_FEATURES
-_NO_BUILD_TILE = (1.0,) + (0.0,) * (N_BLD_TYPES - 1) + (0.0, 0.0, 0.0)
+_NO_BUILD_TILE = (1.0,) + (0.0,) * (N_BLD_TYPES - 1) + (0.0, 0.0, 0.0, 0.0, 0.0)
 _BLD_ONE_HOTS = tuple(
     tuple(1.0 if i == idx else 0.0 for i in range(N_BLD_TYPES))
     for idx in range(N_BLD_TYPES)
 )
-
-
-# ---------------------------------------------------------------------------
-# SinusoidalPositionEmbedding (stdlib-only, no tensor_lib)
-# ---------------------------------------------------------------------------
-
-class SinusoidalPositionEmbedding:
-    __slots__ = ("d_model", "freqs", "_quarter")
-
-    def __init__(self, d_model: int, base: float = 10000.0):
-        self.d_model = d_model
-        self._quarter = d_model // 4
-        self.freqs: list[float] = [
-            1.0 / (base ** (2.0 * i / d_model))
-            for i in range(self._quarter)
-        ]
-
-    def encode(self, x: int, y: int) -> list[float]:
-        q = self._quarter
-        freqs = self.freqs
-        vec = [0.0] * self.d_model
-        half = q * 2
-        for i in range(q):
-            angle = x * freqs[i]
-            vec[2 * i] = math.sin(angle)
-            vec[2 * i + 1] = math.cos(angle)
-        for i in range(q):
-            angle = y * freqs[i]
-            vec[half + 2 * i] = math.sin(angle)
-            vec[half + 2 * i + 1] = math.cos(angle)
-        return vec
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +152,8 @@ class GameState:
     all_ore_keys: set[tuple[int, int]] = set()
     harv_proximity: dict[tuple[int, int], float] = {}
     harv_placed_ores: set[tuple[int, int]] = set()
-    conv_proximity: dict[tuple[int, int], float] = {}
+    conv_proximity: dict[tuple[int, int], float] = {}  # ore_key → conv proximity reward given
+
     working_harv_positions: set[tuple[int, int]] = set()
     working_harv_round: int = -1
     working_harv_count: int = 0
@@ -176,6 +172,7 @@ class GameState:
         cls.harv_proximity = {}
         cls.harv_placed_ores = set()
         cls.conv_proximity = {}
+
         cls.working_harv_positions = set()
         cls.working_harv_round = -1
         cls.working_harv_count = 0
@@ -290,7 +287,7 @@ def scan_working_harvesters(ct: Controller) -> None:
 # ---------------------------------------------------------------------------
 
 def encode_state_into(ct: Controller, features, core_center, enemy_core,
-                      my_team, pos_encoder, prev_resources, spawn_round,
+                      my_team, pos_encoder, prev_collected, spawn_round,
                       n_builders_out: list) -> None:
     """Append encoded state into a list-like float buffer.
 
@@ -334,6 +331,12 @@ def encode_state_into(ct: Controller, features, core_center, enemy_core,
                     append(float(bdy))
                 except Exception:
                     extend((0.0, 0.0))
+                append(0.0)  # bld_cooldown: populated by replay parser during training
+                try:
+                    sr = ct.get_stored_resource(bid)
+                    append(0.0 if sr is None else 1.0 if sr == ResourceType.TITANIUM else -1.0)
+                except Exception:
+                    append(0.0)
             else:
                 extend(_NO_BUILD_TILE)
 
@@ -376,49 +379,48 @@ def encode_state_into(ct: Controller, features, core_center, enemy_core,
             pass
     n_builders_out[0] = n_builders
 
-    core_dx, core_dy = 0.0, 0.0
+    core_dx, core_dy, core_known = 0.0, 0.0, 0.0
     if _core_center is not None:
-        cdx = _core_center.x - pos.x
-        cdy = _core_center.y - pos.y
-        d = max(abs(cdx), abs(cdy), 1)
-        core_dx = cdx / d
-        core_dy = cdy / d
+        core_dx = float(_core_center.x - pos.x)
+        core_dy = float(_core_center.y - pos.y)
+        core_known = 1.0
 
-    ecore_dx, ecore_dy = 0.0, 0.0
+    ecore_dx, ecore_dy, ecore_known = 0.0, 0.0, 0.0
     if _enemy_core is not None:
-        edx = _enemy_core.x - pos.x
-        edy = _enemy_core.y - pos.y
-        d = max(abs(edx), abs(edy), 1)
-        ecore_dx = edx / d
-        ecore_dy = edy / d
+        ecore_dx = float(_enemy_core.x - pos.x)
+        ecore_dy = float(_enemy_core.y - pos.y)
+        ecore_known = 1.0
 
-    ti_delta, ax_delta = 0.0, 0.0
-    if prev_resources is not None:
-        prev_ti, prev_ax = prev_resources
-        ti_delta = (ti - prev_ti) / 500.0
-        ax_delta = (ax - prev_ax) / 500.0
+    ti_income, ax_income = 0.0, 0.0
+    if prev_collected is not None:
+        prev_ti, prev_ax = prev_collected
+        ti_income = (ti - prev_ti) / 500.0
+        ax_income = (ax - prev_ax) / 500.0
 
     hp_advantage = (own_hp - enemy_hp) / 500.0
+
+    scan_working_harvesters(ct)
 
     extend([
         rnd, x_norm, y_norm, ti / 500.0, ax / 500.0, scale,
         core_dx, core_dy, ecore_dx, ecore_dy,
         n_builders / 10.0,
-        ti_delta, ax_delta, hp_advantage,
+        ti_income, ax_income, hp_advantage,
         spawn_round / 2000.0 if spawn_round >= 0 else 0.0,
+        core_known, ecore_known,
+        w / 50.0, h / 50.0,
+        GameState.working_harv_count / 20.0,
     ])
 
-    extend(pos_encoder.encode(pos.x, pos.y))
-
-    return _core_center, _enemy_core
+    return _core_center, _enemy_core, (ti, ax)
 
 
 def encode_state(ct: Controller, core_center, enemy_core, my_team,
-                 pos_encoder, prev_resources, spawn_round,
+                 pos_encoder, prev_collected, spawn_round,
                  n_builders_out: list) -> list[float]:
     features: list[float] = []
     updated = encode_state_into(ct, features, core_center, enemy_core,
-                                my_team, pos_encoder, prev_resources,
+                                my_team, pos_encoder, prev_collected,
                                 spawn_round, n_builders_out)
     return features, updated
 
@@ -427,40 +429,8 @@ def encode_state(ct: Controller, core_center, enemy_core, my_team,
 # Masks
 # ---------------------------------------------------------------------------
 
-def compute_harvester_build_dir_mask(obs: list[float], bd_mask: list[bool]) -> list[bool]:
-    has_visible_ore = False
-    for tile in range(GRID_SIZE * GRID_SIZE):
-        ts = tile * TILE_FEATURES
-        if obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0:
-            has_visible_ore = True
-            break
-
-    harv_bd_mask = [False] * 9
-    for d_idx in range(9):
-        if not bd_mask[d_idx]:
-            continue
-        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
-        is_ore = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
-        empty = obs[ts + 4] == 1.0
-        harv_bd_mask[d_idx] = (is_ore and empty) or ((not is_ore) and has_visible_ore)
-    return harv_bd_mask
-
-
-def compute_conditional_build_dir_mask(
-    obs: list[float],
-    build_type_idx: int,
-    bd_mask: list[bool],
-    harv_bd_mask: list[bool] | None = None,
-) -> list[bool]:
-    if build_type_idx != _HARVESTER_BUILD_TYPE:
-        return bd_mask
-    if harv_bd_mask is None:
-        harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
-    return harv_bd_mask
-
-
-def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], list[bool]]:
-    """Returns (bt_mask, bd_mask, harv_bd_mask)."""
+def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool]]:
+    """Returns (bt_mask, bd_mask)."""
     g = _GLOBAL_OBS_START
     ti = obs[g + 3] * 500.0
     ax = obs[g + 4] * 500.0
@@ -479,21 +449,49 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], li
     for d_idx in range(9):
         ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
         not_wall = obs[ts] == 0.0
-        no_unit = obs[ts + 15] == 0.0
+        no_unit = obs[ts + 19] == 0.0
         empty = obs[ts + 4] == 1.0
-        replaceable = obs[ts + 4] == 0.0 and obs[ts + 12] == 1.0 and obs[ts + 11] == 0.0
+        replaceable = obs[ts + 4] == 0.0 and obs[ts + 14] == 1.0 and obs[ts + 13] == 0.0
         if not_wall and no_unit and (empty or replaceable):
             bd_mask[d_idx] = True
             any_dir = True
 
-    harv_bd_mask = compute_harvester_build_dir_mask(obs, bd_mask)
-    if not any(harv_bd_mask):
+    if not any_affordable or not any_dir:
+        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9
+
+    return bt_mask, bd_mask
+
+
+def compute_harvester_build_dir_mask(obs: list[float], bd_mask: list[bool]) -> list[bool]:
+    """Harvester placement is legal on ore tiles that are empty or have a friendly replaceable building."""
+    harv_mask = [False] * 9
+    for d_idx, allowed in enumerate(bd_mask):
+        if not allowed:
+            continue
+        ts = _BUILD_DIR_TILE_INDICES[d_idx] * TILE_FEATURES
+        ore_here = obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0
+        harv_mask[d_idx] = ore_here
+    return harv_mask
+
+
+def select_greedy_actions_from_outputs(
+    obs: list[float],
+    outputs: dict[str, list[float]],
+) -> tuple[int, int, int, int, int]:
+    """Match deploy/training greedy action selection for factorized actor heads."""
+    bt_mask, bd_mask = compute_masks_from_obs(obs)
+    build_dir_idx = argmax(outputs["build_dir"], bd_mask)
+
+    # Harvester legality depends on the chosen build direction.
+    ts = _BUILD_DIR_TILE_INDICES[build_dir_idx] * TILE_FEATURES
+    if not (obs[ts + 1] == 1.0 or obs[ts + 2] == 1.0):
         bt_mask[_HARVESTER_BUILD_TYPE] = False
 
-    if not any_affordable or not any_dir:
-        return [True] + [False] * (len(BUILD_COSTS) - 1), [True] * 9, [True] * 9
-
-    return bt_mask, bd_mask, harv_bd_mask
+    build_type_idx = argmax(outputs["build_type"], bt_mask)
+    conv_dir_idx = argmax(outputs["conv_dir"])
+    bridge_target_idx = argmax(outputs["bridge_target"])
+    move_dir_idx = argmax(outputs["move_dir"])
+    return build_type_idx, build_dir_idx, conv_dir_idx, bridge_target_idx, move_dir_idx
 
 
 # ---------------------------------------------------------------------------
@@ -501,29 +499,29 @@ def compute_masks_from_obs(obs: list[float]) -> tuple[list[bool], list[bool], li
 # ---------------------------------------------------------------------------
 
 PLACE_HARV = 5.0
-PLACE_CONV = 5.0
+PLACE_CONV = 2.5
 
 
 def proximity_reward(ct: Controller, build_pos: Position, my_team) -> float:
-    best_delta, best_key, best_reward = 0.0, None, 0.0
+    best_dist, best_key = None, None
     ore_tiles = GameState.all_ore or ()
     for tile_pos in ore_tiles:
         try:
-            key = (tile_pos.x, tile_pos.y)
-            prev = GameState.harv_proximity.get(key, 0.0)
             d = max(abs(tile_pos.x - build_pos.x), abs(tile_pos.y - build_pos.y))
-            if d > 10:
-                continue
-            reward = PLACE_HARV * 0.2 / (1.0 + d)
-            delta = reward - prev
-            if delta > best_delta:
-                best_delta, best_key, best_reward = delta, key, reward
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_key = (tile_pos.x, tile_pos.y)
         except Exception:
             continue
-    if best_key is None or best_delta <= 0:
+    if best_key is None or best_dist > 10:
         return 0.0
-    GameState.harv_proximity[best_key] = best_reward
-    return best_delta
+    prev = GameState.harv_proximity.get(best_key, 0.0)
+    reward = PLACE_HARV * 0.2 / (1.0 + best_dist)
+    delta = reward - prev
+    if delta <= 0:
+        return 0.0
+    GameState.harv_proximity[best_key] = reward
+    return delta
 
 
 def should_reward_harvester_proximity(
@@ -551,61 +549,66 @@ def should_reward_harvester_proximity(
         return False
 
 
-def conv_proximity_reward(ct: Controller, build_pos: Position, conv_direction: Direction) -> float:
-    best_delta, best_key, best_reward = 0.0, None, 0.0
-    ore_tiles = GameState.all_ore or ()
-    fdx, fdy = DIR_DXY.get(conv_direction, (0, 0))
-    for tile_pos in ore_tiles:
+
+def conveyor_reward(ct: Controller, pos: Position, facing: Direction) -> float:
+    """Reward for successful conveyor placement based on manhattan proximity to ore.
+    Target distance is 1 (cardinally adjacent). Zero-sum with proximity advances.
+    Always matches closest ore regardless of fulfillment — no reward if already claimed."""
+    best_dist, best_key = None, None
+    fdx, fdy = DIR_DXY.get(facing, (0, 0))
+    for ore_pos in (GameState.all_ore or []):
+        dx, dy = ore_pos.x - pos.x, ore_pos.y - pos.y
+        d = abs(dx) + abs(dy)
+        if best_dist is None or d < best_dist:
+            best_dist = d
+            best_key = (ore_pos.x, ore_pos.y)
+    if best_key is None:
+        return 0.0
+    # Already finalized — no reward
+    prev = GameState.conv_proximity.get(best_key)
+    if prev is not None and prev < 0:
+        return 0.0
+    # Cardinal adjacent: check facing doesn't point at ore
+    dx, dy = best_key[0] - pos.x, best_key[1] - pos.y
+    if best_dist == 1 and fdx == dx and fdy == dy:
+        return 0.0  # facing into the ore — useless
+    best_given = prev or 0.0
+    effective_dist = max(0, best_dist - 1)  # target is cardinal adjacent (d=1)
+    reward = PLACE_CONV / (1.0 + effective_dist)
+    GameState.conv_proximity[best_key] = -1.0  # mark finalized
+    return reward - best_given
+
+
+def proximity_reward_conv(ct: Controller) -> float:
+    """Proximity reward for failed conveyor placement.
+    Returns delta improvement: new_advance - old_advance. Improvable on closer approach.
+    Always matches closest ore — no reward if already finalized."""
+    pos = ct.get_position()
+    best_dist, best_key = None, None
+    for tile_pos in ct.get_nearby_tiles():
         try:
-            key = (tile_pos.x, tile_pos.y)
-            prev = GameState.conv_proximity.get(key, 0.0)
-            dx = tile_pos.x - build_pos.x
-            dy = tile_pos.y - build_pos.y
-            d = abs(dx) + abs(dy)
-            if d > 10:
+            env = ct.get_tile_env(tile_pos)
+            if env not in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
                 continue
-            if d == 1 and fdx == dx and fdy == dy:
-                continue
-            if d <= 1:
-                reward = PLACE_CONV
-            else:
-                reward = PLACE_CONV * 0.1 / (d - 1)
-            delta = reward - prev
-            if delta > best_delta:
-                best_delta, best_key, best_reward = delta, key, reward
+            d = abs(tile_pos.x - pos.x) + abs(tile_pos.y - pos.y)
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_key = (tile_pos.x, tile_pos.y)
         except Exception:
             continue
-    if best_key is None or best_delta <= 0:
+    if best_key is None:
         return 0.0
-    GameState.conv_proximity[best_key] = best_reward
-    return best_delta
-
-
-def should_reward_conv_proximity(
-    ct: Controller, build_pos: Position, conv_direction: Direction, my_team,
-    tile_building_id=None, tile_building_type=None,
-) -> bool:
-    if conv_direction == Direction.CENTRE:
-        return False
-    try:
-        env = ct.get_tile_env(build_pos)
-        if env in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
-            return False
-        if env == Environment.WALL:
-            return False
-        if ct.get_tile_builder_bot_id(build_pos) is not None:
-            return False
-        bid = tile_building_id
-        btype = tile_building_type
-        if bid is None:
-            bid = ct.get_tile_building_id(build_pos)
-            if bid is not None:
-                btype = ct.get_entity_type(bid)
-        if bid is None:
-            return True
-        return ct.get_team(bid) == my_team and btype != EntityType.CORE
-    except Exception:
-        return False
+    prev = GameState.conv_proximity.get(best_key)
+    if prev is not None and prev < 0:
+        return 0.0  # finalized by successful placement
+    prev = prev or 0.0
+    effective_dist = max(0, best_dist - 1)
+    reward = min(PLACE_CONV / (1.0 + effective_dist), PLACE_CONV * 0.1)
+    delta = reward - prev
+    if delta <= 0:
+        return 0.0
+    GameState.conv_proximity[best_key] = reward
+    return delta
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +650,7 @@ _ZERO_DBG = [0, 0, 0, 0, 0, 0, 0, 0]
 
 
 def execute_build(ct: Controller, action: str, direction: Direction,
-                  conv_direction: Direction, my_team) -> tuple[float, float, list]:
+                  conv_direction: Direction, my_team, bridge_target_idx: int = 0) -> tuple[float, float, list]:
     """Execute build action. Returns (harv_reward, conv_reward, dbg)."""
     if action == "none":
         return 0.0, 0.0, _ZERO_DBG
@@ -669,6 +672,8 @@ def execute_build(ct: Controller, action: str, direction: Direction,
                     return 0.0, 0.0, _ZERO_DBG
                 if action == "armoured_conveyor" and btype == EntityType.ARMOURED_CONVEYOR and ct.get_direction(bid) == conv_direction:
                     return 0.0, 0.0, _ZERO_DBG
+                if action == "splitter" and btype == EntityType.SPLITTER and ct.get_direction(bid) == conv_direction:
+                    return 0.0, 0.0, _ZERO_DBG
             if ct.get_team(bid) == my_team and btype != EntityType.CORE:
                 idx = BUILD_ACTIONS.index(action)
                 base_ti, base_ax = BUILD_COSTS[idx]
@@ -689,30 +694,34 @@ def execute_build(ct: Controller, action: str, direction: Direction,
         if ct.can_build_conveyor(build_pos, conv_direction):
             ct.build_conveyor(build_pos, conv_direction)
             GameState.conv_count += 1
-            if should_reward_conv_proximity(ct, build_pos, conv_direction, my_team, bid, btype):
-                dbg[6] = 1
-                reward = conv_proximity_reward(ct, build_pos, conv_direction)
-                if reward > 0.0:
-                    dbg[7] = 1
-                return 0.0, reward, dbg
+            cr = conveyor_reward(ct, build_pos, conv_direction)
+            dbg[6] = 1
+            if cr > 0:
+                dbg[7] = 1
+            return 0.0, cr, dbg
         else:
             dbg[5] = 1
-        return 0.0, 0.0, dbg
+        cr = proximity_reward_conv(ct)
+        dbg[6] = 1
+        if cr > 0:
+            dbg[7] = 1
+        return 0.0, cr, dbg
     elif action == "harvester":
         dbg[0] = 1
         if ct.can_build_harvester(build_pos):
             ct.build_harvester(build_pos)
             ore_key = (build_pos.x, build_pos.y)
             if ore_key in GameState.harv_placed_ores:
+                dbg[2] = 1
                 return 0.0, 0.0, dbg
             GameState.harv_placed_ores.add(ore_key)
+            dbg[2] = 1
+            dbg[3] = 1
             return PLACE_HARV, 0.0, dbg
         dbg[1] = 1
         if should_reward_harvester_proximity(ct, build_pos, my_team, bid, btype):
             dbg[2] = 1
             reward = proximity_reward(ct, build_pos, my_team)
-            if reward > 0.0:
-                dbg[3] = 1
             return reward, 0.0, dbg
         return 0.0, 0.0, dbg
     elif action == "road":
@@ -728,22 +737,25 @@ def execute_build(ct: Controller, action: str, direction: Direction,
         if ct.can_build_breach(build_pos, direction):
             ct.build_breach(build_pos, direction)
     elif action == "splitter":
-        if ct.can_build_splitter(build_pos, direction):
-            ct.build_splitter(build_pos, direction)
+        if ct.can_build_splitter(build_pos, conv_direction):
+            ct.build_splitter(build_pos, conv_direction)
     elif action == "armoured_conveyor":
         dbg[4] = 1
         if ct.can_build_armoured_conveyor(build_pos, conv_direction):
             ct.build_armoured_conveyor(build_pos, conv_direction)
             GameState.conv_count += 1
-            if should_reward_conv_proximity(ct, build_pos, conv_direction, my_team, bid, btype):
-                dbg[6] = 1
-                reward = conv_proximity_reward(ct, build_pos, conv_direction)
-                if reward > 0.0:
-                    dbg[7] = 1
-                return 0.0, reward, dbg
+            cr = conveyor_reward(ct, build_pos, conv_direction)
+            dbg[6] = 1
+            if cr > 0:
+                dbg[7] = 1
+            return 0.0, cr, dbg
         else:
             dbg[5] = 1
-        return 0.0, 0.0, dbg
+        cr = proximity_reward_conv(ct)
+        dbg[6] = 1
+        if cr > 0:
+            dbg[7] = 1
+        return 0.0, cr, dbg
     elif action == "barrier":
         if ct.can_build_barrier(build_pos):
             ct.build_barrier(build_pos)
@@ -753,6 +765,12 @@ def execute_build(ct: Controller, action: str, direction: Direction,
     elif action == "launcher":
         if ct.can_build_launcher(build_pos):
             ct.build_launcher(build_pos)
+    elif action == "bridge":
+        if bridge_target_idx < len(BRIDGE_OFFSETS):
+            bdx, bdy = BRIDGE_OFFSETS[bridge_target_idx]
+            target = Position(build_pos.x + bdx, build_pos.y + bdy)
+            if ct.can_build_bridge(build_pos, target):
+                ct.build_bridge(build_pos, target)
     return 0.0, 0.0, dbg
 
 

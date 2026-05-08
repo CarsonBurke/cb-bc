@@ -21,6 +21,7 @@ from .nn import (
     Sequential,
     MLP,
 )
+from .actor import ActorModel
 from .embed import SinusoidalPositionEmbedding
 
 __all__ = [
@@ -35,5 +36,6 @@ __all__ = [
     "Dropout",
     "Sequential",
     "MLP",
+    "ActorModel",
     "SinusoidalPositionEmbedding",
 ]

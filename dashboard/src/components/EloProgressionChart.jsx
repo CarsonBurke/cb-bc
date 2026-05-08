@@ -1,41 +1,27 @@
+import { useMemo } from 'react'
 import { Line } from 'react-chartjs-2'
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Tooltip,
-  Legend,
-} from 'chart.js'
-import { botColor, getAllBots, CHART_THEME } from '../data'
+import { botColor, CHART_THEME } from '../data'
+import '../chartjs'
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend)
-
-export default function EloProgressionChart({ rounds }) {
-  const allBots = getAllBots()
-  const labels = rounds.map(r => `Round ${r.round_id}`)
-
-  const datasets = allBots.map((bot, i) => {
-    const data = rounds.map(r => r.bots[bot]?.elo ?? null)
-    return {
+export default function EloProgressionChart({ timeline, allBots }) {
+  const { labels, datasets, botDataMap } = useMemo(() => {
+    const labels = timeline.map((round) => `Round ${round.round_id}`)
+    const botDataMap = Object.fromEntries(
+      allBots.map((bot) => [bot, timeline.map((round) => round.bots[bot] ?? null)]),
+    )
+    const datasets = allBots.map((bot, index) => ({
       label: bot,
-      data,
-      borderColor: botColor(i),
-      backgroundColor: botColor(i) + '22',
+      data: botDataMap[bot],
+      borderColor: botColor(index),
+      backgroundColor: `${botColor(index)}22`,
       tension: 0.3,
       spanGaps: true,
       pointRadius: 5,
       pointHoverRadius: 7,
       borderWidth: 2.5,
-    }
-  })
-
-  // Compute deltas for the tooltip
-  const botDataMap = {}
-  allBots.forEach((bot, i) => {
-    botDataMap[bot] = rounds.map(r => r.bots[bot]?.elo ?? null)
-  })
+    }))
+    return { labels, datasets, botDataMap }
+  }, [allBots, timeline])
 
   return (
     <div className="min-h-[280px]">

@@ -1,7 +1,3 @@
-import historyData from '../../ablations/history.json'
-
-export const DATA = historyData
-
 export const BOT_COLORS = [
   '#89b4fa', '#a6e3a1', '#f9e2af', '#f38ba8', '#cba6f7',
   '#f5c2e7', '#74c7ec', '#94e2d5', '#fab387', '#eba0ac',
@@ -10,14 +6,6 @@ export const BOT_COLORS = [
 
 export function botColor(index) {
   return BOT_COLORS[index % BOT_COLORS.length]
-}
-
-export function getAllBots() {
-  return [...new Set(DATA.rounds.flatMap(r => Object.keys(r.bots)))]
-}
-
-export function getLatestRound() {
-  return DATA.rounds[DATA.rounds.length - 1] ?? null
 }
 
 import { formatDistanceToNow } from 'date-fns'
