@@ -1777,9 +1777,12 @@ def main():
             for gi, trajs in game_trajs.items()
         }
         n_games_logged = max(len(game_shared_flow), 1)
-        mean_r_flow = sum(game_shared_flow.values()) / n_games_logged
         mean_r_delivery = sum(game_delivery_totals.values()) * REWARD_INCOME_SCALE / n_games_logged
-        mean_r_flow -= mean_r_delivery
+        if REWARD_MODE == RewardMode.FLOW:
+            # game_shared_flow sums conveyor hops + delivery; subtract delivery to isolate the pure-flow part
+            mean_r_flow = sum(game_shared_flow.values()) / n_games_logged - mean_r_delivery
+        else:
+            mean_r_flow = 0.0
         mean_r_dmg = sum(r[2] for r in rewards) / n_trajs
         mean_r_own_dmg = sum(r[3] for r in rewards) / n_trajs
         mean_harv_attempts = sum(r[4] for r in rewards) / n_trajs
